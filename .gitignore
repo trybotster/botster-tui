@@ -1,0 +1,6 @@
+/target/
+/.cargo/
+/.env
+/.env.*
+/mise.local.toml
+*.log

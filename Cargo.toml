@@ -1,8 +1,9 @@
 [workspace]
-members = ["crates/botster-tui-spike"]
 resolver = "3"
+members = ["crates/botster-tui", "crates/botster-tui-spike"]
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.88.0"
 license = "MIT"
 publish = false
