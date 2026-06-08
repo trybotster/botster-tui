@@ -2,14 +2,14 @@
 
 ## Status
 
-Accepted for the scaffold proof.
+Accepted. The foundation proof has been ported into the production
+`botster-tui` renderer scaffold.
 
 ## Context
 
-This repository started as a scaffold-only architecture spike: it had no production
-`botster-tui` crate or Rust renderer entry point. The proof therefore cannot wire a
-real production path in this worktree. Its job is to make the intended production
-boundary concrete and testable.
+This repository started as a scaffold-only architecture spike. It now contains a
+production `botster-tui` crate with a ratatui renderer entry point that consumes
+the shared `botster-core` UI contract.
 
 The Botster architecture is not greenfield. The production TUI direction is an
 adapter over the existing Rust render tree:
@@ -37,10 +37,11 @@ platform adapter foundation because it supplies cross-platform terminal events,
 including mouse move, click, scroll, and key events that the renderer can translate
 into Botster actions.
 
-Production integration should wire in at the adapter from the shared `UiNodeV1`
-snapshot plus live entity stores into the existing Rust render tree. The scaffold
-crate models that boundary with `UiNode` fixtures and an `adapter_mapping()` test;
-it does not replace the production tree.
+Production integration wires in at the adapter from shared `UiNode` snapshots
+into ratatui widgets. The current scaffold renders a core-derived sample through
+`crates/botster-tui/src/app.rs` and tests against the bundled
+`botster-core-test-support` renderer conformance fixtures. Live entity stores are
+still future transport work.
 
 ## State And Action Boundary
 
@@ -61,31 +62,38 @@ Cross-process work leaves the renderer as semantic action requests:
   forwarded as PTY bytes through the terminal data plane rather than converted into
   ordinary widget actions
 
-The spike maps these concepts to:
+The renderer maps these concepts to:
 
-- `UiActionRequest::Semantic`
-- `UiActionRequest::LocalPresentation`
-- `UiActionRequest::TerminalForward`
+- core `UiActionRequest` values for shared semantic actions
+- renderer-local event dispatch for hover, scroll, and ignored input
+- terminal input forwarding as PTY bytes, separate from ordinary widget actions
 
 ## Runtime Evidence
 
-The scaffold crate contains tests for:
+The `botster-tui` crate contains tests for:
 
-- split panes plus list, form, dialog, and terminal-view rendering
-- crossterm hover, click, and scroll event translation
+- core renderer conformance fixtures from `botster-core-test-support`
+- stack/inline/panel/text/badge/status_dot/list/list_item/table-as-list/button,
+  form, dialog, empty-state, and unsupported fallback rendering
+- form values, field errors, select/checkbox/text input, and read-only textarea
+- crossterm hover, click, scroll, and terminal key event translation
 - stable-node hit map lookup independent of raw screen-only coordinates
-- semantic selection action emission
-- dialog dismissal through client-local presentation state
-- terminal-view focus and `ctrl+j` input forwarding as separate paths
+- semantic action emission through the core `UiActionRequest` envelope
+- terminal-view focus and input forwarding as separate paths
 - frequent output coalesced by a redraw budget instead of an unbounded tick loop
-- adapter mapping onto the existing Rust render tree names
 
 Run evidence:
 
 ```bash
-./test.sh -p botster-tui-spike
-cargo run -p botster-tui-spike
+script/fmt
+script/test
+script/clippy
+cargo run -p botster-tui -- --smoke
 ```
+
+In Botster session worktrees whose path contains `:`, macOS Rust test execution
+can fail while constructing `DYLD_FALLBACK_LIBRARY_PATH`. Use any colon-free
+`CARGO_TARGET_DIR` for those session-only runs.
 
 ## Alternatives
 
@@ -113,7 +121,6 @@ Positive:
 
 Risks:
 
-- This proof is scaffold-only until applied to the production `botster-tui` crate.
 - The real renderer must consume both `ui_tree_snapshot` and entity stores; rendering
   only the structural tree can produce connected-empty plugin surfaces.
 - The semantic action vocabulary must remain additive and finite. Free-form spike
@@ -123,8 +130,7 @@ Risks:
 
 ## Assumptions
 
-- The empty worktree is intentional for this architecture spike.
-- The production renderer entry point exists outside this scaffold and should receive
-  the adapter, not a rewrite.
 - Dependency versions were checked at implementation time: ratatui `0.30.1` and
   crossterm `0.29.0`.
+- `botster-core` is consumed as a contract-only dependency with
+  `default-features = false` at revision `8f2f4acf`.

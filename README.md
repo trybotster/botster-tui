@@ -5,8 +5,7 @@ It is a renderer/client over hub and core APIs, not a policy owner.
 
 ## Role
 
-This crate is intended to consume shared Botster contracts as they become
-available:
+This crate consumes the shared Botster UI contract from `botster-core`:
 
 - Render `UiNode` trees with ratatui widgets.
 - Emit semantic action requests instead of owning workflow behavior.
@@ -40,7 +39,7 @@ cargo run -p botster-tui -- --smoke
 cargo run -p botster-tui
 ```
 
-The interactive placeholder opens the alternate terminal screen and exits with
+The interactive renderer opens the alternate terminal screen and exits with
 `q`, `Esc`, or `Ctrl-C`.
 
 ## Scope
@@ -50,14 +49,21 @@ Included now:
 - Root Cargo workspace.
 - One binary client crate at `crates/botster-tui`.
 - A real binary entry point with a noninteractive `--smoke` path.
-- A minimal placeholder TUI loop.
+- A first ratatui renderer registry for shared `botster-core` `UiNode`
+  primitives: stack/inline/panel/scroll_area/text/badge/status_dot/empty_state,
+  list/list_item, table-as-list fallback, button actions, form inputs,
+  field errors, dialog, and safe unsupported fallback.
+- Core UI renderer conformance fixture coverage through
+  `botster-core-test-support` with `default-features = false`.
+- A runtime draw path that renders a core-derived `UiNode` sample through the
+  production renderer and dispatches terminal events through the renderer hit map.
 - Deterministic format, test, and clippy scripts.
 
 Not included yet:
 
 - Hub connection, pairing, auth, socket attach, or terminal subscription.
-- UiNode renderer primitives, semantic action routing, entity storage, or
-  terminal_view input forwarding.
+- Entity-store hydration for bound plugin lists, owner-routed action execution,
+  or live `terminal_view` subscription/input forwarding.
 - Plugin execution, Project Pipelines policy, browser surfaces, or hub/core
   runtime policy.
 
