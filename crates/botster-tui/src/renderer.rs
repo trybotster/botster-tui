@@ -12,7 +12,7 @@ use crossterm::event::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 pub const DEMO_SURFACE_ID: &str = "botster-tui.demo";
 
@@ -22,6 +22,8 @@ pub struct HitRegion {
     pub role: HitRole,
     pub rect: Rect,
     pub action: Option<UiAction>,
+    pub field: Option<FieldBinding>,
+    pub row: Option<RowBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -33,6 +35,29 @@ pub enum HitRole {
     Panel,
     TerminalView,
     Text,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldBinding {
+    pub name: String,
+    pub value: Value,
+    pub kind: FieldKind,
+    pub options: Vec<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldKind {
+    Text,
+    Checkbox,
+    Select,
+    ReadOnly,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowBinding {
+    pub group_id: String,
+    pub index: usize,
+    pub value: Value,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -52,64 +77,347 @@ impl HitMap {
             .find(|region| contains(region.rect, column, row))
     }
 
+    #[cfg(test)]
     pub fn regions(&self) -> &[HitRegion] {
         &self.regions
+    }
+
+    pub fn focusable_regions(&self) -> impl Iterator<Item = &HitRegion> {
+        self.regions.iter().filter(|region| region.is_focusable())
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputDispatch {
     Hover { node_id: String },
+    Focus { node_id: String },
     Scroll { node_id: String, lines: i16 },
     Action(UiActionRequest),
     TerminalForward { node_id: String, bytes: Vec<u8> },
     Ignored,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct RedrawBudget {
-    frame_interval: std::time::Duration,
-    last_draw: Option<std::time::Instant>,
-    dirty_nodes: BTreeSet<String>,
-    draws: usize,
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputRouter {
+    hover_node_id: Option<String>,
+    focused_node_id: Option<String>,
+    selected_rows: BTreeMap<String, String>,
+    draft_values: BTreeMap<String, Value>,
+    scroll_offsets: BTreeMap<String, i16>,
 }
 
-#[cfg(test)]
-impl RedrawBudget {
-    pub fn new(frame_interval: std::time::Duration) -> Self {
-        Self {
-            frame_interval,
-            last_draw: None,
-            dirty_nodes: BTreeSet::new(),
-            draws: 0,
+impl InputRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub fn focused_node_id(&self) -> Option<&str> {
+        self.focused_node_id.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn hover_node_id(&self) -> Option<&str> {
+        self.hover_node_id.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn selected_row(&self, group_id: &str) -> Option<&str> {
+        self.selected_rows.get(group_id).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub fn draft_value(&self, field_name: &str) -> Option<&Value> {
+        self.draft_values.get(field_name)
+    }
+
+    #[cfg(test)]
+    pub fn scroll_offset(&self, node_id: &str) -> i16 {
+        self.scroll_offsets
+            .get(node_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn dispatch_event(&mut self, event: Event, hit_map: &HitMap) -> InputDispatch {
+        match event {
+            Event::Mouse(mouse) => self.dispatch_mouse(mouse, hit_map),
+            Event::Key(key) => {
+                self.ensure_focus(hit_map);
+                self.dispatch_key(key, hit_map)
+            }
+            _ => InputDispatch::Ignored,
         }
     }
 
-    pub fn mark_output(&mut self, node_id: impl Into<String>) {
-        self.dirty_nodes.insert(node_id.into());
-    }
+    fn dispatch_mouse(&mut self, mouse: MouseEvent, hit_map: &HitMap) -> InputDispatch {
+        let Some(region) = hit_map.lookup(mouse.column, mouse.row) else {
+            return InputDispatch::Ignored;
+        };
 
-    pub fn maybe_draw(&mut self, now: std::time::Instant) -> Option<BTreeSet<String>> {
-        if self.dirty_nodes.is_empty() {
-            return None;
+        if self.focused_node_id.as_deref() == Some(region.node_id.as_str())
+            && region.role == HitRole::TerminalView
+        {
+            return terminal_mouse_forward(region, mouse);
         }
 
-        let ready = self
-            .last_draw
-            .is_none_or(|last_draw| now.duration_since(last_draw) >= self.frame_interval);
-        if !ready {
-            return None;
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                self.hover_node_id = Some(region.node_id.clone());
+                InputDispatch::Hover {
+                    node_id: region.node_id.clone(),
+                }
+            }
+            MouseEventKind::ScrollDown => self.scroll(region, 3),
+            MouseEventKind::ScrollUp => self.scroll(region, -3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !region.is_focusable() {
+                    return InputDispatch::Ignored;
+                }
+                self.focused_node_id = Some(region.node_id.clone());
+                if region.role == HitRole::TerminalView {
+                    return region
+                        .action
+                        .as_ref()
+                        .map(|action| {
+                            InputDispatch::Action(action_request(
+                                region,
+                                action,
+                                UiActionKind::Submit,
+                                &self.draft_values,
+                            ))
+                        })
+                        .unwrap_or_else(|| InputDispatch::Focus {
+                            node_id: region.node_id.clone(),
+                        });
+                }
+                self.activate_region(region, UiActionKind::Submit)
+            }
+            _ => InputDispatch::Ignored,
+        }
+    }
+
+    fn dispatch_key(&mut self, key: KeyEvent, hit_map: &HitMap) -> InputDispatch {
+        match key.code {
+            KeyCode::Tab => return self.move_focus(hit_map, 1),
+            KeyCode::BackTab => return self.move_focus(hit_map, -1),
+            KeyCode::Esc => {
+                self.draft_values.clear();
+                return self
+                    .focused_region(hit_map)
+                    .and_then(|region| {
+                        region.action.as_ref().map(|action| {
+                            action_request(region, action, UiActionKind::Cancel, &self.draft_values)
+                        })
+                    })
+                    .map(InputDispatch::Action)
+                    .unwrap_or(InputDispatch::Ignored);
+            }
+            _ => {}
         }
 
-        self.last_draw = Some(now);
-        self.draws += 1;
-        Some(std::mem::take(&mut self.dirty_nodes))
+        let Some(region) = self.focused_region(hit_map) else {
+            return InputDispatch::Ignored;
+        };
+
+        if region.role == HitRole::TerminalView {
+            return terminal_key_forward(region, key);
+        }
+
+        match key.code {
+            KeyCode::Enter => self.activate_region(region, UiActionKind::Submit),
+            KeyCode::Char(' ') if region.role != HitRole::Field => {
+                self.activate_region(region, UiActionKind::Submit)
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.activate_region(region, UiActionKind::Validate)
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.draft_values.clear();
+                self.activate_region(region, UiActionKind::Reset)
+            }
+            KeyCode::Down => self.move_row(hit_map, region, 1),
+            KeyCode::Up => self.move_row(hit_map, region, -1),
+            KeyCode::Backspace if region.role == HitRole::Field => {
+                self.edit_field(region, FieldEdit::Backspace)
+            }
+            KeyCode::Char(character) if region.role == HitRole::Field => {
+                self.edit_field(region, FieldEdit::Char(character))
+            }
+            _ => InputDispatch::Ignored,
+        }
     }
 
-    pub fn draws(&self) -> usize {
-        self.draws
+    fn ensure_focus(&mut self, hit_map: &HitMap) {
+        let focus_still_exists = self.focused_node_id.as_deref().is_some_and(|node_id| {
+            hit_map
+                .focusable_regions()
+                .any(|region| region.node_id == node_id)
+        });
+        if !focus_still_exists {
+            self.focused_node_id = hit_map
+                .focusable_regions()
+                .next()
+                .map(|region| region.node_id.clone());
+        }
     }
+
+    fn focused_region<'a>(&self, hit_map: &'a HitMap) -> Option<&'a HitRegion> {
+        let node_id = self.focused_node_id.as_deref()?;
+        hit_map
+            .focusable_regions()
+            .find(|region| region.node_id == node_id)
+    }
+
+    fn move_focus(&mut self, hit_map: &HitMap, delta: isize) -> InputDispatch {
+        let focusable = hit_map.focusable_regions().collect::<Vec<_>>();
+        if focusable.is_empty() {
+            self.focused_node_id = None;
+            return InputDispatch::Ignored;
+        }
+
+        let current = self
+            .focused_node_id
+            .as_deref()
+            .and_then(|node_id| {
+                focusable
+                    .iter()
+                    .position(|region| region.node_id == node_id)
+            })
+            .unwrap_or_default();
+        let next = wrap_index(current, delta, focusable.len());
+        let region = focusable[next];
+        self.focused_node_id = Some(region.node_id.clone());
+        InputDispatch::Focus {
+            node_id: region.node_id.clone(),
+        }
+    }
+
+    fn activate_region(&mut self, region: &HitRegion, kind: UiActionKind) -> InputDispatch {
+        if let Some(row) = &region.row {
+            self.selected_rows
+                .insert(row.group_id.clone(), region.node_id.clone());
+        }
+
+        if kind == UiActionKind::Submit {
+            self.commit_field_cycle(region);
+        }
+
+        region
+            .action
+            .as_ref()
+            .map(|action| {
+                InputDispatch::Action(action_request(region, action, kind, &self.draft_values))
+            })
+            .unwrap_or_else(|| InputDispatch::Focus {
+                node_id: region.node_id.clone(),
+            })
+    }
+
+    fn commit_field_cycle(&mut self, region: &HitRegion) {
+        let Some(field) = &region.field else {
+            return;
+        };
+
+        match field.kind {
+            FieldKind::Checkbox => {
+                let current = self
+                    .draft_values
+                    .get(&field.name)
+                    .cloned()
+                    .unwrap_or_else(|| field.value.clone());
+                self.draft_values.insert(
+                    field.name.clone(),
+                    Value::Bool(!current.as_bool().unwrap_or_default()),
+                );
+            }
+            FieldKind::Select => {
+                if let Some(next) = next_option_value(
+                    &field.options,
+                    self.draft_values.get(&field.name).unwrap_or(&field.value),
+                ) {
+                    self.draft_values.insert(field.name.clone(), next);
+                }
+            }
+            FieldKind::Text | FieldKind::ReadOnly => {}
+        }
+    }
+
+    fn edit_field(&mut self, region: &HitRegion, edit: FieldEdit) -> InputDispatch {
+        let Some(field) = &region.field else {
+            return InputDispatch::Ignored;
+        };
+        if field.kind != FieldKind::Text {
+            return InputDispatch::Ignored;
+        }
+
+        let mut value = self
+            .draft_values
+            .get(&field.name)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| value_as_text(&field.value));
+        match edit {
+            FieldEdit::Char(character) => value.push(character),
+            FieldEdit::Backspace => {
+                value.pop();
+            }
+        }
+        self.draft_values
+            .insert(field.name.clone(), Value::String(value));
+
+        InputDispatch::Focus {
+            node_id: region.node_id.clone(),
+        }
+    }
+
+    fn move_row(&mut self, hit_map: &HitMap, region: &HitRegion, delta: isize) -> InputDispatch {
+        let Some(row) = &region.row else {
+            return InputDispatch::Ignored;
+        };
+        let rows = hit_map
+            .focusable_regions()
+            .filter(|candidate| {
+                candidate
+                    .row
+                    .as_ref()
+                    .is_some_and(|candidate_row| candidate_row.group_id == row.group_id)
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return InputDispatch::Ignored;
+        }
+
+        let current = rows
+            .iter()
+            .position(|candidate| candidate.node_id == region.node_id)
+            .unwrap_or_default();
+        let next = rows[wrap_index(current, delta, rows.len())];
+        self.focused_node_id = Some(next.node_id.clone());
+        self.selected_rows
+            .insert(row.group_id.clone(), next.node_id.clone());
+        InputDispatch::Focus {
+            node_id: next.node_id.clone(),
+        }
+    }
+
+    fn scroll(&mut self, region: &HitRegion, lines: i16) -> InputDispatch {
+        let entry = self
+            .scroll_offsets
+            .entry(region.node_id.clone())
+            .or_default();
+        *entry = entry.saturating_add(lines);
+        InputDispatch::Scroll {
+            node_id: region.node_id.clone(),
+            lines,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FieldEdit {
+    Char(char),
+    Backspace,
 }
 
 pub fn render_node(
@@ -146,12 +454,9 @@ pub fn render_to_lines(root: &UiNode, width: u16, height: u16) -> (Vec<String>, 
     (lines, hit_map)
 }
 
+#[cfg(test)]
 pub fn dispatch_event(event: Event, hit_map: &HitMap) -> InputDispatch {
-    match event {
-        Event::Mouse(mouse) => dispatch_mouse(mouse, hit_map),
-        Event::Key(key) => dispatch_key(key, hit_map),
-        _ => InputDispatch::Ignored,
-    }
+    InputRouter::new().dispatch_event(event, hit_map)
 }
 
 pub fn tui_capabilities() -> UiCapabilitySet {
@@ -204,6 +509,8 @@ pub fn primitive_registry() -> BTreeMap<&'static str, &'static str> {
         ("list_item", "ListItem"),
         ("table", "Paragraph(table_as_list)"),
         ("button", "Paragraph"),
+        ("menu", "Block"),
+        ("menu_item", "Paragraph"),
         ("dialog", "Block"),
         ("text_input", "Paragraph"),
         ("textarea", "Paragraph(read_only)"),
@@ -278,7 +585,7 @@ fn render_node_inner(
         UiNodeKind::EmptyState => render_empty_state(frame, area, node),
         UiNodeKind::List => render_list(frame, area, node, hit_map),
         UiNodeKind::ListItem => render_list_item(frame, area, node, hit_map),
-        UiNodeKind::Table => render_table_as_list(frame, area, node),
+        UiNodeKind::Table => render_table_as_list(frame, area, node, hit_map),
         UiNodeKind::Button | UiNodeKind::IconButton | UiNodeKind::MenuItem => {
             render_button(frame, area, node, hit_map);
         }
@@ -296,9 +603,8 @@ fn render_node_inner(
         }
         UiNodeKind::TerminalView => render_terminal_view(frame, area, node, hit_map),
         UiNodeKind::ConnectionCodeView => render_connection_code(frame, area, node),
-        UiNodeKind::Tree | UiNodeKind::TreeItem | UiNodeKind::Menu => {
-            render_unsupported(frame, area, node);
-        }
+        UiNodeKind::Menu => render_menu(frame, area, node, hit_map),
+        UiNodeKind::Tree | UiNodeKind::TreeItem => render_unsupported(frame, area, node),
         UiNodeKind::Icon => render_label(frame, area, node, hit_map, "icon", HitRole::Text),
     }
 }
@@ -350,11 +656,12 @@ fn render_empty_state(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode)
 }
 
 fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode, hit_map: &mut HitMap) {
+    let list_id = node_id(node).unwrap_or_else(|| "list".to_string());
     let rows = node
         .children
         .iter()
         .enumerate()
-        .flat_map(|(index, child)| list_rows_from_child(index, child, hit_map, area))
+        .flat_map(|(index, child)| list_rows_from_child(index, child, hit_map, area, &list_id))
         .collect::<Vec<_>>();
     frame.render_widget(List::new(rows), area);
 }
@@ -369,7 +676,12 @@ fn render_list_item(
     frame.render_widget(Paragraph::new(node_title(node)), area);
 }
 
-fn render_table_as_list(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode) {
+fn render_table_as_list(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    node: &UiNode,
+    hit_map: &mut HitMap,
+) {
     let columns = node
         .props
         .get("columns")
@@ -382,7 +694,36 @@ fn render_table_as_list(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNod
                 .join(" | ")
         })
         .unwrap_or_else(|| "table".to_string());
-    frame.render_widget(Paragraph::new(format!("table: {columns}")), area);
+    let mut lines = vec![format!("table: {columns}")];
+    let table_id = node_id(node).unwrap_or_else(|| "table".to_string());
+    if let Some(rows) = node.props.get("rows").and_then(Value::as_array) {
+        for (index, row) in rows.iter().enumerate() {
+            let row_id = row
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("{table_id}-row-{index}"));
+            let row_y = area
+                .y
+                .saturating_add(u16::try_from(index + 1).unwrap_or(u16::MAX));
+            if row_y < area.y.saturating_add(area.height) {
+                hit_map.push(HitRegion {
+                    node_id: row_id,
+                    role: HitRole::ListItem,
+                    rect: Rect::new(area.x, row_y, area.width, 1),
+                    action: action_prop(node),
+                    field: None,
+                    row: Some(RowBinding {
+                        group_id: table_id.clone(),
+                        index,
+                        value: row.clone(),
+                    }),
+                });
+            }
+            lines.push(table_row_label(row));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines.join("\n")), area);
 }
 
 fn render_button(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode, hit_map: &mut HitMap) {
@@ -404,13 +745,34 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode, hit_
     render_slot(frame, inner, node, hit_map, "body");
 }
 
+fn render_menu(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode, hit_map: &mut HitMap) {
+    let block = Block::default()
+        .title(prop_str(node, "label").unwrap_or_else(|| "menu".to_string()))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if node.slots.contains_key("items") {
+        render_slot(frame, inner, node, hit_map, "items");
+    } else {
+        render_children(frame, inner, node, hit_map, Direction::Vertical);
+    }
+}
+
 fn render_form_field(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     node: &UiNode,
     hit_map: &mut HitMap,
 ) {
-    push_hit(hit_map, node, HitRole::Field, area, None);
+    push_hit_with(
+        hit_map,
+        node,
+        HitRole::Field,
+        area,
+        action_prop(node),
+        field_binding(node),
+        None,
+    );
     let schema = node
         .props
         .get("schema")
@@ -422,7 +784,15 @@ fn render_form_field(
 }
 
 fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode, hit_map: &mut HitMap) {
-    push_hit(hit_map, node, HitRole::Field, area, None);
+    push_hit_with(
+        hit_map,
+        node,
+        HitRole::Field,
+        area,
+        action_prop(node),
+        field_binding(node),
+        None,
+    );
     let label = prop_text(node, "label");
     let value = match node.kind {
         UiNodeKind::Checkbox => prop_bool(node, "checked")
@@ -569,6 +939,7 @@ fn list_rows_from_child<'a>(
     child: &'a UiChild,
     hit_map: &mut HitMap,
     list_area: Rect,
+    list_id: &str,
 ) -> Vec<ListItem<'a>> {
     match child {
         UiChild::Node(node) if node.kind == UiNodeKind::ListItem => {
@@ -583,6 +954,17 @@ fn list_rows_from_child<'a>(
                     Rect::new(list_area.x, row, list_area.width, 1),
                     action_prop(node),
                 );
+                if let Some(region) = hit_map.regions.last_mut() {
+                    region.row = Some(RowBinding {
+                        group_id: list_id.to_string(),
+                        index,
+                        value: node
+                            .props
+                            .get("value")
+                            .cloned()
+                            .unwrap_or_else(|| Value::String(region.node_id.clone())),
+                    });
+                }
             }
             vec![ListItem::new(node_title(node))]
         }
@@ -652,6 +1034,59 @@ fn action_prop(node: &UiNode) -> Option<UiAction> {
         .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
+fn field_binding(node: &UiNode) -> Option<FieldBinding> {
+    let schema = node
+        .props
+        .get("schema")
+        .and_then(|value| serde_json::from_value::<UiFieldSchema>(value.clone()).ok());
+    let name =
+        prop_str(node, "name").or_else(|| schema.as_ref().map(|schema| schema.name.clone()))?;
+    let kind = match node.kind {
+        UiNodeKind::Checkbox => FieldKind::Checkbox,
+        UiNodeKind::Select => FieldKind::Select,
+        UiNodeKind::Textarea => FieldKind::ReadOnly,
+        UiNodeKind::TextInput | UiNodeKind::FormField => FieldKind::Text,
+        _ => return None,
+    };
+    let value = match kind {
+        FieldKind::Checkbox => prop_bool(node, "checked")
+            .or_else(|| prop_bool(node, "default"))
+            .map(Value::Bool)
+            .unwrap_or(Value::Bool(false)),
+        FieldKind::Select => node
+            .props
+            .get("selected")
+            .or_else(|| node.props.get("value"))
+            .or_else(|| node.props.get("default"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        FieldKind::Text | FieldKind::ReadOnly => node
+            .props
+            .get("value")
+            .or_else(|| node.props.get("default"))
+            .or_else(|| schema.as_ref().and_then(|schema| schema.default.as_ref()))
+            .cloned()
+            .unwrap_or(Value::String(String::new())),
+    };
+    Some(FieldBinding {
+        name,
+        value,
+        kind,
+        options: option_values(node),
+    })
+}
+
+fn option_values(node: &UiNode) -> Vec<Value> {
+    node.slots
+        .get("options")
+        .into_iter()
+        .flatten()
+        .filter_map(static_child_node)
+        .filter(|option| !prop_bool(option, "disabled").unwrap_or_default())
+        .filter_map(|option| option.props.get("value").cloned())
+        .collect()
+}
+
 fn terminal_focus_action(node: &UiNode) -> UiAction {
     UiAction {
         id: UiActionId("botster.terminal.focus".to_string()),
@@ -688,41 +1123,7 @@ fn with_error(node: &UiNode, line: String) -> String {
     }
 }
 
-fn dispatch_mouse(mouse: MouseEvent, hit_map: &HitMap) -> InputDispatch {
-    let Some(region) = hit_map.lookup(mouse.column, mouse.row) else {
-        return InputDispatch::Ignored;
-    };
-
-    match mouse.kind {
-        MouseEventKind::Moved | MouseEventKind::Drag(_) => InputDispatch::Hover {
-            node_id: region.node_id.clone(),
-        },
-        MouseEventKind::ScrollDown => InputDispatch::Scroll {
-            node_id: region.node_id.clone(),
-            lines: 3,
-        },
-        MouseEventKind::ScrollUp => InputDispatch::Scroll {
-            node_id: region.node_id.clone(),
-            lines: -3,
-        },
-        MouseEventKind::Down(MouseButton::Left) => region
-            .action
-            .as_ref()
-            .map(|action| InputDispatch::Action(action_request(region, action)))
-            .unwrap_or(InputDispatch::Ignored),
-        _ => InputDispatch::Ignored,
-    }
-}
-
-fn dispatch_key(key: KeyEvent, hit_map: &HitMap) -> InputDispatch {
-    let terminal = hit_map
-        .regions()
-        .iter()
-        .find(|region| region.role == HitRole::TerminalView);
-    let Some(terminal) = terminal else {
-        return InputDispatch::Ignored;
-    };
-
+fn terminal_key_forward(region: &HitRegion, key: KeyEvent) -> InputDispatch {
     let bytes = match key.code {
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             vec![(character as u8) & 0x1f]
@@ -734,19 +1135,52 @@ fn dispatch_key(key: KeyEvent, hit_map: &HitMap) -> InputDispatch {
     };
 
     InputDispatch::TerminalForward {
-        node_id: terminal.node_id.clone(),
+        node_id: region.node_id.clone(),
         bytes,
     }
 }
 
-fn action_request(region: &HitRegion, action: &UiAction) -> UiActionRequest {
+fn terminal_mouse_forward(region: &HitRegion, mouse: MouseEvent) -> InputDispatch {
+    let Some(button_code) = mouse_button_code(mouse.kind) else {
+        return InputDispatch::Ignored;
+    };
+    let column = mouse.column.saturating_sub(region.rect.x).saturating_add(1);
+    let row = mouse.row.saturating_sub(region.rect.y).saturating_add(1);
+    InputDispatch::TerminalForward {
+        node_id: region.node_id.clone(),
+        bytes: format!("\x1b[<{button_code};{column};{row}M").into_bytes(),
+    }
+}
+
+fn mouse_button_code(kind: MouseEventKind) -> Option<u8> {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(0),
+        MouseEventKind::Down(MouseButton::Middle) => Some(1),
+        MouseEventKind::Down(MouseButton::Right) => Some(2),
+        MouseEventKind::ScrollUp => Some(64),
+        MouseEventKind::ScrollDown => Some(65),
+        _ => None,
+    }
+}
+
+fn action_request(
+    region: &HitRegion,
+    action: &UiAction,
+    kind: UiActionKind,
+    drafts: &BTreeMap<String, Value>,
+) -> UiActionRequest {
     UiActionRequest {
         request_id: RequestId(format!("req-{}", region.node_id)),
         surface_id: UiSurfaceId(DEMO_SURFACE_ID.to_string()),
         action_id: action.id.clone(),
         node_id: Some(UiNodeId(region.node_id.clone())),
-        kind: UiActionKind::Submit,
-        values: Some(UiFormValues(Map::new())),
+        kind,
+        values: Some(UiFormValues(
+            drafts
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )),
         payload: action.payload.clone(),
     }
 }
@@ -758,12 +1192,26 @@ fn push_hit(
     rect: Rect,
     action: Option<UiAction>,
 ) {
+    push_hit_with(hit_map, node, role, rect, action, None, None);
+}
+
+fn push_hit_with(
+    hit_map: &mut HitMap,
+    node: &UiNode,
+    role: HitRole,
+    rect: Rect,
+    action: Option<UiAction>,
+    field: Option<FieldBinding>,
+    row: Option<RowBinding>,
+) {
     if let Some(node_id) = node_id(node) {
         hit_map.push(HitRegion {
             node_id,
             role,
             rect,
             action,
+            field,
+            row,
         });
     }
 }
@@ -826,6 +1274,63 @@ fn contains(rect: Rect, column: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
+fn wrap_index(current: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = isize::try_from(len).unwrap_or(1);
+    let current = isize::try_from(current).unwrap_or_default();
+    usize::try_from((current + delta).rem_euclid(len)).unwrap_or_default()
+}
+
+fn next_option_value(options: &[Value], current: &Value) -> Option<Value> {
+    if options.is_empty() {
+        return None;
+    }
+    let current_index = options
+        .iter()
+        .position(|option| option == current)
+        .unwrap_or_default();
+    options
+        .get(wrap_index(current_index, 1, options.len()))
+        .cloned()
+}
+
+fn value_as_text(value: &Value) -> String {
+    value.as_str().map(ToOwned::to_owned).unwrap_or_else(|| {
+        if value.is_null() {
+            String::new()
+        } else {
+            value.to_string()
+        }
+    })
+}
+
+fn table_row_label(row: &Value) -> String {
+    match row {
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| key.as_str() != "id")
+            .map(|(_, value)| value_as_text(value))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        _ => value_as_text(row),
+    }
+}
+
+impl HitRegion {
+    fn is_focusable(&self) -> bool {
+        matches!(
+            self.role,
+            HitRole::Action
+                | HitRole::Field
+                | HitRole::ListItem
+                | HitRole::Dialog
+                | HitRole::TerminalView
+        )
+    }
+}
+
 trait UiNodeBuilder {
     fn with_children(self, children: Vec<UiChild>) -> UiNode;
 }
@@ -863,7 +1368,6 @@ fn select_option(value: Value, label: &str) -> UiChild {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     use botster_core_test_support::ui_conformance::{
         assert_ui_renderer_conformance_fixture, ui_renderer_conformance_fixtures,
@@ -908,6 +1412,8 @@ mod tests {
             "list_item",
             "table",
             "button",
+            "menu",
+            "menu_item",
             "dialog",
             "text_input",
             "textarea",
@@ -1005,6 +1511,347 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_focus_uses_render_order_filtered_to_focusable_regions() {
+        let root = focus_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 8);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "focus-field".to_string()
+            }
+        );
+        assert_eq!(router.focused_node_id(), Some("focus-field"));
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "focus-action".to_string()
+            }
+        );
+        assert_eq!(router.focused_node_id(), Some("focus-action"));
+    }
+
+    #[test]
+    fn field_editing_stays_local_until_validate_or_submit() {
+        let root = node(
+            UiNodeKind::TextInput,
+            "field-title",
+            json!({
+                "name": "title",
+                "label": "Title",
+                "value": "Draft",
+                "action": { "id": "botster.form.validate" }
+            }),
+        );
+        let (_lines, hit_map) = render_to_lines(&root, 80, 5);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "field-title".to_string()
+            }
+        );
+        assert_eq!(
+            router.draft_value("title"),
+            Some(&Value::String("Draft!".to_string()))
+        );
+
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("validate should emit semantic action request");
+        };
+        assert_eq!(request.kind, UiActionKind::Validate);
+        assert_eq!(
+            request.values.unwrap().0.get("title"),
+            Some(&Value::String("Draft!".to_string()))
+        );
+    }
+
+    #[test]
+    fn checkbox_and_select_commit_through_submit_or_validate_only() {
+        let mut select = node(
+            UiNodeKind::Select,
+            "field-status",
+            json!({
+                "name": "status",
+                "label": "Status",
+                "selected": "open",
+                "action": { "id": "botster.form.submit" }
+            }),
+        );
+        select.slots.insert(
+            "options".to_string(),
+            vec![
+                child(node(
+                    UiNodeKind::SelectOption,
+                    "status-open",
+                    json!({ "value": "open", "label": "Open" }),
+                )),
+                child(node(
+                    UiNodeKind::SelectOption,
+                    "status-closed",
+                    json!({ "value": "closed", "label": "Closed" }),
+                )),
+            ],
+        );
+        let mut root = node(UiNodeKind::Stack, "fields-root", json!({}));
+        root.children = vec![
+            child(node(
+                UiNodeKind::Checkbox,
+                "field-done",
+                json!({
+                    "name": "done",
+                    "label": "Done",
+                    "checked": false,
+                    "action": { "id": "botster.form.submit" }
+                }),
+            )),
+            child(select),
+        ];
+        let (_lines, hit_map) = render_to_lines(&root, 80, 8);
+        let mut router = InputRouter::new();
+
+        let checkbox = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = checkbox else {
+            panic!("checkbox submit should emit an action");
+        };
+        assert_eq!(request.kind, UiActionKind::Submit);
+        assert_eq!(
+            request.values.unwrap().0.get("done"),
+            Some(&Value::Bool(true))
+        );
+
+        let select = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        assert_eq!(
+            select,
+            InputDispatch::Focus {
+                node_id: "field-status".to_string()
+            }
+        );
+        let select_submit = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = select_submit else {
+            panic!("select submit should emit an action");
+        };
+        assert_eq!(request.kind, UiActionKind::Submit);
+        assert_eq!(
+            request.values.unwrap().0.get("status"),
+            Some(&Value::String("closed".to_string()))
+        );
+    }
+
+    #[test]
+    fn list_keyboard_selection_is_group_local_and_activation_is_semantic() {
+        let root = list_with_rows_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 8);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "session-beta".to_string()
+            }
+        );
+        assert_eq!(router.selected_row("session-list"), Some("session-beta"));
+
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("list activation should emit row action");
+        };
+        assert_eq!(request.action_id.0, "botster.session.open");
+        assert_eq!(request.node_id, Some(UiNodeId("session-beta".to_string())));
+    }
+
+    #[test]
+    fn table_fallback_rows_add_hit_regions_and_share_selection_path() {
+        let root = node(
+            UiNodeKind::Table,
+            "sessions-table",
+            json!({
+                "columns": ["name", "status"],
+                "rows": [
+                    { "id": "table-alpha", "name": "alpha", "status": "open" },
+                    { "id": "table-beta", "name": "beta", "status": "closed" }
+                ],
+                "action": { "id": "botster.table.select" }
+            }),
+        );
+        let (_lines, hit_map) = render_to_lines(&root, 80, 6);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            hit_map.lookup(1, 1).map(|region| region.node_id.as_str()),
+            Some("table-alpha")
+        );
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "table-beta".to_string()
+            }
+        );
+        assert_eq!(router.selected_row("sessions-table"), Some("table-beta"));
+    }
+
+    #[test]
+    fn mouse_hover_updates_renderer_local_state_without_action_payload() {
+        let root = action_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 5);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                &hit_map,
+            ),
+            InputDispatch::Hover {
+                node_id: "select-session".to_string()
+            }
+        );
+        assert_eq!(router.hover_node_id(), Some("select-session"));
+    }
+
+    #[test]
+    fn click_on_non_focusable_region_does_not_replace_focus() {
+        let root = focus_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 8);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "focus-field".to_string()
+            }
+        );
+        assert_eq!(
+            router.dispatch_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                &hit_map
+            ),
+            InputDispatch::Ignored
+        );
+        assert_eq!(router.focused_node_id(), Some("focus-field"));
+    }
+
+    #[test]
+    fn normal_mouse_scroll_updates_renderer_local_scroll_state() {
+        let root = list_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 10);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                &hit_map
+            ),
+            InputDispatch::Scroll {
+                node_id: "session-alpha".to_string(),
+                lines: 3,
+            }
+        );
+        assert_eq!(router.scroll_offset("session-alpha"), 3);
+    }
+
+    #[test]
+    fn overlapping_hit_regions_route_to_last_rendered_region() {
+        let root = panel_with_action_child_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 5);
+
+        assert_eq!(
+            hit_map.lookup(1, 1).map(|region| region.node_id.as_str()),
+            Some("panel-action")
+        );
+        let dispatch = dispatch_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("overlapping cell should route to topmost action");
+        };
+        assert_eq!(request.action_id.0, "botster.panel.child");
+    }
+
+    #[test]
+    fn menu_renders_items_as_focusable_actions() {
+        let root = menu_fixture();
+        let (_lines, hit_map) = render_to_lines(&root, 80, 5);
+
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "menu-open" && region.role == HitRole::Action)
+        );
+        let dispatch = dispatch_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("menu item click should emit a semantic action");
+        };
+        assert_eq!(request.action_id.0, "botster.menu.open");
+    }
+
+    #[test]
     fn terminal_focus_and_input_forwarding_are_separate_paths() {
         let root = node(
             UiNodeKind::TerminalView,
@@ -1040,6 +1887,46 @@ mod tests {
     }
 
     #[test]
+    fn focused_terminal_mouse_events_forward_terminal_local_bytes() {
+        let root = node(
+            UiNodeKind::TerminalView,
+            "terminal-main",
+            json!({ "session_id": "session-alpha", "title": "Shell" }),
+        );
+        let (_lines, hit_map) = render_to_lines(&root, 80, 10);
+        let mut router = InputRouter::new();
+
+        let focus = router.dispatch_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &hit_map,
+        );
+        assert!(matches!(focus, InputDispatch::Action(_)));
+
+        let dispatch = router.dispatch_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 4,
+                row: 3,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &hit_map,
+        );
+        assert_eq!(
+            dispatch,
+            InputDispatch::TerminalForward {
+                node_id: "terminal-main".to_string(),
+                bytes: b"\x1b[<65;5;4M".to_vec(),
+            }
+        );
+        assert_eq!(router.scroll_offset("terminal-main"), 0);
+    }
+
+    #[test]
     fn unsupported_primitives_render_safe_fallback() {
         let root = node(UiNodeKind::Tree, "tree-fixture", json!({}));
         let (lines, _hit_map) = render_to_lines(&root, 80, 5);
@@ -1057,19 +1944,6 @@ mod tests {
         let (lines, _hit_map) = render_to_lines(&root, 80, 5);
 
         assert!(lines.join("\n").contains("table: name | status"));
-    }
-
-    #[test]
-    fn frequent_terminal_output_coalesces_into_bounded_redraws() {
-        let start = Instant::now();
-        let mut budget = RedrawBudget::new(Duration::from_millis(16));
-
-        for index in 0..100 {
-            budget.mark_output("terminal-main");
-            let _ = budget.maybe_draw(start + Duration::from_millis(index));
-        }
-
-        assert_eq!(budget.draws(), 7);
     }
 
     fn list_fixture() -> UiNode {
@@ -1109,6 +1983,92 @@ mod tests {
         ];
         root.validate().expect("two-list fixture should validate");
         root
+    }
+
+    fn focus_fixture() -> UiNode {
+        let mut root = node(
+            UiNodeKind::Stack,
+            "focus-root",
+            json!({ "direction": "vertical" }),
+        );
+        root.children = vec![
+            child(node(
+                UiNodeKind::Text,
+                "focus-title",
+                json!({ "text": "Title" }),
+            )),
+            child(node(
+                UiNodeKind::Button,
+                "focus-action",
+                json!({ "label": "Open", "action": { "id": "botster.open" } }),
+            )),
+            child(node(
+                UiNodeKind::TextInput,
+                "focus-field",
+                json!({ "name": "title", "label": "Title", "value": "Draft" }),
+            )),
+            child(node(
+                UiNodeKind::TerminalView,
+                "focus-terminal",
+                json!({ "session_id": "session-alpha" }),
+            )),
+        ];
+        root
+    }
+
+    fn panel_with_action_child_fixture() -> UiNode {
+        node(UiNodeKind::Panel, "panel-root", json!({ "title": "Panel" })).with_children(vec![
+            child(node(
+                UiNodeKind::Button,
+                "panel-action",
+                json!({ "label": "Open", "action": { "id": "botster.panel.child" } }),
+            )),
+        ])
+    }
+
+    fn menu_fixture() -> UiNode {
+        let mut menu = node(UiNodeKind::Menu, "main-menu", json!({ "label": "Actions" }));
+        menu.slots.insert(
+            "items".to_string(),
+            vec![child(node(
+                UiNodeKind::MenuItem,
+                "menu-open",
+                json!({ "label": "Open", "action": { "id": "botster.menu.open" } }),
+            ))],
+        );
+        menu
+    }
+
+    fn list_with_rows_fixture() -> UiNode {
+        let mut list = node(UiNodeKind::List, "session-list", json!({}));
+        list.children = vec![
+            child(list_row_with_action("session-alpha", "alpha")),
+            child(list_row_with_action("session-beta", "beta")),
+        ];
+        list
+    }
+
+    fn list_row_with_action(row_id: &str, label: &str) -> UiNode {
+        let mut row = node(
+            UiNodeKind::ListItem,
+            row_id,
+            json!({
+                "value": row_id,
+                "action": {
+                    "id": "botster.session.open",
+                    "payload": { "session_id": row_id }
+                }
+            }),
+        );
+        row.slots.insert(
+            "title".to_string(),
+            vec![child(node(
+                UiNodeKind::Text,
+                &format!("{row_id}-title"),
+                json!({ "text": label }),
+            ))],
+        );
+        row
     }
 
     fn one_row_list(list_id: &str, row_id: &str, label: &str) -> UiNode {

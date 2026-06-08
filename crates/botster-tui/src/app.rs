@@ -5,13 +5,16 @@ use std::{
 
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 
-use crate::renderer::{self, HitMap};
+use crate::renderer::{self, HitMap, InputRouter};
 
 pub const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 
@@ -35,16 +38,29 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
         let _ = disable_raw_mode();
         return Err(error);
     }
 
-    Terminal::new(CrosstermBackend::new(stdout))
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
+            let _ = disable_raw_mode();
+            Err(error)
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-    let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+    let leave_result = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
     let raw_result = disable_raw_mode();
     let cursor_result = terminal.show_cursor();
 
@@ -54,6 +70,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    let mut router = InputRouter::new();
     loop {
         let mut hit_map = HitMap::default();
         terminal.draw(|frame| draw(frame, &mut hit_map))?;
@@ -63,7 +80,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()>
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
-                    let _dispatch = renderer::dispatch_event(event, &hit_map);
+                    let _dispatch = router.dispatch_event(event, &hit_map);
                 }
             }
         }
