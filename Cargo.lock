@@ -90,6 +90,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "botster-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
+]
+
+[[package]]
 name = "botster-tui-spike"
 version = "0.1.0"
 dependencies = [
