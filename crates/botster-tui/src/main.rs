@@ -1,4 +1,5 @@
 mod app;
+mod renderer;
 
 fn main() -> std::io::Result<()> {
     if std::env::args().skip(1).any(|arg| arg == "--smoke") {

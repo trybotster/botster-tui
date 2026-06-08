@@ -9,14 +9,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+
+use crate::renderer::{self, HitMap};
 
 pub const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 
@@ -60,12 +55,16 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     loop {
-        terminal.draw(draw)?;
+        let mut hit_map = HitMap::default();
+        terminal.draw(|frame| draw(frame, &mut hit_map))?;
 
         if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
+            let event = event::read()?;
+            match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
-                _ => {}
+                _ => {
+                    let _dispatch = renderer::dispatch_event(event, &hit_map);
+                }
             }
         }
     }
@@ -73,22 +72,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()>
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>) {
-    let [content] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(100)])
-        .areas(frame.area());
-
-    let body = Paragraph::new(vec![
-        Line::from("Botster TUI client scaffold"),
-        Line::from("Renderer/client over hub/core APIs."),
-        Line::from("Press q, Esc, or Ctrl-C to exit."),
-    ])
-    .block(Block::default().title("botster-tui").borders(Borders::ALL))
-    .alignment(Alignment::Center)
-    .style(Style::default().add_modifier(Modifier::BOLD));
-
-    frame.render_widget(body, content);
+fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap) {
+    let node = renderer::demo_ui_node();
+    renderer::render_node(frame, frame.area(), &node, hit_map);
 }
 
 fn should_quit(key: KeyEvent) -> bool {
