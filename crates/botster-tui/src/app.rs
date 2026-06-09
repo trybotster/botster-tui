@@ -799,6 +799,30 @@ mod tests {
     }
 
     #[test]
+    fn session_repull_preserves_selected_session_when_still_listed() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.selected_session = Some("session-beta".to_string());
+
+        app.apply_response(sessions_response(["session-alpha", "session-beta"]));
+
+        assert_eq!(app.sessions, vec!["session-alpha", "session-beta"]);
+        assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
+    }
+
+    #[test]
+    fn session_repull_resets_stale_selected_session_to_first_listed_session() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.selected_session = Some("session-beta".to_string());
+
+        app.apply_response(sessions_response(["session-gamma", "session-delta"]));
+
+        assert_eq!(app.sessions, vec!["session-gamma", "session-delta"]);
+        assert_eq!(app.selected_session.as_deref(), Some("session-gamma"));
+    }
+
+    #[test]
     fn headless_dogfood_runs_against_isolated_hub_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -833,5 +857,30 @@ mod tests {
             panic!("{variable} is required when BOTSTER_TUI_REQUIRE_HUB_TEST is set");
         }
         eprintln!("skipping isolated hub dogfood test; {variable} is not set");
+    }
+
+    fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
+        DaemonResponse {
+            kind: DaemonResponseKind::Sessions,
+            status: None,
+            sessions: session_ids
+                .into_iter()
+                .map(|session_id| botster_hub_client::DaemonSession {
+                    session_id: session_id.to_string(),
+                    lifecycle: "running".to_string(),
+                })
+                .collect(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+        }
     }
 }
