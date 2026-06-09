@@ -9,7 +9,7 @@ use std::{
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 use botster_hub_client::{
     DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
+    DaemonResponseKind, DaemonTransportError, DaemonTransportResult, PROTOCOL,
 };
 use crossterm::{
     cursor::Show,
@@ -155,9 +155,13 @@ struct DogfoodApp {
     endpoint: Option<DaemonEndpoint>,
     client: Option<DaemonConnection>,
     status: String,
+    connection_error: Option<String>,
     error: Option<String>,
+    action_feedback: Option<String>,
     sessions: Vec<String>,
     selected_session: Option<String>,
+    attached_session: Option<String>,
+    schema_version: Option<u16>,
     subscription_id: String,
     terminal_output: String,
     command: String,
@@ -174,9 +178,13 @@ impl DogfoodApp {
             endpoint,
             client: None,
             status: "disconnected".to_string(),
+            connection_error: None,
             error: None,
+            action_feedback: None,
             sessions: Vec::new(),
             selected_session: None,
+            attached_session: None,
+            schema_version: None,
             subscription_id: format!("btui-sub-{}", short_suffix()),
             terminal_output: String::new(),
             command: DEFAULT_COMMAND.to_string(),
@@ -212,12 +220,16 @@ impl DogfoodApp {
             return;
         }
 
-        let Some(session_id) = self.selected_session.clone() else {
+        let Some(session_id) = self
+            .attached_session
+            .clone()
+            .or_else(|| self.selected_session.clone())
+        else {
             return;
         };
         match self.request(DaemonRequest::Drain { session_id }) {
             Ok(response) => self.apply_response(response),
-            Err(error) => self.disconnect(error),
+            Err(error) => self.record_transport_error(error),
         }
     }
 
@@ -227,12 +239,16 @@ impl DogfoodApp {
                 self.handle_action(request.action_id.0, request.values, request.payload);
             }
             InputDispatch::TerminalForward { bytes, .. } => {
-                let Some(session_id) = self.selected_session.clone() else {
-                    self.error = Some("attach a session before sending terminal input".to_string());
+                let Some(session_id) = self.attached_session.clone() else {
+                    self.error = Some(
+                        "terminal stream unavailable: attach a session before sending terminal input"
+                            .to_string(),
+                    );
                     return;
                 };
                 match String::from_utf8(bytes) {
                     Ok(data) => {
+                        self.error = None;
                         self.request_and_apply(DaemonRequest::SendInput { session_id, data })
                     }
                     Err(error) => {
@@ -241,7 +257,7 @@ impl DogfoodApp {
                 }
             }
             InputDispatch::TerminalResize { rows, cols, .. } => {
-                if let Some(session_id) = self.selected_session.clone() {
+                if let Some(session_id) = self.attached_session.clone() {
                     self.request_and_apply(DaemonRequest::Resize {
                         session_id,
                         rows,
@@ -278,6 +294,7 @@ impl DogfoodApp {
                 }
                 self.attach_selected_or_first();
             }
+            "botster.tui.detach" => self.detach_attached(),
             "botster.tui.refresh" => self.refresh_sessions(),
             "botster.terminal.focus" => self.attach_selected_or_first(),
             _ => {}
@@ -303,20 +320,21 @@ impl DogfoodApp {
     fn try_connect(&mut self) {
         self.last_reconnect_attempt = Some(Instant::now());
         let Some(endpoint) = &self.endpoint else {
-            self.status = "configure --hub-socket or BOTSTER_HUB_SOCKET".to_string();
+            self.status = "hub socket missing".to_string();
+            self.connection_error =
+                Some("configure --hub-socket or BOTSTER_HUB_SOCKET".to_string());
             return;
         };
         match DaemonConnection::connect(endpoint) {
             Ok(client) => {
                 self.client = Some(client);
                 self.status = "connected".to_string();
-                self.error = None;
+                self.connection_error = None;
+                self.refresh_status();
                 self.restore_after_connect();
             }
             Err(error) => {
-                self.client = None;
-                self.status = "reconnecting".to_string();
-                self.error = Some(error.to_string());
+                self.record_transport_error(error);
             }
         }
     }
@@ -328,6 +346,10 @@ impl DogfoodApp {
         }
     }
 
+    fn refresh_status(&mut self) {
+        self.request_and_apply(DaemonRequest::Status);
+    }
+
     fn refresh_sessions(&mut self) {
         self.request_and_apply(DaemonRequest::ListSessions);
     }
@@ -337,6 +359,7 @@ impl DogfoodApp {
             self.error = Some("command is required".to_string());
             return;
         }
+        self.error = None;
         let session_id = format!("btui-{}", short_suffix());
         let command = self.command.clone();
         match self.request(DaemonRequest::Spawn {
@@ -345,11 +368,12 @@ impl DogfoodApp {
         }) {
             Ok(response) => self.apply_response(response),
             Err(error) => {
-                self.disconnect(error);
+                self.record_transport_error(error);
                 return;
             }
         }
         self.selected_session = Some(session_id.clone());
+        self.action_feedback = Some(format!("spawned {session_id}; attach requested"));
         self.request_and_apply(DaemonRequest::Attach {
             session_id,
             subscription_id: self.subscription_id.clone(),
@@ -365,8 +389,23 @@ impl DogfoodApp {
             self.error = Some("no session available to attach".to_string());
             return;
         };
+        self.error = None;
         self.selected_session = Some(session_id.clone());
+        self.action_feedback = Some(format!("attach requested: {session_id}"));
         self.request_and_apply(DaemonRequest::Attach {
+            session_id,
+            subscription_id: self.subscription_id.clone(),
+        });
+    }
+
+    fn detach_attached(&mut self) {
+        let Some(session_id) = self.attached_session.clone() else {
+            self.error = Some("no attached terminal stream to detach".to_string());
+            return;
+        };
+        self.error = None;
+        self.action_feedback = Some(format!("detach requested: {session_id}"));
+        self.request_and_apply(DaemonRequest::Detach {
             session_id,
             subscription_id: self.subscription_id.clone(),
         });
@@ -377,7 +416,7 @@ impl DogfoodApp {
         self.record_request(&request);
         match self.request(request) {
             Ok(response) => self.apply_response(response),
-            Err(error) => self.disconnect(error),
+            Err(error) => self.record_transport_error(error),
         }
     }
 
@@ -401,14 +440,36 @@ impl DogfoodApp {
                 session_id: session_id.clone(),
                 subscription_id: subscription_id.clone(),
             }),
+            DaemonRequest::Status => {}
             _ => {}
         }
     }
 
-    fn disconnect(&mut self, error: DaemonTransportError) {
+    fn record_transport_error(&mut self, error: DaemonTransportError) {
         self.client = None;
-        self.status = "reconnecting".to_string();
-        self.error = Some(error.to_string());
+        self.attached_session = None;
+        match error {
+            // Defensive for future botster-hub-client revisions. The pinned
+            // client currently collapses hello protocol mismatch to NotRunning.
+            DaemonTransportError::Protocol(message) => {
+                self.status = "compatibility mismatch".to_string();
+                self.connection_error = Some(format!(
+                    "expected daemon protocol {PROTOCOL}; daemon protocol error: {message}"
+                ));
+            }
+            DaemonTransportError::NotRunning => {
+                self.status = "hub unavailable; reconnecting".to_string();
+                self.connection_error = Some(error.to_string());
+            }
+            DaemonTransportError::ClientDisconnected => {
+                self.status = "disconnected; reconnecting".to_string();
+                self.connection_error = Some(error.to_string());
+            }
+            other => {
+                self.status = "reconnecting".to_string();
+                self.connection_error = Some(other.to_string());
+            }
+        }
     }
 
     fn apply_response(&mut self, response: DaemonResponse) {
@@ -417,7 +478,11 @@ impl DogfoodApp {
             return;
         }
 
-        self.error = None;
+        if let Some(status) = response.status {
+            self.schema_version = Some(status.schema_version);
+            self.status = format!("connected ({})", status.lifecycle_state);
+        }
+
         if matches!(
             response.kind,
             DaemonResponseKind::Sessions | DaemonResponseKind::Spawned
@@ -454,9 +519,17 @@ impl DogfoodApp {
                 }
                 DaemonEvent::ProcessExit { code, .. } => {
                     self.status = format!("process exited {}", code.unwrap_or_default());
+                    self.attached_session = None;
                 }
-                DaemonEvent::AttachState { state, .. } => {
-                    self.status = format!("attach {state}");
+                DaemonEvent::AttachState {
+                    session_id, state, ..
+                } => {
+                    self.action_feedback = Some(format!("attach {state}: {session_id}"));
+                    if state == "attached" || state == "subscribed" || state == "ready" {
+                        self.attached_session = Some(session_id);
+                    } else if state == "detached" || state == "closed" || state == "unsubscribed" {
+                        self.attached_session = None;
+                    }
                 }
                 _ => {}
             }
@@ -495,6 +568,11 @@ impl DogfoodApp {
                 "dogfood-status",
                 json!({ "text": self.status }),
             )),
+            child(node(
+                UiNodeKind::Text,
+                "dogfood-compatibility",
+                json!({ "text": self.compatibility_text() }),
+            )),
             child(button(
                 "dogfood-refresh",
                 "Refresh",
@@ -508,6 +586,20 @@ impl DogfoodApp {
                 json!({}),
             )),
         ];
+        if let Some(error) = &self.connection_error {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-connection-error",
+                json!({ "text": format!("connection: {error}") }),
+            )));
+        }
+        if let Some(feedback) = &self.action_feedback {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-action-feedback",
+                json!({ "text": format!("action: {feedback}") }),
+            )));
+        }
         if let Some(error) = &self.error {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -515,8 +607,23 @@ impl DogfoodApp {
                 json!({ "text": format!("error: {error}") }),
             )));
         }
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-hints",
+            json!({ "text": "hints: Tab focus | up/down select | Enter/Space activate | terminal focus forwards keys" }),
+        )));
         panel.children = children;
         panel
+    }
+
+    fn compatibility_text(&self) -> String {
+        let schema = self
+            .schema_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "compatibility: expected protocol {PROTOCOL}; daemon schema {schema}; descriptor pending"
+        )
     }
 
     fn command_form(&self) -> UiNode {
@@ -556,6 +663,12 @@ impl DogfoodApp {
             .sessions
             .iter()
             .map(|session_id| {
+                let mut title = session_id.to_string();
+                if self.attached_session.as_deref() == Some(session_id) {
+                    title.push_str(" (attached)");
+                } else if self.selected_session.as_deref() == Some(session_id) {
+                    title.push_str(" (selected)");
+                }
                 let mut item = node(
                     UiNodeKind::ListItem,
                     &format!("dogfood-session-{session_id}"),
@@ -568,7 +681,7 @@ impl DogfoodApp {
                     vec![child(node(
                         UiNodeKind::Text,
                         &format!("dogfood-session-{session_id}-title"),
-                        json!({ "text": session_id }),
+                        json!({ "text": title }),
                     ))],
                 );
                 item.slots.insert(
@@ -588,7 +701,25 @@ impl DogfoodApp {
             "dogfood-sessions-panel",
             json!({ "title": "sessions" }),
         );
-        panel.children = vec![child(list)];
+        panel.children = vec![
+            child(node(
+                UiNodeKind::Text,
+                "dogfood-selected-session",
+                json!({ "text": format!("selected: {}", self.selected_session.as_deref().unwrap_or("none")) }),
+            )),
+            child(node(
+                UiNodeKind::Text,
+                "dogfood-attached-session",
+                json!({ "text": format!("attached: {}", self.attached_session.as_deref().unwrap_or("none")) }),
+            )),
+            child(list),
+            child(button(
+                "dogfood-detach",
+                "Detach",
+                "botster.tui.detach",
+                json!({}),
+            )),
+        ];
         panel
     }
 
@@ -597,16 +728,37 @@ impl DogfoodApp {
             UiNodeKind::TerminalView,
             "dogfood-terminal",
             json!({
-                "title": "terminal",
-                "session_id": self.selected_session.clone().unwrap_or_else(|| "not attached".to_string())
+                "title": self.terminal_title(),
+                "session_id": self.attached_session.clone().unwrap_or_else(|| "not attached".to_string())
             }),
         );
         terminal.children = vec![child(node(
             UiNodeKind::Text,
             "dogfood-terminal-output",
-            json!({ "text": self.terminal_output }),
+            json!({ "text": self.terminal_content() }),
         ))];
         terminal
+    }
+
+    fn terminal_title(&self) -> String {
+        match (&self.attached_session, &self.selected_session) {
+            (Some(attached), _) => format!("terminal attached: {attached}"),
+            (None, Some(selected)) => format!("terminal stream unavailable: selected {selected}"),
+            (None, None) => "terminal stream unavailable: no session selected".to_string(),
+        }
+    }
+
+    fn terminal_content(&self) -> String {
+        if !self.terminal_output.is_empty() {
+            return self.terminal_output.clone();
+        }
+        match (&self.attached_session, &self.selected_session) {
+            (Some(session_id), _) => format!("waiting for terminal output from {session_id}"),
+            (None, Some(session_id)) => {
+                format!("terminal stream unavailable: attach selected session {session_id}")
+            }
+            (None, None) => "terminal stream unavailable: no session selected".to_string(),
+        }
     }
 }
 
@@ -769,7 +921,7 @@ mod tests {
             Value::String("printf draft\\n".to_string()),
         )]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         assert!(lines.join("\n").contains("printf draft"));
     }
 
@@ -781,8 +933,119 @@ mod tests {
         app.spawn_session();
 
         assert_eq!(app.error.as_deref(), Some("command is required"));
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         assert!(lines.join("\n").contains("error: command is required"));
+    }
+
+    #[test]
+    fn missing_hub_socket_renders_connection_diagnostic() {
+        let app = DogfoodApp::new(None);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("hub socket missing"));
+        assert!(rendered.contains("configure --hub-socket or BOTSTER_HUB_SOCKET"));
+        assert!(rendered.contains(PROTOCOL));
+    }
+
+    #[test]
+    fn defensive_protocol_error_branch_renders_distinct_compatibility_diagnostic() {
+        let mut app = DogfoodApp::new(None);
+
+        app.record_transport_error(DaemonTransportError::Protocol("unexpected hello protocol"));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("compatibility mismatch"));
+        assert!(rendered.contains(&format!("expected daemon protocol {PROTOCOL}")));
+        assert!(!rendered.contains("hub unavailable; reconnecting"));
+    }
+
+    #[test]
+    fn daemon_status_renders_schema_version_from_public_status_response() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(status_response("running", 7));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("connected (running)"));
+        assert!(rendered.contains("daemon schema 7"));
+    }
+
+    #[test]
+    fn action_failure_survives_unrelated_successful_session_refresh() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(operator_error_response("spawn failed"));
+        app.apply_response(sessions_response(["session-alpha"]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        assert!(lines.join("\n").contains("error: spawn failed"));
+    }
+
+    #[test]
+    fn corrected_user_action_clears_stale_validation_error() {
+        let mut app = DogfoodApp::new(None);
+        app.command = " \t\n".to_string();
+        app.spawn_session();
+        assert_eq!(app.error.as_deref(), Some("command is required"));
+
+        app.command = "printf fixed\\n".to_string();
+        app.spawn_session();
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(!rendered.contains("error: command is required"));
+        assert!(rendered.contains("hub unavailable; reconnecting"));
+    }
+
+    #[test]
+    fn current_pinned_client_not_running_path_is_not_reported_as_compatibility_mismatch() {
+        let mut app = DogfoodApp::new(None);
+
+        app.record_transport_error(DaemonTransportError::NotRunning);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("hub unavailable; reconnecting"));
+        assert!(!rendered.contains("compatibility mismatch"));
+    }
+
+    #[test]
+    fn terminal_input_before_attach_renders_stream_unavailable_error() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string()];
+        app.selected_session = Some("session-alpha".to_string());
+
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "dogfood-terminal".to_string(),
+            bytes: b"echo hello\n".to_vec(),
+        });
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("terminal stream unavailable"));
+        assert!(rendered.contains("attached: none"));
+    }
+
+    #[test]
+    fn attach_state_tracks_attached_session_separately_from_selection() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.selected_session = Some("session-beta".to_string());
+
+        app.apply_response(attach_state_response("session-beta", "attached"));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert_eq!(app.attached_session.as_deref(), Some("session-beta"));
+        assert!(rendered.contains("attached: session-beta"));
+        assert!(rendered.contains("session-beta (attached)"));
+        assert!(rendered.contains("terminal attached: session-beta"));
     }
 
     #[test]
@@ -790,7 +1053,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.terminal_output = "hello terminal".to_string();
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         assert!(lines.join("\n").contains("hello terminal"));
     }
 
@@ -799,7 +1062,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.terminal_output = "primitive terminal bytes".to_string();
 
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
 
         assert!(lines.join("\n").contains("primitive terminal bytes"));
         assert!(
@@ -821,7 +1084,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
         app.selected_session = Some("session-alpha".to_string());
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
         let mut router = InputRouter::new();
         let first_row = hit_map
             .regions()
@@ -992,16 +1255,64 @@ mod tests {
     }
 
     fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Sessions);
+        response.sessions = session_ids
+            .into_iter()
+            .map(|session_id| botster_hub_client::DaemonSession {
+                session_id: session_id.to_string(),
+                lifecycle: "running".to_string(),
+            })
+            .collect();
+        response
+    }
+
+    fn status_response(lifecycle_state: &str, schema_version: u16) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Status);
+        response.status = Some(botster_hub_client::DaemonStatus {
+            lifecycle_state: lifecycle_state.to_string(),
+            host_id: "test-host".to_string(),
+            host_display_name: "test host".to_string(),
+            schema_version,
+            data_dir_configured: true,
+            core_initialized: true,
+            state_source: "test".to_string(),
+            package_count: 0,
+            enabled_package_count: 0,
+            provider_count: 0,
+            enabled_provider_count: 0,
+            session_count: 0,
+            recovered_sessions: Vec::new(),
+            stale_sessions: Vec::new(),
+        });
+        response
+    }
+
+    fn operator_error_response(message: &str) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::OperatorError);
+        response.error = Some(botster_hub_client::DaemonOperatorError {
+            code: "test".to_string(),
+            request_id: "request-test".to_string(),
+            operation: "spawn".to_string(),
+            message: message.to_string(),
+        });
+        response
+    }
+
+    fn attach_state_response(session_id: &str, state: &str) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Events);
+        response.events = vec![DaemonEvent::AttachState {
+            session_id: session_id.to_string(),
+            subscription_id: "sub-test".to_string(),
+            state: state.to_string(),
+        }];
+        response
+    }
+
+    fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
         DaemonResponse {
-            kind: DaemonResponseKind::Sessions,
+            kind,
             status: None,
-            sessions: session_ids
-                .into_iter()
-                .map(|session_id| botster_hub_client::DaemonSession {
-                    session_id: session_id.to_string(),
-                    lifecycle: "running".to_string(),
-                })
-                .collect(),
+            sessions: Vec::new(),
             packages: Vec::new(),
             package_decision: None,
             lifecycle: Vec::new(),
