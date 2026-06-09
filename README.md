@@ -68,6 +68,29 @@ BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" \
   cargo run -p botster-tui -- --headless-dogfood
 ```
 
+The visible diagnostics are intentionally local-client diagnostics, not private
+hub probes. The hub panel distinguishes:
+
+- missing socket configuration (`--hub-socket` or `BOTSTER_HUB_SOCKET` needed);
+- local hub unavailable, disconnected, or reconnecting;
+- current expected hub daemon protocol and observed daemon status schema version
+  when status is available;
+- action or validation failures that stay visible after unrelated successful
+  refreshes.
+
+The terminal panel distinguishes selected session from attached stream. Selecting
+a row changes the attach target; terminal input is sent only after an attach
+state is observed for that stream. Until then, the panel reports terminal stream
+unavailable rather than silently treating selection as an attached PTY.
+
+The pinned `botster-hub-client` revision does not yet expose the richer
+compatibility descriptor/capability mismatch DTO. `botster-tui` therefore shows
+the real expected protocol and daemon status schema, and labels the descriptor
+integration as pending instead of inventing fake capability state. At this pin,
+the public client helper also collapses a hello protocol mismatch to
+`NotRunning`, so an incompatible-but-running hub currently appears as hub
+unavailable until `botster-hub-client` exposes a distinct compatibility signal.
+
 There is also an automated isolated-hub test using the merged
 `botster-hub-test-support` crate. The preferred command builds matching
 `botster-hub` and `botster-session-worker` binaries from the pinned git
