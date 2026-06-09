@@ -552,6 +552,55 @@ pub fn primitive_registry() -> BTreeMap<&'static str, &'static str> {
     ])
 }
 
+pub fn demo_ui_node() -> UiNode {
+    let mut root = node(
+        UiNodeKind::Stack,
+        "demo-root",
+        json!({ "direction": "vertical" }),
+    );
+    root.children = vec![
+        child(
+            node(
+                UiNodeKind::Panel,
+                "demo-panel",
+                json!({ "title": "botster-tui" }),
+            )
+            .with_children(vec![
+                child(node(
+                    UiNodeKind::Text,
+                    "demo-title",
+                    json!({ "text": "Core UiNode renderer scaffold" }),
+                )),
+                child(node(
+                    UiNodeKind::Badge,
+                    "demo-badge",
+                    json!({ "label": "Ready", "tone": "success" }),
+                )),
+            ]),
+        ),
+        child(node(
+            UiNodeKind::Button,
+            "demo-action",
+            json!({
+                "label": "Select session",
+                "action": { "id": "botster.session.select", "payload": { "session_id": "session-demo" } }
+            }),
+        )),
+        child(node(
+            UiNodeKind::EmptyState,
+            "demo-empty",
+            json!({ "title": "Hub connection not attached", "description": "Rendering a core-derived fixture." }),
+        )),
+    ];
+
+    root.validate()
+        .expect("demo UiNode should satisfy the core UI contract");
+    tui_capabilities()
+        .validate_node(&root)
+        .expect("demo UiNode should fit TUI renderer capabilities");
+    root
+}
+
 fn render_node_inner(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -813,20 +862,17 @@ fn render_terminal_view(
             terminal_mouse_mode: prop_bool(node, "mouse_mode").unwrap_or_default(),
         });
     }
-    let content = prop_str(node, "content").unwrap_or_else(|| {
-        format!(
+    frame.render_widget(
+        Paragraph::new(format!(
             "terminal: {}",
             prop_str(node, "session_id").unwrap_or_default()
+        ))
+        .block(
+            Block::default()
+                .title(prop_str(node, "title").unwrap_or_else(|| "terminal".to_string()))
+                .borders(Borders::ALL),
         )
-    });
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(
-                Block::default()
-                    .title(prop_str(node, "title").unwrap_or_else(|| "terminal".to_string()))
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false }),
+        .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1334,12 +1380,10 @@ impl HitRegion {
     }
 }
 
-#[cfg(test)]
 trait UiNodeBuilder {
     fn with_children(self, children: Vec<UiChild>) -> UiNode;
 }
 
-#[cfg(test)]
 impl UiNodeBuilder for UiNode {
     fn with_children(mut self, children: Vec<UiChild>) -> UiNode {
         self.children = children;

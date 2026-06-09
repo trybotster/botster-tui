@@ -36,36 +36,11 @@ script/fmt
 script/test
 script/clippy
 cargo run -p botster-tui -- --smoke
-BOTSTER_HUB_SOCKET=/path/to/botster.sock cargo run -p botster-tui
+cargo run -p botster-tui
 ```
 
 The interactive renderer opens the alternate terminal screen and exits with
 `q`, `Esc`, or `Ctrl-C`.
-
-This standalone crate does not start a hub daemon. For local dogfood, start an
-installed Botster hub separately and pass its socket path into the TUI:
-
-```sh
-botster start --headless
-botster status
-BOTSTER_HUB_SOCKET=/path/from/status/or/runtime-artifact.sock cargo run -p botster-tui
-```
-
-The TUI socket client uses the existing attach protocol: it sends `hello`,
-waits for `hello_ack`, subscribes to the `hub` channel as `tui_hub`, and then
-requests core entity snapshots with `hub:entities` for `hub`,
-`connection_code`, `session`, `session_action`, `workspace`, `spawn_target`,
-and `worktree`. Path existence or Unix connect success alone is not treated as
-a usable hub connection.
-
-Dogfood checks in the UI:
-
-- Leave the prompt blank and activate `Spawn and attach` to see local validation.
-- Provide a branch or issue plus a prompt to send a `create_agent` command over
-  the hub socket.
-- Once a session entity is present, activate `Attach first session`; terminal
-  bytes and scrollback delivered by the hub are shown below the `terminal_view`,
-  while keyboard input and resize dispatch back to the socket client.
 
 ## Scope
 
@@ -74,26 +49,21 @@ Included now:
 - Root Cargo workspace.
 - One binary client crate at `crates/botster-tui`.
 - A real binary entry point with a noninteractive `--smoke` path.
-- A production dogfood surface for session spawn/attach that renders through the
-  shared `UiNode` renderer instead of the old demo fixture.
-- A small local hub socket adapter for the installed Botster attach protocol:
-  length-prefixed JSON/PTY frames, `hello`/`hello_ack`, hub subscribe, explicit
-  core entity snapshot pull, `create_agent`, terminal subscribe, PTY input, and
-  resize.
 - A first ratatui renderer registry for shared `botster-core` `UiNode`
   primitives: stack/inline/panel/scroll_area/text/badge/status_dot/empty_state,
   list/list_item, table-as-list fallback, button actions, form inputs,
   field errors, dialog, and safe unsupported fallback.
 - Core UI renderer conformance fixture coverage through
   `botster-core-test-support` with `default-features = false`.
-- A runtime draw path that renders the dogfood session surface through the
+- A runtime draw path that renders a core-derived `UiNode` sample through the
   production renderer and dispatches terminal events through the renderer hit map.
 - Deterministic format, test, and clippy scripts.
 
 Not included yet:
 
-- Starting or provisioning the hub daemon from this repo.
-- Pairing, auth, socket discovery, plugin entity-bound lists, or browser routes.
+- Hub connection, pairing, auth, socket attach, or terminal subscription.
+- Entity-store hydration for bound plugin lists, owner-routed action execution,
+  or live `terminal_view` subscription/input forwarding.
 - Plugin execution, Project Pipelines policy, browser surfaces, or hub/core
   runtime policy.
 
