@@ -118,6 +118,7 @@ pub struct InputRouter {
     hover_node_id: Option<String>,
     focused_node_id: Option<String>,
     selected_rows: BTreeMap<String, String>,
+    selected_row_values: BTreeMap<String, Value>,
     draft_values: BTreeMap<String, Value>,
     scroll_offsets: BTreeMap<String, i16>,
 }
@@ -140,6 +141,10 @@ impl InputRouter {
     #[cfg(test)]
     pub fn selected_row(&self, group_id: &str) -> Option<&str> {
         self.selected_rows.get(group_id).map(String::as_str)
+    }
+
+    pub fn selected_row_value(&self, group_id: &str) -> Option<&Value> {
+        self.selected_row_values.get(group_id)
     }
 
     #[cfg(test)]
@@ -334,6 +339,8 @@ impl InputRouter {
         if let Some(row) = &region.row {
             self.selected_rows
                 .insert(row.group_id.clone(), region.node_id.clone());
+            self.selected_row_values
+                .insert(row.group_id.clone(), row.value.clone());
         }
 
         if kind == UiActionKind::Submit {
@@ -433,6 +440,10 @@ impl InputRouter {
         self.focused_node_id = Some(next.node_id.clone());
         self.selected_rows
             .insert(row.group_id.clone(), next.node_id.clone());
+        if let Some(next_row) = &next.row {
+            self.selected_row_values
+                .insert(row.group_id.clone(), next_row.value.clone());
+        }
         InputDispatch::Focus {
             node_id: next.node_id.clone(),
         }
@@ -874,17 +885,29 @@ fn render_terminal_view(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if node.children.is_empty() && node.slots.is_empty() {
-        frame.render_widget(
-            Paragraph::new(format!(
-                "terminal: {}",
-                prop_str(node, "session_id").unwrap_or_default()
-            ))
-            .wrap(Wrap { trim: false }),
-            inner,
-        );
+    frame.render_widget(
+        Paragraph::new(terminal_view_content(node)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn terminal_view_content(node: &UiNode) -> String {
+    let content = node
+        .children
+        .iter()
+        .filter_map(static_child_node)
+        .filter(|child| child.kind == UiNodeKind::Text)
+        .map(|child| prop_text(child, "text"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if content.is_empty() {
+        format!(
+            "terminal: {}",
+            prop_str(node, "session_id").unwrap_or_default()
+        )
     } else {
-        render_children(frame, inner, node, hit_map, Direction::Vertical);
+        content
     }
 }
 
@@ -1081,6 +1104,19 @@ fn action_prop(node: &UiNode) -> Option<UiAction> {
     node.props
         .get("action")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .or_else(|| {
+            node.slots
+                .get("actions")
+                .into_iter()
+                .flatten()
+                .filter_map(static_child_node)
+                .find_map(|child| {
+                    child
+                        .props
+                        .get("action")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                })
+        })
 }
 
 fn field_binding(node: &UiNode) -> Option<FieldBinding> {
@@ -1741,6 +1777,10 @@ mod tests {
             }
         );
         assert_eq!(router.selected_row("session-list"), Some("session-beta"));
+        assert_eq!(
+            router.selected_row_value("session-list"),
+            Some(&Value::String("session-beta".to_string()))
+        );
 
         let dispatch = router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1945,6 +1985,30 @@ mod tests {
                 node_id: "terminal-main".to_string(),
                 bytes: vec![10],
             }
+        );
+    }
+
+    #[test]
+    fn terminal_view_renders_text_children_as_primitive_content() {
+        let mut root = node(
+            UiNodeKind::TerminalView,
+            "terminal-main",
+            json!({ "session_id": "session-alpha", "title": "Shell" }),
+        );
+        root.children = vec![child(node(
+            UiNodeKind::Text,
+            "terminal-output",
+            json!({ "text": "output from terminal primitive" }),
+        ))];
+
+        let (lines, hit_map) = render_to_lines(&root, 80, 10);
+
+        assert!(lines.join("\n").contains("output from terminal primitive"));
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "terminal-output")
         );
     }
 

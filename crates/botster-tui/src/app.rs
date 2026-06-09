@@ -130,6 +130,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
+                    app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
                     app.handle_dispatch(dispatch);
                 }
             }
@@ -186,6 +187,19 @@ impl DogfoodApp {
 
     fn set_drafts(&mut self, drafts: BTreeMap<String, Value>) {
         self.drafts = drafts;
+    }
+
+    fn sync_focused_session(&mut self, selected_row: Option<&Value>) {
+        let Some(session_id) = selected_row.and_then(Value::as_str) else {
+            return;
+        };
+        if self
+            .sessions
+            .iter()
+            .any(|candidate| candidate == session_id)
+        {
+            self.selected_session = Some(session_id.to_string());
+        }
     }
 
     fn poll_hub(&mut self) {
@@ -294,6 +308,9 @@ impl DogfoodApp {
                 self.status = "connected".to_string();
                 self.error = None;
                 self.refresh_sessions();
+                if self.selected_session.is_some() {
+                    self.attach_selected_or_first();
+                }
             }
             Err(error) => {
                 self.client = None;
@@ -383,7 +400,11 @@ impl DogfoodApp {
                 .into_iter()
                 .map(|session| session.session_id)
                 .collect();
-            if self.selected_session.is_none() {
+            if self
+                .selected_session
+                .as_ref()
+                .is_none_or(|selected| !self.sessions.contains(selected))
+            {
                 self.selected_session = self.sessions.first().cloned();
             }
         }
@@ -508,18 +529,31 @@ impl DogfoodApp {
             .sessions
             .iter()
             .map(|session_id| {
-                child(node(
+                let mut item = node(
                     UiNodeKind::ListItem,
                     &format!("dogfood-session-{session_id}"),
                     json!({
-                        "title": session_id,
-                        "value": session_id,
-                        "action": {
-                            "id": "botster.tui.attach",
-                            "payload": { "session_id": session_id }
-                        }
+                        "value": session_id
                     }),
-                ))
+                );
+                item.slots.insert(
+                    "title".to_string(),
+                    vec![child(node(
+                        UiNodeKind::Text,
+                        &format!("dogfood-session-{session_id}-title"),
+                        json!({ "text": session_id }),
+                    ))],
+                );
+                item.slots.insert(
+                    "actions".to_string(),
+                    vec![child(button(
+                        &format!("dogfood-session-{session_id}-attach"),
+                        "Attach",
+                        "botster.tui.attach",
+                        json!({ "session_id": session_id }),
+                    ))],
+                );
+                child(item)
             })
             .collect();
         let mut panel = node(
@@ -578,6 +612,18 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         data: HEADLESS_INPUT.to_string(),
     });
     wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
+    #[cfg(test)]
+    {
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(HEADLESS_OUTPUT));
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "dogfood-terminal-output")
+        );
+    }
     println!("terminal-output: {HEADLESS_OUTPUT}");
     app.request_and_apply(DaemonRequest::ShutdownSession { session_id });
     Ok(())
@@ -700,6 +746,83 @@ mod tests {
     }
 
     #[test]
+    fn terminal_output_renders_as_terminal_primitive_content() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output = "primitive terminal bytes".to_string();
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 100, 24);
+
+        assert!(lines.join("\n").contains("primitive terminal bytes"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "dogfood-terminal")
+        );
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "dogfood-terminal-output")
+        );
+    }
+
+    #[test]
+    fn focused_session_list_row_updates_attach_selection() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.selected_session = Some("session-alpha".to_string());
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let mut router = InputRouter::new();
+        let first_row = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "dogfood-session-session-alpha")
+            .expect("first session row should be focusable");
+
+        router.dispatch_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: first_row.rect.x,
+                row: first_row.rect.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &hit_map,
+        );
+        router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
+
+        assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
+    }
+
+    #[test]
+    fn session_repull_preserves_selected_session_when_still_listed() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.selected_session = Some("session-beta".to_string());
+
+        app.apply_response(sessions_response(["session-alpha", "session-beta"]));
+
+        assert_eq!(app.sessions, vec!["session-alpha", "session-beta"]);
+        assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
+    }
+
+    #[test]
+    fn session_repull_resets_stale_selected_session_to_first_listed_session() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.selected_session = Some("session-beta".to_string());
+
+        app.apply_response(sessions_response(["session-gamma", "session-delta"]));
+
+        assert_eq!(app.sessions, vec!["session-gamma", "session-delta"]);
+        assert_eq!(app.selected_session.as_deref(), Some("session-gamma"));
+    }
+
+    #[test]
     fn headless_dogfood_runs_against_isolated_hub_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -710,10 +833,11 @@ mod tests {
             return;
         };
 
+        let root = PathBuf::from(format!("/tmp/bt{}", short_suffix() % 1_000_000));
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
             .hub_bin(hub_bin)
             .session_worker_bin(session_worker_bin)
-            .root("/tmp/btui")
+            .root(&root)
             .name("botster-tui-headless-dogfood")
             .start()
             .expect("isolated hub starts");
@@ -733,5 +857,30 @@ mod tests {
             panic!("{variable} is required when BOTSTER_TUI_REQUIRE_HUB_TEST is set");
         }
         eprintln!("skipping isolated hub dogfood test; {variable} is not set");
+    }
+
+    fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
+        DaemonResponse {
+            kind: DaemonResponseKind::Sessions,
+            status: None,
+            sessions: session_ids
+                .into_iter()
+                .map(|session_id| botster_hub_client::DaemonSession {
+                    session_id: session_id.to_string(),
+                    lifecycle: "running".to_string(),
+                })
+                .collect(),
+            packages: Vec::new(),
+            package_decision: None,
+            lifecycle: Vec::new(),
+            plugin_tools: Vec::new(),
+            plugin_tool_result: Value::Null,
+            plugin_surface: None,
+            plugin_action_result: None,
+            events: Vec::new(),
+            cleanup: None,
+            coordination: None,
+            error: None,
+        }
     }
 }

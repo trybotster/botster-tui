@@ -54,16 +54,17 @@ drain events. `botster-tui` does not implement a private socket protocol.
 Run against a separately started isolated hub:
 
 ```sh
-botster-hub start --data-dir /tmp/botster-tui-hub
-BOTSTER_HUB_SOCKET=/tmp/botster-tui-hub/botster-hub.sock cargo run -p botster-tui
-botster-hub shutdown --data-dir /tmp/botster-tui-hub
+hub_dir="$(mktemp -d /tmp/botster-tui-hub.XXXXXX)"
+botster-hub start --data-dir "$hub_dir"
+BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" cargo run -p botster-tui
+botster-hub shutdown --data-dir "$hub_dir"
 ```
 
 The headless dogfood path proves the same client/app surface without opening the
 alternate screen:
 
 ```sh
-BOTSTER_HUB_SOCKET=/tmp/botster-tui-hub/botster-hub.sock \
+BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" \
   cargo run -p botster-tui -- --headless-dogfood
 ```
 

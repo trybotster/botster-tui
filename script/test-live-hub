@@ -14,6 +14,7 @@ cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir
 cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked -p botster-core --bin botster-session-worker
 
 BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
+BOTSTER_ENV=test \
 BOTSTER_HUB_BIN="$hub_target_dir/debug/botster-hub" \
 BOTSTER_SESSION_WORKER_BIN="$hub_target_dir/debug/botster-session-worker" \
 CARGO_TARGET_DIR="$target_dir" \
