@@ -24,6 +24,7 @@ pub struct HitRegion {
     pub action: Option<UiAction>,
     pub field: Option<FieldBinding>,
     pub row: Option<RowBinding>,
+    pub terminal_mouse_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -89,11 +90,26 @@ impl HitMap {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputDispatch {
-    Hover { node_id: String },
-    Focus { node_id: String },
-    Scroll { node_id: String, lines: i16 },
+    Hover {
+        node_id: String,
+    },
+    Focus {
+        node_id: String,
+    },
+    Scroll {
+        node_id: String,
+        lines: i16,
+    },
     Action(UiActionRequest),
-    TerminalForward { node_id: String, bytes: Vec<u8> },
+    TerminalForward {
+        node_id: String,
+        bytes: Vec<u8>,
+    },
+    TerminalResize {
+        node_id: String,
+        rows: u16,
+        cols: u16,
+    },
     Ignored,
 }
 
@@ -146,6 +162,7 @@ impl InputRouter {
                 self.ensure_focus(hit_map);
                 self.dispatch_key(key, hit_map)
             }
+            Event::Resize(_, _) => self.dispatch_resize(hit_map),
             _ => InputDispatch::Ignored,
         }
     }
@@ -157,6 +174,7 @@ impl InputRouter {
 
         if self.focused_node_id.as_deref() == Some(region.node_id.as_str())
             && region.role == HitRole::TerminalView
+            && region.terminal_mouse_mode
         {
             return terminal_mouse_forward(region, mouse);
         }
@@ -245,6 +263,21 @@ impl InputRouter {
                 self.edit_field(region, FieldEdit::Char(character))
             }
             _ => InputDispatch::Ignored,
+        }
+    }
+
+    fn dispatch_resize(&mut self, hit_map: &HitMap) -> InputDispatch {
+        let Some(region) = self.focused_region(hit_map) else {
+            return InputDispatch::Ignored;
+        };
+        if region.role != HitRole::TerminalView {
+            return InputDispatch::Ignored;
+        }
+        let inner = terminal_inner_rect(region.rect);
+        InputDispatch::TerminalResize {
+            node_id: region.node_id.clone(),
+            rows: inner.height,
+            cols: inner.width,
         }
     }
 
@@ -718,6 +751,7 @@ fn render_table_as_list(
                         index,
                         value: row.clone(),
                     }),
+                    terminal_mouse_mode: false,
                 });
             }
             lines.push(table_row_label(row));
@@ -817,13 +851,17 @@ fn render_terminal_view(
     node: &UiNode,
     hit_map: &mut HitMap,
 ) {
-    push_hit(
-        hit_map,
-        node,
-        HitRole::TerminalView,
-        area,
-        Some(terminal_focus_action(node)),
-    );
+    if let Some(node_id) = node_id(node) {
+        hit_map.push(HitRegion {
+            node_id,
+            role: HitRole::TerminalView,
+            rect: area,
+            action: Some(terminal_focus_action(node)),
+            field: None,
+            row: None,
+            terminal_mouse_mode: prop_bool(node, "mouse_mode").unwrap_or_default(),
+        });
+    }
     frame.render_widget(
         Paragraph::new(format!(
             "terminal: {}",
@@ -1144,11 +1182,21 @@ fn terminal_mouse_forward(region: &HitRegion, mouse: MouseEvent) -> InputDispatc
     let Some(button_code) = mouse_button_code(mouse.kind) else {
         return InputDispatch::Ignored;
     };
-    let column = mouse.column.saturating_sub(region.rect.x).saturating_add(1);
-    let row = mouse.row.saturating_sub(region.rect.y).saturating_add(1);
+    let inner = terminal_inner_rect(region.rect);
+    let column = mouse.column.saturating_sub(inner.x).saturating_add(1);
+    let row = mouse.row.saturating_sub(inner.y).saturating_add(1);
     InputDispatch::TerminalForward {
         node_id: region.node_id.clone(),
         bytes: format!("\x1b[<{button_code};{column};{row}M").into_bytes(),
+    }
+}
+
+fn terminal_inner_rect(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x.saturating_add(1),
+        y: rect.y.saturating_add(1),
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
     }
 }
 
@@ -1212,6 +1260,7 @@ fn push_hit_with(
             action,
             field,
             row,
+            terminal_mouse_mode: false,
         });
     }
 }
@@ -1887,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_terminal_mouse_events_forward_terminal_local_bytes() {
+    fn focused_terminal_without_mouse_mode_keeps_mouse_events_botster_owned() {
         let root = node(
             UiNodeKind::TerminalView,
             "terminal-main",
@@ -1918,12 +1967,107 @@ mod tests {
         );
         assert_eq!(
             dispatch,
+            InputDispatch::Scroll {
+                node_id: "terminal-main".to_string(),
+                lines: 3,
+            }
+        );
+        assert_eq!(router.scroll_offset("terminal-main"), 3);
+    }
+
+    #[test]
+    fn focused_terminal_mouse_mode_forwards_sgr_press_and_wheel_only() {
+        let root = node(
+            UiNodeKind::TerminalView,
+            "terminal-main",
+            json!({ "session_id": "session-alpha", "title": "Shell", "mouse_mode": true }),
+        );
+        let (_lines, hit_map) = render_to_lines(&root, 80, 10);
+        let mut router = InputRouter::new();
+
+        let focus = router.dispatch_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &hit_map,
+        );
+        assert!(matches!(focus, InputDispatch::Action(_)));
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 4,
+                    row: 3,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                &hit_map,
+            ),
             InputDispatch::TerminalForward {
                 node_id: "terminal-main".to_string(),
-                bytes: b"\x1b[<65;5;4M".to_vec(),
+                bytes: b"\x1b[<65;4;3M".to_vec(),
             }
         );
         assert_eq!(router.scroll_offset("terminal-main"), 0);
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: 4,
+                    row: 3,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                &hit_map,
+            ),
+            InputDispatch::Ignored
+        );
+        assert_eq!(
+            router.dispatch_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: 4,
+                    row: 3,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                &hit_map,
+            ),
+            InputDispatch::Ignored
+        );
+    }
+
+    #[test]
+    fn resize_dispatch_targets_focused_terminal_inner_rect() {
+        let root = node(
+            UiNodeKind::TerminalView,
+            "terminal-main",
+            json!({ "session_id": "session-alpha", "title": "Shell" }),
+        );
+        let (_lines, hit_map) = render_to_lines(&root, 80, 10);
+        let mut router = InputRouter::new();
+
+        let focus = router.dispatch_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &hit_map,
+        );
+        assert!(matches!(focus, InputDispatch::Action(_)));
+
+        assert_eq!(
+            router.dispatch_event(Event::Resize(120, 40), &hit_map),
+            InputDispatch::TerminalResize {
+                node_id: "terminal-main".to_string(),
+                rows: 8,
+                cols: 78,
+            }
+        );
     }
 
     #[test]
