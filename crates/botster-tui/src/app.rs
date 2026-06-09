@@ -163,6 +163,8 @@ struct DogfoodApp {
     command: String,
     drafts: BTreeMap<String, Value>,
     last_reconnect_attempt: Option<Instant>,
+    #[cfg(test)]
+    observed_requests: Vec<ObservedRequest>,
 }
 
 impl DogfoodApp {
@@ -180,6 +182,8 @@ impl DogfoodApp {
             command: DEFAULT_COMMAND.to_string(),
             drafts: BTreeMap::new(),
             last_reconnect_attempt: None,
+            #[cfg(test)]
+            observed_requests: Vec::new(),
         };
         app.try_connect();
         app
@@ -307,16 +311,20 @@ impl DogfoodApp {
                 self.client = Some(client);
                 self.status = "connected".to_string();
                 self.error = None;
-                self.refresh_sessions();
-                if self.selected_session.is_some() {
-                    self.attach_selected_or_first();
-                }
+                self.restore_after_connect();
             }
             Err(error) => {
                 self.client = None;
                 self.status = "reconnecting".to_string();
                 self.error = Some(error.to_string());
             }
+        }
+    }
+
+    fn restore_after_connect(&mut self) {
+        self.refresh_sessions();
+        if self.selected_session.is_some() {
+            self.attach_selected_or_first();
         }
     }
 
@@ -365,6 +373,8 @@ impl DogfoodApp {
     }
 
     fn request_and_apply(&mut self, request: DaemonRequest) {
+        #[cfg(test)]
+        self.record_request(&request);
         match self.request(request) {
             Ok(response) => self.apply_response(response),
             Err(error) => self.disconnect(error),
@@ -375,6 +385,23 @@ impl DogfoodApp {
         match &mut self.client {
             Some(client) => client.request(&request),
             None => Err(DaemonTransportError::NotRunning),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_request(&mut self, request: &DaemonRequest) {
+        match request {
+            DaemonRequest::ListSessions => {
+                self.observed_requests.push(ObservedRequest::ListSessions)
+            }
+            DaemonRequest::Attach {
+                session_id,
+                subscription_id,
+            } => self.observed_requests.push(ObservedRequest::Attach {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            }),
+            _ => {}
         }
     }
 
@@ -583,6 +610,16 @@ impl DogfoodApp {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum ObservedRequest {
+    ListSessions,
+    Attach {
+        session_id: String,
+        subscription_id: String,
+    },
+}
+
 fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
     let Some(socket) = args.hub_socket else {
         return Err(DaemonTransportError::NotRunning);
@@ -737,6 +774,18 @@ mod tests {
     }
 
     #[test]
+    fn blank_command_validation_renders_visible_error_state() {
+        let mut app = DogfoodApp::new(None);
+        app.command = " \t\n".to_string();
+
+        app.spawn_session();
+
+        assert_eq!(app.error.as_deref(), Some("command is required"));
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 100, 24);
+        assert!(lines.join("\n").contains("error: command is required"));
+    }
+
+    #[test]
     fn terminal_view_carries_output_bytes() {
         let mut app = DogfoodApp::new(None);
         app.terminal_output = "hello terminal".to_string();
@@ -823,6 +872,64 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_restore_pulls_session_read_model_before_reattaching_selected_session() {
+        let mut app = DogfoodApp::new(None);
+        app.observed_requests.clear();
+        app.sessions = vec!["session-alpha".to_string()];
+        app.selected_session = Some("session-alpha".to_string());
+        let subscription_id = app.subscription_id.clone();
+
+        app.restore_after_connect();
+
+        assert_eq!(
+            app.observed_requests,
+            vec![
+                ObservedRequest::ListSessions,
+                ObservedRequest::Attach {
+                    session_id: "session-alpha".to_string(),
+                    subscription_id,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tui_hub_boundary_uses_public_client_without_private_protocol_plumbing() {
+        let source = source_without_line_comments();
+
+        assert!(source.contains("use botster_hub_client"));
+        for required in [
+            "DaemonConnection",
+            "DaemonEndpoint",
+            "DaemonRequest",
+            "DaemonResponse",
+        ] {
+            assert!(
+                source.contains(required),
+                "botster-tui should keep using public botster-hub-client {required}"
+            );
+        }
+
+        let forbidden_patterns = [
+            concat!("FRA", "ME_"),
+            concat!("SESSION", "_FRAME"),
+            concat!("Daemon", "Frame"),
+            concat!("Session", "Frame"),
+            concat!("Hub", "Frame"),
+            concat!("session", "_protocol"),
+            concat!("Unix", "Stream"),
+            concat!("read", "_line"),
+            concat!("write", "_all"),
+        ];
+        for pattern in forbidden_patterns {
+            assert!(
+                !source.contains(pattern),
+                "botster-tui source must not reintroduce private hub protocol plumbing: {pattern}"
+            );
+        }
+    }
+
+    #[test]
     fn headless_dogfood_runs_against_isolated_hub_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -857,6 +964,31 @@ mod tests {
             panic!("{variable} is required when BOTSTER_TUI_REQUIRE_HUB_TEST is set");
         }
         eprintln!("skipping isolated hub dogfood test; {variable} is not set");
+    }
+
+    fn source_without_line_comments() -> String {
+        let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        std::fs::read_dir(src_dir)
+            .expect("botster-tui src directory is readable")
+            .map(|entry| entry.expect("source entry is readable").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .map(|path| {
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
+            })
+            .flat_map(|contents| {
+                contents
+                    .lines()
+                    .map(|line| {
+                        line.split_once("//")
+                            .map(|(before_comment, _)| before_comment)
+                            .unwrap_or(line)
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
