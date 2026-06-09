@@ -147,6 +147,10 @@ impl InputRouter {
         self.draft_values.get(field_name)
     }
 
+    pub fn draft_values(&self) -> BTreeMap<String, Value> {
+        self.draft_values.clone()
+    }
+
     #[cfg(test)]
     pub fn scroll_offset(&self, node_id: &str) -> i16 {
         self.scroll_offsets
@@ -552,6 +556,8 @@ pub fn primitive_registry() -> BTreeMap<&'static str, &'static str> {
     ])
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn demo_ui_node() -> UiNode {
     let mut root = node(
         UiNodeKind::Stack,
@@ -862,19 +868,24 @@ fn render_terminal_view(
             terminal_mouse_mode: prop_bool(node, "mouse_mode").unwrap_or_default(),
         });
     }
-    frame.render_widget(
-        Paragraph::new(format!(
-            "terminal: {}",
-            prop_str(node, "session_id").unwrap_or_default()
-        ))
-        .block(
-            Block::default()
-                .title(prop_str(node, "title").unwrap_or_else(|| "terminal".to_string()))
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: false }),
-        area,
-    );
+    let block = Block::default()
+        .title(prop_str(node, "title").unwrap_or_else(|| "terminal".to_string()))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if node.children.is_empty() && node.slots.is_empty() {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "terminal: {}",
+                prop_str(node, "session_id").unwrap_or_default()
+            ))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+    } else {
+        render_children(frame, inner, node, hit_map, Direction::Vertical);
+    }
 }
 
 fn render_connection_code(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode) {
@@ -1380,10 +1391,12 @@ impl HitRegion {
     }
 }
 
+#[cfg(test)]
 trait UiNodeBuilder {
     fn with_children(self, children: Vec<UiChild>) -> UiNode;
 }
 
+#[cfg(test)]
 impl UiNodeBuilder for UiNode {
     fn with_children(mut self, children: Vec<UiChild>) -> UiNode {
         self.children = children;

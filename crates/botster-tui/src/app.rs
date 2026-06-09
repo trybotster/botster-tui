@@ -1,8 +1,16 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Stdout},
-    time::Duration,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
+use botster_hub_client::{
+    DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
+};
 use crossterm::{
     cursor::Show,
     event::{
@@ -13,18 +21,55 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use serde_json::{Value, json};
 
-use crate::renderer::{self, HitMap, InputRouter};
+use crate::renderer::{self, HitMap, InputDispatch, InputRouter};
 
-pub const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
+const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
+const HEADLESS_INPUT: &str = "botster-tui-headless\n";
+const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
+const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppArgs {
+    pub smoke: bool,
+    pub hub_socket: Option<PathBuf>,
+    pub headless_dogfood: bool,
+}
+
+impl AppArgs {
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
+        let mut parsed = Self::default();
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--smoke" => parsed.smoke = true,
+                "--headless-dogfood" => parsed.headless_dogfood = true,
+                "--hub-socket" => {
+                    parsed.hub_socket = iter.next().map(PathBuf::from);
+                }
+                _ => {}
+            }
+        }
+        if parsed.hub_socket.is_none() {
+            parsed.hub_socket = std::env::var_os("BOTSTER_HUB_SOCKET").map(PathBuf::from);
+        }
+        parsed
+    }
+}
 
 pub fn smoke_message() -> &'static str {
     SMOKE_MESSAGE
 }
 
-pub fn run() -> io::Result<()> {
+pub fn run(args: AppArgs) -> io::Result<()> {
+    if args.headless_dogfood {
+        return run_headless_dogfood(args)
+            .map_err(|error| io::Error::other(format!("headless dogfood failed: {error}")));
+    }
+
     let mut terminal = setup_terminal()?;
-    let run_result = run_loop(&mut terminal);
+    let run_result = run_loop(&mut terminal, args);
     let restore_result = restore_terminal(&mut terminal);
 
     match (run_result, restore_result) {
@@ -69,18 +114,23 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
     cursor_result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) -> io::Result<()> {
+    let mut app = DogfoodApp::new(args.hub_socket);
     let mut router = InputRouter::new();
     loop {
-        let mut hit_map = HitMap::default();
-        terminal.draw(|frame| draw(frame, &mut hit_map))?;
+        app.poll_hub();
+        app.set_drafts(router.draft_values());
 
-        if event::poll(Duration::from_millis(250))? {
+        let mut hit_map = HitMap::default();
+        terminal.draw(|frame| draw(frame, &mut hit_map, &app))?;
+
+        if event::poll(Duration::from_millis(100))? {
             let event = event::read()?;
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
-                    let _dispatch = router.dispatch_event(event, &hit_map);
+                    let dispatch = router.dispatch_event(event, &hit_map);
+                    app.handle_dispatch(dispatch);
                 }
             }
         }
@@ -89,8 +139,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()>
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap) {
-    let node = renderer::demo_ui_node();
+fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &DogfoodApp) {
+    let node = app.surface();
     renderer::render_node(frame, frame.area(), &node, hit_map);
 }
 
@@ -98,6 +148,496 @@ fn should_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Esc
         || matches!(key.code, KeyCode::Char('q' | 'Q'))
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+struct DogfoodApp {
+    endpoint: Option<DaemonEndpoint>,
+    client: Option<DaemonConnection>,
+    status: String,
+    error: Option<String>,
+    sessions: Vec<String>,
+    selected_session: Option<String>,
+    subscription_id: String,
+    terminal_output: String,
+    command: String,
+    drafts: BTreeMap<String, Value>,
+    last_reconnect_attempt: Option<Instant>,
+}
+
+impl DogfoodApp {
+    fn new(hub_socket: Option<PathBuf>) -> Self {
+        let endpoint = hub_socket.map(DaemonEndpoint::new);
+        let mut app = Self {
+            endpoint,
+            client: None,
+            status: "disconnected".to_string(),
+            error: None,
+            sessions: Vec::new(),
+            selected_session: None,
+            subscription_id: format!("btui-sub-{}", short_suffix()),
+            terminal_output: String::new(),
+            command: DEFAULT_COMMAND.to_string(),
+            drafts: BTreeMap::new(),
+            last_reconnect_attempt: None,
+        };
+        app.try_connect();
+        app
+    }
+
+    fn set_drafts(&mut self, drafts: BTreeMap<String, Value>) {
+        self.drafts = drafts;
+    }
+
+    fn poll_hub(&mut self) {
+        if self.client.is_none() {
+            self.try_connect_throttled();
+            return;
+        }
+
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        match self.request(DaemonRequest::Drain { session_id }) {
+            Ok(response) => self.apply_response(response),
+            Err(error) => self.disconnect(error),
+        }
+    }
+
+    fn handle_dispatch(&mut self, dispatch: InputDispatch) {
+        match dispatch {
+            InputDispatch::Action(request) => {
+                self.handle_action(request.action_id.0, request.values, request.payload);
+            }
+            InputDispatch::TerminalForward { bytes, .. } => {
+                let Some(session_id) = self.selected_session.clone() else {
+                    self.error = Some("attach a session before sending terminal input".to_string());
+                    return;
+                };
+                match String::from_utf8(bytes) {
+                    Ok(data) => {
+                        self.request_and_apply(DaemonRequest::SendInput { session_id, data })
+                    }
+                    Err(error) => {
+                        self.error = Some(format!("terminal input was not UTF-8: {error}"))
+                    }
+                }
+            }
+            InputDispatch::TerminalResize { rows, cols, .. } => {
+                if let Some(session_id) = self.selected_session.clone() {
+                    self.request_and_apply(DaemonRequest::Resize {
+                        session_id,
+                        rows,
+                        cols,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_action(
+        &mut self,
+        action_id: String,
+        values: Option<UiFormValues>,
+        payload: Option<Value>,
+    ) {
+        if let Some(values) = values
+            && let Some(value) = values.0.get("command").and_then(Value::as_str)
+        {
+            self.command = value.to_string();
+        }
+
+        match action_id.as_str() {
+            "botster.tui.connect" => self.force_reconnect(),
+            "botster.tui.spawn" => self.spawn_session(),
+            "botster.tui.attach" => {
+                if let Some(session_id) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("session_id"))
+                    .and_then(Value::as_str)
+                {
+                    self.selected_session = Some(session_id.to_string());
+                }
+                self.attach_selected_or_first();
+            }
+            "botster.tui.refresh" => self.refresh_sessions(),
+            "botster.terminal.focus" => self.attach_selected_or_first(),
+            _ => {}
+        }
+    }
+
+    fn try_connect_throttled(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_reconnect_attempt
+            .is_some_and(|attempt| now.duration_since(attempt) < Duration::from_millis(750))
+        {
+            return;
+        }
+        self.try_connect();
+    }
+
+    fn force_reconnect(&mut self) {
+        self.client = None;
+        self.try_connect();
+    }
+
+    fn try_connect(&mut self) {
+        self.last_reconnect_attempt = Some(Instant::now());
+        let Some(endpoint) = &self.endpoint else {
+            self.status = "configure --hub-socket or BOTSTER_HUB_SOCKET".to_string();
+            return;
+        };
+        match DaemonConnection::connect(endpoint) {
+            Ok(client) => {
+                self.client = Some(client);
+                self.status = "connected".to_string();
+                self.error = None;
+                self.refresh_sessions();
+            }
+            Err(error) => {
+                self.client = None;
+                self.status = "reconnecting".to_string();
+                self.error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn refresh_sessions(&mut self) {
+        self.request_and_apply(DaemonRequest::ListSessions);
+    }
+
+    fn spawn_session(&mut self) {
+        if self.command.trim().is_empty() {
+            self.error = Some("command is required".to_string());
+            return;
+        }
+        let session_id = format!("btui-{}", short_suffix());
+        let command = self.command.clone();
+        match self.request(DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command,
+        }) {
+            Ok(response) => self.apply_response(response),
+            Err(error) => {
+                self.disconnect(error);
+                return;
+            }
+        }
+        self.selected_session = Some(session_id.clone());
+        self.request_and_apply(DaemonRequest::Attach {
+            session_id,
+            subscription_id: self.subscription_id.clone(),
+        });
+    }
+
+    fn attach_selected_or_first(&mut self) {
+        let Some(session_id) = self
+            .selected_session
+            .clone()
+            .or_else(|| self.sessions.first().cloned())
+        else {
+            self.error = Some("no session available to attach".to_string());
+            return;
+        };
+        self.selected_session = Some(session_id.clone());
+        self.request_and_apply(DaemonRequest::Attach {
+            session_id,
+            subscription_id: self.subscription_id.clone(),
+        });
+    }
+
+    fn request_and_apply(&mut self, request: DaemonRequest) {
+        match self.request(request) {
+            Ok(response) => self.apply_response(response),
+            Err(error) => self.disconnect(error),
+        }
+    }
+
+    fn request(&mut self, request: DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+        match &mut self.client {
+            Some(client) => client.request(&request),
+            None => Err(DaemonTransportError::NotRunning),
+        }
+    }
+
+    fn disconnect(&mut self, error: DaemonTransportError) {
+        self.client = None;
+        self.status = "reconnecting".to_string();
+        self.error = Some(error.to_string());
+    }
+
+    fn apply_response(&mut self, response: DaemonResponse) {
+        if let Some(error) = response.error {
+            self.error = Some(error.message);
+            return;
+        }
+
+        self.error = None;
+        if matches!(
+            response.kind,
+            DaemonResponseKind::Sessions | DaemonResponseKind::Spawned
+        ) {
+            self.sessions = response
+                .sessions
+                .into_iter()
+                .map(|session| session.session_id)
+                .collect();
+            if self.selected_session.is_none() {
+                self.selected_session = self.sessions.first().cloned();
+            }
+        }
+
+        for event in response.events {
+            match event {
+                DaemonEvent::TerminalOutput { data, .. } => {
+                    self.terminal_output.push_str(&data);
+                    if self.terminal_output.len() > 8_000 {
+                        self.terminal_output = self
+                            .terminal_output
+                            .chars()
+                            .rev()
+                            .take(8_000)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                    }
+                }
+                DaemonEvent::ProcessExit { code, .. } => {
+                    self.status = format!("process exited {}", code.unwrap_or_default());
+                }
+                DaemonEvent::AttachState { state, .. } => {
+                    self.status = format!("attach {state}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn surface(&self) -> UiNode {
+        let mut root = node(
+            UiNodeKind::Stack,
+            "dogfood-root",
+            json!({ "direction": "vertical" }),
+        );
+        root.children = vec![
+            child(self.status_panel()),
+            child(self.command_form()),
+            child(self.sessions_panel()),
+            child(self.terminal_panel()),
+        ];
+        root.validate()
+            .expect("dogfood UiNode should satisfy the core UI contract");
+        renderer::tui_capabilities()
+            .validate_node(&root)
+            .expect("dogfood UiNode should fit TUI renderer capabilities");
+        root
+    }
+
+    fn status_panel(&self) -> UiNode {
+        let mut panel = node(
+            UiNodeKind::Panel,
+            "dogfood-status-panel",
+            json!({ "title": "hub" }),
+        );
+        let mut children = vec![
+            child(node(
+                UiNodeKind::Text,
+                "dogfood-status",
+                json!({ "text": self.status }),
+            )),
+            child(button(
+                "dogfood-refresh",
+                "Refresh",
+                "botster.tui.refresh",
+                json!({}),
+            )),
+            child(button(
+                "dogfood-connect",
+                "Reconnect",
+                "botster.tui.connect",
+                json!({}),
+            )),
+        ];
+        if let Some(error) = &self.error {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-error",
+                json!({ "text": format!("error: {error}") }),
+            )));
+        }
+        panel.children = children;
+        panel
+    }
+
+    fn command_form(&self) -> UiNode {
+        let command = self
+            .drafts
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.command);
+        let mut panel = node(
+            UiNodeKind::Panel,
+            "dogfood-command-panel",
+            json!({ "title": "spawn" }),
+        );
+        panel.children = vec![
+            child(node(
+                UiNodeKind::TextInput,
+                "dogfood-command",
+                json!({
+                    "name": "command",
+                    "label": "command",
+                    "value": command
+                }),
+            )),
+            child(button(
+                "dogfood-spawn",
+                "Spawn and attach",
+                "botster.tui.spawn",
+                json!({}),
+            )),
+        ];
+        panel
+    }
+
+    fn sessions_panel(&self) -> UiNode {
+        let mut list = node(UiNodeKind::List, "dogfood-session-list", json!({}));
+        list.children = self
+            .sessions
+            .iter()
+            .map(|session_id| {
+                child(node(
+                    UiNodeKind::ListItem,
+                    &format!("dogfood-session-{session_id}"),
+                    json!({
+                        "title": session_id,
+                        "value": session_id,
+                        "action": {
+                            "id": "botster.tui.attach",
+                            "payload": { "session_id": session_id }
+                        }
+                    }),
+                ))
+            })
+            .collect();
+        let mut panel = node(
+            UiNodeKind::Panel,
+            "dogfood-sessions-panel",
+            json!({ "title": "sessions" }),
+        );
+        panel.children = vec![child(list)];
+        panel
+    }
+
+    fn terminal_panel(&self) -> UiNode {
+        let mut terminal = node(
+            UiNodeKind::TerminalView,
+            "dogfood-terminal",
+            json!({
+                "title": "terminal",
+                "session_id": self.selected_session.clone().unwrap_or_else(|| "not attached".to_string())
+            }),
+        );
+        terminal.children = vec![child(node(
+            UiNodeKind::Text,
+            "dogfood-terminal-output",
+            json!({ "text": self.terminal_output }),
+        ))];
+        terminal
+    }
+}
+
+fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
+    let Some(socket) = args.hub_socket else {
+        return Err(DaemonTransportError::NotRunning);
+    };
+    let mut app = DogfoodApp::new(Some(socket));
+    app.command = DEFAULT_COMMAND.to_string();
+    app.spawn_session();
+    if let Some(error) = &app.error {
+        eprintln!("headless-dogfood-error: {error}");
+        return Err(DaemonTransportError::Protocol("headless dogfood app error"));
+    }
+    let session_id = app
+        .selected_session
+        .clone()
+        .ok_or(DaemonTransportError::Protocol(
+            "headless session was not selected",
+        ))?;
+
+    wait_for_app_output(&mut app, "botster-tui-ready")?;
+    app.request_and_apply(DaemonRequest::Resize {
+        session_id: session_id.clone(),
+        rows: 24,
+        cols: 80,
+    });
+    app.request_and_apply(DaemonRequest::SendInput {
+        session_id: session_id.clone(),
+        data: HEADLESS_INPUT.to_string(),
+    });
+    wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
+    println!("terminal-output: {HEADLESS_OUTPUT}");
+    app.request_and_apply(DaemonRequest::ShutdownSession { session_id });
+    Ok(())
+}
+
+fn wait_for_app_output(app: &mut DogfoodApp, needle: &str) -> DaemonTransportResult<()> {
+    if app.terminal_output.contains(needle) {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        app.poll_hub();
+        if app.terminal_output.contains(needle) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    eprintln!("terminal-output-observed: {:?}", app.terminal_output);
+    Err(DaemonTransportError::ClientDisconnected)
+}
+
+fn node(kind: UiNodeKind, id: &str, props: Value) -> UiNode {
+    UiNode {
+        kind,
+        id: Some(UiNodeId(id.to_string())),
+        props: props.as_object().cloned().unwrap_or_default(),
+        children: Vec::new(),
+        slots: BTreeMap::new(),
+    }
+}
+
+fn child(node: UiNode) -> UiChild {
+    UiChild::Node(Box::new(node))
+}
+
+fn button(id: &str, label: &str, action_id: &str, payload: Value) -> UiNode {
+    node(
+        UiNodeKind::Button,
+        id,
+        json!({
+            "label": label,
+            "action": {
+                "id": action_id,
+                "payload": payload
+            }
+        }),
+    )
+}
+
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+fn short_suffix() -> u64 {
+    (unique_suffix() % 1_000_000_000_000) as u64
 }
 
 #[cfg(test)]
@@ -124,5 +664,74 @@ mod tests {
             KeyCode::Char('c'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn parses_hub_socket_and_headless_mode() {
+        let args = AppArgs::parse([
+            "--hub-socket".to_string(),
+            "target/hub.sock".to_string(),
+            "--headless-dogfood".to_string(),
+        ]);
+
+        assert_eq!(args.hub_socket, Some(PathBuf::from("target/hub.sock")));
+        assert!(args.headless_dogfood);
+    }
+
+    #[test]
+    fn command_draft_is_rendered_before_submit() {
+        let mut app = DogfoodApp::new(None);
+        app.set_drafts(BTreeMap::from([(
+            "command".to_string(),
+            Value::String("printf draft\\n".to_string()),
+        )]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 100, 24);
+        assert!(lines.join("\n").contains("printf draft"));
+    }
+
+    #[test]
+    fn terminal_view_carries_output_bytes() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output = "hello terminal".to_string();
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 100, 24);
+        assert!(lines.join("\n").contains("hello terminal"));
+    }
+
+    #[test]
+    fn headless_dogfood_runs_against_isolated_hub_when_binaries_are_available() {
+        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
+            skip_or_panic("BOTSTER_HUB_BIN");
+            return;
+        };
+        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
+            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
+            return;
+        };
+
+        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(hub_bin)
+            .session_worker_bin(session_worker_bin)
+            .root("/tmp/btui")
+            .name("botster-tui-headless-dogfood")
+            .start()
+            .expect("isolated hub starts");
+
+        run_headless_dogfood(AppArgs {
+            smoke: false,
+            hub_socket: Some(hub.endpoint().socket_path.clone()),
+            headless_dogfood: true,
+        })
+        .expect("headless dogfood surface completes a real hub round trip");
+
+        hub.shutdown().expect("isolated hub shuts down cleanly");
+    }
+
+    fn skip_or_panic(variable: &'static str) {
+        if std::env::var_os("BOTSTER_TUI_REQUIRE_HUB_TEST").is_some() {
+            panic!("{variable} is required when BOTSTER_TUI_REQUIRE_HUB_TEST is set");
+        }
+        eprintln!("skipping isolated hub dogfood test; {variable} is not set");
     }
 }

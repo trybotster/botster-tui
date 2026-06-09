@@ -42,6 +42,48 @@ cargo run -p botster-tui
 The interactive renderer opens the alternate terminal screen and exits with
 `q`, `Esc`, or `Ctrl-C`.
 
+## Local Hub Dogfood
+
+The dogfood session surface uses the authoritative external hub client protocol
+from `botster-hub-client`, pinned to botster-hub revision
+`e97fc3779488ab8adedb98708898e7106254331e`. The protocol source is
+`crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
+handshake, request/response frames, session spawn/attach, input, resize, and
+drain events. `botster-tui` does not implement a private socket protocol.
+
+Run against a separately started isolated hub:
+
+```sh
+botster-hub start --data-dir /tmp/botster-tui-hub
+BOTSTER_HUB_SOCKET=/tmp/botster-tui-hub/botster-hub.sock cargo run -p botster-tui
+botster-hub shutdown --data-dir /tmp/botster-tui-hub
+```
+
+The headless dogfood path proves the same client/app surface without opening the
+alternate screen:
+
+```sh
+BOTSTER_HUB_SOCKET=/tmp/botster-tui-hub/botster-hub.sock \
+  cargo run -p botster-tui -- --headless-dogfood
+```
+
+There is also an automated isolated-hub test using the merged
+`botster-hub-test-support` crate. The preferred command builds matching
+`botster-hub` and `botster-session-worker` binaries from the pinned git
+dependencies, starts an isolated daemon, runs the TUI dogfood path, and tears
+the daemon down:
+
+```sh
+CARGO_TARGET_DIR=/tmp/botster-tui-impl-target script/test-live-hub
+```
+
+Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
+`BOTSTER_SESSION_WORKER_BIN` paths because `botster-tui` does not own those
+binaries. The wrapper script supplies those paths internally. Without the two
+binary path variables, the test is skipped during the normal unit test suite.
+With `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, missing binaries fail the test instead of
+silently skipping it.
+
 ## Scope
 
 Included now:
@@ -55,15 +97,20 @@ Included now:
   field errors, dialog, and safe unsupported fallback.
 - Core UI renderer conformance fixture coverage through
   `botster-core-test-support` with `default-features = false`.
-- A runtime draw path that renders a core-derived `UiNode` sample through the
-  production renderer and dispatches terminal events through the renderer hit map.
+- A runtime draw path that renders the session dogfood surface as shared
+  `UiNode`, routes semantic actions through the renderer hit map, reflects
+  visible form drafts, and displays terminal bytes inside `terminal_view`.
+- Hub session spawn, attach, terminal input, resize, drain, reconnect, and
+  validation/error states through `botster-hub-client`.
+- Automated isolated-hub bring-up and teardown coverage when matching hub
+  binaries are supplied to the test harness.
 - Deterministic format, test, and clippy scripts.
 
 Not included yet:
 
-- Hub connection, pairing, auth, socket attach, or terminal subscription.
-- Entity-store hydration for bound plugin lists, owner-routed action execution,
-  or live `terminal_view` subscription/input forwarding.
+- Pairing, remote auth, or hub provisioning inside this crate.
+- Entity-store hydration for bound plugin lists or owner-routed plugin action
+  execution.
 - Plugin execution, Project Pipelines policy, browser surfaces, or hub/core
   runtime policy.
 
