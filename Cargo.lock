@@ -159,11 +159,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "botster-hub-client"
+version = "0.1.0"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=e97fc3779488ab8adedb98708898e7106254331e#e97fc3779488ab8adedb98708898e7106254331e"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "botster-hub-test-support"
+version = "0.1.0"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=e97fc3779488ab8adedb98708898e7106254331e#e97fc3779488ab8adedb98708898e7106254331e"
+dependencies = [
+ "botster-hub-client",
+]
+
+[[package]]
 name = "botster-tui"
 version = "0.1.0"
 dependencies = [
  "botster-core",
  "botster-core-test-support",
+ "botster-hub-client",
+ "botster-hub-test-support",
  "crossterm",
  "ratatui",
  "serde_json",

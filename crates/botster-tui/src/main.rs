@@ -2,10 +2,11 @@ mod app;
 mod renderer;
 
 fn main() -> std::io::Result<()> {
-    if std::env::args().skip(1).any(|arg| arg == "--smoke") {
+    let args = app::AppArgs::parse(std::env::args().skip(1));
+    if args.smoke {
         println!("{}", app::smoke_message());
         return Ok(());
     }
 
-    app::run()
+    app::run(args)
 }
