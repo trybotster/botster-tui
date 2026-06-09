@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+target_dir="${CARGO_TARGET_DIR:-/tmp/botster-tui-impl-target}"
+hub_target_dir="${BOTSTER_LIVE_HUB_TARGET_DIR:-/tmp/botster-tui-live-hub-target}"
+
+hub_client_manifest="$(
+  cargo metadata --format-version 1 |
+    ruby -rjson -e 'metadata = JSON.parse(STDIN.read); package = metadata["packages"].find { |entry| entry["name"] == "botster-hub-client" }; abort "botster-hub-client dependency not found" unless package; puts package["manifest_path"]'
+)"
+hub_root="$(cd "$(dirname "$hub_client_manifest")/../.." && pwd)"
+
+cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked --bin botster-hub
+cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked -p botster-core --bin botster-session-worker
+
+BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
+BOTSTER_HUB_BIN="$hub_target_dir/debug/botster-hub" \
+BOTSTER_SESSION_WORKER_BIN="$hub_target_dir/debug/botster-session-worker" \
+CARGO_TARGET_DIR="$target_dir" \
+cargo test -p botster-tui headless_dogfood_runs_against_isolated_hub_when_binaries_are_available -- --nocapture
