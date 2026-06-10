@@ -78,11 +78,19 @@ hub probes. The hub panel distinguishes:
 - observed daemon compatibility descriptor values from status, including
   protocol, protocol version, feature list, conformance fixture revision, and
   status schema version;
+- package registry state from public status/list responses, including installed
+  package count, enabled package count, package name, version, classification,
+  enabled/disabled/error state, requested capabilities, and provider profile
+  admission;
 - connected, terminal stream unavailable, action failure, and startup
   diagnostics from public `DaemonDiagnostic` rows on status, response, operator
   error, and compatibility error payloads;
 - action or validation failures that stay visible after unrelated successful
   refreshes.
+
+Package registry display is read-only in this dogfood slice. Local package
+install, enable, disable, and remove flows remain owned by hub package
+operations rather than private TUI-only controls.
 
 The terminal panel distinguishes selected session from attached stream. Selecting
 a row changes the attach target; terminal input is sent only after an attach
