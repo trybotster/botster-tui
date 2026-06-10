@@ -9,7 +9,7 @@ use std::{
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
-    DaemonEndpoint, DaemonEvent, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonEndpoint, DaemonEvent, DaemonPackage, DaemonRequest, DaemonResponse, DaemonResponseKind,
     DaemonTransportError, DaemonTransportResult, FEATURE_RESIZE, FEATURE_SESSIONS,
     FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
     read_frame_from_reader, write_frame,
@@ -163,6 +163,9 @@ struct DogfoodApp {
     action_feedback: Option<String>,
     compatibility: Option<DaemonCompatibility>,
     diagnostics: Vec<DaemonDiagnostic>,
+    package_count: usize,
+    enabled_package_count: usize,
+    packages: Vec<DaemonPackage>,
     sessions: Vec<String>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -188,6 +191,9 @@ impl DogfoodApp {
             action_feedback: None,
             compatibility: None,
             diagnostics: Vec::new(),
+            package_count: 0,
+            enabled_package_count: 0,
+            packages: Vec::new(),
             sessions: Vec::new(),
             selected_session: None,
             attached_session: None,
@@ -302,7 +308,7 @@ impl DogfoodApp {
                 self.attach_selected_or_first();
             }
             "botster.tui.detach" => self.detach_attached(),
-            "botster.tui.refresh" => self.refresh_sessions(),
+            "botster.tui.refresh" => self.refresh_read_models(),
             "botster.terminal.focus" => self.attach_selected_or_first(),
             _ => {}
         }
@@ -337,7 +343,7 @@ impl DogfoodApp {
                 self.client = Some(client);
                 self.status = "connected".to_string();
                 self.connection_error = None;
-                self.refresh_status();
+                self.refresh_read_models();
                 self.restore_after_connect();
             }
             Err(error) => {
@@ -347,10 +353,15 @@ impl DogfoodApp {
     }
 
     fn restore_after_connect(&mut self) {
-        self.refresh_sessions();
         if self.selected_session.is_some() {
             self.attach_selected_or_first();
         }
+    }
+
+    fn refresh_read_models(&mut self) {
+        self.refresh_status();
+        self.refresh_sessions();
+        self.refresh_packages();
     }
 
     fn refresh_status(&mut self) {
@@ -359,6 +370,10 @@ impl DogfoodApp {
 
     fn refresh_sessions(&mut self) {
         self.request_and_apply(DaemonRequest::ListSessions);
+    }
+
+    fn refresh_packages(&mut self) {
+        self.request_and_apply(DaemonRequest::ListPackages);
     }
 
     fn spawn_session(&mut self) {
@@ -437,8 +452,12 @@ impl DogfoodApp {
     #[cfg(test)]
     fn record_request(&mut self, request: &DaemonRequest) {
         match request {
+            DaemonRequest::Status => self.observed_requests.push(ObservedRequest::Status),
             DaemonRequest::ListSessions => {
                 self.observed_requests.push(ObservedRequest::ListSessions)
+            }
+            DaemonRequest::ListPackages => {
+                self.observed_requests.push(ObservedRequest::ListPackages)
             }
             DaemonRequest::Attach {
                 session_id,
@@ -447,7 +466,6 @@ impl DogfoodApp {
                 session_id: session_id.clone(),
                 subscription_id: subscription_id.clone(),
             }),
-            DaemonRequest::Status => {}
             _ => {}
         }
     }
@@ -502,6 +520,8 @@ impl DogfoodApp {
             self.compatibility = Some(status.compatibility);
             self.record_diagnostics(status.diagnostics);
             self.status = format!("connected ({})", status.lifecycle_state);
+            self.package_count = status.package_count;
+            self.enabled_package_count = status.enabled_package_count;
         }
 
         if matches!(
@@ -520,6 +540,10 @@ impl DogfoodApp {
             {
                 self.selected_session = self.sessions.first().cloned();
             }
+        }
+
+        if matches!(response.kind, DaemonResponseKind::Packages) {
+            self.packages = response.packages;
         }
 
         for event in response.events {
@@ -641,6 +665,26 @@ impl DogfoodApp {
                 json!({ "text": format!("connection: {error}") }),
             )));
         }
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-package-summary",
+            json!({ "text": self.package_summary_text() }),
+        )));
+        if self.packages.is_empty() {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-package-empty",
+                json!({ "text": "packages: none reported" }),
+            )));
+        } else {
+            for (index, package) in self.packages.iter().enumerate() {
+                children.push(child(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-package-{index}"),
+                    json!({ "text": format!("package: {}", package_text(package)) }),
+                )));
+            }
+        }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -669,6 +713,13 @@ impl DogfoodApp {
         )));
         panel.children = children;
         panel
+    }
+
+    fn package_summary_text(&self) -> String {
+        format!(
+            "packages: {} installed; {} enabled",
+            self.package_count, self.enabled_package_count
+        )
     }
 
     fn compatibility_text(&self) -> String {
@@ -831,7 +882,9 @@ impl DogfoodApp {
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum ObservedRequest {
+    Status,
     ListSessions,
+    ListPackages,
     Attach {
         session_id: String,
         subscription_id: String,
@@ -1007,6 +1060,33 @@ fn diagnostic_text(diagnostic: &DaemonDiagnostic) -> String {
     parts.join("; ")
 }
 
+fn package_text(package: &DaemonPackage) -> String {
+    format!(
+        "{} {} classification={} state={} capabilities={} provider_profile_admitted={}",
+        package.package_name,
+        package.version,
+        package.classification,
+        package.state,
+        capability_text(&package.requested_capabilities),
+        package.provider_profile_admitted
+    )
+}
+
+fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> String {
+    if capabilities.is_empty() {
+        return "none".to_string();
+    }
+
+    capabilities
+        .iter()
+        .map(|capability| match &capability.scope {
+            Some(scope) => format!("{}:{scope}", capability.surface),
+            None => capability.surface.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1196,96 @@ mod tests {
         assert!(rendered.contains("daemon schema 7"));
         assert!(rendered.contains("protocol botster-hub-daemon-v1 version 1"));
         assert!(rendered.contains("features sessions,terminal_streaming,resize"));
+    }
+
+    #[test]
+    fn daemon_status_renders_package_counts_from_public_status_response() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(status_response_with_package_counts("running", 7, 3, 1));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("packages: 3 installed; 1 enabled"));
+    }
+
+    #[test]
+    fn package_response_renders_installed_state_capabilities_and_provider_admission() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(status_response_with_package_counts("running", 7, 3, 1));
+        app.apply_response(packages_response(vec![
+            package(
+                "local-alpha",
+                "0.1.0",
+                "local",
+                "enabled",
+                vec![
+                    capability("mcp", Some("tools")),
+                    capability("surface", None),
+                ],
+                true,
+            ),
+            package(
+                "local-beta",
+                "0.2.0",
+                "local",
+                "disabled",
+                Vec::new(),
+                false,
+            ),
+            package(
+                "local-gamma",
+                "0.3.0",
+                "local",
+                "pending-review",
+                Vec::new(),
+                false,
+            ),
+        ]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("packages: 3 installed; 1 enabled"));
+        assert!(rendered.contains(
+            "package: local-alpha 0.1.0 classification=local state=enabled capabilities=mcp:tools,surface provider_profile_admitted=true"
+        ));
+        assert!(rendered.contains(
+            "package: local-beta 0.2.0 classification=local state=disabled capabilities=none provider_profile_admitted=false"
+        ));
+        assert!(rendered.contains("local-gamma 0.3.0 classification=local state=pending-review"));
+    }
+
+    #[test]
+    fn package_diagnostics_render_through_existing_diagnostic_surface() {
+        let mut app = DogfoodApp::new(None);
+        app.apply_response(status_response_with_package_counts("running", 7, 1, 0));
+        let mut response = packages_response(vec![package(
+            "local-alpha",
+            "0.1.0",
+            "local",
+            "disabled",
+            Vec::new(),
+            false,
+        )]);
+        response.diagnostics.push(DaemonDiagnostic {
+            kind: DaemonDiagnosticKind::ActionFailure,
+            operation: Some("list_packages".to_string()),
+            feature: Some("package_registry".to_string()),
+            message: Some("package manifest failed compatibility checks".to_string()),
+        });
+
+        app.apply_response(response);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("diagnostic: action_failure"));
+        assert!(rendered.contains("operation=list_packages"));
+        assert!(rendered.contains("feature=package_registry"));
+        assert!(rendered.contains("package manifest failed compatibility checks"));
     }
 
     #[test]
@@ -1343,7 +1513,24 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_restore_pulls_session_read_model_before_reattaching_selected_session() {
+    fn refresh_read_models_pulls_status_sessions_and_packages() {
+        let mut app = DogfoodApp::new(None);
+        app.observed_requests.clear();
+
+        app.refresh_read_models();
+
+        assert_eq!(
+            app.observed_requests,
+            vec![
+                ObservedRequest::Status,
+                ObservedRequest::ListSessions,
+                ObservedRequest::ListPackages,
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_restore_reattaches_selected_session_after_read_model_refresh() {
         let mut app = DogfoodApp::new(None);
         app.observed_requests.clear();
         app.sessions = vec!["session-alpha".to_string()];
@@ -1354,13 +1541,10 @@ mod tests {
 
         assert_eq!(
             app.observed_requests,
-            vec![
-                ObservedRequest::ListSessions,
-                ObservedRequest::Attach {
-                    session_id: "session-alpha".to_string(),
-                    subscription_id,
-                },
-            ]
+            vec![ObservedRequest::Attach {
+                session_id: "session-alpha".to_string(),
+                subscription_id,
+            }]
         );
     }
 
@@ -1488,6 +1672,15 @@ mod tests {
     }
 
     fn status_response(lifecycle_state: &str, schema_version: u16) -> DaemonResponse {
+        status_response_with_package_counts(lifecycle_state, schema_version, 0, 0)
+    }
+
+    fn status_response_with_package_counts(
+        lifecycle_state: &str,
+        schema_version: u16,
+        package_count: usize,
+        enabled_package_count: usize,
+    ) -> DaemonResponse {
         let mut response = base_response(DaemonResponseKind::Status);
         response.status = Some(botster_hub_client::DaemonStatus {
             lifecycle_state: lifecycle_state.to_string(),
@@ -1507,8 +1700,8 @@ mod tests {
             data_dir_configured: true,
             core_initialized: true,
             state_source: "test".to_string(),
-            package_count: 0,
-            enabled_package_count: 0,
+            package_count,
+            enabled_package_count,
             provider_count: 0,
             enabled_provider_count: 0,
             session_count: 0,
@@ -1517,6 +1710,37 @@ mod tests {
             diagnostics: Vec::new(),
         });
         response
+    }
+
+    fn packages_response(packages: Vec<DaemonPackage>) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Packages);
+        response.packages = packages;
+        response
+    }
+
+    fn package(
+        package_name: &str,
+        version: &str,
+        classification: &str,
+        state: &str,
+        requested_capabilities: Vec<botster_hub_client::DaemonCapability>,
+        provider_profile_admitted: bool,
+    ) -> DaemonPackage {
+        DaemonPackage {
+            package_name: package_name.to_string(),
+            version: version.to_string(),
+            classification: classification.to_string(),
+            state: state.to_string(),
+            requested_capabilities,
+            provider_profile_admitted,
+        }
+    }
+
+    fn capability(surface: &str, scope: Option<&str>) -> botster_hub_client::DaemonCapability {
+        botster_hub_client::DaemonCapability {
+            surface: surface.to_string(),
+            scope: scope.map(str::to_string),
+        }
     }
 
     fn operator_error_response(message: &str) -> DaemonResponse {
