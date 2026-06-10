@@ -46,7 +46,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`e97fc3779488ab8adedb98708898e7106254331e`. The protocol source is
+`24453ef448fb4c89ed63e784ed518de7ca301cd7`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -73,8 +73,14 @@ hub probes. The hub panel distinguishes:
 
 - missing socket configuration (`--hub-socket` or `BOTSTER_HUB_SOCKET` needed);
 - local hub unavailable, disconnected, or reconnecting;
-- current expected hub daemon protocol and observed daemon status schema version
-  when status is available;
+- compatibility mismatch and unsupported feature diagnostics from the
+  `botster-hub-client` compatibility handshake;
+- observed daemon compatibility descriptor values from status, including
+  protocol, protocol version, feature list, conformance fixture revision, and
+  status schema version;
+- connected, terminal stream unavailable, action failure, and startup
+  diagnostics from public `DaemonDiagnostic` rows on status, response, operator
+  error, and compatibility error payloads;
 - action or validation failures that stay visible after unrelated successful
   refreshes.
 
@@ -83,13 +89,11 @@ a row changes the attach target; terminal input is sent only after an attach
 state is observed for that stream. Until then, the panel reports terminal stream
 unavailable rather than silently treating selection as an attached PTY.
 
-The pinned `botster-hub-client` revision does not yet expose the richer
-compatibility descriptor/capability mismatch DTO. `botster-tui` therefore shows
-the real expected protocol and daemon status schema, and labels the descriptor
-integration as pending instead of inventing fake capability state. At this pin,
-the public client helper also collapses a hello protocol mismatch to
-`NotRunning`, so an incompatible-but-running hub currently appears as hub
-unavailable until `botster-hub-client` exposes a distinct compatibility signal.
+The TUI uses a deliberately narrowed compatibility requirement for the dogfood
+terminal surface: sessions, terminal streaming, and resize. It does not require
+plugin surface render/action capabilities for this path. A running but
+incompatible hub is reported as a compatibility mismatch instead of being
+collapsed into the generic unavailable/reconnecting state.
 
 There is also an automated isolated-hub test using the merged
 `botster-hub-test-support` crate. The preferred command builds matching
@@ -106,7 +110,10 @@ Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
 binaries. The wrapper script supplies those paths internally. Without the two
 binary path variables, the test is skipped during the normal unit test suite.
 With `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, missing binaries fail the test instead of
-silently skipping it.
+silently skipping it. The live-hub test also asserts non-default compatibility
+descriptor values from the isolated daemon and exercises a compatibility
+mismatch through `connect_and_hello_with_requirement` with an unsatisfied
+required feature.
 
 ## Scope
 
