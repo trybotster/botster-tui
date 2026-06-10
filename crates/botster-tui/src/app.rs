@@ -544,12 +544,6 @@ impl DogfoodApp {
 
         if matches!(response.kind, DaemonResponseKind::Packages) {
             self.packages = response.packages;
-            self.package_count = self.packages.len();
-            self.enabled_package_count = self
-                .packages
-                .iter()
-                .filter(|package| package.state == "enabled")
-                .count();
         }
 
         for event in response.events {
@@ -1220,6 +1214,7 @@ mod tests {
     fn package_response_renders_installed_state_capabilities_and_provider_admission() {
         let mut app = DogfoodApp::new(None);
 
+        app.apply_response(status_response_with_package_counts("running", 7, 3, 1));
         app.apply_response(packages_response(vec![
             package(
                 "local-alpha",
@@ -1240,7 +1235,14 @@ mod tests {
                 Vec::new(),
                 false,
             ),
-            package("local-gamma", "0.3.0", "local", "error", Vec::new(), false),
+            package(
+                "local-gamma",
+                "0.3.0",
+                "local",
+                "pending-review",
+                Vec::new(),
+                false,
+            ),
         ]));
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
@@ -1253,17 +1255,18 @@ mod tests {
         assert!(rendered.contains(
             "package: local-beta 0.2.0 classification=local state=disabled capabilities=none provider_profile_admitted=false"
         ));
-        assert!(rendered.contains("local-gamma 0.3.0 classification=local state=error"));
+        assert!(rendered.contains("local-gamma 0.3.0 classification=local state=pending-review"));
     }
 
     #[test]
     fn package_diagnostics_render_through_existing_diagnostic_surface() {
         let mut app = DogfoodApp::new(None);
+        app.apply_response(status_response_with_package_counts("running", 7, 1, 0));
         let mut response = packages_response(vec![package(
             "local-alpha",
             "0.1.0",
             "local",
-            "error",
+            "disabled",
             Vec::new(),
             false,
         )]);
