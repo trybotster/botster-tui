@@ -683,6 +683,21 @@ impl DogfoodApp {
                     &format!("dogfood-package-{index}"),
                     json!({ "text": format!("package: {}", package_text(package)) }),
                 )));
+                for (entrypoint_index, entrypoint) in
+                    package.runnable_entrypoints.iter().enumerate()
+                {
+                    children.push(child(node(
+                        UiNodeKind::Text,
+                        &format!("dogfood-package-{index}-entrypoint-{entrypoint_index}"),
+                        json!({
+                            "text": format!(
+                                "entrypoint: {} {}",
+                                package.package_name,
+                                entrypoint_text(entrypoint)
+                            )
+                        }),
+                    )));
+                }
             }
         }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
@@ -1072,6 +1087,37 @@ fn package_text(package: &DaemonPackage) -> String {
     )
 }
 
+fn entrypoint_text(entrypoint: &botster_hub_client::DaemonPackageRunnableEntrypoint) -> String {
+    let process = &entrypoint.process;
+    let mut parts = vec![
+        format!("id={}", entrypoint.id),
+        format!("kind={}", entrypoint.kind),
+        format!("state={}", process.state),
+    ];
+    if !process.diagnostics.is_empty() {
+        let diagnostics = process
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}:{}", diagnostic.kind, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("diagnostics={diagnostics}"));
+    }
+    if let Some(pid) = process.pid {
+        parts.push(format!("pid={pid}"));
+    }
+    if let Some(started_at) = process.started_at {
+        parts.push(format!("started_at={started_at}"));
+    }
+    if let Some(exited_at) = process.exited_at {
+        parts.push(format!("exited_at={exited_at}"));
+    }
+    if let Some(exit_status) = &process.exit_status {
+        parts.push(format!("exit_status={exit_status}"));
+    }
+    parts.join(",")
+}
+
 fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> String {
     if capabilities.is_empty() {
         return "none".to_string();
@@ -1245,7 +1291,7 @@ mod tests {
             ),
         ]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("packages: 3 installed; 1 enabled"));
@@ -1256,6 +1302,136 @@ mod tests {
             "package: local-beta 0.2.0 classification=local state=disabled capabilities=none provider_profile_admitted=false"
         ));
         assert!(rendered.contains("local-gamma 0.3.0 classification=local state=pending-review"));
+    }
+
+    #[test]
+    fn package_response_preserves_zero_entrypoint_package_row() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(packages_response(vec![package(
+            "local-alpha",
+            "0.1.0",
+            "local",
+            "enabled",
+            Vec::new(),
+            true,
+        )]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains(
+            "package: local-alpha 0.1.0 classification=local state=enabled capabilities=none provider_profile_admitted=true"
+        ));
+        assert!(!rendered.contains("entrypoints="));
+    }
+
+    #[test]
+    fn package_response_renders_running_entrypoint_process_state_without_url() {
+        let mut app = DogfoodApp::new(None);
+
+        let mut package = package(
+            "workflow.plugin",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.runnable_entrypoints = vec![entrypoint("web", "web", process("running"))];
+
+        app.apply_response(packages_response(vec![package]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let rendered = lines.join("\n");
+
+        assert!(
+            rendered.contains("entrypoint: workflow.plugin id=web,kind=web,state=running,pid=1234")
+        );
+        assert!(rendered.contains("started_at=1781060000"));
+        assert!(!rendered.contains("url="));
+    }
+
+    #[test]
+    fn package_response_renders_failed_entrypoint_diagnostics() {
+        let mut app = DogfoodApp::new(None);
+
+        let mut failed = process("failed");
+        failed.exit_status = Some("exit code 1".to_string());
+        failed.diagnostics = vec![package_diagnostic("stderr", "server failed to bind")];
+        let mut package = package(
+            "workflow.plugin",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.runnable_entrypoints = vec![entrypoint("web", "web", failed)];
+
+        app.apply_response(packages_response(vec![package]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("entrypoint: workflow.plugin id=web,kind=web,state=failed"));
+        assert!(rendered.contains("exit_status=exit code 1"));
+        assert!(rendered.contains("diagnostics=stderr:server failed to bind"));
+    }
+
+    #[test]
+    fn package_response_renders_stopped_entrypoint_process_state() {
+        let mut app = DogfoodApp::new(None);
+
+        let mut stopped = process("stopped");
+        stopped.pid = None;
+        stopped.started_at = None;
+        stopped.exited_at = Some(1781060300);
+        let mut package = package(
+            "workflow.plugin",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.runnable_entrypoints = vec![entrypoint("worker", "worker", stopped)];
+
+        app.apply_response(packages_response(vec![package]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("id=worker,kind=worker,state=stopped"));
+        assert!(rendered.contains("exited_at=1781060300"));
+    }
+
+    #[test]
+    fn package_response_renders_multiple_entrypoint_process_states() {
+        let mut app = DogfoodApp::new(None);
+
+        let mut worker = process("starting");
+        worker.pid = None;
+        let mut package = package(
+            "workflow.plugin",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.runnable_entrypoints = vec![
+            entrypoint("web", "web", process("running")),
+            entrypoint("worker", "worker", worker),
+        ];
+
+        app.apply_response(packages_response(vec![package]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("id=web,kind=web,state=running"));
+        assert!(rendered.contains("id=worker,kind=worker,state=starting"));
     }
 
     #[test]
@@ -1732,7 +1908,51 @@ mod tests {
             classification: classification.to_string(),
             state: state.to_string(),
             requested_capabilities,
+            runnable_entrypoints: Vec::new(),
             provider_profile_admitted,
+        }
+    }
+
+    fn entrypoint(
+        id: &str,
+        kind: &str,
+        process: botster_hub_client::DaemonPackageProcess,
+    ) -> botster_hub_client::DaemonPackageRunnableEntrypoint {
+        botster_hub_client::DaemonPackageRunnableEntrypoint {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            command: "bin/run".to_string(),
+            args: Vec::new(),
+            working_directory: botster_hub_client::DaemonPackageWorkingDirectory {
+                policy: "package_root".to_string(),
+                path: None,
+            },
+            environment: Vec::new(),
+            mode: "dev".to_string(),
+            capabilities: Vec::new(),
+            may_supervise: true,
+            process,
+        }
+    }
+
+    fn process(state: &str) -> botster_hub_client::DaemonPackageProcess {
+        botster_hub_client::DaemonPackageProcess {
+            state: state.to_string(),
+            pid: Some(1234),
+            started_at: Some(1781060000),
+            exited_at: None,
+            exit_status: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn package_diagnostic(
+        kind: &str,
+        message: &str,
+    ) -> botster_hub_client::DaemonPackageDiagnostic {
+        botster_hub_client::DaemonPackageDiagnostic {
+            kind: kind.to_string(),
+            message: message.to_string(),
         }
     }
 
