@@ -8,8 +8,11 @@ use std::{
 
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 use botster_hub_client::{
-    DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonTransportError, DaemonTransportResult, PROTOCOL,
+    DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
+    DaemonEndpoint, DaemonEvent, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonTransportError, DaemonTransportResult, FEATURE_RESIZE, FEATURE_SESSIONS,
+    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
+    read_frame_from_reader, write_frame,
 };
 use crossterm::{
     cursor::Show,
@@ -153,11 +156,13 @@ fn should_quit(key: KeyEvent) -> bool {
 
 struct DogfoodApp {
     endpoint: Option<DaemonEndpoint>,
-    client: Option<DaemonConnection>,
+    client: Option<HubConnection>,
     status: String,
     connection_error: Option<String>,
     error: Option<String>,
     action_feedback: Option<String>,
+    compatibility: Option<DaemonCompatibility>,
+    diagnostics: Vec<DaemonDiagnostic>,
     sessions: Vec<String>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -181,6 +186,8 @@ impl DogfoodApp {
             connection_error: None,
             error: None,
             action_feedback: None,
+            compatibility: None,
+            diagnostics: Vec::new(),
             sessions: Vec::new(),
             selected_session: None,
             attached_session: None,
@@ -325,7 +332,7 @@ impl DogfoodApp {
                 Some("configure --hub-socket or BOTSTER_HUB_SOCKET".to_string());
             return;
         };
-        match DaemonConnection::connect(endpoint) {
+        match HubConnection::connect(endpoint) {
             Ok(client) => {
                 self.client = Some(client);
                 self.status = "connected".to_string();
@@ -449,13 +456,19 @@ impl DogfoodApp {
         self.client = None;
         self.attached_session = None;
         match error {
-            // Defensive for future botster-hub-client revisions. The pinned
-            // client currently collapses hello protocol mismatch to NotRunning.
+            // Defensive for malformed protocol frames outside the hello
+            // compatibility path, which now surfaces as Compatibility below.
             DaemonTransportError::Protocol(message) => {
                 self.status = "compatibility mismatch".to_string();
                 self.connection_error = Some(format!(
                     "expected daemon protocol {PROTOCOL}; daemon protocol error: {message}"
                 ));
+                self.record_diagnostic(DaemonDiagnostic::compatibility_mismatch(message));
+            }
+            DaemonTransportError::Compatibility(error) => {
+                self.status = "compatibility mismatch".to_string();
+                self.connection_error = Some(error.diagnostic.clone());
+                self.record_diagnostics(error.diagnostics);
             }
             DaemonTransportError::NotRunning => {
                 self.status = "hub unavailable; reconnecting".to_string();
@@ -464,6 +477,7 @@ impl DogfoodApp {
             DaemonTransportError::ClientDisconnected => {
                 self.status = "disconnected; reconnecting".to_string();
                 self.connection_error = Some(error.to_string());
+                self.record_diagnostic(DaemonDiagnostic::disconnected(error.to_string()));
             }
             other => {
                 self.status = "reconnecting".to_string();
@@ -473,13 +487,20 @@ impl DogfoodApp {
     }
 
     fn apply_response(&mut self, response: DaemonResponse) {
+        self.record_diagnostics(response.diagnostics);
+
         if let Some(error) = response.error {
+            self.record_diagnostics(error.diagnostics);
             self.error = Some(error.message);
             return;
         }
 
         if let Some(status) = response.status {
+            self.connection_error = None;
+            self.clear_connection_diagnostics();
             self.schema_version = Some(status.schema_version);
+            self.compatibility = Some(status.compatibility);
+            self.record_diagnostics(status.diagnostics);
             self.status = format!("connected ({})", status.lifecycle_state);
         }
 
@@ -534,6 +555,33 @@ impl DogfoodApp {
                 _ => {}
             }
         }
+    }
+
+    fn clear_connection_diagnostics(&mut self) {
+        self.diagnostics.retain(|diagnostic| {
+            !matches!(
+                diagnostic.kind,
+                DaemonDiagnosticKind::CompatibilityMismatch
+                    | DaemonDiagnosticKind::UnsupportedFeature
+                    | DaemonDiagnosticKind::Disconnected
+                    | DaemonDiagnosticKind::DaemonStartupFailure
+            )
+        });
+    }
+
+    fn record_diagnostics(&mut self, diagnostics: Vec<DaemonDiagnostic>) {
+        for diagnostic in diagnostics {
+            self.record_diagnostic(diagnostic);
+        }
+    }
+
+    fn record_diagnostic(&mut self, diagnostic: DaemonDiagnostic) {
+        self.diagnostics.retain(|existing| {
+            !(existing.kind == diagnostic.kind
+                && existing.operation == diagnostic.operation
+                && existing.feature == diagnostic.feature)
+        });
+        self.diagnostics.push(diagnostic);
     }
 
     fn surface(&self) -> UiNode {
@@ -593,6 +641,13 @@ impl DogfoodApp {
                 json!({ "text": format!("connection: {error}") }),
             )));
         }
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            children.push(child(node(
+                UiNodeKind::Text,
+                &format!("dogfood-diagnostic-{index}"),
+                json!({ "text": format!("diagnostic: {}", diagnostic_text(diagnostic)) }),
+            )));
+        }
         if let Some(feedback) = &self.action_feedback {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -617,13 +672,24 @@ impl DogfoodApp {
     }
 
     fn compatibility_text(&self) -> String {
-        let schema = self
-            .schema_version
-            .map(|version| version.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        format!(
-            "compatibility: expected protocol {PROTOCOL}; daemon schema {schema}; descriptor pending"
-        )
+        match &self.compatibility {
+            Some(compatibility) => format!(
+                "compatibility: protocol {} version {}; features {}; conformance {}; daemon schema {}",
+                compatibility.protocol,
+                compatibility.protocol_version,
+                compatibility.features.join(","),
+                compatibility.conformance_fixture_revision,
+                self.schema_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+            None => format!(
+                "compatibility: expected protocol {PROTOCOL}; daemon schema {}; descriptor unavailable",
+                self.schema_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        }
     }
 
     fn command_form(&self) -> UiNode {
@@ -803,8 +869,18 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
     wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
     #[cfg(test)]
     {
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 100, 24);
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 48);
         let rendered = lines.join("\n");
+        let compatibility = app
+            .compatibility
+            .as_ref()
+            .expect("live hub status should include compatibility descriptor");
+        assert_eq!(compatibility.protocol, PROTOCOL);
+        assert!(compatibility.protocol_version > 0);
+        assert!(!compatibility.features.is_empty());
+        assert!(rendered.contains(&format!("protocol {}", compatibility.protocol)));
+        assert!(rendered.contains(&format!("version {}", compatibility.protocol_version)));
+        assert!(rendered.contains(&format!("features {}", compatibility.features.join(","))));
         assert!(rendered.contains(HEADLESS_OUTPUT));
         assert!(
             !hit_map
@@ -875,6 +951,62 @@ fn short_suffix() -> u64 {
     (unique_suffix() % 1_000_000_000_000) as u64
 }
 
+struct HubConnection {
+    stream: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl HubConnection {
+    fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
+        let stream =
+            connect_and_hello_with_requirement(endpoint, &tui_compatibility_requirement())?;
+        let reader = std::io::BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
+        Ok(Self { stream, reader })
+    }
+
+    fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+        write_frame(&mut self.stream, request)?;
+        read_frame_from_reader(&mut self.reader)
+    }
+}
+
+fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
+    DaemonCompatibilityRequirement {
+        protocol: PROTOCOL.to_string(),
+        minimum_protocol_version: botster_hub_client::PROTOCOL_VERSION,
+        required_features: vec![
+            FEATURE_SESSIONS.to_string(),
+            FEATURE_TERMINAL_STREAMING.to_string(),
+            FEATURE_RESIZE.to_string(),
+        ],
+        minimum_conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+        client_name: "botster-tui".to_string(),
+    }
+}
+
+fn diagnostic_text(diagnostic: &DaemonDiagnostic) -> String {
+    let label = match diagnostic.kind {
+        DaemonDiagnosticKind::Connected => "connected",
+        DaemonDiagnosticKind::Disconnected => "disconnected",
+        DaemonDiagnosticKind::CompatibilityMismatch => "compatibility_mismatch",
+        DaemonDiagnosticKind::UnsupportedFeature => "unsupported_feature",
+        DaemonDiagnosticKind::TerminalStreamUnavailable => "terminal_stream_unavailable",
+        DaemonDiagnosticKind::ActionFailure => "action_failure",
+        DaemonDiagnosticKind::DaemonStartupFailure => "daemon_startup_failure",
+    };
+    let mut parts = vec![label.to_string()];
+    if let Some(operation) = &diagnostic.operation {
+        parts.push(format!("operation={operation}"));
+    }
+    if let Some(feature) = &diagnostic.feature {
+        parts.push(format!("feature={feature}"));
+    }
+    if let Some(message) = &diagnostic.message {
+        parts.push(message.clone());
+    }
+    parts.join("; ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,7 +1053,7 @@ mod tests {
             Value::String("printf draft\\n".to_string()),
         )]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
         assert!(lines.join("\n").contains("printf draft"));
     }
 
@@ -933,7 +1065,7 @@ mod tests {
         app.spawn_session();
 
         assert_eq!(app.error.as_deref(), Some("command is required"));
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
         assert!(lines.join("\n").contains("error: command is required"));
     }
 
@@ -950,30 +1082,106 @@ mod tests {
     }
 
     #[test]
-    fn defensive_protocol_error_branch_renders_distinct_compatibility_diagnostic() {
+    fn compatibility_error_branch_renders_distinct_compatibility_diagnostic() {
         let mut app = DogfoodApp::new(None);
+        let mut requirement = tui_compatibility_requirement();
+        requirement
+            .required_features
+            .push("botster-tui-future-feature".to_string());
+        let error =
+            botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
+                .expect_err("unsatisfied requirement should produce compatibility error");
 
-        app.record_transport_error(DaemonTransportError::Protocol("unexpected hello protocol"));
+        app.record_transport_error(DaemonTransportError::Compatibility(error));
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("compatibility mismatch"));
-        assert!(rendered.contains(&format!("expected daemon protocol {PROTOCOL}")));
+        assert!(rendered.contains("unsupported_feature"));
+        assert!(rendered.contains("botster-tui-future-feature"));
         assert!(!rendered.contains("hub unavailable; reconnecting"));
     }
 
     #[test]
-    fn daemon_status_renders_schema_version_from_public_status_response() {
+    fn daemon_status_renders_compatibility_descriptor_from_public_status_response() {
         let mut app = DogfoodApp::new(None);
 
         app.apply_response(status_response("running", 7));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("connected (running)"));
         assert!(rendered.contains("daemon schema 7"));
+        assert!(rendered.contains("protocol botster-hub-daemon-v1 version 1"));
+        assert!(rendered.contains("features sessions,terminal_streaming,resize"));
+    }
+
+    #[test]
+    fn response_diagnostics_render_connected_state() {
+        let mut app = DogfoodApp::new(None);
+        let mut response = status_response("running", 7);
+        response
+            .diagnostics
+            .push(DaemonDiagnostic::connected("status"));
+
+        app.apply_response(response);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        assert!(
+            lines
+                .join("\n")
+                .contains("diagnostic: connected; operation=status")
+        );
+    }
+
+    #[test]
+    fn healthy_status_clears_stale_connection_lifecycle_diagnostics() {
+        let mut app = DogfoodApp::new(None);
+        let mut requirement = tui_compatibility_requirement();
+        requirement
+            .required_features
+            .push("botster-tui-future-feature".to_string());
+        let error =
+            botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
+                .expect_err("unsatisfied requirement should produce compatibility error");
+        let mut response = status_response("running", 7);
+        response
+            .diagnostics
+            .push(DaemonDiagnostic::connected("status"));
+
+        app.record_transport_error(DaemonTransportError::Compatibility(error));
+        app.record_transport_error(DaemonTransportError::ClientDisconnected);
+        app.apply_response(response);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("connected (running)"));
+        assert!(rendered.contains("diagnostic: connected; operation=status"));
+        assert!(!rendered.contains("compatibility_mismatch"));
+        assert!(!rendered.contains("unsupported_feature"));
+        assert!(!rendered.contains("disconnected"));
+        assert!(!rendered.contains("botster-tui-future-feature"));
+    }
+
+    #[test]
+    fn operator_diagnostics_render_terminal_stream_unavailable() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(operator_error_response_with_diagnostics(
+            "attach failed",
+            vec![DaemonDiagnostic::terminal_stream_unavailable(
+                "attach",
+                "no terminal stream",
+            )],
+        ));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("error: attach failed"));
+        assert!(rendered.contains("terminal_stream_unavailable"));
+        assert!(rendered.contains("feature=terminal_streaming"));
     }
 
     #[test]
@@ -1004,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn current_pinned_client_not_running_path_is_not_reported_as_compatibility_mismatch() {
+    fn not_running_path_is_not_reported_as_compatibility_mismatch() {
         let mut app = DogfoodApp::new(None);
 
         app.record_transport_error(DaemonTransportError::NotRunning);
@@ -1162,7 +1370,7 @@ mod tests {
 
         assert!(source.contains("use botster_hub_client"));
         for required in [
-            "DaemonConnection",
+            "connect_and_hello_with_requirement",
             "DaemonEndpoint",
             "DaemonRequest",
             "DaemonResponse",
@@ -1180,7 +1388,6 @@ mod tests {
             concat!("Session", "Frame"),
             concat!("Hub", "Frame"),
             concat!("session", "_protocol"),
-            concat!("Unix", "Stream"),
             concat!("read", "_line"),
             concat!("write", "_all"),
         ];
@@ -1218,6 +1425,20 @@ mod tests {
             headless_dogfood: true,
         })
         .expect("headless dogfood surface completes a real hub round trip");
+
+        let mut requirement = tui_compatibility_requirement();
+        requirement
+            .required_features
+            .push("botster-tui-future-feature".to_string());
+        let error = connect_and_hello_with_requirement(hub.endpoint(), &requirement)
+            .expect_err("live hub should reject unsatisfied TUI compatibility requirement");
+        let mut app = DogfoodApp::new(None);
+        app.record_transport_error(error);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("compatibility mismatch"));
+        assert!(rendered.contains("unsupported_feature"));
+        assert!(rendered.contains("botster-tui-future-feature"));
 
         hub.shutdown().expect("isolated hub shuts down cleanly");
     }
@@ -1270,6 +1491,16 @@ mod tests {
         let mut response = base_response(DaemonResponseKind::Status);
         response.status = Some(botster_hub_client::DaemonStatus {
             lifecycle_state: lifecycle_state.to_string(),
+            compatibility: DaemonCompatibility {
+                protocol: PROTOCOL.to_string(),
+                protocol_version: 1,
+                features: vec![
+                    FEATURE_SESSIONS.to_string(),
+                    FEATURE_TERMINAL_STREAMING.to_string(),
+                    FEATURE_RESIZE.to_string(),
+                ],
+                conformance_fixture_revision: 1,
+            },
             host_id: "test-host".to_string(),
             host_display_name: "test host".to_string(),
             schema_version,
@@ -1283,17 +1514,26 @@ mod tests {
             session_count: 0,
             recovered_sessions: Vec::new(),
             stale_sessions: Vec::new(),
+            diagnostics: Vec::new(),
         });
         response
     }
 
     fn operator_error_response(message: &str) -> DaemonResponse {
+        operator_error_response_with_diagnostics(message, Vec::new())
+    }
+
+    fn operator_error_response_with_diagnostics(
+        message: &str,
+        diagnostics: Vec<DaemonDiagnostic>,
+    ) -> DaemonResponse {
         let mut response = base_response(DaemonResponseKind::OperatorError);
         response.error = Some(botster_hub_client::DaemonOperatorError {
             code: "test".to_string(),
             request_id: "request-test".to_string(),
             operation: "spawn".to_string(),
             message: message.to_string(),
+            diagnostics,
         });
         response
     }
@@ -1324,6 +1564,7 @@ mod tests {
             cleanup: None,
             coordination: None,
             error: None,
+            diagnostics: Vec::new(),
         }
     }
 }
