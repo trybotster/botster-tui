@@ -456,8 +456,8 @@ impl DogfoodApp {
         self.client = None;
         self.attached_session = None;
         match error {
-            // Defensive for future botster-hub-client revisions. The pinned
-            // client currently collapses hello protocol mismatch to NotRunning.
+            // Defensive for malformed protocol frames outside the hello
+            // compatibility path, which now surfaces as Compatibility below.
             DaemonTransportError::Protocol(message) => {
                 self.status = "compatibility mismatch".to_string();
                 self.connection_error = Some(format!(
@@ -496,6 +496,8 @@ impl DogfoodApp {
         }
 
         if let Some(status) = response.status {
+            self.connection_error = None;
+            self.clear_connection_diagnostics();
             self.schema_version = Some(status.schema_version);
             self.compatibility = Some(status.compatibility);
             self.record_diagnostics(status.diagnostics);
@@ -553,6 +555,18 @@ impl DogfoodApp {
                 _ => {}
             }
         }
+    }
+
+    fn clear_connection_diagnostics(&mut self) {
+        self.diagnostics.retain(|diagnostic| {
+            !matches!(
+                diagnostic.kind,
+                DaemonDiagnosticKind::CompatibilityMismatch
+                    | DaemonDiagnosticKind::UnsupportedFeature
+                    | DaemonDiagnosticKind::Disconnected
+                    | DaemonDiagnosticKind::DaemonStartupFailure
+            )
+        });
     }
 
     fn record_diagnostics(&mut self, diagnostics: Vec<DaemonDiagnostic>) {
@@ -1120,6 +1134,35 @@ mod tests {
                 .join("\n")
                 .contains("diagnostic: connected; operation=status")
         );
+    }
+
+    #[test]
+    fn healthy_status_clears_stale_connection_lifecycle_diagnostics() {
+        let mut app = DogfoodApp::new(None);
+        let mut requirement = tui_compatibility_requirement();
+        requirement
+            .required_features
+            .push("botster-tui-future-feature".to_string());
+        let error =
+            botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
+                .expect_err("unsatisfied requirement should produce compatibility error");
+        let mut response = status_response("running", 7);
+        response
+            .diagnostics
+            .push(DaemonDiagnostic::connected("status"));
+
+        app.record_transport_error(DaemonTransportError::Compatibility(error));
+        app.record_transport_error(DaemonTransportError::ClientDisconnected);
+        app.apply_response(response);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("connected (running)"));
+        assert!(rendered.contains("diagnostic: connected; operation=status"));
+        assert!(!rendered.contains("compatibility_mismatch"));
+        assert!(!rendered.contains("unsupported_feature"));
+        assert!(!rendered.contains("disconnected"));
+        assert!(!rendered.contains("botster-tui-future-feature"));
     }
 
     #[test]
