@@ -80,8 +80,9 @@ hub probes. The hub panel distinguishes:
   status schema version;
 - package registry state from public status/list responses, including installed
   package count, enabled package count, package name, version, classification,
-  enabled/disabled/error state, requested capabilities, and provider profile
-  admission;
+  package state, requested capabilities, and provider profile admission;
+- package compatibility failures and package errors through public diagnostics,
+  including diagnostic operation and feature fields for package registry work;
 - connected, terminal stream unavailable, action failure, and startup
   diagnostics from public `DaemonDiagnostic` rows on status, response, operator
   error, and compatibility error payloads;

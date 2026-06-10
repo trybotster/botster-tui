@@ -24,9 +24,9 @@ run: run_1781061911_346944
   - consume `DaemonStatus.package_count` and `enabled_package_count` whenever status is applied;
   - issue `DaemonRequest::ListPackages` on connect/refresh alongside the existing status/session pulls, if the public request compiles against the pinned dependency;
   - consume `DaemonResponseKind::Packages` / `DaemonResponse.packages` without parsing strings or using hub internals.
-- Render package state inside the existing hub/status diagnostics panel so local hub dogfood shows installed/enabled/disabled/error states where operators already inspect hub health.
+- Render package state inside the existing hub/status diagnostics panel so local hub dogfood shows installed/enabled/disabled states where operators already inspect hub health; package errors and compatibility failures are shown through public diagnostics.
 - Render, per package, at least name, version, classification, state, capability summary, and provider admission state. Compatibility/capability diagnostics continue to come from public `DaemonDiagnostic` rows and package capability DTO fields.
-- Add focused tests in `crates/botster-tui/src/app.rs` that drive the production `apply_response` / refresh paths and assert visible package count, enabled count, installed/enabled/disabled/error package rows, capability text, and diagnostics.
+- Add focused tests in `crates/botster-tui/src/app.rs` that drive the production `apply_response` / refresh paths and assert visible package count, enabled count, installed/enabled/disabled package rows, verbatim package state display, capability text, and diagnostics.
 - Update `README.md` Local Hub Dogfood docs to mention package registry state and package diagnostics in local hub dogfood mode.
 
 ## Non-Scope
@@ -40,10 +40,10 @@ run: run_1781061911_346944
 ## Assumptions and Unknowns
 
 - Assumption: the pinned hub-client revision is fresh enough because it already exposes package count/status fields and `ListPackages`.
-- Assumption: `DaemonPackage.state` is the authoritative display value for enabled/disabled/error-like state; the TUI should display it verbatim instead of inventing local state mapping.
+- Assumption: `DaemonPackage.state` is the authoritative package state display value; the current hub protocol emits installed/enabled/disabled-like states, and the TUI should display the value verbatim instead of inventing local state mapping.
 - Assumption: package capability diagnostics are read-only display of `requested_capabilities` plus existing `DaemonDiagnostic` rows; no extra compatibility policy belongs in TUI.
 - Unknown: whether the live daemon returns `DaemonResponseKind::Packages` after `ListPackages` in all local dogfood states, including zero packages. Implementation should write tests for both empty and non-empty package responses and keep live-hub verification best-effort if constructing package fixtures through the daemon is not available in this repo.
-- Unknown: whether package error state is represented only as `DaemonPackage.state == "error"` or also through diagnostics. The implementation should render both when present.
+- Current protocol fact: package errors and compatibility failures are represented through public diagnostics, not a `DaemonPackage.state == "error"` row state. The implementation should render diagnostics through the existing diagnostic path.
 - Worktree/target assumption: this run is bound to `target_id=tgt_c3d470bab78549df920a41e8fb0e58d8` and the assigned worktree is this repository checkout, not an ambient Botster checkout.
 
 ## Botster Layers Touched
@@ -85,7 +85,7 @@ run: run_1781061911_346944
   - If live package fixture setup is unavailable in this repo, document that limitation while still proving the TUI connects through the real hub-client and package rendering is covered through `DaemonResponse` fixtures.
 - New or updated focused tests in `crates/botster-tui/src/app.rs` should prove:
   - status responses render `package_count` and `enabled_package_count`;
-  - package list responses render installed package rows with enabled/disabled/error-like states;
+  - package list responses render installed package rows with enabled/disabled states and preserve arbitrary package state text verbatim;
   - requested capabilities render from `DaemonPackage.requested_capabilities`;
   - provider admission state is visible;
   - package diagnostics from public `DaemonDiagnostic` rows remain visible;
@@ -102,4 +102,3 @@ run: run_1781061911_346944
 
 - No new durable vault note is needed from planning alone. Existing notes already cover the public hub-client boundary, package registry ownership in hub state, diagnostics from public DTOs, TUI terminal data-plane constraints, plan artifacts, and checklist timeout fallback.
 - Capture candidate only if implementation discovers a recurring rule not already covered, such as a stable convention for first-party clients refreshing package counts and package lists together after daemon package mutations.
-
