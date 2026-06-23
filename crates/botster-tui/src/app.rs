@@ -549,18 +549,10 @@ impl DogfoodApp {
         for event in response.events {
             match event {
                 DaemonEvent::TerminalOutput { data, .. } => {
-                    self.terminal_output.push_str(&data);
-                    if self.terminal_output.len() > 8_000 {
-                        self.terminal_output = self
-                            .terminal_output
-                            .chars()
-                            .rev()
-                            .take(8_000)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect();
-                    }
+                    self.append_terminal_output(&data);
+                }
+                DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. } => {
+                    self.append_terminal_output(&data);
                 }
                 DaemonEvent::ProcessExit { code, .. } => {
                     self.status = format!("process exited {}", code.unwrap_or_default());
@@ -578,6 +570,21 @@ impl DogfoodApp {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn append_terminal_output(&mut self, data: &str) {
+        self.terminal_output.push_str(data);
+        if self.terminal_output.len() > 8_000 {
+            self.terminal_output = self
+                .terminal_output
+                .chars()
+                .rev()
+                .take(8_000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
         }
     }
 
@@ -1634,6 +1641,88 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_scrollback_events_append_before_later_terminal_output() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(events_response(vec![
+            DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                data: "snapshot\n".to_string(),
+                bytes: 9,
+            },
+            DaemonEvent::Scrollback {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                data: "scrollback\n".to_string(),
+                bytes: 11,
+            },
+            DaemonEvent::TerminalOutput {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                data: "live\n".to_string(),
+            },
+        ]));
+
+        assert_eq!(app.terminal_output, "snapshot\nscrollback\nlive\n");
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("snapshot"));
+        assert!(rendered.contains("scrollback"));
+        assert!(rendered.contains("live"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "dogfood-terminal")
+        );
+    }
+
+    #[test]
+    fn empty_history_event_data_is_non_fatal() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output = "existing output\n".to_string();
+
+        app.apply_response(events_response(vec![
+            DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                data: String::new(),
+                bytes: 128,
+            },
+            DaemonEvent::Scrollback {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                data: String::new(),
+                bytes: 256,
+            },
+        ]));
+
+        assert_eq!(app.terminal_output, "existing output\n");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn history_events_use_same_terminal_output_cap() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output = "a".repeat(7_995);
+
+        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            data: "bbbbbbbbbb".to_string(),
+            bytes: 10,
+        }]));
+
+        assert_eq!(app.terminal_output.len(), 8_000);
+        assert_eq!(
+            app.terminal_output,
+            format!("{}{}", "a".repeat(7_990), "b".repeat(10))
+        );
+    }
+
+    #[test]
     fn focused_session_list_row_updates_attach_selection() {
         let mut app = DogfoodApp::new(None);
         app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
@@ -1983,12 +2072,16 @@ mod tests {
     }
 
     fn attach_state_response(session_id: &str, state: &str) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::Events);
-        response.events = vec![DaemonEvent::AttachState {
+        events_response(vec![DaemonEvent::AttachState {
             session_id: session_id.to_string(),
             subscription_id: "sub-test".to_string(),
             state: state.to_string(),
-        }];
+        }])
+    }
+
+    fn events_response(events: Vec<DaemonEvent>) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Events);
+        response.events = events;
         response
     }
 
