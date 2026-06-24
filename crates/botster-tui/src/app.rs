@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter};
 
+const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
 const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
 const HEADLESS_INPUT: &str = "botster-tui-headless\n";
 const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
@@ -288,7 +289,7 @@ impl DogfoodApp {
         values: Option<UiFormValues>,
         payload: Option<Value>,
     ) {
-        if let Some(values) = values
+        if let Some(values) = values.as_ref()
             && let Some(value) = values.0.get("command").and_then(Value::as_str)
         {
             self.command = value.to_string();
@@ -309,6 +310,15 @@ impl DogfoodApp {
             }
             "botster.tui.detach" => self.detach_attached(),
             "botster.tui.refresh" => self.refresh_read_models(),
+            "botster.tui.package_config.submit" => {
+                if let Some(package_name) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("package_name"))
+                    .and_then(Value::as_str)
+                {
+                    self.submit_package_configuration(package_name, values.as_ref());
+                }
+            }
             "botster.terminal.focus" => self.attach_selected_or_first(),
             _ => {}
         }
@@ -433,6 +443,44 @@ impl DogfoodApp {
         });
     }
 
+    fn submit_package_configuration(&mut self, package_name: &str, values: Option<&UiFormValues>) {
+        let Some(values) = values else {
+            self.error = Some("configuration form values were not submitted".to_string());
+            return;
+        };
+        let Some(package) = self
+            .packages
+            .iter()
+            .find(|package| package.package_name == package_name)
+        else {
+            self.error = Some(format!("package not found: {package_name}"));
+            return;
+        };
+
+        let mut updates = BTreeMap::new();
+        for field in package_configuration_fields(package) {
+            let field_name = package_config_field_name(package_name, &field.key);
+            let Some(draft) = values.0.get(&field_name) else {
+                continue;
+            };
+            if let Some(value) = package_configuration_submit_value(&field, draft) {
+                updates.insert(field.key, value);
+            }
+        }
+
+        if updates.is_empty() {
+            self.error = Some(format!("no configuration changes for {package_name}"));
+            return;
+        }
+
+        self.error = None;
+        self.action_feedback = Some(format!("configuration update requested: {package_name}"));
+        self.request_and_apply(DaemonRequest::SetPackageConfiguration {
+            package_name: package_name.to_string(),
+            values: updates,
+        });
+    }
+
     fn request_and_apply(&mut self, request: DaemonRequest) {
         #[cfg(test)]
         self.record_request(&request);
@@ -459,6 +507,15 @@ impl DogfoodApp {
             DaemonRequest::ListPackages => {
                 self.observed_requests.push(ObservedRequest::ListPackages)
             }
+            DaemonRequest::SetPackageConfiguration {
+                package_name,
+                values,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::SetPackageConfiguration {
+                    package_name: package_name.clone(),
+                    values: values.clone(),
+                }),
             DaemonRequest::Attach {
                 session_id,
                 subscription_id,
@@ -542,7 +599,10 @@ impl DogfoodApp {
             }
         }
 
-        if matches!(response.kind, DaemonResponseKind::Packages) {
+        if matches!(
+            response.kind,
+            DaemonResponseKind::Packages | DaemonResponseKind::PackageDecision
+        ) {
             self.packages = response.packages;
         }
 
@@ -705,6 +765,11 @@ impl DogfoodApp {
                         }),
                     )));
                 }
+                children.extend(
+                    self.package_configuration_nodes(package, index)
+                        .into_iter()
+                        .map(child),
+                );
             }
         }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
@@ -742,6 +807,168 @@ impl DogfoodApp {
             "packages: {} installed; {} enabled",
             self.package_count, self.enabled_package_count
         )
+    }
+
+    fn package_configuration_nodes(&self, package: &DaemonPackage, index: usize) -> Vec<UiNode> {
+        let fields = package_configuration_fields(package);
+        if fields.is_empty() && package.configuration.schema.is_none() {
+            return Vec::new();
+        }
+
+        let mut nodes = vec![node(
+            UiNodeKind::Text,
+            &format!("dogfood-package-{index}-configuration-summary"),
+            json!({
+                "text": format!(
+                    "configuration: schema={} values={} missing={} diagnostics={}",
+                    if package.configuration.schema.is_some() { "yes" } else { "no" },
+                    package.configuration.effective_values.len(),
+                    package.configuration.missing_required.len(),
+                    package.configuration.diagnostics.len()
+                )
+            }),
+        )];
+
+        for missing in &package.configuration.missing_required {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("dogfood-package-{index}-configuration-missing-{missing}"),
+                json!({ "text": format!("configuration missing: {missing}") }),
+            ));
+        }
+
+        for (diagnostic_index, diagnostic) in package.configuration.diagnostics.iter().enumerate() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("dogfood-package-{index}-configuration-diagnostic-{diagnostic_index}"),
+                json!({
+                    "text": format!(
+                        "configuration diagnostic: {}",
+                        package_configuration_diagnostic_text(diagnostic)
+                    )
+                }),
+            ));
+        }
+
+        for field in fields {
+            nodes.push(self.package_configuration_field_node(package, index, &field));
+        }
+
+        if !nodes.is_empty() {
+            nodes.push(button(
+                &format!("dogfood-package-{index}-configuration-submit"),
+                "Update configuration",
+                "botster.tui.package_config.submit",
+                json!({ "package_name": package.package_name }),
+            ));
+        }
+
+        nodes
+    }
+
+    fn package_configuration_field_node(
+        &self,
+        package: &DaemonPackage,
+        index: usize,
+        field: &PackageConfigurationField,
+    ) -> UiNode {
+        let field_name = package_config_field_name(&package.package_name, &field.key);
+        let draft = self.drafts.get(&field_name);
+        let effective = package.configuration.effective_values.get(&field.key);
+        let error = package_configuration_field_error(package, &field.key);
+        let mut props = json!({
+            "name": field_name,
+            "label": package_configuration_field_label(field),
+        });
+        if let Some(error) = error {
+            props["error"] = Value::String(error);
+        }
+
+        match field.field_type.as_str() {
+            "boolean" => {
+                props["checked"] = draft
+                    .cloned()
+                    .unwrap_or_else(|| Value::Bool(configuration_value_bool(effective)));
+                node(
+                    UiNodeKind::Checkbox,
+                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    props,
+                )
+            }
+            "select" => {
+                props["selected"] = draft
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(configuration_value_text(effective)));
+                let mut select = node(
+                    UiNodeKind::Select,
+                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    props,
+                );
+                select.slots.insert(
+                    "options".to_string(),
+                    field
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(option_index, option)| {
+                            child(node(
+                                UiNodeKind::SelectOption,
+                                &format!(
+                                    "dogfood-package-{index}-configuration-{}-option-{option_index}",
+                                    field.key
+                                ),
+                                json!({ "value": option.value, "label": option.label }),
+                            ))
+                        })
+                        .collect(),
+                );
+                select
+            }
+            "multiline_text" => {
+                props["value"] = draft
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(configuration_value_text(effective)));
+                node(
+                    UiNodeKind::Textarea,
+                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    props,
+                )
+            }
+            "secret" => {
+                props["checked"] = draft.cloned().unwrap_or(Value::Bool(false));
+                let state = configuration_secret_state(effective);
+                props["label"] = Value::String(format!(
+                    "{} secret ({state}; Space marks write-only update)",
+                    field.label
+                ));
+                node(
+                    UiNodeKind::Checkbox,
+                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    props,
+                )
+            }
+            "string" | "path" | "url" => {
+                props["value"] = draft
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(configuration_value_text(effective)));
+                node(
+                    UiNodeKind::TextInput,
+                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    props,
+                )
+            }
+            other => node(
+                UiNodeKind::Text,
+                &format!("dogfood-package-{index}-configuration-{}", field.key),
+                json!({
+                    "text": format!(
+                        "{}: unsupported configuration type {}",
+                        package_configuration_field_label(field),
+                        other
+                    )
+                }),
+            ),
+        }
     }
 
     fn compatibility_text(&self) -> String {
@@ -907,10 +1134,179 @@ enum ObservedRequest {
     Status,
     ListSessions,
     ListPackages,
+    SetPackageConfiguration {
+        package_name: String,
+        values: BTreeMap<String, Value>,
+    },
     Attach {
         session_id: String,
         subscription_id: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PackageConfigurationField {
+    key: String,
+    field_type: String,
+    label: String,
+    required: bool,
+    order: Option<i64>,
+    options: Vec<PackageConfigurationOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PackageConfigurationOption {
+    value: String,
+    label: String,
+}
+
+fn package_configuration_fields(package: &DaemonPackage) -> Vec<PackageConfigurationField> {
+    let Some(schema) = &package.configuration.schema else {
+        return Vec::new();
+    };
+    let Some(fields) = schema.get("fields").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut parsed = fields
+        .iter()
+        .filter_map(package_configuration_field)
+        .collect::<Vec<_>>();
+    parsed.sort_by(|left, right| {
+        left.order
+            .cmp(&right.order)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    parsed
+}
+
+fn package_configuration_field(value: &Value) -> Option<PackageConfigurationField> {
+    let key = value.get("key").and_then(Value::as_str)?.to_string();
+    let field_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unsupported")
+        .to_string();
+    let label = value
+        .get("label")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| key.clone());
+    let required = value
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    let order = value.get("order").and_then(Value::as_i64);
+    let options = value
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            let value = option.get("value").and_then(Value::as_str)?.to_string();
+            let label = option
+                .get("label")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.clone());
+            Some(PackageConfigurationOption { value, label })
+        })
+        .collect();
+
+    Some(PackageConfigurationField {
+        key,
+        field_type,
+        label,
+        required,
+        order,
+        options,
+    })
+}
+
+fn package_config_field_name(package_name: &str, key: &str) -> String {
+    format!("{PACKAGE_CONFIG_FIELD_PREFIX}:{package_name}:{key}")
+}
+
+fn package_configuration_field_label(field: &PackageConfigurationField) -> String {
+    if field.required {
+        format!("{} *", field.label)
+    } else {
+        field.label.clone()
+    }
+}
+
+fn package_configuration_field_error(package: &DaemonPackage, key: &str) -> Option<String> {
+    if package
+        .configuration
+        .missing_required
+        .iter()
+        .any(|missing| missing == key)
+    {
+        return Some("required configuration value is missing".to_string());
+    }
+    None
+}
+
+fn package_configuration_diagnostic_text(
+    diagnostic: &botster_hub_client::DaemonPackageDiagnostic,
+) -> String {
+    format!("{}:{}", diagnostic.kind, diagnostic.message)
+}
+
+fn package_configuration_submit_value(
+    field: &PackageConfigurationField,
+    draft: &Value,
+) -> Option<Value> {
+    match field.field_type.as_str() {
+        "boolean" => Some(json!({
+            "type": "boolean",
+            "value": draft.as_bool().unwrap_or_default()
+        })),
+        "select" => Some(json!({
+            "type": "select",
+            "value": draft.as_str().unwrap_or_default()
+        })),
+        "multiline_text" => Some(json!({
+            "type": "multiline_text",
+            "value": draft.as_str().unwrap_or_default()
+        })),
+        "secret" => draft.as_bool().unwrap_or_default().then(|| {
+            json!({
+                "type": "secret",
+                "state": "write_only"
+            })
+        }),
+        "string" | "path" | "url" => Some(json!({
+            "type": field.field_type,
+            "value": draft.as_str().unwrap_or_default()
+        })),
+        _ => None,
+    }
+}
+
+fn configuration_value_text(value: Option<&Value>) -> String {
+    value
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn configuration_value_bool(value: Option<&Value>) -> bool {
+    value
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default()
+}
+
+fn configuration_secret_state(value: Option<&Value>) -> &'static str {
+    match value
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+    {
+        Some("redacted") => "redacted",
+        Some("write_only") => "write-only",
+        _ => "unset",
+    }
 }
 
 fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
@@ -1472,6 +1868,141 @@ mod tests {
     }
 
     #[test]
+    fn package_configuration_response_renders_schema_values_validation_and_redacted_secret() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(packages_response(vec![package_with_configuration()]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("configuration: schema=yes values=5 missing=1 diagnostics=1"));
+        assert!(rendered.contains("Endpoint *: https://example.invalid/hook"));
+        assert!(rendered.contains("Debug: [x]"));
+        assert!(rendered.contains("Mode: Read"));
+        assert!(rendered.contains("Notes: Line one"));
+        assert!(
+            rendered.contains("API token secret (redacted; Space marks write-only update): [ ]")
+        );
+        assert!(rendered.contains("configuration missing: endpoint"));
+        assert!(rendered.contains("configuration diagnostic: schema:manifest warning"));
+        assert!(!rendered.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn package_configuration_drafts_render_and_submit_hub_shaped_values_without_raw_secrets() {
+        let mut app = DogfoodApp::new(None);
+        app.apply_response(packages_response(vec![package_with_configuration()]));
+        app.set_drafts(BTreeMap::from([
+            (
+                package_config_field_name("configuration.plugin", "endpoint"),
+                Value::String("https://example.invalid/new".to_string()),
+            ),
+            (
+                package_config_field_name("configuration.plugin", "debug"),
+                Value::Bool(false),
+            ),
+            (
+                package_config_field_name("configuration.plugin", "mode"),
+                Value::String("write".to_string()),
+            ),
+            (
+                package_config_field_name("configuration.plugin", "notes"),
+                Value::String("Line one\nLine two".to_string()),
+            ),
+            (
+                package_config_field_name("configuration.plugin", "api_token"),
+                Value::Bool(true),
+            ),
+        ]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Endpoint *: https://example.invalid/new"));
+        assert!(rendered.contains("Debug: [ ]"));
+        assert!(rendered.contains("Mode: Write"));
+        assert!(rendered.contains("Notes: Line one"));
+
+        app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
+            request_id: botster_core::RequestId("req-config-submit".to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::DEMO_SURFACE_ID.to_string()),
+            action_id: botster_core::ui::UiActionId(
+                "botster.tui.package_config.submit".to_string(),
+            ),
+            node_id: Some(UiNodeId(
+                "dogfood-package-0-configuration-submit".to_string(),
+            )),
+            kind: botster_core::ui::UiActionKind::Submit,
+            values: Some(UiFormValues(
+                app.drafts
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )),
+            payload: Some(json!({ "package_name": "configuration.plugin" })),
+        }));
+
+        let Some(ObservedRequest::SetPackageConfiguration {
+            package_name,
+            values,
+        }) = app.observed_requests.last()
+        else {
+            panic!("expected set package configuration request");
+        };
+        assert_eq!(package_name, "configuration.plugin");
+        assert_eq!(
+            values["endpoint"],
+            json!({"type":"url","value":"https://example.invalid/new"})
+        );
+        assert_eq!(values["debug"], json!({"type":"boolean","value":false}));
+        assert_eq!(values["mode"], json!({"type":"select","value":"write"}));
+        assert_eq!(
+            values["notes"],
+            json!({"type":"multiline_text","value":"Line one\nLine two"})
+        );
+        assert_eq!(
+            values["api_token"],
+            json!({"type":"secret","state":"write_only"})
+        );
+        assert!(
+            !serde_json::to_string(values)
+                .unwrap()
+                .contains("super-secret-token")
+        );
+    }
+
+    #[test]
+    fn package_configuration_success_refreshes_from_package_decision_response() {
+        let mut app = DogfoodApp::new(None);
+        let mut package = package_with_configuration();
+        package.configuration.missing_required.clear();
+
+        app.apply_response(package_decision_response(vec![package]));
+
+        assert_eq!(app.packages.len(), 1);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("configuration: schema=yes values=5 missing=0 diagnostics=1"));
+        assert!(!rendered.contains("configuration missing: endpoint"));
+    }
+
+    #[test]
+    fn package_configuration_operator_error_renders_validation_failure() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(operator_error_response(
+            "configuration field endpoint expects url",
+        ));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        assert!(
+            lines
+                .join("\n")
+                .contains("error: configuration field endpoint expects url")
+        );
+    }
+
+    #[test]
     fn response_diagnostics_render_connected_state() {
         let mut app = DogfoodApp::new(None);
         let mut response = status_response("running", 7);
@@ -1983,6 +2514,12 @@ mod tests {
         response
     }
 
+    fn package_decision_response(packages: Vec<DaemonPackage>) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PackageDecision);
+        response.packages = packages;
+        response
+    }
+
     fn package(
         package_name: &str,
         version: &str,
@@ -1998,8 +2535,81 @@ mod tests {
             state: state.to_string(),
             requested_capabilities,
             runnable_entrypoints: Vec::new(),
+            configuration: botster_hub_client::DaemonPackageConfiguration::default(),
             provider_profile_admitted,
         }
+    }
+
+    fn package_with_configuration() -> DaemonPackage {
+        let mut package = package(
+            "configuration.plugin",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.configuration = botster_hub_client::DaemonPackageConfiguration {
+            schema: Some(json!({
+                "fields": [
+                    {
+                        "key": "endpoint",
+                        "type": "url",
+                        "label": "Endpoint",
+                        "required": true,
+                        "order": 1
+                    },
+                    {
+                        "key": "debug",
+                        "type": "boolean",
+                        "label": "Debug",
+                        "order": 2
+                    },
+                    {
+                        "key": "mode",
+                        "type": "select",
+                        "label": "Mode",
+                        "order": 3,
+                        "options": [
+                            { "value": "read", "label": "Read" },
+                            { "value": "write", "label": "Write" }
+                        ]
+                    },
+                    {
+                        "key": "notes",
+                        "type": "multiline_text",
+                        "label": "Notes",
+                        "order": 4
+                    },
+                    {
+                        "key": "api_token",
+                        "type": "secret",
+                        "label": "API token",
+                        "required": true,
+                        "order": 5
+                    }
+                ]
+            })),
+            effective_values: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    json!({"type":"url","value":"https://example.invalid/hook"}),
+                ),
+                ("debug".to_string(), json!({"type":"boolean","value":true})),
+                ("mode".to_string(), json!({"type":"select","value":"read"})),
+                (
+                    "notes".to_string(),
+                    json!({"type":"multiline_text","value":"Line one"}),
+                ),
+                (
+                    "api_token".to_string(),
+                    json!({"type":"secret","state":"redacted"}),
+                ),
+            ]),
+            missing_required: vec!["endpoint".to_string()],
+            diagnostics: vec![package_diagnostic("schema", "manifest warning")],
+        };
+        package
     }
 
     fn entrypoint(

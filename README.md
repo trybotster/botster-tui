@@ -83,15 +83,20 @@ hub probes. The hub panel distinguishes:
   package state, requested capabilities, and provider profile admission;
 - package compatibility failures and package errors through public diagnostics,
   including diagnostic operation and feature fields for package registry work;
+- package configuration schema and sanitized values from public package rows,
+  including string, boolean, select, multiline text, and secret-placeholder
+  fields, required/missing state, package-level diagnostics, and update
+  submission through the hub daemon;
 - connected, terminal stream unavailable, action failure, and startup
   diagnostics from public `DaemonDiagnostic` rows on status, response, operator
   error, and compatibility error payloads;
 - action or validation failures that stay visible after unrelated successful
   refreshes.
 
-Package registry display is read-only in this dogfood slice. Local package
-install, enable, disable, and remove flows remain owned by hub package
-operations rather than private TUI-only controls.
+Package install, enable, disable, and remove flows remain owned by hub package
+operations rather than private TUI-only controls. Configuration edits submit the
+hub-owned package configuration value shape; secret fields render only state
+markers and never raw secret material.
 
 The terminal panel distinguishes selected session from attached stream. Selecting
 a row changes the attach target; terminal input is sent only after an attach
