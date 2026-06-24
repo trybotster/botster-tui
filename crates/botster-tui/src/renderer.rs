@@ -51,7 +51,7 @@ pub enum FieldKind {
     Text,
     Checkbox,
     Select,
-    ReadOnly,
+    Textarea,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -383,7 +383,7 @@ impl InputRouter {
                     self.draft_values.insert(field.name.clone(), next);
                 }
             }
-            FieldKind::Text | FieldKind::ReadOnly => {}
+            FieldKind::Text | FieldKind::Textarea => {}
         }
     }
 
@@ -391,7 +391,7 @@ impl InputRouter {
         let Some(field) = &region.field else {
             return InputDispatch::Ignored;
         };
-        if field.kind != FieldKind::Text {
+        if !matches!(field.kind, FieldKind::Text | FieldKind::Textarea) {
             return InputDispatch::Ignored;
         }
 
@@ -853,7 +853,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, node: &UiNode, hit_m
         UiNodeKind::Select => {
             selected_option_label(node).unwrap_or_else(|| prop_text(node, "selected"))
         }
-        UiNodeKind::Textarea => format!("{} (read-only)", prop_text(node, "value")),
+        UiNodeKind::Textarea => prop_text(node, "value"),
         _ => prop_text(node, "value"),
     };
     frame.render_widget(
@@ -1129,7 +1129,7 @@ fn field_binding(node: &UiNode) -> Option<FieldBinding> {
     let kind = match node.kind {
         UiNodeKind::Checkbox => FieldKind::Checkbox,
         UiNodeKind::Select => FieldKind::Select,
-        UiNodeKind::Textarea => FieldKind::ReadOnly,
+        UiNodeKind::Textarea => FieldKind::Textarea,
         UiNodeKind::TextInput | UiNodeKind::FormField => FieldKind::Text,
         _ => return None,
     };
@@ -1145,7 +1145,7 @@ fn field_binding(node: &UiNode) -> Option<FieldBinding> {
             .or_else(|| node.props.get("default"))
             .cloned()
             .unwrap_or(Value::Null),
-        FieldKind::Text | FieldKind::ReadOnly => node
+        FieldKind::Text | FieldKind::Textarea => node
             .props
             .get("value")
             .or_else(|| node.props.get("default"))
@@ -1528,13 +1528,13 @@ mod tests {
     }
 
     #[test]
-    fn renders_forms_field_errors_and_read_only_textarea() {
+    fn renders_forms_field_errors_and_editable_textarea() {
         let root = form_fixture();
         let (lines, hit_map) = render_to_lines(&root, 80, 24);
         let frame = lines.join("\n");
 
         assert!(frame.contains("Title: Owner authored"));
-        assert!(frame.contains("Description: Line one (read-only)"));
+        assert!(frame.contains("Description: Line one"));
         assert!(frame.contains("Done: [x]"));
         assert!(frame.contains("Status: Open"));
         assert!(frame.contains("error: Title is required"));
@@ -1677,6 +1677,35 @@ mod tests {
         assert_eq!(
             request.values.unwrap().0.get("title"),
             Some(&Value::String("Draft!".to_string()))
+        );
+    }
+
+    #[test]
+    fn textarea_editing_uses_text_field_draft_path() {
+        let root = node(
+            UiNodeKind::Textarea,
+            "field-notes",
+            json!({
+                "name": "notes",
+                "label": "Notes",
+                "value": "Line one"
+            }),
+        );
+        let (_lines, hit_map) = render_to_lines(&root, 80, 5);
+        let mut router = InputRouter::new();
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)),
+                &hit_map
+            ),
+            InputDispatch::Focus {
+                node_id: "field-notes".to_string()
+            }
+        );
+        assert_eq!(
+            router.draft_value("notes"),
+            Some(&Value::String("Line one!".to_string()))
         );
     }
 
