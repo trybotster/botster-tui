@@ -66,6 +66,25 @@ pub fn smoke_message() -> &'static str {
     SMOKE_MESSAGE
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRow {
+    session_id: String,
+    lifecycle: String,
+}
+
+impl SessionRow {
+    fn running(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            lifecycle: "running".to_string(),
+        }
+    }
+
+    fn is_attachable(&self) -> bool {
+        self.lifecycle == "running"
+    }
+}
+
 pub fn run(args: AppArgs) -> io::Result<()> {
     if args.headless_dogfood {
         return run_headless_dogfood(args)
@@ -167,7 +186,7 @@ struct DogfoodApp {
     package_count: usize,
     enabled_package_count: usize,
     packages: Vec<DaemonPackage>,
-    sessions: Vec<String>,
+    sessions: Vec<SessionRow>,
     selected_session: Option<String>,
     attached_session: Option<String>,
     schema_version: Option<u16>,
@@ -222,7 +241,7 @@ impl DogfoodApp {
         if self
             .sessions
             .iter()
-            .any(|candidate| candidate == session_id)
+            .any(|candidate| candidate.session_id == session_id)
         {
             self.selected_session = Some(session_id.to_string());
         }
@@ -237,7 +256,7 @@ impl DogfoodApp {
         let Some(session_id) = self
             .attached_session
             .clone()
-            .or_else(|| self.selected_session.clone())
+            .or_else(|| self.selected_attachable_session_id_for_poll())
         else {
             return;
         };
@@ -405,20 +424,19 @@ impl DogfoodApp {
             }
         }
         self.selected_session = Some(session_id.clone());
+        if !self
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            self.sessions.push(SessionRow::running(session_id.clone()));
+        }
         self.action_feedback = Some(format!("spawned {session_id}; attach requested"));
-        self.request_and_apply(DaemonRequest::Attach {
-            session_id,
-            subscription_id: self.subscription_id.clone(),
-        });
+        self.attach_selected_or_first();
     }
 
     fn attach_selected_or_first(&mut self) {
-        let Some(session_id) = self
-            .selected_session
-            .clone()
-            .or_else(|| self.sessions.first().cloned())
-        else {
-            self.error = Some("no session available to attach".to_string());
+        let Some(session_id) = self.selected_attachable_session_id() else {
             return;
         };
         self.error = None;
@@ -428,6 +446,45 @@ impl DogfoodApp {
             session_id,
             subscription_id: self.subscription_id.clone(),
         });
+    }
+
+    fn selected_attachable_session_id(&mut self) -> Option<String> {
+        let Some(session_id) = self.selected_session.clone().or_else(|| {
+            self.sessions
+                .first()
+                .map(|session| session.session_id.clone())
+        }) else {
+            self.error = Some("no session available to attach".to_string());
+            return None;
+        };
+        self.selected_session = Some(session_id.clone());
+
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|candidate| candidate.session_id == session_id)
+        else {
+            self.error = Some(format!("{session_id} is not listed - cannot attach"));
+            return None;
+        };
+
+        if session.is_attachable() {
+            return Some(session_id);
+        }
+
+        self.error = Some(format!(
+            "{} {} - cannot attach",
+            session.session_id, session.lifecycle
+        ));
+        None
+    }
+
+    fn selected_attachable_session_id_for_poll(&self) -> Option<String> {
+        let session_id = self.selected_session.as_ref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.session_id == *session_id && session.is_attachable())
+            .map(|session| session.session_id.clone())
     }
 
     fn detach_attached(&mut self) {
@@ -588,14 +645,21 @@ impl DogfoodApp {
             self.sessions = response
                 .sessions
                 .into_iter()
-                .map(|session| session.session_id)
+                .map(|session| SessionRow {
+                    session_id: session.session_id,
+                    lifecycle: session.lifecycle,
+                })
                 .collect();
-            if self
-                .selected_session
-                .as_ref()
-                .is_none_or(|selected| !self.sessions.contains(selected))
-            {
-                self.selected_session = self.sessions.first().cloned();
+            if self.selected_session.as_ref().is_none_or(|selected| {
+                !self
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == *selected)
+            }) {
+                self.selected_session = self
+                    .sessions
+                    .first()
+                    .map(|session| session.session_id.clone());
             }
         }
 
@@ -1028,11 +1092,12 @@ impl DogfoodApp {
         list.children = self
             .sessions
             .iter()
-            .map(|session_id| {
-                let mut title = session_id.to_string();
-                if self.attached_session.as_deref() == Some(session_id) {
+            .map(|session| {
+                let session_id = &session.session_id;
+                let mut title = format!("{session_id} [{}]", session.lifecycle);
+                if self.attached_session.as_deref() == Some(session_id.as_str()) {
                     title.push_str(" (attached)");
-                } else if self.selected_session.as_deref() == Some(session_id) {
+                } else if self.selected_session.as_deref() == Some(session_id.as_str()) {
                     title.push_str(" (selected)");
                 }
                 let mut item = node(
@@ -2110,7 +2175,7 @@ mod tests {
     #[test]
     fn terminal_input_before_attach_renders_stream_unavailable_error() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = vec!["session-alpha".to_string()];
+        app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
 
         app.handle_dispatch(InputDispatch::TerminalForward {
@@ -2127,7 +2192,7 @@ mod tests {
     #[test]
     fn attach_state_tracks_attached_session_separately_from_selection() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-beta".to_string());
 
         app.apply_response(attach_state_response("session-beta", "attached"));
@@ -2136,7 +2201,7 @@ mod tests {
         let rendered = lines.join("\n");
         assert_eq!(app.attached_session.as_deref(), Some("session-beta"));
         assert!(rendered.contains("attached: session-beta"));
-        assert!(rendered.contains("session-beta (attached)"));
+        assert!(rendered.contains("session-beta [running] (attached)"));
         assert!(rendered.contains("terminal attached: session-beta"));
     }
 
@@ -2256,7 +2321,7 @@ mod tests {
     #[test]
     fn focused_session_list_row_updates_attach_selection() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
         let mut router = InputRouter::new();
@@ -2287,25 +2352,164 @@ mod tests {
     #[test]
     fn session_repull_preserves_selected_session_when_still_listed() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-beta".to_string());
 
         app.apply_response(sessions_response(["session-alpha", "session-beta"]));
 
-        assert_eq!(app.sessions, vec!["session-alpha", "session-beta"]);
+        assert_eq!(
+            app.sessions,
+            session_rows([("session-alpha", "running"), ("session-beta", "running"),])
+        );
         assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
     }
 
     #[test]
     fn session_repull_resets_stale_selected_session_to_first_listed_session() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = vec!["session-alpha".to_string(), "session-beta".to_string()];
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-beta".to_string());
 
         app.apply_response(sessions_response(["session-gamma", "session-delta"]));
 
-        assert_eq!(app.sessions, vec!["session-gamma", "session-delta"]);
+        assert_eq!(
+            app.sessions,
+            session_rows([("session-gamma", "running"), ("session-delta", "running"),])
+        );
         assert_eq!(app.selected_session.as_deref(), Some("session-gamma"));
+    }
+
+    #[test]
+    fn sessions_response_preserves_and_renders_lifecycle_state() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(sessions_response_with_lifecycles([
+            ("session-alpha", "running"),
+            ("session-beta", "exited"),
+        ]));
+
+        assert_eq!(
+            app.sessions,
+            session_rows([("session-alpha", "running"), ("session-beta", "exited"),])
+        );
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("session-alpha [running]"));
+        assert!(rendered.contains("session-beta [exited]"));
+    }
+
+    #[test]
+    fn action_dispatch_rejects_exited_session_before_daemon_attach() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "exited")]);
+        app.selected_session = Some("session-beta".to_string());
+        app.observed_requests.clear();
+
+        app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
+            request_id: botster_core::RequestId("req-attach-exited".to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::DEMO_SURFACE_ID.to_string()),
+            action_id: botster_core::ui::UiActionId("botster.tui.attach".to_string()),
+            node_id: Some(UiNodeId("dogfood-session-session-beta-attach".to_string())),
+            kind: botster_core::ui::UiActionKind::Submit,
+            values: None,
+            payload: Some(json!({ "session_id": "session-beta" })),
+        }));
+
+        assert!(app.observed_requests.is_empty());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("session-beta exited - cannot attach")
+        );
+    }
+
+    #[test]
+    fn repeated_exited_attach_attempts_render_one_deduplicated_error() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec![SessionRow {
+            session_id: "session-beta".to_string(),
+            lifecycle: "exited".to_string(),
+        }];
+        app.selected_session = Some("session-beta".to_string());
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let mut router = InputRouter::new();
+        let session_row = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "dogfood-session-session-beta")
+            .expect("exited session row should be focusable");
+
+        let mouse_dispatch = router.dispatch_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: session_row.rect.x,
+                row: session_row.rect.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &hit_map,
+        );
+        app.handle_dispatch(mouse_dispatch);
+        let key_dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        app.handle_dispatch(key_dispatch);
+
+        assert!(app.observed_requests.is_empty());
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert_eq!(
+            rendered
+                .matches("session-beta exited - cannot attach")
+                .count(),
+            1
+        );
+        assert!(!rendered.contains("attached session disappeared"));
+    }
+
+    #[test]
+    fn terminal_focus_attach_rejects_non_running_session_before_daemon_attach() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec![SessionRow {
+            session_id: "session-beta".to_string(),
+            lifecycle: "stopped".to_string(),
+        }];
+        app.selected_session = Some("session-beta".to_string());
+        app.observed_requests.clear();
+
+        app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
+            request_id: botster_core::RequestId("req-terminal-focus".to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::DEMO_SURFACE_ID.to_string()),
+            action_id: botster_core::ui::UiActionId("botster.terminal.focus".to_string()),
+            node_id: Some(UiNodeId("dogfood-terminal".to_string())),
+            kind: botster_core::ui::UiActionKind::Submit,
+            values: None,
+            payload: None,
+        }));
+
+        assert!(app.observed_requests.is_empty());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("session-beta stopped - cannot attach")
+        );
+    }
+
+    #[test]
+    fn reconnect_restore_does_not_reattach_known_non_running_session() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec![SessionRow {
+            session_id: "session-beta".to_string(),
+            lifecycle: "exited".to_string(),
+        }];
+        app.selected_session = Some("session-beta".to_string());
+        app.observed_requests.clear();
+
+        app.restore_after_connect();
+
+        assert!(app.observed_requests.is_empty());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("session-beta exited - cannot attach")
+        );
     }
 
     #[test]
@@ -2329,7 +2533,7 @@ mod tests {
     fn reconnect_restore_reattaches_selected_session_after_read_model_refresh() {
         let mut app = DogfoodApp::new(None);
         app.observed_requests.clear();
-        app.sessions = vec!["session-alpha".to_string()];
+        app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
         let subscription_id = app.subscription_id.clone();
 
@@ -2455,14 +2659,32 @@ mod tests {
             .join("\n")
     }
 
-    fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::Sessions);
-        response.sessions = session_ids
+    fn session_rows<const N: usize>(sessions: [(&str, &str); N]) -> Vec<SessionRow> {
+        sessions
             .into_iter()
-            .map(|session_id| botster_hub_client::DaemonSession {
+            .map(|(session_id, lifecycle)| SessionRow {
                 session_id: session_id.to_string(),
-                lifecycle: "running".to_string(),
+                lifecycle: lifecycle.to_string(),
             })
+            .collect()
+    }
+
+    fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
+        sessions_response_with_lifecycles(session_ids.map(|session_id| (session_id, "running")))
+    }
+
+    fn sessions_response_with_lifecycles<const N: usize>(
+        sessions: [(&str, &str); N],
+    ) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Sessions);
+        response.sessions = sessions
+            .into_iter()
+            .map(
+                |(session_id, lifecycle)| botster_hub_client::DaemonSession {
+                    session_id: session_id.to_string(),
+                    lifecycle: lifecycle.to_string(),
+                },
+            )
             .collect();
         response
     }
