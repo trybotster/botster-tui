@@ -8,8 +8,8 @@ use std::{
 
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 use botster_hub_client::{
-    DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic,
-    DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonPackage,
+    DaemonApp, DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityRequirement,
+    DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonPackage,
     DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
     DaemonPackagePin, DaemonPackageUpdateStatus, DaemonRequest, DaemonResponse, DaemonResponseKind,
     DaemonTransportError, DaemonTransportResult, FEATURE_RESIZE, FEATURE_SESSIONS,
@@ -187,6 +187,7 @@ struct DogfoodApp {
     diagnostics: Vec<DaemonDiagnostic>,
     package_count: usize,
     enabled_package_count: usize,
+    apps: Vec<DaemonApp>,
     packages: Vec<DaemonPackage>,
     available_packages: Vec<DaemonAvailablePackage>,
     install_plan: Option<DaemonPackageInstallPlan>,
@@ -219,6 +220,7 @@ impl DogfoodApp {
             diagnostics: Vec::new(),
             package_count: 0,
             enabled_package_count: 0,
+            apps: Vec::new(),
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -493,6 +495,7 @@ impl DogfoodApp {
     fn refresh_read_models(&mut self) {
         self.refresh_status();
         self.refresh_sessions();
+        self.refresh_apps();
         self.refresh_packages();
     }
 
@@ -502,6 +505,10 @@ impl DogfoodApp {
 
     fn refresh_sessions(&mut self) {
         self.request_and_apply(DaemonRequest::ListSessions);
+    }
+
+    fn refresh_apps(&mut self) {
+        self.request_and_apply(DaemonRequest::ListApps);
     }
 
     fn refresh_packages(&mut self) {
@@ -664,6 +671,7 @@ impl DogfoodApp {
             DaemonRequest::ListSessions => {
                 self.observed_requests.push(ObservedRequest::ListSessions)
             }
+            DaemonRequest::ListApps => self.observed_requests.push(ObservedRequest::ListApps),
             DaemonRequest::ListPackages => {
                 self.observed_requests.push(ObservedRequest::ListPackages)
             }
@@ -834,6 +842,9 @@ impl DogfoodApp {
         ) {
             self.packages = response.packages;
         }
+        if matches!(response.kind, DaemonResponseKind::Apps) {
+            self.apps = response.apps;
+        }
         if matches!(response.kind, DaemonResponseKind::AvailablePackages) {
             self.available_packages = response.available_packages;
         }
@@ -978,6 +989,7 @@ impl DogfoodApp {
             "dogfood-package-summary",
             json!({ "text": self.package_summary_text() }),
         )));
+        children.extend(self.app_nodes().into_iter().map(child));
         if self.packages.is_empty() {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -1110,6 +1122,58 @@ impl DogfoodApp {
             "packages: {} installed; {} enabled",
             self.package_count, self.enabled_package_count
         )
+    }
+
+    fn app_nodes(&self) -> Vec<UiNode> {
+        let mut nodes = vec![node(
+            UiNodeKind::Text,
+            "dogfood-app-summary",
+            json!({ "text": format!("apps: {} installed", self.apps.len()) }),
+        )];
+        if self.apps.is_empty() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "dogfood-app-empty",
+                json!({ "text": "apps: none reported" }),
+            ));
+            return nodes;
+        }
+
+        for (app_index, app) in self.apps.iter().enumerate() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("dogfood-app-{app_index}"),
+                json!({ "text": format!("app: {}", app_text(app)) }),
+            ));
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("dogfood-app-{app_index}-launch-target"),
+                json!({ "text": format!("launch target: {}", app_launch_target_text(app)) }),
+            ));
+            for (reason_index, reason) in app.blocked_reasons.iter().enumerate() {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-app-{app_index}-blocked-{reason_index}"),
+                    json!({ "text": format!("app blocked: {reason}") }),
+                ));
+            }
+            for (diagnostic_index, diagnostic) in app.diagnostics.iter().enumerate() {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-app-{app_index}-diagnostic-{diagnostic_index}"),
+                    json!({ "text": format!("app diagnostic: {}", package_diagnostic_text(diagnostic)) }),
+                ));
+            }
+            nodes.extend(
+                action_state_nodes(
+                    &app.actions,
+                    "app action",
+                    &format!("dogfood-app-{app_index}"),
+                )
+                .into_iter(),
+            );
+        }
+        nodes
     }
 
     fn package_configuration_nodes(&self, package: &DaemonPackage, index: usize) -> Vec<UiNode> {
@@ -1437,6 +1501,7 @@ impl DogfoodApp {
 enum ObservedRequest {
     Status,
     ListSessions,
+    ListApps,
     ListPackages,
     SetPackageConfiguration {
         package_name: String,
@@ -2005,6 +2070,119 @@ fn available_package_text(package: &DaemonAvailablePackage) -> String {
     parts.join(" ")
 }
 
+fn app_text(app: &DaemonApp) -> String {
+    format!(
+        "package={} app={} entrypoint={} kind={} launch_mode={} lifecycle={}",
+        app.package_name,
+        app.app_id,
+        app.entrypoint_id,
+        app.kind,
+        app.launch_mode,
+        app.lifecycle_state
+    )
+}
+
+fn app_launch_target_text(app: &DaemonApp) -> String {
+    let mut parts = vec![format!("kind={}", app.launch_target.kind)];
+    match app.launch_target.local_url.as_deref() {
+        Some(local_url) => {
+            parts.push(format!("local_url={local_url}"));
+            parts.push("open=copy URL or open it in a browser".to_string());
+        }
+        None if app.kind == "web_app" || app.launch_target.kind == "web_app" => {
+            parts.push("local_url=unavailable".to_string());
+            parts.push("open=blocked or not launched by hub".to_string());
+        }
+        None => {
+            parts.push("local_url=not_applicable".to_string());
+            parts.push("open=use hub-provided terminal app action when available".to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+fn action_state_nodes(
+    actions: &[botster_hub_client::DaemonPackageActionState],
+    label: &str,
+    id_prefix: &str,
+) -> Vec<UiNode> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(action_index, action)| {
+            node(
+                UiNodeKind::Text,
+                &format!("{id_prefix}-action-{action_index}"),
+                json!({ "text": format!("{label}: {}", action_state_text(action)) }),
+            )
+        })
+        .collect()
+}
+
+fn action_state_text(action: &botster_hub_client::DaemonPackageActionState) -> String {
+    let mut parts = vec![
+        format!("action_id={}", action.action_id),
+        format!("status={}", action_status_text(action.status)),
+    ];
+    if let Some(reason) = &action.reason {
+        parts.push(format!("reason={reason}"));
+    }
+    if !action.diagnostics.is_empty() {
+        parts.push(format!(
+            "diagnostics={}",
+            action
+                .diagnostics
+                .iter()
+                .map(package_diagnostic_text)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if !action.required_references.is_empty() {
+        parts.push(format!(
+            "required_references={}",
+            action
+                .required_references
+                .iter()
+                .map(|reference| format!("{}:{}", reference.kind, reference.key))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if let Some(request) = &action.request {
+        parts.push(format!("request={}", action_request_text(request)));
+    }
+    parts.join(" ")
+}
+
+fn action_status_text(status: botster_hub_client::DaemonPackageActionStatus) -> &'static str {
+    match status {
+        botster_hub_client::DaemonPackageActionStatus::Available => "available",
+        botster_hub_client::DaemonPackageActionStatus::Blocked => "blocked",
+        botster_hub_client::DaemonPackageActionStatus::Unavailable => "unavailable",
+    }
+}
+
+fn action_request_text(request: &botster_hub_client::DaemonPackageActionRequest) -> String {
+    let mut parts = vec![format!("type={}", request.request_type)];
+    if let Some(package_name) = &request.package_name {
+        parts.push(format!("package={package_name}"));
+    }
+    if let Some(entry_id) = &request.entry_id {
+        parts.push(format!("entry_id={entry_id}"));
+    }
+    if let Some(entrypoint_id) = &request.entrypoint_id {
+        parts.push(format!("entrypoint_id={entrypoint_id}"));
+    }
+    if let Some(pin) = &request.pin {
+        parts.push(format!("pin={}", pin_text(pin)));
+    }
+    if request.registry_path.is_some() {
+        parts.push("registry_path=provided".to_string());
+    }
+    parts.join(",")
+}
+
 fn install_plan_nodes(plan: &DaemonPackageInstallPlan) -> Vec<UiNode> {
     let mut nodes = vec![node(
         UiNodeKind::Text,
@@ -2353,13 +2531,111 @@ mod tests {
             true,
         )]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains(
             "package: local-alpha 0.1.0 classification=local state=enabled capabilities=none provider_profile_admitted=true"
         ));
         assert!(!rendered.contains("entrypoints="));
+    }
+
+    #[test]
+    fn apps_response_updates_state_and_renders_web_app_launch_url_from_public_dto() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(apps_response(vec![web_app_with_url()]));
+
+        assert_eq!(app.apps.len(), 1);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("apps: 1 installed"));
+        assert!(rendered.contains(
+            "app: package=workflow.plugin app=dashboard entrypoint=web kind=web_app launch_mode=supervised lifecycle=running"
+        ));
+        assert!(rendered.contains("launch target: kind=web_app local_url=http://127.0.0.1:49152 open=copy URL or open it in a browser"));
+    }
+
+    #[test]
+    fn apps_response_keeps_web_app_without_url_visible_without_deriving_one() {
+        let mut app = DogfoodApp::new(None);
+        let mut app_row = web_app_with_url();
+        app_row.launch_target.local_url = None;
+        app_row.lifecycle_state = "blocked".to_string();
+        app_row.blocked_reasons = vec!["missing_config: port".to_string()];
+        app_row.diagnostics = vec![package_diagnostic("blocked", "launch target unavailable")];
+
+        app.apply_response(apps_response(vec![app_row]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("kind=web_app local_url=unavailable"));
+        assert!(rendered.contains("app blocked: missing_config: port"));
+        assert!(rendered.contains("app diagnostic: blocked:launch target unavailable"));
+        assert!(!rendered.contains("http://localhost"));
+        assert!(!rendered.contains("http://127.0.0.1"));
+    }
+
+    #[test]
+    fn terminal_app_renders_launchability_from_action_descriptors_without_fake_url() {
+        let mut app = DogfoodApp::new(None);
+        let mut app_row = terminal_app();
+        app_row.actions = vec![action_state(
+            "open",
+            botster_hub_client::DaemonPackageActionStatus::Available,
+            None,
+            Some(action_request("start_entrypoint")),
+        )];
+
+        app.apply_response(apps_response(vec![app_row]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(
+            "app: package=botster-tui app=tui entrypoint=tui kind=terminal_app launch_mode=foreground_stdio lifecycle=launchable"
+        ));
+        assert!(rendered.contains("launch target: kind=terminal_app local_url=not_applicable open=use hub-provided terminal app action when available"));
+        assert!(rendered.contains("app action: action_id=open status=available request=type=start_entrypoint,package=botster-tui,entrypoint_id=tui"));
+        assert!(!rendered.contains("http://"));
+    }
+
+    #[test]
+    fn blocked_app_reasons_diagnostics_actions_and_request_mapping_are_visible_without_paths() {
+        let mut app = DogfoodApp::new(None);
+        let mut app_row = terminal_app();
+        app_row.lifecycle_state = "blocked".to_string();
+        app_row.blocked_reasons = vec![
+            "missing_auth: github_token".to_string(),
+            "disabled_package: botster-tui".to_string(),
+        ];
+        app_row.diagnostics = vec![package_diagnostic("warning", "terminal app is blocked")];
+        let mut request = action_request("install_package");
+        request.registry_path = Some("/Users/jason/private/catalog.json".to_string());
+        request.entry_id = Some("botster-tui".to_string());
+        app_row.actions = vec![action_state(
+            "install",
+            botster_hub_client::DaemonPackageActionStatus::Blocked,
+            Some("missing auth"),
+            Some(request),
+        )];
+        app_row.actions[0].diagnostics = vec![package_diagnostic("auth", "token missing")];
+        app_row.actions[0].required_references =
+            vec![botster_hub_client::DaemonPackageActionRequiredReference {
+                kind: "auth".to_string(),
+                key: "github_token".to_string(),
+            }];
+
+        app.apply_response(apps_response(vec![app_row]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("app blocked: missing_auth: github_token"));
+        assert!(rendered.contains("app blocked: disabled_package: botster-tui"));
+        assert!(rendered.contains("app diagnostic: warning:terminal app is blocked"));
+        assert!(rendered.contains("app action: action_id=install status=blocked reason=missing auth diagnostics=auth:token missing required_references=auth:github_token request=type=install_package,package=botster-tui,entry_id=botster-tui,entrypoint_id=tui,registry_path=provided"));
+        assert!(!rendered.contains("/Users/"));
+        assert!(!rendered.contains("private/catalog"));
     }
 
     #[test]
@@ -2463,7 +2739,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 120);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("id=web,kind=web,state=running"));
@@ -2607,6 +2883,7 @@ mod tests {
                 restart_required: false,
                 pin: Some(pin),
                 diagnostics: vec![package_diagnostic("warning", "entrypoint restart optional")],
+                actions: Vec::new(),
             },
         ));
 
@@ -3377,6 +3654,7 @@ mod tests {
             vec![
                 ObservedRequest::Status,
                 ObservedRequest::ListSessions,
+                ObservedRequest::ListApps,
                 ObservedRequest::ListPackages,
             ]
         );
@@ -3589,6 +3867,12 @@ mod tests {
         response
     }
 
+    fn apps_response(apps: Vec<DaemonApp>) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::Apps);
+        response.apps = apps;
+        response
+    }
+
     fn package_decision_response(packages: Vec<DaemonPackage>) -> DaemonResponse {
         let mut response = base_response(DaemonResponseKind::PackageDecision);
         response.packages = packages;
@@ -3633,6 +3917,7 @@ mod tests {
             availability: botster_hub_client::DaemonPackageAvailability::default(),
             dependency_availability: Vec::new(),
             feature_availability: Vec::new(),
+            actions: Vec::new(),
             provider_profile_admitted,
         }
     }
@@ -3717,6 +4002,7 @@ mod tests {
         botster_hub_client::DaemonPackageRunnableEntrypoint {
             id: id.to_string(),
             kind: kind.to_string(),
+            launch_mode: "dev".to_string(),
             command: "bin/run".to_string(),
             args: Vec::new(),
             working_directory: botster_hub_client::DaemonPackageWorkingDirectory {
@@ -3724,10 +4010,10 @@ mod tests {
                 path: None,
             },
             environment: Vec::new(),
-            mode: "dev".to_string(),
             capabilities: Vec::new(),
             may_supervise: true,
             process,
+            actions: Vec::new(),
         }
     }
 
@@ -3786,6 +4072,70 @@ mod tests {
                 diagnostics: vec!["requires current hub".to_string()],
             },
             pin: Some(package_pin()),
+            actions: Vec::new(),
+        }
+    }
+
+    fn web_app_with_url() -> DaemonApp {
+        DaemonApp {
+            package_name: "workflow.plugin".to_string(),
+            app_id: "dashboard".to_string(),
+            entrypoint_id: "web".to_string(),
+            kind: "web_app".to_string(),
+            launch_mode: "supervised".to_string(),
+            lifecycle_state: "running".to_string(),
+            diagnostics: Vec::new(),
+            actions: Vec::new(),
+            blocked_reasons: Vec::new(),
+            launch_target: botster_hub_client::DaemonAppLaunchTarget {
+                kind: "web_app".to_string(),
+                local_url: Some("http://127.0.0.1:49152".to_string()),
+            },
+        }
+    }
+
+    fn terminal_app() -> DaemonApp {
+        DaemonApp {
+            package_name: "botster-tui".to_string(),
+            app_id: "tui".to_string(),
+            entrypoint_id: "tui".to_string(),
+            kind: "terminal_app".to_string(),
+            launch_mode: "foreground_stdio".to_string(),
+            lifecycle_state: "launchable".to_string(),
+            diagnostics: Vec::new(),
+            actions: Vec::new(),
+            blocked_reasons: Vec::new(),
+            launch_target: botster_hub_client::DaemonAppLaunchTarget {
+                kind: "terminal_app".to_string(),
+                local_url: None,
+            },
+        }
+    }
+
+    fn action_state(
+        action_id: &str,
+        status: botster_hub_client::DaemonPackageActionStatus,
+        reason: Option<&str>,
+        request: Option<botster_hub_client::DaemonPackageActionRequest>,
+    ) -> botster_hub_client::DaemonPackageActionState {
+        botster_hub_client::DaemonPackageActionState {
+            action_id: action_id.to_string(),
+            status,
+            reason: reason.map(str::to_string),
+            diagnostics: Vec::new(),
+            required_references: Vec::new(),
+            request,
+        }
+    }
+
+    fn action_request(request_type: &str) -> botster_hub_client::DaemonPackageActionRequest {
+        botster_hub_client::DaemonPackageActionRequest {
+            request_type: request_type.to_string(),
+            pin: None,
+            package_name: Some("botster-tui".to_string()),
+            entry_id: None,
+            entrypoint_id: Some("tui".to_string()),
+            registry_path: None,
         }
     }
 
@@ -3845,6 +4195,7 @@ mod tests {
             kind,
             status: None,
             sessions: Vec::new(),
+            apps: Vec::new(),
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
