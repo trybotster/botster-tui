@@ -46,7 +46,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`24453ef448fb4c89ed63e784ed518de7ca301cd7`. The protocol source is
+`b91d774f31fabe1d8f0d28d538dca8e372988298`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -83,6 +83,10 @@ hub probes. The hub panel distinguishes:
   package state, requested capabilities, provider profile admission, package
   availability, dependency availability, feature availability, and hub-supplied
   blocked reason/action rows;
+- installed app rows from public app registry responses, including package id,
+  app id, entrypoint id, app kind, launch mode, lifecycle state, blocked reasons,
+  diagnostics, hub-provided action descriptors, web app local URLs, and terminal
+  app launchability;
 - marketplace available package rows from public package lifecycle responses,
   including entry id, source labels, first-party state, compatibility results,
   requested capabilities, pin metadata, install plans, update status, and package
@@ -105,6 +109,13 @@ renders hub-resolved dependency/auth/update state and does not infer it from
 package configuration, capabilities, or local registry paths. Configuration
 edits submit the hub-owned package configuration value shape; secret fields
 render only state markers and never raw secret material.
+
+Installed app rows are also hub-owned. `web_app` rows show only the
+hub-provided `local_url` and copy/open instructions; if the hub omits a URL, the
+TUI keeps the row visible with blocked reasons or diagnostics instead of
+guessing a port. `terminal_app` rows show launchability from lifecycle, blocked
+reasons, diagnostics, and action descriptors; app action descriptors are
+display-only in this client path.
 
 The terminal panel distinguishes selected session from attached stream. Selecting
 a row changes the attach target; terminal input is sent only after an attach
