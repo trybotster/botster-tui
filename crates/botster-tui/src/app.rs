@@ -2611,7 +2611,7 @@ mod tests {
         ];
         app_row.diagnostics = vec![package_diagnostic("warning", "terminal app is blocked")];
         let mut request = action_request("install_package");
-        request.registry_path = Some("/Users/jason/private/catalog.json".to_string());
+        request.registry_path = Some("/redacted/catalog.json".to_string());
         request.entry_id = Some("botster-tui".to_string());
         app_row.actions = vec![action_state(
             "install",
@@ -2634,8 +2634,7 @@ mod tests {
         assert!(rendered.contains("app blocked: disabled_package: botster-tui"));
         assert!(rendered.contains("app diagnostic: warning:terminal app is blocked"));
         assert!(rendered.contains("app action: action_id=install status=blocked reason=missing auth diagnostics=auth:token missing required_references=auth:github_token request=type=install_package,package=botster-tui,entry_id=botster-tui,entrypoint_id=tui,registry_path=provided"));
-        assert!(!rendered.contains("/Users/"));
-        assert!(!rendered.contains("private/catalog"));
+        assert!(!rendered.contains("/redacted/catalog"));
     }
 
     #[test]
