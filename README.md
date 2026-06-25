@@ -80,7 +80,13 @@ hub probes. The hub panel distinguishes:
   status schema version;
 - package registry state from public status/list responses, including installed
   package count, enabled package count, package name, version, classification,
-  package state, requested capabilities, and provider profile admission;
+  package state, requested capabilities, provider profile admission, package
+  availability, dependency availability, feature availability, and hub-supplied
+  blocked reason/action rows;
+- marketplace available package rows from public package lifecycle responses,
+  including entry id, source labels, first-party state, compatibility results,
+  requested capabilities, pin metadata, install plans, update status, and package
+  action decisions;
 - package compatibility failures and package errors through public diagnostics,
   including diagnostic operation and feature fields for package registry work;
 - package configuration schema and sanitized values from public package rows,
@@ -93,10 +99,12 @@ hub probes. The hub panel distinguishes:
 - action or validation failures that stay visible after unrelated successful
   refreshes.
 
-Package install, enable, disable, and remove flows remain owned by hub package
-operations rather than private TUI-only controls. Configuration edits submit the
-hub-owned package configuration value shape; secret fields render only state
-markers and never raw secret material.
+Package install, enable, disable, remove, entrypoint, and update flows remain
+owned by hub package operations rather than private TUI-only controls. The TUI
+renders hub-resolved dependency/auth/update state and does not infer it from
+package configuration, capabilities, or local registry paths. Configuration
+edits submit the hub-owned package configuration value shape; secret fields
+render only state markers and never raw secret material.
 
 The terminal panel distinguishes selected session from attached stream. Selecting
 a row changes the attach target; terminal input is sent only after an attach
