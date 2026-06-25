@@ -8,8 +8,10 @@ use std::{
 
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 use botster_hub_client::{
-    DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind,
-    DaemonEndpoint, DaemonEvent, DaemonPackage, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic,
+    DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonPackage,
+    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
+    DaemonPackagePin, DaemonPackageUpdateStatus, DaemonRequest, DaemonResponse, DaemonResponseKind,
     DaemonTransportError, DaemonTransportResult, FEATURE_RESIZE, FEATURE_SESSIONS,
     FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
     read_frame_from_reader, write_frame,
@@ -186,6 +188,10 @@ struct DogfoodApp {
     package_count: usize,
     enabled_package_count: usize,
     packages: Vec<DaemonPackage>,
+    available_packages: Vec<DaemonAvailablePackage>,
+    install_plan: Option<DaemonPackageInstallPlan>,
+    update_status: Option<DaemonPackageUpdateStatus>,
+    package_decision: Option<botster_hub_client::DaemonPackageDecision>,
     sessions: Vec<SessionRow>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -214,6 +220,10 @@ impl DogfoodApp {
             package_count: 0,
             enabled_package_count: 0,
             packages: Vec::new(),
+            available_packages: Vec::new(),
+            install_plan: None,
+            update_status: None,
+            package_decision: None,
             sessions: Vec::new(),
             selected_session: None,
             attached_session: None,
@@ -336,6 +346,99 @@ impl DogfoodApp {
                     .and_then(Value::as_str)
                 {
                     self.submit_package_configuration(package_name, values.as_ref());
+                }
+            }
+            "botster.tui.package.enable" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.action_feedback = Some(format!("enable requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::EnablePackage { package_name });
+                }
+            }
+            "botster.tui.package.disable" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.action_feedback = Some(format!("disable requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::DisablePackage { package_name });
+                }
+            }
+            "botster.tui.package.remove" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.action_feedback = Some(format!("remove requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::RemovePackage { package_name });
+                }
+            }
+            "botster.tui.package.update_status" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.action_feedback = Some(format!("update status requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::CheckPackageUpdate { package_name });
+                }
+            }
+            "botster.tui.package.update_preview" => {
+                if let Some((package_name, pin)) = package_name_and_pin_from_payload(&payload) {
+                    self.action_feedback =
+                        Some(format!("update preview requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::PreviewPackageUpdate {
+                        package_name,
+                        pin,
+                    });
+                }
+            }
+            "botster.tui.package.update_apply" => {
+                if let Some((package_name, pin)) = package_name_and_pin_from_payload(&payload) {
+                    self.action_feedback = Some(format!("update apply requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::ApplyPackageUpdate { package_name, pin });
+                }
+            }
+            "botster.tui.entrypoint.start" => {
+                if let Some((package_name, entrypoint_id)) =
+                    package_entrypoint_from_payload(&payload)
+                {
+                    self.action_feedback = Some(format!(
+                        "entrypoint start requested: {package_name}/{entrypoint_id}"
+                    ));
+                    self.request_and_apply(DaemonRequest::StartPackageEntrypoint {
+                        package_name,
+                        entrypoint_id,
+                        environment_overrides: BTreeMap::new(),
+                    });
+                }
+            }
+            "botster.tui.entrypoint.stop" => {
+                if let Some((package_name, entrypoint_id)) =
+                    package_entrypoint_from_payload(&payload)
+                {
+                    self.action_feedback = Some(format!(
+                        "entrypoint stop requested: {package_name}/{entrypoint_id}"
+                    ));
+                    self.request_and_apply(DaemonRequest::StopPackageEntrypoint {
+                        package_name,
+                        entrypoint_id,
+                    });
+                }
+            }
+            "botster.tui.entrypoint.restart" => {
+                if let Some((package_name, entrypoint_id)) =
+                    package_entrypoint_from_payload(&payload)
+                {
+                    self.action_feedback = Some(format!(
+                        "entrypoint restart requested: {package_name}/{entrypoint_id}"
+                    ));
+                    self.request_and_apply(DaemonRequest::RestartPackageEntrypoint {
+                        package_name,
+                        entrypoint_id,
+                    });
+                }
+            }
+            "botster.tui.entrypoint.status" => {
+                if let Some((package_name, entrypoint_id)) =
+                    package_entrypoint_from_payload(&payload)
+                {
+                    self.action_feedback = Some(format!(
+                        "entrypoint status requested: {package_name}/{entrypoint_id}"
+                    ));
+                    self.request_and_apply(DaemonRequest::PackageEntrypointStatus {
+                        package_name,
+                        entrypoint_id,
+                    });
                 }
             }
             "botster.terminal.focus" => self.attach_selected_or_first(),
@@ -573,6 +676,68 @@ impl DogfoodApp {
                     package_name: package_name.clone(),
                     values: values.clone(),
                 }),
+            DaemonRequest::EnablePackage { package_name } => self
+                .observed_requests
+                .push(ObservedRequest::EnablePackage(package_name.clone())),
+            DaemonRequest::DisablePackage { package_name } => self
+                .observed_requests
+                .push(ObservedRequest::DisablePackage(package_name.clone())),
+            DaemonRequest::RemovePackage { package_name } => self
+                .observed_requests
+                .push(ObservedRequest::RemovePackage(package_name.clone())),
+            DaemonRequest::CheckPackageUpdate { package_name } => self
+                .observed_requests
+                .push(ObservedRequest::CheckPackageUpdate(package_name.clone())),
+            DaemonRequest::PreviewPackageUpdate { package_name, pin } => self
+                .observed_requests
+                .push(ObservedRequest::PreviewPackageUpdate {
+                    package_name: package_name.clone(),
+                    pin: pin.clone(),
+                }),
+            DaemonRequest::ApplyPackageUpdate { package_name, pin } => {
+                self.observed_requests
+                    .push(ObservedRequest::ApplyPackageUpdate {
+                        package_name: package_name.clone(),
+                        pin: pin.clone(),
+                    })
+            }
+            DaemonRequest::StartPackageEntrypoint {
+                package_name,
+                entrypoint_id,
+                ..
+            } => self
+                .observed_requests
+                .push(ObservedRequest::StartPackageEntrypoint {
+                    package_name: package_name.clone(),
+                    entrypoint_id: entrypoint_id.clone(),
+                }),
+            DaemonRequest::StopPackageEntrypoint {
+                package_name,
+                entrypoint_id,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::StopPackageEntrypoint {
+                    package_name: package_name.clone(),
+                    entrypoint_id: entrypoint_id.clone(),
+                }),
+            DaemonRequest::RestartPackageEntrypoint {
+                package_name,
+                entrypoint_id,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::RestartPackageEntrypoint {
+                    package_name: package_name.clone(),
+                    entrypoint_id: entrypoint_id.clone(),
+                }),
+            DaemonRequest::PackageEntrypointStatus {
+                package_name,
+                entrypoint_id,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::PackageEntrypointStatus {
+                    package_name: package_name.clone(),
+                    entrypoint_id: entrypoint_id.clone(),
+                }),
             DaemonRequest::Attach {
                 session_id,
                 subscription_id,
@@ -668,6 +833,18 @@ impl DogfoodApp {
             DaemonResponseKind::Packages | DaemonResponseKind::PackageDecision
         ) {
             self.packages = response.packages;
+        }
+        if matches!(response.kind, DaemonResponseKind::AvailablePackages) {
+            self.available_packages = response.available_packages;
+        }
+        if matches!(response.kind, DaemonResponseKind::PackageInstallPlan) {
+            self.install_plan = response.install_plan;
+        }
+        if matches!(response.kind, DaemonResponseKind::PackageUpdateStatus) {
+            self.update_status = response.update_status;
+        }
+        if matches!(response.kind, DaemonResponseKind::PackageDecision) {
+            self.package_decision = response.package_decision;
         }
 
         for event in response.events {
@@ -814,6 +991,12 @@ impl DogfoodApp {
                     &format!("dogfood-package-{index}"),
                     json!({ "text": format!("package: {}", package_text(package)) }),
                 )));
+                children.extend(
+                    package_availability_nodes(package, index)
+                        .into_iter()
+                        .map(child),
+                );
+                children.extend(package_action_nodes(package, index).into_iter().map(child));
                 for (entrypoint_index, entrypoint) in
                     package.runnable_entrypoints.iter().enumerate()
                 {
@@ -828,6 +1011,11 @@ impl DogfoodApp {
                             )
                         }),
                     )));
+                    children.extend(
+                        entrypoint_action_nodes(package, index, entrypoint, entrypoint_index)
+                            .into_iter()
+                            .map(child),
+                    );
                 }
                 children.extend(
                     self.package_configuration_nodes(package, index)
@@ -835,6 +1023,57 @@ impl DogfoodApp {
                         .map(child),
                 );
             }
+        }
+        if !self.available_packages.is_empty() {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-marketplace-summary",
+                json!({ "text": format!("marketplace: {} available", self.available_packages.len()) }),
+            )));
+            for (index, available_package) in self.available_packages.iter().enumerate() {
+                children.push(child(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-available-package-{index}"),
+                    json!({ "text": format!("available package: {}", available_package_text(available_package)) }),
+                )));
+            }
+        }
+        if let Some(install_plan) = &self.install_plan {
+            children.extend(
+                install_plan_nodes(install_plan)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut node)| {
+                        node.id = Some(UiNodeId(format!("dogfood-install-plan-{index}")));
+                        child(node)
+                    }),
+            );
+        }
+        if let Some(update_status) = &self.update_status {
+            children.extend(
+                update_status_nodes(update_status)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut node)| {
+                        node.id = Some(UiNodeId(format!("dogfood-update-status-{index}")));
+                        child(node)
+                    }),
+            );
+        }
+        if let Some(decision) = &self.package_decision {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-package-decision",
+                json!({
+                    "text": format!(
+                        "package decision: package={} action={} state={} classification={}",
+                        decision.package_name,
+                        decision.action,
+                        decision.state,
+                        decision.classification
+                    )
+                }),
+            )));
         }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             children.push(child(node(
@@ -1203,6 +1442,34 @@ enum ObservedRequest {
         package_name: String,
         values: BTreeMap<String, Value>,
     },
+    EnablePackage(String),
+    DisablePackage(String),
+    RemovePackage(String),
+    CheckPackageUpdate(String),
+    PreviewPackageUpdate {
+        package_name: String,
+        pin: DaemonPackagePin,
+    },
+    ApplyPackageUpdate {
+        package_name: String,
+        pin: DaemonPackagePin,
+    },
+    StartPackageEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    StopPackageEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    RestartPackageEntrypoint {
+        package_name: String,
+        entrypoint_id: String,
+    },
+    PackageEntrypointStatus {
+        package_name: String,
+        entrypoint_id: String,
+    },
     Attach {
         session_id: String,
         subscription_id: String,
@@ -1543,16 +1810,317 @@ fn diagnostic_text(diagnostic: &DaemonDiagnostic) -> String {
     parts.join("; ")
 }
 
+fn package_diagnostic_text(diagnostic: &botster_hub_client::DaemonPackageDiagnostic) -> String {
+    format!("{}:{}", diagnostic.kind, diagnostic.message)
+}
+
+fn package_name_from_payload(payload: &Option<Value>) -> Option<String> {
+    payload
+        .as_ref()
+        .and_then(|value| value.get("package_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn package_entrypoint_from_payload(payload: &Option<Value>) -> Option<(String, String)> {
+    let value = payload.as_ref()?;
+    let package_name = value.get("package_name")?.as_str()?.to_string();
+    let entrypoint_id = value.get("entrypoint_id")?.as_str()?.to_string();
+    Some((package_name, entrypoint_id))
+}
+
+fn package_name_and_pin_from_payload(
+    payload: &Option<Value>,
+) -> Option<(String, DaemonPackagePin)> {
+    let value = payload.as_ref()?;
+    let package_name = value.get("package_name")?.as_str()?.to_string();
+    let pin = serde_json::from_value(value.get("pin")?.clone()).ok()?;
+    Some((package_name, pin))
+}
+
 fn package_text(package: &DaemonPackage) -> String {
     format!(
-        "{} {} classification={} state={} capabilities={} provider_profile_admitted={}",
+        "{} {} classification={} state={} capabilities={} provider_profile_admitted={} availability={} surfaces={}",
         package.package_name,
         package.version,
         package.classification,
         package.state,
         capability_text(&package.requested_capabilities),
-        package.provider_profile_admitted
+        package.provider_profile_admitted,
+        availability_state_text(package.availability.state),
+        package.surfaces.len()
     )
+}
+
+fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
+    let mut nodes = Vec::new();
+    for (reason_index, reason) in package.availability.reasons.iter().enumerate() {
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("dogfood-package-{index}-availability-reason-{reason_index}"),
+            json!({ "text": format!("package blocked: {}", availability_reason_text(reason)) }),
+        ));
+    }
+    for (dependency_index, dependency) in package.dependency_availability.iter().enumerate() {
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("dogfood-package-{index}-dependency-{dependency_index}"),
+            json!({
+                "text": format!(
+                    "dependency: id={} package={} state={}",
+                    dependency.id,
+                    dependency.package_name,
+                    availability_state_text(dependency.state)
+                )
+            }),
+        ));
+        for (reason_index, reason) in dependency.reasons.iter().enumerate() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!(
+                    "dogfood-package-{index}-dependency-{dependency_index}-reason-{reason_index}"
+                ),
+                json!({ "text": format!("dependency blocked: {}", availability_reason_text(reason)) }),
+            ));
+        }
+    }
+    for (feature_index, feature) in package.feature_availability.iter().enumerate() {
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("dogfood-package-{index}-feature-{feature_index}"),
+            json!({
+                "text": format!(
+                    "feature: id={} state={}",
+                    feature.id,
+                    availability_state_text(feature.state)
+                )
+            }),
+        ));
+        for (reason_index, reason) in feature.reasons.iter().enumerate() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("dogfood-package-{index}-feature-{feature_index}-reason-{reason_index}"),
+                json!({ "text": format!("feature blocked: {}", availability_reason_text(reason)) }),
+            ));
+        }
+    }
+    nodes
+}
+
+fn package_action_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
+    vec![
+        button(
+            &format!("dogfood-package-{index}-enable"),
+            "Enable",
+            "botster.tui.package.enable",
+            json!({ "package_name": package.package_name }),
+        ),
+        button(
+            &format!("dogfood-package-{index}-disable"),
+            "Disable",
+            "botster.tui.package.disable",
+            json!({ "package_name": package.package_name }),
+        ),
+        button(
+            &format!("dogfood-package-{index}-remove"),
+            "Remove",
+            "botster.tui.package.remove",
+            json!({ "package_name": package.package_name }),
+        ),
+        button(
+            &format!("dogfood-package-{index}-update-status"),
+            "Update status",
+            "botster.tui.package.update_status",
+            json!({ "package_name": package.package_name }),
+        ),
+    ]
+}
+
+fn entrypoint_action_nodes(
+    package: &DaemonPackage,
+    package_index: usize,
+    entrypoint: &botster_hub_client::DaemonPackageRunnableEntrypoint,
+    entrypoint_index: usize,
+) -> Vec<UiNode> {
+    let payload = json!({
+        "package_name": package.package_name,
+        "entrypoint_id": entrypoint.id,
+    });
+    vec![
+        button(
+            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-start"),
+            "Start",
+            "botster.tui.entrypoint.start",
+            payload.clone(),
+        ),
+        button(
+            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-stop"),
+            "Stop",
+            "botster.tui.entrypoint.stop",
+            payload.clone(),
+        ),
+        button(
+            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-restart"),
+            "Restart",
+            "botster.tui.entrypoint.restart",
+            payload.clone(),
+        ),
+        button(
+            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-status"),
+            "Status",
+            "botster.tui.entrypoint.status",
+            payload,
+        ),
+    ]
+}
+
+fn available_package_text(package: &DaemonAvailablePackage) -> String {
+    let mut parts = vec![
+        format!("entry_id={}", package.entry_id),
+        format!("package={}", package.package_name),
+        format!("version={}", package.version),
+        format!("classification={}", package.classification),
+        format!("source_kind={}", package.source_kind),
+        format!("source_label={}", package.source_label),
+        format!("first_party={}", package.first_party),
+        format!("state={}", package.state),
+        format!(
+            "capabilities={}",
+            capability_text(&package.requested_capabilities)
+        ),
+        format!(
+            "compatibility={}:{}",
+            package.compatibility.result, package.compatibility.botster_requirement
+        ),
+    ];
+    if !package.compatibility.diagnostics.is_empty() {
+        parts.push(format!(
+            "compatibility_diagnostics={}",
+            package.compatibility.diagnostics.join(",")
+        ));
+    }
+    if let Some(pin) = &package.pin {
+        parts.push(format!("pin={}", pin_text(pin)));
+    }
+    parts.join(" ")
+}
+
+fn install_plan_nodes(plan: &DaemonPackageInstallPlan) -> Vec<UiNode> {
+    let mut nodes = vec![node(
+        UiNodeKind::Text,
+        "dogfood-install-plan-summary",
+        json!({
+            "text": format!(
+                "install plan: package={} mutates_registry={} starts_entrypoints={} {}",
+                plan.entry.package_name,
+                plan.mutates_registry,
+                plan.starts_entrypoints,
+                available_package_text(&plan.entry)
+            )
+        }),
+    )];
+    for (index, effect) in plan.effects.iter().enumerate() {
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("dogfood-install-plan-effect-{index}"),
+            json!({ "text": format!("install effect: {}:{}", effect.kind, effect.message) }),
+        ));
+    }
+    for (index, diagnostic) in plan.diagnostics.iter().enumerate() {
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("dogfood-install-plan-diagnostic-{index}"),
+            json!({ "text": format!("install diagnostic: {}", package_diagnostic_text(diagnostic)) }),
+        ));
+    }
+    nodes
+}
+
+fn update_status_nodes(status: &DaemonPackageUpdateStatus) -> Vec<UiNode> {
+    let mut text = format!(
+        "update status: package={} update_available={} reload_required={} restart_required={}",
+        status.package_name,
+        status.update_available,
+        status.reload_required,
+        status.restart_required
+    );
+    if let Some(pin) = &status.pin {
+        text.push_str(&format!(" pin={}", pin_text(pin)));
+    }
+    let mut nodes = vec![node(
+        UiNodeKind::Text,
+        "dogfood-update-status-summary",
+        json!({ "text": text }),
+    )];
+    if let Some(pin) = &status.pin {
+        nodes.push(button(
+            "dogfood-update-status-preview",
+            "Preview update",
+            "botster.tui.package.update_preview",
+            json!({ "package_name": status.package_name, "pin": pin }),
+        ));
+        nodes.push(button(
+            "dogfood-update-status-apply",
+            "Apply update",
+            "botster.tui.package.update_apply",
+            json!({ "package_name": status.package_name, "pin": pin }),
+        ));
+    }
+    for (index, diagnostic) in status.diagnostics.iter().enumerate() {
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("dogfood-update-status-diagnostic-{index}"),
+            json!({ "text": format!("update diagnostic: {}", package_diagnostic_text(diagnostic)) }),
+        ));
+    }
+    nodes
+}
+
+fn availability_state_text(state: DaemonPackageAvailabilityState) -> &'static str {
+    match state {
+        DaemonPackageAvailabilityState::Available => "available",
+        DaemonPackageAvailabilityState::Blocked => "blocked",
+    }
+}
+
+fn availability_reason_text(reason: &DaemonPackageAvailabilityReason) -> String {
+    let mut parts = vec![
+        format!("reason={}", reason.reason),
+        format!("action={}", reason.action),
+    ];
+    if let Some(package_name) = &reason.package_name {
+        parts.push(format!("package={package_name}"));
+    }
+    if let Some(capability) = &reason.capability {
+        parts.push(format!(
+            "capability={}",
+            capability_text(std::slice::from_ref(capability))
+        ));
+    }
+    if let Some(requirement) = &reason.requirement {
+        parts.push(format!("requirement={requirement}"));
+    }
+    parts.join(" ")
+}
+
+fn pin_text(pin: &DaemonPackagePin) -> String {
+    let mut parts = vec![
+        format!("revision={}", pin.revision),
+        format!("update_policy={}", pin.update_policy),
+    ];
+    if let Some(branch) = &pin.branch {
+        parts.push(format!("branch={branch}"));
+    }
+    if let Some(tag) = &pin.tag {
+        parts.push(format!("tag={tag}"));
+    }
+    if let Some(rev) = &pin.rev {
+        parts.push(format!("rev={rev}"));
+    }
+    if let Some(checksum) = &pin.checksum {
+        parts.push(format!("checksum={checksum}"));
+    }
+    parts.join(",")
 }
 
 fn entrypoint_text(entrypoint: &botster_hub_client::DaemonPackageRunnableEntrypoint) -> String {
@@ -1759,7 +2327,7 @@ mod tests {
             ),
         ]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 220);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("packages: 3 installed; 1 enabled"));
@@ -1810,7 +2378,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 180);
         let rendered = lines.join("\n");
 
         assert!(
@@ -1839,7 +2407,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 180);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("entrypoint: workflow.plugin id=web,kind=web,state=failed"));
@@ -1867,7 +2435,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 180);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("id=worker,kind=worker,state=stopped"));
@@ -1900,6 +2468,291 @@ mod tests {
 
         assert!(rendered.contains("id=web,kind=web,state=running"));
         assert!(rendered.contains("id=worker,kind=worker,state=starting"));
+    }
+
+    #[test]
+    fn package_response_renders_hub_resolved_availability_gates_without_local_inference() {
+        let mut app = DogfoodApp::new(None);
+        let mut package = package(
+            "workflow.plugin",
+            "1.0.0",
+            "plugin",
+            "disabled",
+            vec![capability("mcp", Some("tools"))],
+            false,
+        );
+        package.availability = botster_hub_client::DaemonPackageAvailability {
+            state: DaemonPackageAvailabilityState::Blocked,
+            reasons: vec![
+                availability_reason(
+                    "missing_config",
+                    "configure_package",
+                    None,
+                    None,
+                    Some("endpoint"),
+                ),
+                availability_reason(
+                    "missing_auth",
+                    "authenticate",
+                    None,
+                    None,
+                    Some("github_token"),
+                ),
+            ],
+        };
+        package.dependency_availability =
+            vec![botster_hub_client::DaemonPackageDependencyAvailability {
+                id: "dep-db".to_string(),
+                package_name: "database.provider".to_string(),
+                state: DaemonPackageAvailabilityState::Blocked,
+                reasons: vec![
+                    availability_reason(
+                        "missing_package",
+                        "install_package",
+                        Some("database.provider"),
+                        None,
+                        None,
+                    ),
+                    availability_reason(
+                        "disabled_package",
+                        "enable_package",
+                        Some("database.provider"),
+                        None,
+                        None,
+                    ),
+                ],
+            }];
+        package.feature_availability = vec![botster_hub_client::DaemonPackageFeatureAvailability {
+            id: "cloud-sync".to_string(),
+            state: DaemonPackageAvailabilityState::Blocked,
+            reasons: vec![
+                availability_reason(
+                    "missing_provider",
+                    "install_provider",
+                    Some("cloud.provider"),
+                    None,
+                    None,
+                ),
+                availability_reason(
+                    "missing_capability",
+                    "grant_capability",
+                    None,
+                    Some(capability("http", Some("egress"))),
+                    None,
+                ),
+                availability_reason(
+                    "package_disabled",
+                    "enable_package",
+                    Some("workflow.plugin"),
+                    None,
+                    None,
+                ),
+                availability_reason(
+                    "invalid_configuration",
+                    "fix_configuration",
+                    None,
+                    None,
+                    Some("mode"),
+                ),
+            ],
+        }];
+
+        app.apply_response(packages_response(vec![package]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 260);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("availability=blocked"));
+        assert!(rendered.contains(
+            "package blocked: reason=missing_config action=configure_package requirement=endpoint"
+        ));
+        assert!(rendered.contains(
+            "package blocked: reason=missing_auth action=authenticate requirement=github_token"
+        ));
+        assert!(rendered.contains("dependency: id=dep-db package=database.provider state=blocked"));
+        assert!(rendered.contains("dependency blocked: reason=missing_package action=install_package package=database.provider"));
+        assert!(rendered.contains("dependency blocked: reason=disabled_package action=enable_package package=database.provider"));
+        assert!(rendered.contains("feature: id=cloud-sync state=blocked"));
+        assert!(rendered.contains("feature blocked: reason=missing_provider action=install_provider package=cloud.provider"));
+        assert!(rendered.contains("feature blocked: reason=missing_capability action=grant_capability capability=http:egress"));
+        assert!(rendered.contains(
+            "feature blocked: reason=package_disabled action=enable_package package=workflow.plugin"
+        ));
+        assert!(rendered.contains("feature blocked: reason=invalid_configuration action=fix_configuration requirement=mode"));
+    }
+
+    #[test]
+    fn marketplace_lifecycle_responses_render_from_public_dtos_without_paths_or_secrets() {
+        let mut app = DogfoodApp::new(None);
+        let available = available_package();
+        let pin = package_pin();
+        let mut install_plan = botster_hub_client::DaemonPackageInstallPlan {
+            entry: available.clone(),
+            effects: vec![botster_hub_client::DaemonPackageInstallEffect {
+                kind: "write_manifest".to_string(),
+                message: "registry entry will be installed".to_string(),
+            }],
+            diagnostics: vec![package_diagnostic("notice", "install preview ok")],
+            mutates_registry: true,
+            starts_entrypoints: true,
+        };
+        install_plan.entry.pin = Some(pin.clone());
+
+        app.apply_response(available_packages_response(vec![available]));
+        app.apply_response(install_plan_response(install_plan));
+        app.apply_response(update_status_response(
+            botster_hub_client::DaemonPackageUpdateStatus {
+                package_name: "workflow.plugin".to_string(),
+                update_available: true,
+                reload_required: true,
+                restart_required: false,
+                pin: Some(pin),
+                diagnostics: vec![package_diagnostic("warning", "entrypoint restart optional")],
+            },
+        ));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("marketplace: 1 available"));
+        assert!(rendered.contains(
+            "available package: entry_id=workflow-plugin package=workflow.plugin version=1.2.0"
+        ));
+        assert!(rendered.contains("source_kind=registry source_label=first-party catalog"));
+        assert!(rendered.contains("first_party=true state=available capabilities=mcp:tools"));
+        assert!(rendered.contains("compatibility=compatible:>=0.1.0"));
+        assert!(rendered.contains("compatibility_diagnostics=requires current hub"));
+        assert!(rendered.contains("pin=revision=rev-2026,update_policy=manual,branch=main"));
+        assert!(rendered.contains("install plan: package=workflow.plugin"));
+        assert!(rendered.contains("entry_id=workflow-plugin"));
+        assert!(rendered.contains("mutates_registry=true"));
+        assert!(rendered.contains("starts_entrypoints=true"));
+        assert!(
+            rendered.contains("install effect: write_manifest:registry entry will be installed")
+        );
+        assert!(rendered.contains("install diagnostic: notice:install preview ok"));
+        assert!(rendered.contains("update status: package=workflow.plugin update_available=true reload_required=true restart_required=false"));
+        assert!(rendered.contains("update diagnostic: warning:entrypoint restart optional"));
+        assert!(!rendered.contains("/Users/"));
+        assert!(!rendered.contains("/tmp/"));
+        assert!(!rendered.contains("token"));
+    }
+
+    #[test]
+    fn package_decision_response_keeps_action_result_visible_with_refreshed_packages() {
+        let mut app = DogfoodApp::new(None);
+        let mut response = package_decision_response(vec![package(
+            "workflow.plugin",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        )]);
+        response.package_decision = Some(botster_hub_client::DaemonPackageDecision {
+            package_name: "workflow.plugin".to_string(),
+            action: "enable".to_string(),
+            state: "enabled".to_string(),
+            classification: "plugin".to_string(),
+        });
+
+        app.apply_response(response);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 80);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("package: workflow.plugin 1.0.0"));
+        assert!(rendered.contains(
+            "package decision: package=workflow.plugin action=enable state=enabled classification=plugin"
+        ));
+    }
+
+    #[test]
+    fn lifecycle_action_buttons_emit_public_daemon_requests() {
+        let mut app = DogfoodApp::new(None);
+        let pin = package_pin();
+
+        app.handle_action(
+            "botster.tui.package.enable".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin" })),
+        );
+        app.handle_action(
+            "botster.tui.package.disable".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin" })),
+        );
+        app.handle_action(
+            "botster.tui.package.remove".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin" })),
+        );
+        app.handle_action(
+            "botster.tui.package.update_status".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin" })),
+        );
+        app.handle_action(
+            "botster.tui.package.update_preview".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin", "pin": pin.clone() })),
+        );
+        app.handle_action(
+            "botster.tui.package.update_apply".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin", "pin": pin.clone() })),
+        );
+        app.handle_action(
+            "botster.tui.entrypoint.start".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin", "entrypoint_id": "web" })),
+        );
+        app.handle_action(
+            "botster.tui.entrypoint.stop".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin", "entrypoint_id": "web" })),
+        );
+        app.handle_action(
+            "botster.tui.entrypoint.restart".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin", "entrypoint_id": "web" })),
+        );
+        app.handle_action(
+            "botster.tui.entrypoint.status".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin", "entrypoint_id": "web" })),
+        );
+
+        assert_eq!(
+            app.observed_requests,
+            vec![
+                ObservedRequest::EnablePackage("workflow.plugin".to_string()),
+                ObservedRequest::DisablePackage("workflow.plugin".to_string()),
+                ObservedRequest::RemovePackage("workflow.plugin".to_string()),
+                ObservedRequest::CheckPackageUpdate("workflow.plugin".to_string()),
+                ObservedRequest::PreviewPackageUpdate {
+                    package_name: "workflow.plugin".to_string(),
+                    pin: pin.clone(),
+                },
+                ObservedRequest::ApplyPackageUpdate {
+                    package_name: "workflow.plugin".to_string(),
+                    pin,
+                },
+                ObservedRequest::StartPackageEntrypoint {
+                    package_name: "workflow.plugin".to_string(),
+                    entrypoint_id: "web".to_string(),
+                },
+                ObservedRequest::StopPackageEntrypoint {
+                    package_name: "workflow.plugin".to_string(),
+                    entrypoint_id: "web".to_string(),
+                },
+                ObservedRequest::RestartPackageEntrypoint {
+                    package_name: "workflow.plugin".to_string(),
+                    entrypoint_id: "web".to_string(),
+                },
+                ObservedRequest::PackageEntrypointStatus {
+                    package_name: "workflow.plugin".to_string(),
+                    entrypoint_id: "web".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2742,6 +3595,24 @@ mod tests {
         response
     }
 
+    fn available_packages_response(packages: Vec<DaemonAvailablePackage>) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::AvailablePackages);
+        response.available_packages = packages;
+        response
+    }
+
+    fn install_plan_response(plan: DaemonPackageInstallPlan) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PackageInstallPlan);
+        response.install_plan = Some(plan);
+        response
+    }
+
+    fn update_status_response(status: DaemonPackageUpdateStatus) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PackageUpdateStatus);
+        response.update_status = Some(status);
+        response
+    }
+
     fn package(
         package_name: &str,
         version: &str,
@@ -2756,8 +3627,12 @@ mod tests {
             classification: classification.to_string(),
             state: state.to_string(),
             requested_capabilities,
+            surfaces: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: botster_hub_client::DaemonPackageConfiguration::default(),
+            availability: botster_hub_client::DaemonPackageAvailability::default(),
+            dependency_availability: Vec::new(),
+            feature_availability: Vec::new(),
             provider_profile_admitted,
         }
     }
@@ -2877,6 +3752,54 @@ mod tests {
         }
     }
 
+    fn availability_reason(
+        reason: &str,
+        action: &str,
+        package_name: Option<&str>,
+        capability: Option<botster_hub_client::DaemonCapability>,
+        requirement: Option<&str>,
+    ) -> DaemonPackageAvailabilityReason {
+        DaemonPackageAvailabilityReason {
+            reason: reason.to_string(),
+            action: action.to_string(),
+            package_name: package_name.map(str::to_string),
+            capability,
+            requirement: requirement.map(str::to_string),
+        }
+    }
+
+    fn available_package() -> DaemonAvailablePackage {
+        DaemonAvailablePackage {
+            entry_id: "workflow-plugin".to_string(),
+            package_name: "workflow.plugin".to_string(),
+            version: "1.2.0".to_string(),
+            classification: "plugin".to_string(),
+            source_kind: "registry".to_string(),
+            source_label: "first-party catalog".to_string(),
+            first_party: true,
+            state: "available".to_string(),
+            requested_capabilities: vec![capability("mcp", Some("tools"))],
+            compatibility: botster_hub_client::DaemonPackageCompatibility {
+                botster_requirement: ">=0.1.0".to_string(),
+                hub_version: "0.1.0".to_string(),
+                result: "compatible".to_string(),
+                diagnostics: vec!["requires current hub".to_string()],
+            },
+            pin: Some(package_pin()),
+        }
+    }
+
+    fn package_pin() -> DaemonPackagePin {
+        DaemonPackagePin {
+            revision: "rev-2026".to_string(),
+            branch: Some("main".to_string()),
+            tag: None,
+            rev: Some("3c7a448".to_string()),
+            checksum: None,
+            update_policy: "manual".to_string(),
+        }
+    }
+
     fn capability(surface: &str, scope: Option<&str>) -> botster_hub_client::DaemonCapability {
         botster_hub_client::DaemonCapability {
             surface: surface.to_string(),
@@ -2923,6 +3846,9 @@ mod tests {
             status: None,
             sessions: Vec::new(),
             packages: Vec::new(),
+            available_packages: Vec::new(),
+            install_plan: None,
+            update_status: None,
             package_decision: None,
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
