@@ -117,6 +117,35 @@ plugin surface render/action capabilities for this path. A running but
 incompatible hub is reported as a compatibility mismatch instead of being
 collapsed into the generic unavailable/reconnecting state.
 
+## Local Package
+
+`botster-tui` declares a first-party local package manifest in
+`botster-package.json`. The package exposes one runnable entrypoint, `tui`, as a
+`terminal_app` with `foreground_stdio` launch mode. It is a foreground terminal
+client contract, not a background supervised web process.
+
+For source-checkout dogfood, build the binary and install the checkout as a
+local package:
+
+```sh
+cargo build -p botster-tui
+botster-hub packages install --path <botster-tui checkout>
+```
+
+The future app-open flow should launch the checked-in runnable entrypoint and
+inject the hub socket as the `--hub-socket` value while also declaring the hub
+connection and package data directory expectations:
+
+```sh
+botster-hub apps open botster-tui tui
+```
+
+Until that app-open launcher exists, use the direct foreground dogfood command:
+
+```sh
+BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" cargo run -p botster-tui
+```
+
 There is also an automated isolated-hub test using the merged
 `botster-hub-test-support` crate. The preferred command builds matching
 `botster-hub` and `botster-session-worker` binaries from the pinned git

@@ -136,7 +136,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=8f2f4acf7e9b73f4ff777151bfb55284871f8bdd#8f2f4acf7e9b73f4ff777151bfb55284871f8bdd"
+source = "git+https://github.com/trybotster/botster-core.git?rev=42538009bc6f6291872c5657bedbe7370f504f8d#42538009bc6f6291872c5657bedbe7370f504f8d"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=8f2f4acf7e9b73f4ff777151bfb55284871f8bdd#8f2f4acf7e9b73f4ff777151bfb55284871f8bdd"
+source = "git+https://github.com/trybotster/botster-core.git?rev=42538009bc6f6291872c5657bedbe7370f504f8d#42538009bc6f6291872c5657bedbe7370f504f8d"
 dependencies = [
  "botster-core",
  "serde",
