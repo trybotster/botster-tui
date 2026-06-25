@@ -1,0 +1,67 @@
+{
+  "name": "botster-tui",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": null,
+  "capabilities": [],
+  "entrypoints": [],
+  "runnable_entrypoints": [
+    {
+      "id": "tui",
+      "kind": "terminal_app",
+      "launch_mode": "foreground_stdio",
+      "command": "target/debug/botster-tui",
+      "args": ["--hub-socket", "{{hub_socket}}"],
+      "working_directory": {
+        "policy": "package_root"
+      },
+      "injections": [
+        {
+          "kind": "hub_connection",
+          "target": {
+            "type": "environment",
+            "name": "BOTSTER_HUB_CONNECTION"
+          },
+          "required": true,
+          "description": "Hub connection descriptor supplied by the host."
+        },
+        {
+          "kind": "data_dir",
+          "target": {
+            "type": "environment",
+            "name": "BOTSTER_PACKAGE_DATA_DIR"
+          },
+          "required": true,
+          "description": "Package data directory supplied by the host."
+        },
+        {
+          "kind": "hub_socket",
+          "target": {
+            "type": "argument",
+            "value": "{{hub_socket}}"
+          },
+          "required": true,
+          "description": "Hub socket supplied by the host as the --hub-socket value."
+        }
+      ],
+      "environment": [
+        {
+          "name": "BOTSTER_HUB_SOCKET",
+          "required": false,
+          "description": "Fallback hub socket environment variable consumed by botster-tui when --hub-socket is not supplied."
+        },
+        {
+          "name": "BOTSTER_HUB_CONNECTION",
+          "required": true,
+          "description": "Host-selected hub connection descriptor."
+        },
+        {
+          "name": "BOTSTER_PACKAGE_DATA_DIR",
+          "required": true,
+          "description": "Host-selected package data directory."
+        }
+      ]
+    }
+  ]
+}
