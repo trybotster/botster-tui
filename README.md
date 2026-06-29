@@ -1,13 +1,17 @@
 # botster-tui
 
 `botster-tui` is the first-party Rust terminal client scaffold for Botster.
-It is a renderer/client over hub and core APIs, not a policy owner.
+It is a hub client over core APIs and the shared TUI renderer kit, not a policy
+owner.
 
 ## Role
 
-This crate consumes the shared Botster UI contract from `botster-core`:
+This crate consumes the shared Botster UI contract from `botster-core` and the
+reusable Ratatui/Crossterm mechanics from `botster-tui-kit`:
 
-- Render `UiNode` trees with ratatui widgets.
+- Render `UiNode` trees with kit-owned ratatui widgets.
+- Route keyboard, mouse, form, list, and terminal input through the kit-owned
+  input router.
 - Emit semantic action requests instead of owning workflow behavior.
 - Consume entity frames for client-visible model state.
 - Display `terminal_view` output and forward terminal input through the shared
@@ -21,11 +25,12 @@ control-key input passthrough across attach and reattach paths.
 
 ## Foundation
 
-This scaffold uses ratatui `0.30.1` and crossterm `0.29.0` on Rust 2024 with
-`rust-version = "1.88.0"`. Project Pipelines dependency ticket
-`ticket_1780941198_279684` was closed with no known blocker in the current
-pipeline context, so ratatui plus crossterm is the accepted foundation for this
-scaffold.
+This scaffold uses `botster-tui-kit` pinned to merged main revision
+`4fad1ad4ab23ee669291d7045bfcdfb9fb67fbea`. The kit owns reusable
+Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
+input forwarding. `botster-tui` owns the first-party hub client app, including
+hub connection setup, dogfood state, sessions, packages, installed apps,
+marketplace diagnostics, and terminal attach/input/resize/drain behavior.
 
 ## Commands
 
@@ -184,15 +189,12 @@ Included now:
 - Root Cargo workspace.
 - One binary client crate at `crates/botster-tui`.
 - A real binary entry point with a noninteractive `--smoke` path.
-- A first ratatui renderer registry for shared `botster-core` `UiNode`
-  primitives: stack/inline/panel/scroll_area/text/badge/status_dot/empty_state,
-  list/list_item, table-as-list fallback, button actions, form inputs,
-  field errors, dialog, and safe unsupported fallback.
-- Core UI renderer conformance fixture coverage through
-  `botster-core-test-support` with `default-features = false`.
+- Consumption of `botster-tui-kit` for shared `botster-core` `UiNode`
+  rendering and input routing mechanics.
 - A runtime draw path that renders the session dogfood surface as shared
-  `UiNode`, routes semantic actions through the renderer hit map, reflects
-  visible form drafts, and displays terminal bytes inside `terminal_view`.
+  `UiNode`, routes semantic actions through the kit hit map/input router,
+  reflects visible form drafts, and displays terminal bytes inside
+  `terminal_view`.
 - Hub session spawn, attach, terminal input, resize, drain, reconnect, and
   validation/error states through `botster-hub-client`.
 - Automated isolated-hub bring-up and teardown coverage when matching hub

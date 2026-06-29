@@ -141,7 +141,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) -> io::Result<()> {
     let mut app = DogfoodApp::new(args.hub_socket);
-    let mut router = InputRouter::new();
+    let mut router = InputRouter::new(renderer::action_request_context());
     loop {
         app.poll_hub();
         app.set_drafts(router.draft_values());
@@ -3119,7 +3119,7 @@ mod tests {
 
         app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
             request_id: botster_core::RequestId("req-config-submit".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::DEMO_SURFACE_ID.to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
             action_id: botster_core::ui::UiActionId(
                 "botster.tui.package_config.submit".to_string(),
             ),
@@ -3453,7 +3453,7 @@ mod tests {
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
-        let mut router = InputRouter::new();
+        let mut router = InputRouter::new(renderer::action_request_context());
         let first_row = hit_map
             .regions()
             .iter()
@@ -3536,7 +3536,7 @@ mod tests {
 
         app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
             request_id: botster_core::RequestId("req-attach-exited".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::DEMO_SURFACE_ID.to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
             action_id: botster_core::ui::UiActionId("botster.tui.attach".to_string()),
             node_id: Some(UiNodeId("dogfood-session-session-beta-attach".to_string())),
             kind: botster_core::ui::UiActionKind::Submit,
@@ -3560,7 +3560,7 @@ mod tests {
         }];
         app.selected_session = Some("session-beta".to_string());
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
-        let mut router = InputRouter::new();
+        let mut router = InputRouter::new(renderer::action_request_context());
         let session_row = hit_map
             .regions()
             .iter()
@@ -3607,7 +3607,7 @@ mod tests {
 
         app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
             request_id: botster_core::RequestId("req-terminal-focus".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::DEMO_SURFACE_ID.to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
             action_id: botster_core::ui::UiActionId("botster.terminal.focus".to_string()),
             node_id: Some(UiNodeId("dogfood-terminal".to_string())),
             kind: botster_core::ui::UiActionKind::Submit,
