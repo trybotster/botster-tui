@@ -12,6 +12,9 @@ hub_root="$(cd "$(dirname "$hub_client_manifest")/../.." && pwd)"
 
 cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked --bin botster-hub
 cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked -p botster-core --bin botster-session-worker
+cargo build -p botster-tui --target-dir "$target_dir" --locked
+mkdir -p target/debug
+cp "$target_dir/debug/botster-tui" target/debug/botster-tui
 
 BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
 BOTSTER_ENV=test \
