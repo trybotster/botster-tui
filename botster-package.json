@@ -5,14 +5,20 @@
   "botster": ">=0.1.0",
   "source": null,
   "capabilities": [],
-  "entrypoints": [],
+  "entrypoints": [
+    {
+      "runtime": "lua",
+      "path": "plugin.lua",
+      "bootstrap": false
+    }
+  ],
   "runnable_entrypoints": [
     {
       "id": "tui",
       "kind": "terminal_app",
       "launch_mode": "foreground_stdio",
       "command": "target/debug/botster-tui",
-      "args": ["--hub-socket", "{{hub_socket}}"],
+      "args": [],
       "working_directory": {
         "policy": "package_root"
       },
@@ -21,28 +27,28 @@
           "kind": "hub_connection",
           "target": {
             "type": "environment",
-            "name": "BOTSTER_HUB_CONNECTION"
+            "name": "BOTSTER_HUB_SOCKET"
           },
           "required": true,
-          "description": "Hub connection descriptor supplied by the host."
+          "description": "Hub socket supplied by the host."
         },
         {
           "kind": "data_dir",
           "target": {
             "type": "environment",
-            "name": "BOTSTER_PACKAGE_DATA_DIR"
+            "name": "BOTSTER_HUB_DATA_DIR"
           },
           "required": true,
-          "description": "Package data directory supplied by the host."
+          "description": "Hub data directory supplied by the host."
         },
         {
           "kind": "hub_socket",
           "target": {
-            "type": "argument",
-            "value": "{{hub_socket}}"
+            "type": "environment",
+            "name": "BOTSTER_HUB_SOCKET"
           },
           "required": true,
-          "description": "Hub socket supplied by the host as the --hub-socket value."
+          "description": "Hub socket supplied by the host."
         }
       ],
       "environment": [
@@ -53,13 +59,13 @@
         },
         {
           "name": "BOTSTER_HUB_CONNECTION",
-          "required": true,
-          "description": "Host-selected hub connection descriptor."
+          "required": false,
+          "description": "Legacy host-selected hub connection descriptor."
         },
         {
-          "name": "BOTSTER_PACKAGE_DATA_DIR",
+          "name": "BOTSTER_HUB_DATA_DIR",
           "required": true,
-          "description": "Host-selected package data directory."
+          "description": "Host-selected hub data directory."
         }
       ]
     }

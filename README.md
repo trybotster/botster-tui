@@ -51,7 +51,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`b91d774f31fabe1d8f0d28d538dca8e372988298`. The protocol source is
+`b5f80286605fcb1e432e5b673b506fa124739728`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -145,18 +145,26 @@ local package:
 
 ```sh
 cargo build -p botster-tui
-botster-hub packages install --path <botster-tui checkout>
+botster-hub packages install --data-dir "$hub_dir" --path <botster-tui checkout>
+botster-hub packages enable --data-dir "$hub_dir" botster-tui
 ```
 
-The future app-open flow should launch the checked-in runnable entrypoint and
-inject the hub socket as the `--hub-socket` value while also declaring the hub
-connection and package data directory expectations:
+The manifest command is `target/debug/botster-tui` relative to the package root,
+so source-checkout installs must build or stage that debug binary before
+opening the app. `script/test-live-hub` does this staging when it uses an
+external `CARGO_TARGET_DIR`.
+
+The app-open flow launches the checked-in runnable entrypoint through the
+hub-resolved foreground terminal contract. The hub supplies canonical
+foreground launch environment such as `BOTSTER_HUB_SOCKET` and
+`BOTSTER_HUB_DATA_DIR`, and the TUI consumes both launch inputs:
 
 ```sh
-botster-hub apps open botster-tui tui
+botster-hub apps open --data-dir "$hub_dir" botster-tui
 ```
 
-Until that app-open launcher exists, use the direct foreground dogfood command:
+For lower-level client debugging, the direct foreground dogfood command remains
+available:
 
 ```sh
 BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" cargo run -p botster-tui
@@ -166,7 +174,9 @@ There is also an automated isolated-hub test using the merged
 `botster-hub-test-support` crate. The preferred command builds matching
 `botster-hub` and `botster-session-worker` binaries from the pinned git
 dependencies, starts an isolated daemon, runs the TUI dogfood path, and tears
-the daemon down:
+the daemon down. It also installs/enables this checkout as a local package and
+opens `botster-tui` through `botster-hub apps open` with a headless dogfood env
+switch so the foreground app exits cleanly under automation:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/botster-tui-impl-target script/test-live-hub

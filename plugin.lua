@@ -1,0 +1,1 @@
+return botster.register({})
