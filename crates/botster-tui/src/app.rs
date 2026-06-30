@@ -40,6 +40,7 @@ const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 pub struct AppArgs {
     pub smoke: bool,
     pub hub_socket: Option<PathBuf>,
+    pub hub_data_dir: Option<PathBuf>,
     pub headless_dogfood: bool,
 }
 
@@ -54,11 +55,20 @@ impl AppArgs {
                 "--hub-socket" => {
                     parsed.hub_socket = iter.next().map(PathBuf::from);
                 }
+                "--data-dir" => {
+                    parsed.hub_data_dir = iter.next().map(PathBuf::from);
+                }
                 _ => {}
             }
         }
         if parsed.hub_socket.is_none() {
             parsed.hub_socket = std::env::var_os("BOTSTER_HUB_SOCKET").map(PathBuf::from);
+        }
+        if parsed.hub_data_dir.is_none() {
+            parsed.hub_data_dir = std::env::var_os("BOTSTER_HUB_DATA_DIR").map(PathBuf::from);
+        }
+        if std::env::var_os("BOTSTER_TUI_HEADLESS_DOGFOOD").is_some() {
+            parsed.headless_dogfood = true;
         }
         parsed
     }
@@ -1710,6 +1720,14 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
     let Some(socket) = args.hub_socket else {
         return Err(DaemonTransportError::NotRunning);
     };
+    if let Some(data_dir) = args.hub_data_dir.as_ref() {
+        if !data_dir.is_dir() {
+            return Err(DaemonTransportError::Protocol(
+                "injected hub data dir is not a directory",
+            ));
+        }
+        println!("hub-data-dir: configured");
+    }
     let mut app = DogfoodApp::new(Some(socket));
     app.command = DEFAULT_COMMAND.to_string();
     app.spawn_session();
@@ -2378,10 +2396,13 @@ mod tests {
         let args = AppArgs::parse([
             "--hub-socket".to_string(),
             "target/hub.sock".to_string(),
+            "--data-dir".to_string(),
+            "target/hub-data".to_string(),
             "--headless-dogfood".to_string(),
         ]);
 
         assert_eq!(args.hub_socket, Some(PathBuf::from("target/hub.sock")));
+        assert_eq!(args.hub_data_dir, Some(PathBuf::from("target/hub-data")));
         assert!(args.headless_dogfood);
     }
 
@@ -3726,7 +3747,7 @@ mod tests {
 
         let root = PathBuf::from(format!("/tmp/bt{}", short_suffix() % 1_000_000));
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(hub_bin)
+            .hub_bin(&hub_bin)
             .session_worker_bin(session_worker_bin)
             .root(&root)
             .name("botster-tui-headless-dogfood")
@@ -3736,9 +3757,84 @@ mod tests {
         run_headless_dogfood(AppArgs {
             smoke: false,
             hub_socket: Some(hub.endpoint().socket_path.clone()),
+            hub_data_dir: Some(hub.data_dir().to_path_buf()),
             headless_dogfood: true,
         })
         .expect("headless dogfood surface completes a real hub round trip");
+
+        let foreground_conformance =
+            botster_hub_test_support::run_foreground_terminal_app_open_conformance(&hub)
+                .expect("foreground terminal app-open conformance passes");
+        assert!(foreground_conformance.hub_socket_env_present);
+        assert!(foreground_conformance.hub_data_dir_env_present);
+        assert_eq!(foreground_conformance.real_hub_action_operation, "status");
+
+        let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let data_dir = hub.data_dir().to_string_lossy().to_string();
+        let package_root = package_root.to_string_lossy().to_string();
+        let package_open_output = std::process::Command::new(&hub_bin)
+            .args([
+                "packages",
+                "install",
+                "--data-dir",
+                data_dir.as_str(),
+                "--path",
+                package_root.as_str(),
+            ])
+            .output()
+            .expect("run packages install for botster-tui checkout");
+        assert!(
+            package_open_output.status.success(),
+            "packages install failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&package_open_output.stdout),
+            String::from_utf8_lossy(&package_open_output.stderr)
+        );
+        let package_enable_output = std::process::Command::new(&hub_bin)
+            .args([
+                "packages",
+                "enable",
+                "--data-dir",
+                data_dir.as_str(),
+                "botster-tui",
+            ])
+            .output()
+            .expect("run packages enable for botster-tui checkout");
+        assert!(
+            package_enable_output.status.success(),
+            "packages enable failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&package_enable_output.stdout),
+            String::from_utf8_lossy(&package_enable_output.stderr)
+        );
+        let app_open_output = std::process::Command::new(&hub_bin)
+            .args([
+                "apps",
+                "open",
+                "--data-dir",
+                data_dir.as_str(),
+                "botster-tui",
+            ])
+            .env("BOTSTER_TUI_HEADLESS_DOGFOOD", "1")
+            .output()
+            .expect("run apps open for botster-tui package");
+        assert!(
+            app_open_output.status.success(),
+            "apps open failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&app_open_output.stdout),
+            String::from_utf8_lossy(&app_open_output.stderr)
+        );
+        let app_open_stdout = String::from_utf8_lossy(&app_open_output.stdout);
+        assert!(
+            app_open_stdout.contains("terminal-output: echo:botster-tui-headless"),
+            "apps open stdout={} stderr={}",
+            app_open_stdout,
+            String::from_utf8_lossy(&app_open_output.stderr)
+        );
+        assert!(
+            app_open_stdout.contains("hub-data-dir: configured"),
+            "apps open stdout={} stderr={}",
+            app_open_stdout,
+            String::from_utf8_lossy(&app_open_output.stderr)
+        );
 
         let mut requirement = tui_compatibility_requirement();
         requirement
@@ -3908,6 +4004,7 @@ mod tests {
             package_name: package_name.to_string(),
             version: version.to_string(),
             classification: classification.to_string(),
+            source_kind: "local".to_string(),
             state: state.to_string(),
             requested_capabilities,
             surfaces: Vec::new(),
@@ -4194,7 +4291,11 @@ mod tests {
             kind,
             status: None,
             sessions: Vec::new(),
+            session_templates: Vec::new(),
+            resolved_session_template: None,
+            session_context: None,
             apps: Vec::new(),
+            resolved_app_launch: None,
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
