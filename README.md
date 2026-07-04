@@ -26,7 +26,7 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 This scaffold uses `botster-tui-kit` pinned to merged main revision
-`4fad1ad4ab23ee669291d7045bfcdfb9fb67fbea`. The kit owns reusable
+`327dc64a540108cba7ce760255aa5759290292b9`. The kit owns reusable
 Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
 input forwarding. `botster-tui` owns the first-party hub client app, including
 hub connection setup, dogfood state, sessions, packages, installed apps,
