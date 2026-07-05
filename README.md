@@ -51,7 +51,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`b5f80286605fcb1e432e5b673b506fa124739728`. The protocol source is
+`27118ab75f4ff511ccdfcfa754f74b878c0b9b45`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -102,6 +102,9 @@ hub probes. The hub panel distinguishes:
   including string, boolean, select, multiline text, and secret-placeholder
   fields, required/missing state, package-level diagnostics, and update
   submission through the hub daemon;
+- plugin app/settings route rows from public package/app DTOs, and hub-delivered
+  plugin surface/action responses rendered through the shared TUI `UiNode`
+  renderer path;
 - connected, terminal stream unavailable, action failure, and startup
   diagnostics from public `DaemonDiagnostic` rows on status, response, operator
   error, and compatibility error payloads;
@@ -132,6 +135,15 @@ terminal surface: sessions, terminal streaming, and resize. It does not require
 plugin surface render/action capabilities for this path. A running but
 incompatible hub is reported as a compatibility mismatch instead of being
 collapsed into the generic unavailable/reconnecting state.
+
+The live-hub smoke also runs the hub-owned plugin contract matrix harness from
+`botster-hub-test-support`, then independently requests the real fixture's
+app, empty, and settings surfaces through `botster-hub-client`. Those delivered
+surface bodies are deserialized to `botster_core::ui::UiNode`, validated against
+the core contract, checked against TUI renderer capabilities, and rendered with
+the production TUI kit. Unsupported client primitives fail with the
+capability-validation diagnostic, including the node id and primitive, instead
+of being treated as a passing render.
 
 ## Local Package
 
@@ -173,10 +185,12 @@ BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" cargo run -p botster-tui
 There is also an automated isolated-hub test using the merged
 `botster-hub-test-support` crate. The preferred command builds matching
 `botster-hub` and `botster-session-worker` binaries from the pinned git
-dependencies, starts an isolated daemon, runs the TUI dogfood path, and tears
-the daemon down. It also installs/enables this checkout as a local package and
-opens `botster-tui` through `botster-hub apps open` with a headless dogfood env
-switch so the foreground app exits cleanly under automation:
+dependencies, starts an isolated daemon, runs the TUI dogfood path, runs the
+plugin contract matrix conformance harness, renders the delivered fixture
+surfaces through the TUI renderer, and tears the daemon down. It also
+installs/enables this checkout as a local package and opens `botster-tui`
+through `botster-hub apps open` with a headless dogfood env switch so the
+foreground app exits cleanly under automation:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/botster-tui-impl-target script/test-live-hub

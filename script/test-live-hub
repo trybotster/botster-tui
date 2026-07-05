@@ -9,6 +9,7 @@ hub_client_manifest="$(
     ruby -rjson -e 'metadata = JSON.parse(STDIN.read); package = metadata["packages"].find { |entry| entry["name"] == "botster-hub-client" }; abort "botster-hub-client dependency not found" unless package; puts package["manifest_path"]'
 )"
 hub_root="$(cd "$(dirname "$hub_client_manifest")/../.." && pwd)"
+contract_matrix_fixture="$hub_root/fixtures/plugins/plugin-contract-matrix"
 
 cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked --bin botster-hub
 cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked -p botster-core --bin botster-session-worker
@@ -20,5 +21,6 @@ BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
 BOTSTER_ENV=test \
 BOTSTER_HUB_BIN="$hub_target_dir/debug/botster-hub" \
 BOTSTER_SESSION_WORKER_BIN="$hub_target_dir/debug/botster-session-worker" \
+BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="$contract_matrix_fixture" \
 CARGO_TARGET_DIR="$target_dir" \
 cargo test -p botster-tui headless_dogfood_runs_against_isolated_hub_when_binaries_are_available -- --nocapture
