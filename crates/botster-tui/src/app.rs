@@ -11,10 +11,10 @@ use botster_hub_client::{
     DaemonApp, DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityRequirement,
     DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonPackage,
     DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
-    DaemonPackagePin, DaemonPackageUpdateStatus, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonTransportError, DaemonTransportResult, FEATURE_RESIZE, FEATURE_SESSIONS,
-    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
-    read_frame_from_reader, write_frame,
+    DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
+    FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_STREAMING, PROTOCOL,
+    connect_and_hello_with_requirement, read_frame_from_reader, write_frame,
 };
 use crossterm::{
     cursor::Show,
@@ -203,6 +203,8 @@ struct DogfoodApp {
     install_plan: Option<DaemonPackageInstallPlan>,
     update_status: Option<DaemonPackageUpdateStatus>,
     package_decision: Option<botster_hub_client::DaemonPackageDecision>,
+    plugin_surface: Option<DaemonPluginSurface>,
+    plugin_action_result: Option<Value>,
     sessions: Vec<SessionRow>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -236,6 +238,8 @@ impl DogfoodApp {
             install_plan: None,
             update_status: None,
             package_decision: None,
+            plugin_surface: None,
+            plugin_action_result: None,
             sessions: Vec::new(),
             selected_session: None,
             attached_session: None,
@@ -806,7 +810,10 @@ impl DogfoodApp {
 
         if let Some(error) = response.error {
             self.record_diagnostics(error.diagnostics);
-            self.error = Some(error.message);
+            self.error = Some(format!(
+                "{} (code={} operation={})",
+                error.message, error.code, error.operation
+            ));
             return;
         }
 
@@ -866,6 +873,12 @@ impl DogfoodApp {
         }
         if matches!(response.kind, DaemonResponseKind::PackageDecision) {
             self.package_decision = response.package_decision;
+        }
+        if matches!(response.kind, DaemonResponseKind::PluginSurface) {
+            self.plugin_surface = response.plugin_surface;
+        }
+        if matches!(response.kind, DaemonResponseKind::PluginActionResult) {
+            self.plugin_action_result = response.plugin_action_result;
         }
 
         for event in response.events {
@@ -1018,6 +1031,7 @@ impl DogfoodApp {
                         .into_iter()
                         .map(child),
                 );
+                children.extend(package_route_nodes(package, index).into_iter().map(child));
                 children.extend(package_action_nodes(package, index).into_iter().map(child));
                 for (entrypoint_index, entrypoint) in
                     package.runnable_entrypoints.iter().enumerate()
@@ -1095,6 +1109,21 @@ impl DogfoodApp {
                         decision.classification
                     )
                 }),
+            )));
+        }
+        if let Some(surface) = &self.plugin_surface {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-plugin-surface",
+                json!({ "text": format!("plugin surface: {}", plugin_surface_text(surface)) }),
+            )));
+            children.extend(plugin_surface_nodes(surface).into_iter().map(child));
+        }
+        if let Some(result) = &self.plugin_action_result {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-plugin-action-result",
+                json!({ "text": format!("plugin action result: {}", plugin_action_result_text(result)) }),
             )));
         }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
@@ -1182,6 +1211,13 @@ impl DogfoodApp {
                 )
                 .into_iter(),
             );
+            if let Some(route) = &app.route {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-app-{app_index}-route"),
+                    json!({ "text": format!("app route: {}", route_text(route)) }),
+                ));
+            }
         }
         nodes
     }
@@ -1879,6 +1915,7 @@ fn diagnostic_text(diagnostic: &DaemonDiagnostic) -> String {
         DaemonDiagnosticKind::TerminalStreamUnavailable => "terminal_stream_unavailable",
         DaemonDiagnosticKind::ActionFailure => "action_failure",
         DaemonDiagnosticKind::DaemonStartupFailure => "daemon_startup_failure",
+        DaemonDiagnosticKind::Backpressure => "backpressure",
     };
     let mut parts = vec![label.to_string()];
     if let Some(operation) = &diagnostic.operation {
@@ -1988,6 +2025,43 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
         }
     }
     nodes
+}
+
+fn package_route_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
+    package
+        .routes
+        .iter()
+        .enumerate()
+        .map(|(route_index, route)| {
+            node(
+                UiNodeKind::Text,
+                &format!("dogfood-package-{index}-route-{route_index}"),
+                json!({ "text": format!("package route: {}", route_text(route)) }),
+            )
+        })
+        .collect()
+}
+
+fn route_text(route: &DaemonPackageRouteDescriptor) -> String {
+    let mut parts = vec![
+        format!("package={}", route.package_name),
+        format!("route_id={}", route.route_id),
+        format!("path={}", route.route_path),
+        format!("target={}", route.target.kind),
+        format!("enabled={}", route.enabled),
+        format!("blocked={}", route.blocked),
+        format!("supports_settings={}", route.supports_settings),
+    ];
+    if let Some(surface_id) = &route.surface_id {
+        parts.push(format!("surface_id={surface_id}"));
+    }
+    if let Some(target_surface_id) = &route.target.surface_id {
+        parts.push(format!("target_surface_id={target_surface_id}"));
+    }
+    if let Some(app_id) = &route.app_id {
+        parts.push(format!("app_id={app_id}"));
+    }
+    parts.join(" ")
 }
 
 fn package_action_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
@@ -2117,6 +2191,86 @@ fn app_launch_target_text(app: &DaemonApp) -> String {
         }
     }
     parts.join(" ")
+}
+
+fn plugin_surface_text(surface: &DaemonPluginSurface) -> String {
+    let body_id = surface
+        .body
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let body_kind = surface
+        .body
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    format!(
+        "package={} surface={} kind={} node_id={}",
+        surface.package_name, surface.surface_id, body_kind, body_id
+    )
+}
+
+fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
+    let Some(root) = plugin_surface_body_node(surface).ok() else {
+        return vec![node(
+            UiNodeKind::Text,
+            "dogfood-plugin-surface-invalid",
+            json!({ "text": "plugin surface render: invalid UiNode body" }),
+        )];
+    };
+    let (lines, _) = botster_tui_kit::render_to_lines(&root, 120, 20)
+        .expect("validated plugin surface should render in test backend");
+    vec![node(
+        UiNodeKind::Text,
+        "dogfood-plugin-surface-rendered",
+        json!({ "text": format!("plugin surface render: {}", lines.join(" | ")) }),
+    )]
+}
+
+fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, String> {
+    let node: UiNode = serde_json::from_value(surface.body.clone()).map_err(|error| {
+        format!(
+            "plugin surface {}:{} failed UiNode deserialize: {error}",
+            surface.package_name, surface.surface_id
+        )
+    })?;
+    node.validate().map_err(|error| {
+        format!(
+            "plugin surface {}:{} failed UiNode validate: {error}",
+            surface.package_name, surface.surface_id
+        )
+    })?;
+    renderer::tui_capabilities()
+        .validate_node(&node)
+        .map_err(|error| {
+            format!(
+                "plugin surface {}:{} unsupported TUI primitive: {error}",
+                surface.package_name, surface.surface_id
+            )
+        })?;
+    Ok(node)
+}
+
+fn plugin_action_result_text(result: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(state) = result.get("state").and_then(Value::as_str) {
+        parts.push(format!("state={state}"));
+    }
+    if let Some(request_id) = result.get("request_id").and_then(Value::as_str) {
+        parts.push(format!("request_id={request_id}"));
+    }
+    if let Some(message) = result
+        .get("normalized_values")
+        .and_then(|values| values.get("message"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("message={message}"));
+    }
+    if parts.is_empty() {
+        "unstructured".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 fn action_state_nodes(
@@ -2619,6 +2773,87 @@ mod tests {
         assert!(rendered.contains("launch target: kind=terminal_app local_url=not_applicable open=use hub-provided terminal app action when available"));
         assert!(rendered.contains("app action: action_id=open status=available request=type=start_entrypoint,package=botster-tui,entrypoint_id=tui"));
         assert!(!rendered.contains("http://"));
+    }
+
+    #[test]
+    fn package_and_app_routes_render_from_public_dtos() {
+        let mut app = DogfoodApp::new(None);
+        let route = plugin_contract_app_route();
+        let mut package = package(
+            "botster.plugin-contract-matrix",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.routes = vec![route.clone(), plugin_contract_settings_route()];
+        let mut app_row = terminal_app();
+        app_row.package_name = "botster.plugin-contract-matrix".to_string();
+        app_row.app_id = "contract.app".to_string();
+        app_row.entrypoint_id = "contract.app".to_string();
+        app_row.kind = "plugin_surface".to_string();
+        app_row.launch_mode = "host_route".to_string();
+        app_row.route = Some(route);
+
+        app.apply_response(packages_response(vec![package]));
+        app.apply_response(apps_response(vec![app_row]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(
+            "package route: package=botster.plugin-contract-matrix route_id=surface:contract.app"
+        ));
+        assert!(
+            rendered
+                .contains("path=/packages/botster.plugin-contract-matrix/surfaces/contract.app")
+        );
+        assert!(rendered.contains("target=plugin_surface"));
+        assert!(rendered.contains("target_surface_id=contract.app"));
+        assert!(rendered.contains("route_id=settings"));
+        assert!(rendered.contains("supports_settings=true"));
+        assert!(rendered.contains("app route: package=botster.plugin-contract-matrix"));
+    }
+
+    #[test]
+    fn plugin_surface_and_action_results_render_from_public_dtos() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "contract-action-success",
+            "surface_id": "contract.app",
+            "action_id": "contract.action",
+            "node_id": "contract-app-action",
+            "state": "accepted",
+            "normalized_values": {
+                "message": "hello"
+            }
+        })));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(
+            "plugin surface: package=botster.plugin-contract-matrix surface=contract.app kind=panel node_id=contract-app-panel"
+        ));
+        assert!(rendered.contains("UiNode payload delivered through plugin_surface_render."));
+        assert!(rendered.contains(
+            "plugin action result: state=accepted request_id=contract-action-success message=hello"
+        ));
+    }
+
+    #[test]
+    fn unsupported_uinode_primitive_reports_node_id_and_primitive() {
+        let table = node(UiNodeKind::Table, "contract-unsupported-table", json!({}));
+
+        let error = renderer::tui_capabilities()
+            .validate_node(&table)
+            .expect_err("table without fallback should fail TUI capability validation");
+        let message = error.to_string();
+
+        assert!(message.contains("contract-unsupported-table"));
+        assert!(message.contains("Table"));
+        assert!(message.contains("table"));
     }
 
     #[test]
@@ -3769,6 +4004,20 @@ mod tests {
         assert!(foreground_conformance.hub_data_dir_env_present);
         assert_eq!(foreground_conformance.real_hub_action_operation, "status");
 
+        let Some(contract_matrix_fixture) =
+            std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE").map(PathBuf::from)
+        else {
+            skip_or_panic("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE");
+            hub.shutdown().expect("isolated hub shuts down cleanly");
+            return;
+        };
+        let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+            &hub,
+            contract_matrix_fixture,
+        )
+        .expect("plugin contract matrix conformance passes");
+        assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
+
         let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let data_dir = hub.data_dir().to_string_lossy().to_string();
         let package_root = package_root.to_string_lossy().to_string();
@@ -3851,6 +4100,173 @@ mod tests {
         assert!(rendered.contains("botster-tui-future-feature"));
 
         hub.shutdown().expect("isolated hub shuts down cleanly");
+    }
+
+    fn assert_plugin_contract_matrix_renders_through_tui(
+        hub: &botster_hub_test_support::IsolatedHub,
+        report: &botster_hub_test_support::PluginContractMatrixConformanceReport,
+    ) {
+        assert_eq!(
+            report.failure_classes.client_rendering,
+            report.client_render_check.class
+        );
+        assert_eq!(
+            report.app_surface_node_id,
+            report.client_render_check.app_surface_node_id
+        );
+        assert_eq!(
+            report.empty_surface_child_id,
+            report.client_render_check.empty_surface_child_id
+        );
+        assert_eq!(
+            report.settings_surface_node_id,
+            report.client_render_check.settings_surface_node_id
+        );
+        assert_eq!(
+            report.valid_configuration_secret_state,
+            report.client_render_check.expected_redacted_secret_state
+        );
+
+        let mut client = HubConnection::connect(hub.endpoint()).expect("connect to live hub");
+        let list_packages = client
+            .request(&DaemonRequest::ListPackages)
+            .expect("list packages after contract matrix conformance");
+        let list_apps = client
+            .request(&DaemonRequest::ListApps)
+            .expect("list apps after contract matrix conformance");
+        let mut app = DogfoodApp::new(None);
+        app.apply_response(list_packages);
+        app.apply_response(list_apps);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 240);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(&report.app_route_path));
+        assert!(rendered.contains("route_id=settings"));
+        assert!(rendered.contains("supports_settings=true"));
+        assert!(rendered.contains(&format!(
+            "target_surface_id={}",
+            report.app_route_surface_id
+        )));
+
+        let app_surface = request_plugin_surface(&mut client, &report.package_name, "contract.app");
+        assert_rendered_plugin_surface_contains(
+            &app_surface,
+            &report.client_render_check.app_surface_node_id,
+            "UiNode payload delivered through plugin_surface_render.",
+        );
+
+        let empty_surface =
+            request_plugin_surface(&mut client, &report.package_name, "contract.empty");
+        assert_rendered_plugin_surface_contains(
+            &empty_surface,
+            &report.client_render_check.empty_surface_child_id,
+            "No fixture rows are available.",
+        );
+
+        let settings_surface =
+            request_plugin_surface(&mut client, &report.package_name, "contract.settings");
+        let settings_rendered = assert_rendered_plugin_surface_contains(
+            &settings_surface,
+            &report.client_render_check.settings_surface_node_id,
+            "api_token_state=redacted",
+        );
+        assert!(settings_rendered.contains("mode=write"));
+        assert!(
+            settings_rendered
+                .contains("endpoint=https://example.invalid/plugin-contract-matrix/acceptance")
+        );
+        assert!(!settings_rendered.contains("write_only"));
+        assert!(!settings_rendered.contains("contract-action-secret"));
+
+        let success = client
+            .request(&DaemonRequest::PluginSurfaceAction {
+                package_name: report.package_name.clone(),
+                surface_id: "contract.app".to_string(),
+                action_id: "contract.action".to_string(),
+                payload: json!({
+                    "request_id": "contract-action-success",
+                    "message": "hello",
+                }),
+            })
+            .expect("dispatch contract action success");
+        let mut action_app = DogfoodApp::new(None);
+        action_app.apply_response(success);
+        let (lines, _) = renderer::render_to_lines(&action_app.surface(), 240, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("plugin action result: state=accepted"));
+        assert!(rendered.contains("request_id=contract-action-success"));
+        assert!(rendered.contains("message=hello"));
+
+        let failure = client
+            .request(&DaemonRequest::PluginSurfaceAction {
+                package_name: report.package_name.clone(),
+                surface_id: "contract.app".to_string(),
+                action_id: "contract.action".to_string(),
+                payload: json!({
+                    "request_id": "contract-action-error",
+                    "fail": true,
+                }),
+            })
+            .expect("dispatch contract action error");
+        let mut failure_app = DogfoodApp::new(None);
+        failure_app.apply_response(failure);
+        let (lines, _) = renderer::render_to_lines(&failure_app.surface(), 240, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("plugin action result: state=error"));
+        assert!(rendered.contains("request_id=contract-action-error"));
+        assert!(rendered.contains("action_failure"));
+        assert!(rendered.contains("operation=plugin_surface_action"));
+
+        let blocked = client
+            .request(&DaemonRequest::PluginSurfaceRender {
+                package_name: report.package_name.clone(),
+                surface_id: "contract.blocked".to_string(),
+                payload: json!({}),
+            })
+            .expect("render blocked contract surface");
+        let mut blocked_app = DogfoodApp::new(None);
+        blocked_app.apply_response(blocked);
+        let (lines, _) = renderer::render_to_lines(&blocked_app.surface(), 240, 120);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("plugin surface render failed"));
+        assert!(rendered.contains("plugin_invocation_failed"));
+    }
+
+    fn request_plugin_surface(
+        client: &mut HubConnection,
+        package_name: &str,
+        surface_id: &str,
+    ) -> DaemonPluginSurface {
+        let response = client
+            .request(&DaemonRequest::PluginSurfaceRender {
+                package_name: package_name.to_string(),
+                surface_id: surface_id.to_string(),
+                payload: json!({}),
+            })
+            .expect("render contract plugin surface");
+        assert_eq!(response.kind, DaemonResponseKind::PluginSurface);
+        response
+            .plugin_surface
+            .expect("plugin surface response includes body")
+    }
+
+    fn assert_rendered_plugin_surface_contains(
+        surface: &DaemonPluginSurface,
+        expected_node_id: &str,
+        expected_text: &str,
+    ) -> String {
+        assert!(
+            surface.body.to_string().contains(expected_node_id),
+            "delivered surface body should include node id {expected_node_id}: {}",
+            surface.body
+        );
+        let node = plugin_surface_body_node(surface).expect("delivered surface validates for TUI");
+        let (lines, _) = renderer::render_to_lines(&node, 180, 80);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains(expected_text),
+            "rendered plugin surface should contain {expected_text:?}: {rendered}"
+        );
+        rendered
     }
 
     fn skip_or_panic(variable: &'static str) {
@@ -3992,6 +4408,100 @@ mod tests {
         response
     }
 
+    fn plugin_surface_response(surface: DaemonPluginSurface) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PluginSurface);
+        response.plugin_surface = Some(surface);
+        response
+    }
+
+    fn plugin_action_response(result: Value) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PluginActionResult);
+        response.plugin_action_result = Some(result);
+        response
+    }
+
+    fn contract_app_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.app".to_string(),
+            body: json!({
+                "type": "panel",
+                "id": "contract-app-panel",
+                "props": {
+                    "title": "Plugin Contract Matrix"
+                },
+                "children": [
+                    {
+                        "type": "text",
+                        "id": "contract-app-summary",
+                        "props": {
+                            "text": "UiNode payload delivered through plugin_surface_render."
+                        }
+                    },
+                    {
+                        "type": "button",
+                        "id": "contract-app-action",
+                        "props": {
+                            "label": "Run contract action",
+                            "action": "contract.action"
+                        }
+                    }
+                ]
+            }),
+        }
+    }
+
+    fn plugin_contract_app_route() -> DaemonPackageRouteDescriptor {
+        DaemonPackageRouteDescriptor {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            route_id: "surface:contract.app".to_string(),
+            route_path: "/packages/botster.plugin-contract-matrix/surfaces/contract.app"
+                .to_string(),
+            target: botster_hub_client::DaemonPackageRouteTarget {
+                kind: "plugin_surface".to_string(),
+                entrypoint_id: None,
+                surface_id: Some("contract.app".to_string()),
+            },
+            title: "Contract App".to_string(),
+            label: "Contract App".to_string(),
+            app_id: Some("contract.app".to_string()),
+            surface_id: Some("contract.app".to_string()),
+            icon: None,
+            category: None,
+            layout_mode: "host".to_string(),
+            required_capabilities: Vec::new(),
+            enabled: true,
+            blocked: false,
+            diagnostics: Vec::new(),
+            supports_settings: false,
+        }
+    }
+
+    fn plugin_contract_settings_route() -> DaemonPackageRouteDescriptor {
+        DaemonPackageRouteDescriptor {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            route_id: "settings".to_string(),
+            route_path: "/packages/botster.plugin-contract-matrix/settings".to_string(),
+            target: botster_hub_client::DaemonPackageRouteTarget {
+                kind: "settings".to_string(),
+                entrypoint_id: None,
+                surface_id: Some("contract.settings".to_string()),
+            },
+            title: "Contract Settings".to_string(),
+            label: "Settings".to_string(),
+            app_id: None,
+            surface_id: Some("contract.settings".to_string()),
+            icon: None,
+            category: None,
+            layout_mode: "host".to_string(),
+            required_capabilities: Vec::new(),
+            enabled: true,
+            blocked: false,
+            diagnostics: Vec::new(),
+            supports_settings: true,
+        }
+    }
+
     fn package(
         package_name: &str,
         version: &str,
@@ -4008,6 +4518,7 @@ mod tests {
             state: state.to_string(),
             requested_capabilities,
             surfaces: Vec::new(),
+            routes: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: botster_hub_client::DaemonPackageConfiguration::default(),
             availability: botster_hub_client::DaemonPackageAvailability::default(),
@@ -4187,6 +4698,7 @@ mod tests {
                 kind: "web_app".to_string(),
                 local_url: Some("http://127.0.0.1:49152".to_string()),
             },
+            route: None,
         }
     }
 
@@ -4205,6 +4717,7 @@ mod tests {
                 kind: "terminal_app".to_string(),
                 local_url: None,
             },
+            route: None,
         }
     }
 
@@ -4296,6 +4809,7 @@ mod tests {
             session_context: None,
             apps: Vec::new(),
             resolved_app_launch: None,
+            resolved_package_route: None,
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -4306,6 +4820,8 @@ mod tests {
             plugin_tool_result: Value::Null,
             plugin_surface: None,
             plugin_action_result: None,
+            local_webrtc_bootstrap: None,
+            local_webrtc_answer: None,
             events: Vec::new(),
             cleanup: None,
             coordination: None,
