@@ -2211,12 +2211,15 @@ fn plugin_surface_text(surface: &DaemonPluginSurface) -> String {
 }
 
 fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
-    let Some(root) = plugin_surface_body_node(surface).ok() else {
-        return vec![node(
-            UiNodeKind::Text,
-            "dogfood-plugin-surface-invalid",
-            json!({ "text": "plugin surface render: invalid UiNode body" }),
-        )];
+    let root = match plugin_surface_body_node(surface) {
+        Ok(root) => root,
+        Err(error) => {
+            return vec![node(
+                UiNodeKind::Text,
+                "dogfood-plugin-surface-invalid",
+                json!({ "text": format!("plugin surface render: {error}") }),
+            )];
+        }
     };
     let (lines, _) = botster_tui_kit::render_to_lines(&root, 120, 20)
         .expect("validated plugin surface should render in test backend");
@@ -2840,6 +2843,26 @@ mod tests {
         assert!(rendered.contains(
             "plugin action result: state=accepted request_id=contract-action-success message=hello"
         ));
+    }
+
+    #[test]
+    fn plugin_surface_invalid_body_diagnostic_renders_from_app_surface() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(plugin_surface_response(invalid_table_plugin_surface()));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(
+            "plugin surface: package=botster.plugin-contract-matrix surface=contract.invalid kind=table node_id=contract-invalid-table"
+        ));
+        assert!(rendered.contains(
+            "plugin surface render: plugin surface botster.plugin-contract-matrix:contract.invalid failed UiNode validate"
+        ));
+        assert!(rendered.contains("contract-invalid-table"));
+        assert!(rendered.contains("Table"));
+        assert!(rendered.contains("table"));
+        assert!(!rendered.contains("plugin surface render: invalid UiNode body"));
     }
 
     #[test]
@@ -4447,6 +4470,17 @@ mod tests {
                         }
                     }
                 ]
+            }),
+        }
+    }
+
+    fn invalid_table_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.invalid".to_string(),
+            body: json!({
+                "type": "table",
+                "id": "contract-invalid-table"
             }),
         }
     }
