@@ -11,8 +11,9 @@ use botster_hub_client::{
     DaemonApp, DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityRequirement,
     DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonPackage,
     DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
-    DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
+    DaemonPackageNavigationEntry, DaemonPackagePin, DaemonPackageRouteDescriptor,
+    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION,
     FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_STREAMING, PROTOCOL,
     connect_and_hello_with_requirement, read_frame_from_reader, write_frame,
 };
@@ -198,6 +199,7 @@ struct DogfoodApp {
     package_count: usize,
     enabled_package_count: usize,
     apps: Vec<DaemonApp>,
+    package_navigation: Vec<DaemonPackageNavigationEntry>,
     packages: Vec<DaemonPackage>,
     available_packages: Vec<DaemonAvailablePackage>,
     install_plan: Option<DaemonPackageInstallPlan>,
@@ -233,6 +235,7 @@ impl DogfoodApp {
             package_count: 0,
             enabled_package_count: 0,
             apps: Vec::new(),
+            package_navigation: Vec::new(),
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
@@ -355,6 +358,13 @@ impl DogfoodApp {
             }
             "botster.tui.detach" => self.detach_attached(),
             "botster.tui.refresh" => self.refresh_read_models(),
+            "botster.tui.navigation.open" => {
+                if let Some((package_name, surface_id, route_id)) =
+                    navigation_open_payload(&payload)
+                {
+                    self.open_package_navigation(package_name, surface_id, route_id);
+                }
+            }
             "botster.tui.package_config.submit" => {
                 if let Some(package_name) = payload
                     .as_ref()
@@ -510,6 +520,7 @@ impl DogfoodApp {
         self.refresh_status();
         self.refresh_sessions();
         self.refresh_apps();
+        self.refresh_package_navigation();
         self.refresh_packages();
     }
 
@@ -525,8 +536,29 @@ impl DogfoodApp {
         self.request_and_apply(DaemonRequest::ListApps);
     }
 
+    fn refresh_package_navigation(&mut self) {
+        self.request_and_apply(DaemonRequest::ListPackageNavigation);
+    }
+
     fn refresh_packages(&mut self) {
         self.request_and_apply(DaemonRequest::ListPackages);
+    }
+
+    fn open_package_navigation(
+        &mut self,
+        package_name: String,
+        surface_id: String,
+        route_id: String,
+    ) {
+        self.error = None;
+        self.action_feedback = Some(format!(
+            "navigation open requested: {package_name} {route_id}"
+        ));
+        self.request_and_apply(DaemonRequest::PluginSurfaceRender {
+            package_name,
+            surface_id,
+            payload: json!({}),
+        });
     }
 
     fn spawn_session(&mut self) {
@@ -686,6 +718,9 @@ impl DogfoodApp {
                 self.observed_requests.push(ObservedRequest::ListSessions)
             }
             DaemonRequest::ListApps => self.observed_requests.push(ObservedRequest::ListApps),
+            DaemonRequest::ListPackageNavigation => self
+                .observed_requests
+                .push(ObservedRequest::ListPackageNavigation),
             DaemonRequest::ListPackages => {
                 self.observed_requests.push(ObservedRequest::ListPackages)
             }
@@ -759,6 +794,16 @@ impl DogfoodApp {
                 .push(ObservedRequest::PackageEntrypointStatus {
                     package_name: package_name.clone(),
                     entrypoint_id: entrypoint_id.clone(),
+                }),
+            DaemonRequest::PluginSurfaceRender {
+                package_name,
+                surface_id,
+                ..
+            } => self
+                .observed_requests
+                .push(ObservedRequest::PluginSurfaceRender {
+                    package_name: package_name.clone(),
+                    surface_id: surface_id.clone(),
                 }),
             DaemonRequest::Attach {
                 session_id,
@@ -861,6 +906,9 @@ impl DogfoodApp {
         }
         if matches!(response.kind, DaemonResponseKind::Apps) {
             self.apps = response.apps;
+        }
+        if matches!(response.kind, DaemonResponseKind::PackageNavigation) {
+            self.package_navigation = response.package_navigation;
         }
         if matches!(response.kind, DaemonResponseKind::AvailablePackages) {
             self.available_packages = response.available_packages;
@@ -1012,6 +1060,7 @@ impl DogfoodApp {
             "dogfood-package-summary",
             json!({ "text": self.package_summary_text() }),
         )));
+        children.extend(self.package_navigation_nodes().into_iter().map(child));
         children.extend(self.app_nodes().into_iter().map(child));
         if self.packages.is_empty() {
             children.push(child(node(
@@ -1031,7 +1080,6 @@ impl DogfoodApp {
                         .into_iter()
                         .map(child),
                 );
-                children.extend(package_route_nodes(package, index).into_iter().map(child));
                 children.extend(package_action_nodes(package, index).into_iter().map(child));
                 for (entrypoint_index, entrypoint) in
                     package.runnable_entrypoints.iter().enumerate()
@@ -1217,6 +1265,54 @@ impl DogfoodApp {
                     &format!("dogfood-app-{app_index}-route"),
                     json!({ "text": format!("app route: {}", route_text(route)) }),
                 ));
+            }
+        }
+        nodes
+    }
+
+    fn package_navigation_nodes(&self) -> Vec<UiNode> {
+        if self.package_navigation.is_empty() {
+            return Vec::new();
+        }
+
+        let mut nodes = vec![node(
+            UiNodeKind::Text,
+            "dogfood-package-navigation-summary",
+            json!({ "text": format!("navigation: {} admitted entries", self.package_navigation.len()) }),
+        )];
+
+        for (index, entry) in self.package_navigation.iter().enumerate() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("dogfood-package-navigation-{index}"),
+                json!({ "text": format!("navigation entry: {}", navigation_entry_text(entry)) }),
+            ));
+            for (diagnostic_index, diagnostic) in entry.diagnostics.iter().enumerate() {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-package-navigation-{index}-diagnostic-{diagnostic_index}"),
+                    json!({ "text": format!("navigation diagnostic: {}", package_diagnostic_text(diagnostic)) }),
+                ));
+            }
+            match navigation_open_payload_for_entry(entry) {
+                Some(payload) if entry.enabled && !entry.blocked => {
+                    nodes.push(button(
+                        &format!("dogfood-package-navigation-{index}-open"),
+                        "Open",
+                        "botster.tui.navigation.open",
+                        payload,
+                    ));
+                }
+                Some(_) => nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-package-navigation-{index}-blocked"),
+                    json!({ "text": format!("navigation blocked: {}", navigation_blocked_text(entry)) }),
+                )),
+                None => nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("dogfood-package-navigation-{index}-unsupported"),
+                    json!({ "text": format!("navigation unsupported: {}", navigation_unsupported_text(entry)) }),
+                )),
             }
         }
         nodes
@@ -1548,6 +1644,7 @@ enum ObservedRequest {
     Status,
     ListSessions,
     ListApps,
+    ListPackageNavigation,
     ListPackages,
     SetPackageConfiguration {
         package_name: String,
@@ -1580,6 +1677,10 @@ enum ObservedRequest {
     PackageEntrypointStatus {
         package_name: String,
         entrypoint_id: String,
+    },
+    PluginSurfaceRender {
+        package_name: String,
+        surface_id: String,
     },
     Attach {
         session_id: String,
@@ -1900,6 +2001,7 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_SESSIONS.to_string(),
             FEATURE_TERMINAL_STREAMING.to_string(),
             FEATURE_RESIZE.to_string(),
+            FEATURE_PACKAGE_NAVIGATION.to_string(),
         ],
         minimum_conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
@@ -1947,6 +2049,14 @@ fn package_entrypoint_from_payload(payload: &Option<Value>) -> Option<(String, S
     let package_name = value.get("package_name")?.as_str()?.to_string();
     let entrypoint_id = value.get("entrypoint_id")?.as_str()?.to_string();
     Some((package_name, entrypoint_id))
+}
+
+fn navigation_open_payload(payload: &Option<Value>) -> Option<(String, String, String)> {
+    let value = payload.as_ref()?;
+    let package_name = value.get("package_name")?.as_str()?.to_string();
+    let surface_id = value.get("surface_id")?.as_str()?.to_string();
+    let route_id = value.get("route_id")?.as_str()?.to_string();
+    Some((package_name, surface_id, route_id))
 }
 
 fn package_name_and_pin_from_payload(
@@ -2025,21 +2135,6 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
         }
     }
     nodes
-}
-
-fn package_route_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
-    package
-        .routes
-        .iter()
-        .enumerate()
-        .map(|(route_index, route)| {
-            node(
-                UiNodeKind::Text,
-                &format!("dogfood-package-{index}-route-{route_index}"),
-                json!({ "text": format!("package route: {}", route_text(route)) }),
-            )
-        })
-        .collect()
 }
 
 fn route_text(route: &DaemonPackageRouteDescriptor) -> String {
@@ -2193,6 +2288,94 @@ fn app_launch_target_text(app: &DaemonApp) -> String {
     parts.join(" ")
 }
 
+fn navigation_entry_text(entry: &DaemonPackageNavigationEntry) -> String {
+    let mut parts = vec![
+        format!("package={}", entry.package_name),
+        format!("item_id={}", entry.item_id),
+        format!("label={}", entry.label),
+        format!("route_id={}", entry.route_id),
+        format!("path={}", entry.route_path),
+        format!("target={}", entry.target.kind),
+        format!("source={}", entry.source.kind),
+        format!("enabled={}", entry.enabled),
+        format!("blocked={}", entry.blocked),
+    ];
+    if let Some(description) = &entry.description {
+        parts.push(format!("description={description}"));
+    }
+    if let Some(icon) = &entry.icon {
+        parts.push(format!("icon={icon}"));
+    }
+    if let Some(surface_id) = &entry.target.surface_id {
+        parts.push(format!("target_surface_id={surface_id}"));
+    }
+    if let Some(surface_id) = &entry.source.surface_id {
+        parts.push(format!("source_surface_id={surface_id}"));
+    }
+    if let Some(entrypoint_id) = &entry.target.entrypoint_id {
+        parts.push(format!("target_entrypoint_id={entrypoint_id}"));
+    }
+    if let Some(entrypoint_id) = &entry.source.entrypoint_id {
+        parts.push(format!("source_entrypoint_id={entrypoint_id}"));
+    }
+    parts.join(" ")
+}
+
+fn navigation_open_payload_for_entry(entry: &DaemonPackageNavigationEntry) -> Option<Value> {
+    if entry.target.kind != "plugin_surface" && entry.target.kind != "settings" {
+        return None;
+    }
+    let surface_id = entry
+        .target
+        .surface_id
+        .as_ref()
+        .or(entry.source.surface_id.as_ref())?;
+    Some(json!({
+        "package_name": entry.package_name,
+        "surface_id": surface_id,
+        "route_id": entry.route_id,
+    }))
+}
+
+fn navigation_blocked_text(entry: &DaemonPackageNavigationEntry) -> String {
+    let mut parts = vec![
+        format!("label={}", entry.label),
+        format!("route_id={}", entry.route_id),
+        format!("enabled={}", entry.enabled),
+        format!("blocked={}", entry.blocked),
+    ];
+    if entry.diagnostics.is_empty() {
+        parts.push("diagnostics=none".to_string());
+    } else {
+        parts.push(format!(
+            "diagnostics={}",
+            entry
+                .diagnostics
+                .iter()
+                .map(package_diagnostic_text)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    parts.join(" ")
+}
+
+fn navigation_unsupported_text(entry: &DaemonPackageNavigationEntry) -> String {
+    let mut parts = vec![
+        format!("label={}", entry.label),
+        format!("route_id={}", entry.route_id),
+        format!("target={}", entry.target.kind),
+    ];
+    if let Some(surface_id) = &entry.target.surface_id {
+        parts.push(format!("target_surface_id={surface_id}"));
+    }
+    if let Some(entrypoint_id) = &entry.target.entrypoint_id {
+        parts.push(format!("target_entrypoint_id={entrypoint_id}"));
+    }
+    parts.push("open=unsupported in botster-tui".to_string());
+    parts.join(" ")
+}
+
 fn plugin_surface_text(surface: &DaemonPluginSurface) -> String {
     let body_id = surface
         .body
@@ -2211,6 +2394,13 @@ fn plugin_surface_text(surface: &DaemonPluginSurface) -> String {
 }
 
 fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
+    if let Some(diagnostic) = iframe_unsupported_diagnostic(surface) {
+        return vec![node(
+            UiNodeKind::Text,
+            "dogfood-plugin-surface-iframe-unsupported",
+            json!({ "text": diagnostic }),
+        )];
+    }
     let root = match plugin_surface_body_node(surface) {
         Ok(root) => root,
         Err(error) => {
@@ -2252,6 +2442,47 @@ fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, Str
             )
         })?;
     Ok(node)
+}
+
+fn iframe_unsupported_diagnostic(surface: &DaemonPluginSurface) -> Option<String> {
+    let iframe = find_iframe_node(&surface.body)?;
+    let title = iframe
+        .get("props")
+        .and_then(|props| props.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("untitled");
+    let src = iframe
+        .get("props")
+        .and_then(|props| props.get("src"))
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let sandbox = iframe
+        .get("props")
+        .and_then(|props| props.get("sandbox"))
+        .map(compact_json)
+        .unwrap_or_else(|| "default".to_string());
+    Some(format!(
+        "plugin surface iframe unsupported: package={} surface={} title={} src={} sandbox={} open=copy URL or open it in a browser",
+        surface.package_name, surface.surface_id, title, src, sandbox
+    ))
+}
+
+fn find_iframe_node(value: &Value) -> Option<&Value> {
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "iframe")
+    {
+        return Some(value);
+    }
+    value
+        .get("children")
+        .and_then(Value::as_array)
+        .and_then(|children| children.iter().find_map(find_iframe_node))
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn plugin_action_result_text(result: &Value) -> String {
@@ -2525,6 +2756,7 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use botster_core::{RequestId, UiActionId, UiActionKind, UiActionRequest, UiSurfaceId};
 
     #[test]
     fn smoke_message_names_the_scaffold() {
@@ -2633,7 +2865,9 @@ mod tests {
         assert!(rendered.contains("connected (running)"));
         assert!(rendered.contains("daemon schema 7"));
         assert!(rendered.contains("protocol botster-hub-daemon-v1 version 1"));
-        assert!(rendered.contains("features sessions,terminal_streaming,resize"));
+        assert!(
+            rendered.contains("features sessions,terminal_streaming,resize,package_navigation")
+        );
     }
 
     #[test]
@@ -2779,7 +3013,7 @@ mod tests {
     }
 
     #[test]
-    fn package_and_app_routes_render_from_public_dtos() {
+    fn package_navigation_renders_from_admitted_registry_not_package_routes() {
         let mut app = DogfoodApp::new(None);
         let route = plugin_contract_app_route();
         let mut package = package(
@@ -2801,11 +3035,14 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
         app.apply_response(apps_response(vec![app_row]));
+        app.apply_response(package_navigation_response(vec![
+            plugin_contract_app_navigation(),
+        ]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 500, 180);
         let rendered = lines.join("\n");
         assert!(rendered.contains(
-            "package route: package=botster.plugin-contract-matrix route_id=surface:contract.app"
+            "navigation entry: package=botster.plugin-contract-matrix item_id=contract.app label=Contract App route_id=surface:contract.app"
         ));
         assert!(
             rendered
@@ -2813,9 +3050,11 @@ mod tests {
         );
         assert!(rendered.contains("target=plugin_surface"));
         assert!(rendered.contains("target_surface_id=contract.app"));
-        assert!(rendered.contains("route_id=settings"));
-        assert!(rendered.contains("supports_settings=true"));
+        assert!(rendered.contains("source_surface_id=contract.app"));
+        assert!(rendered.contains("Open"));
         assert!(rendered.contains("app route: package=botster.plugin-contract-matrix"));
+        assert!(!rendered.contains("package route:"));
+        assert!(!rendered.contains("route_id=settings"));
     }
 
     #[test]
@@ -2863,6 +3102,92 @@ mod tests {
         assert!(rendered.contains("Table"));
         assert!(rendered.contains("table"));
         assert!(!rendered.contains("plugin surface render: invalid UiNode body"));
+    }
+
+    #[test]
+    fn navigation_open_requests_public_plugin_surface_render() {
+        let mut app = DogfoodApp::new(None);
+        app.observed_requests.clear();
+        let entry = plugin_contract_app_navigation();
+
+        app.apply_response(package_navigation_response(vec![entry.clone()]));
+        app.handle_dispatch(InputDispatch::Action(UiActionRequest {
+            request_id: RequestId("req-navigation-open".to_string()),
+            surface_id: UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
+            action_id: UiActionId("botster.tui.navigation.open".to_string()),
+            node_id: Some(UiNodeId("dogfood-package-navigation-0-open".to_string())),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: navigation_open_payload_for_entry(&entry),
+        }));
+
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::PluginSurfaceRender {
+                package_name: "botster.plugin-contract-matrix".to_string(),
+                surface_id: "contract.app".to_string(),
+            }]
+        );
+        assert_eq!(
+            app.action_feedback.as_deref(),
+            Some("navigation open requested: botster.plugin-contract-matrix surface:contract.app")
+        );
+    }
+
+    #[test]
+    fn blocked_navigation_entry_stays_visible_without_open_affordance() {
+        let mut app = DogfoodApp::new(None);
+        let mut entry = plugin_contract_app_navigation();
+        entry.enabled = false;
+        entry.blocked = true;
+        entry.diagnostics = vec![package_diagnostic("blocked", "missing configuration")];
+
+        app.apply_response(package_navigation_response(vec![entry]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("navigation entry: package=botster.plugin-contract-matrix"));
+        assert!(rendered.contains("enabled=false"));
+        assert!(rendered.contains("blocked=true"));
+        assert!(rendered.contains("navigation diagnostic: blocked:missing configuration"));
+        assert!(rendered.contains("navigation blocked: label=Contract App"));
+        assert!(!rendered.contains("dogfood-package-navigation-0-open"));
+    }
+
+    #[test]
+    fn unsupported_navigation_target_stays_visible_with_precise_target() {
+        let mut app = DogfoodApp::new(None);
+        let mut entry = plugin_contract_app_navigation();
+        entry.target.kind = "web_app".to_string();
+        entry.target.surface_id = None;
+        entry.target.entrypoint_id = Some("web".to_string());
+
+        app.apply_response(package_navigation_response(vec![entry]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("navigation unsupported: label=Contract App"));
+        assert!(rendered.contains("target=web_app"));
+        assert!(rendered.contains("target_entrypoint_id=web"));
+        assert!(rendered.contains("open=unsupported in botster-tui"));
+    }
+
+    #[test]
+    fn iframe_plugin_surface_renders_precise_unsupported_diagnostic() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(plugin_surface_response(iframe_plugin_surface()));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("plugin surface iframe unsupported"));
+        assert!(rendered.contains("package=botster.plugin-contract-matrix"));
+        assert!(rendered.contains("surface=contract.iframe"));
+        assert!(rendered.contains("title=Contract HTML"));
+        assert!(rendered.contains("src=/assets/botster.plugin-contract-matrix/contract.html"));
+        assert!(rendered.contains(r#"sandbox=["allow_scripts"]"#));
+        assert!(rendered.contains("open=copy URL or open it in a browser"));
+        assert!(!rendered.contains("failed UiNode deserialize"));
     }
 
     #[test]
@@ -3933,6 +4258,7 @@ mod tests {
                 ObservedRequest::Status,
                 ObservedRequest::ListSessions,
                 ObservedRequest::ListApps,
+                ObservedRequest::ListPackageNavigation,
                 ObservedRequest::ListPackages,
             ]
         );
@@ -4157,14 +4483,18 @@ mod tests {
         let list_apps = client
             .request(&DaemonRequest::ListApps)
             .expect("list apps after contract matrix conformance");
+        let list_package_navigation = client
+            .request(&DaemonRequest::ListPackageNavigation)
+            .expect("list package navigation after contract matrix conformance");
         let mut app = DogfoodApp::new(None);
         app.apply_response(list_packages);
         app.apply_response(list_apps);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 240);
+        app.apply_response(list_package_navigation);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 500, 240);
         let rendered = lines.join("\n");
+        assert!(rendered.contains("navigation entry: package=botster.plugin-contract-matrix"));
         assert!(rendered.contains(&report.app_route_path));
-        assert!(rendered.contains("route_id=settings"));
-        assert!(rendered.contains("supports_settings=true"));
+        assert!(rendered.contains("route_id=surface:contract.app"));
         assert!(rendered.contains(&format!(
             "target_surface_id={}",
             report.app_route_surface_id
@@ -4374,6 +4704,7 @@ mod tests {
                     FEATURE_SESSIONS.to_string(),
                     FEATURE_TERMINAL_STREAMING.to_string(),
                     FEATURE_RESIZE.to_string(),
+                    FEATURE_PACKAGE_NAVIGATION.to_string(),
                 ],
                 conformance_fixture_revision: 1,
             },
@@ -4404,6 +4735,12 @@ mod tests {
     fn apps_response(apps: Vec<DaemonApp>) -> DaemonResponse {
         let mut response = base_response(DaemonResponseKind::Apps);
         response.apps = apps;
+        response
+    }
+
+    fn package_navigation_response(entries: Vec<DaemonPackageNavigationEntry>) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PackageNavigation);
+        response.package_navigation = entries;
         response
     }
 
@@ -4471,6 +4808,7 @@ mod tests {
                     }
                 ]
             }),
+            ui_tree_snapshot: None,
         }
     }
 
@@ -4482,6 +4820,59 @@ mod tests {
                 "type": "table",
                 "id": "contract-invalid-table"
             }),
+            ui_tree_snapshot: None,
+        }
+    }
+
+    fn iframe_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.iframe".to_string(),
+            body: json!({
+                "type": "panel",
+                "id": "contract-iframe-panel",
+                "props": {
+                    "title": "Contract HTML Host"
+                },
+                "children": [
+                    {
+                        "type": "iframe",
+                        "id": "contract-html-frame",
+                        "props": {
+                            "title": "Contract HTML",
+                            "src": "/assets/botster.plugin-contract-matrix/contract.html",
+                            "sandbox": ["allow_scripts"]
+                        }
+                    }
+                ]
+            }),
+            ui_tree_snapshot: None,
+        }
+    }
+
+    fn plugin_contract_app_navigation() -> DaemonPackageNavigationEntry {
+        DaemonPackageNavigationEntry {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            item_id: "contract.app".to_string(),
+            label: "Contract App".to_string(),
+            icon: Some("workflow".to_string()),
+            description: Some("Plugin contract app".to_string()),
+            route_id: "surface:contract.app".to_string(),
+            route_path: "/packages/botster.plugin-contract-matrix/surfaces/contract.app"
+                .to_string(),
+            target: botster_hub_client::DaemonPackageRouteTarget {
+                kind: "plugin_surface".to_string(),
+                entrypoint_id: None,
+                surface_id: Some("contract.app".to_string()),
+            },
+            source: botster_hub_client::DaemonPackageNavigationSource {
+                kind: "surface".to_string(),
+                surface_id: Some("contract.app".to_string()),
+                entrypoint_id: None,
+            },
+            enabled: true,
+            blocked: false,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -4844,6 +5235,7 @@ mod tests {
             apps: Vec::new(),
             resolved_app_launch: None,
             resolved_package_route: None,
+            package_navigation: Vec::new(),
             packages: Vec::new(),
             available_packages: Vec::new(),
             install_plan: None,
