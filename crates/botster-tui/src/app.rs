@@ -1903,7 +1903,20 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         assert!(!compatibility.features.is_empty());
         assert!(rendered.contains(&format!("protocol {}", compatibility.protocol)));
         assert!(rendered.contains(&format!("version {}", compatibility.protocol_version)));
-        assert!(rendered.contains(&format!("features {}", compatibility.features.join(","))));
+        for required_feature in [
+            FEATURE_SESSIONS,
+            FEATURE_TERMINAL_STREAMING,
+            FEATURE_RESIZE,
+            FEATURE_PACKAGE_NAVIGATION,
+        ] {
+            assert!(
+                compatibility
+                    .features
+                    .iter()
+                    .any(|feature| feature == required_feature)
+            );
+        }
+        assert!(rendered.contains("features "));
         assert!(rendered.contains(HEADLESS_OUTPUT));
         assert!(
             !hit_map
@@ -3078,10 +3091,97 @@ mod tests {
         assert!(rendered.contains(
             "plugin surface: package=botster.plugin-contract-matrix surface=contract.app kind=panel node_id=contract-app-panel"
         ));
+        assert!(rendered.contains("plugin surface render:"));
         assert!(rendered.contains("UiNode payload delivered through plugin_surface_render."));
         assert!(rendered.contains(
             "plugin action result: state=accepted request_id=contract-action-success message=hello"
         ));
+    }
+
+    #[test]
+    fn composite_application_primitives_render_through_tui_kit() {
+        let surface = composite_application_primitives_plugin_surface();
+        let node = plugin_surface_body_node(&surface).expect("composite surface validates for TUI");
+
+        let (lines, hit_map) = renderer::render_to_lines(&node, 100, 36);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("Project Pipeline Overview"));
+        assert!(rendered.contains("Active Runs: 3"));
+        assert!(rendered.contains("status_badge: Healthy"));
+        assert!(rendered.contains("table: Ticket | State"));
+        assert!(rendered.contains("> 1783529012 | review"));
+        assert!(rendered.contains("No blocked tickets"));
+        assert!(rendered.contains("Reviewer"));
+        assert!(rendered.contains("Notes"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "contract-composite-refresh")
+        );
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "contract-composite-ticket-a")
+        );
+    }
+
+    #[test]
+    fn composite_application_primitives_render_from_production_plugin_surface_path() {
+        let mut app = DogfoodApp::new(None);
+
+        app.apply_response(plugin_surface_response(
+            composite_application_primitives_plugin_surface(),
+        ));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 420, 220);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains(
+            "plugin surface: package=botster.plugin-contract-matrix surface=contract.composite kind=section node_id=contract-composite-section"
+        ));
+        assert!(rendered.contains("Project Pipeline Overview"));
+        assert!(rendered.contains("plugin surface render:"));
+    }
+
+    #[test]
+    fn composite_table_mouse_selection_dispatches_exact_row_action() {
+        let surface = composite_application_primitives_plugin_surface();
+        let node = plugin_surface_body_node(&surface).expect("composite surface validates for TUI");
+        let (_lines, hit_map) = renderer::render_to_lines(&node, 100, 36);
+        let row = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "contract-composite-ticket-a")
+            .expect("bordered composite table row should be hit-testable");
+        let mut router = InputRouter::new(renderer::action_request_context());
+
+        let dispatch = router.dispatch_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: row.rect.x,
+                row: row.rect.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &hit_map,
+        );
+
+        assert!(matches!(
+            dispatch,
+            InputDispatch::Action(request)
+                if request.action_id == botster_core::ui::UiActionId("contract.ticket.open".to_string())
+                    && request.node_id == Some(UiNodeId("contract-composite-ticket-a".to_string()))
+                    && request.payload == Some(json!({ "ticket_id": "1783529012" }))
+        ));
+        assert_eq!(
+            router
+                .selected_row_value("contract-composite-ticket-table")
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
+            Some("contract-composite-ticket-a")
+        );
     }
 
     #[test]
@@ -4501,11 +4601,13 @@ mod tests {
         )));
 
         let app_surface = request_plugin_surface(&mut client, &report.package_name, "contract.app");
-        assert_rendered_plugin_surface_contains(
+        let app_rendered = assert_rendered_plugin_surface_contains(
             &app_surface,
             &report.client_render_check.app_surface_node_id,
-            "UiNode payload delivered through plugin_surface_render.",
+            "plugin_surface_render",
         );
+        assert!(app_rendered.contains("Render path: validated"));
+        assert!(app_rendered.contains("status_badge: Validated"));
 
         let empty_surface =
             request_plugin_surface(&mut client, &report.package_name, "contract.empty");
@@ -4803,10 +4905,241 @@ mod tests {
                         "id": "contract-app-action",
                         "props": {
                             "label": "Run contract action",
-                            "action": "contract.action"
+                            "action": {
+                                "id": "contract.action"
+                            }
                         }
                     }
                 ]
+            }),
+            ui_tree_snapshot: None,
+        }
+    }
+
+    fn composite_application_primitives_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.composite".to_string(),
+            body: json!({
+                "type": "section",
+                "id": "contract-composite-section",
+                "props": {
+                    "title": "Project Pipeline Overview",
+                    "description": "Composite surface for upgraded application primitives"
+                },
+                "slots": {
+                    "toolbar": [
+                        {
+                            "type": "toolbar",
+                            "id": "contract-composite-toolbar",
+                            "props": {
+                                "label": "Pipeline tools"
+                            },
+                            "slots": {
+                                "actions": [
+                                    {
+                                        "type": "button",
+                                        "id": "contract-composite-refresh",
+                                        "props": {
+                                            "label": "Refresh",
+                                            "action": {
+                                                "id": "contract.refresh",
+                                                "payload": { "source": "toolbar" }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "body": [
+                        {
+                            "type": "panel",
+                            "id": "contract-composite-panel",
+                            "props": {
+                                "title": "Review queue",
+                                "density": "compact",
+                                "variant": "subtle"
+                            },
+                            "slots": {
+                                "header": [
+                                    {
+                                        "type": "status_badge",
+                                        "id": "contract-composite-health",
+                                        "props": {
+                                            "label": "Healthy",
+                                            "status": "online",
+                                            "tone": "success"
+                                        }
+                                    }
+                                ],
+                                "body": [
+                                    {
+                                        "type": "metric_grid",
+                                        "id": "contract-composite-metrics",
+                                        "props": {
+                                            "density": "compact",
+                                            "variant": "plain"
+                                        },
+                                        "children": [
+                                            {
+                                                "type": "metric",
+                                                "id": "contract-composite-active-runs",
+                                                "props": {
+                                                    "label": "Active Runs",
+                                                    "value": "3",
+                                                    "caption": "currently assigned"
+                                                }
+                                            },
+                                            {
+                                                "type": "metric",
+                                                "id": "contract-composite-findings",
+                                                "props": {
+                                                    "label": "Open Findings",
+                                                    "value": "1",
+                                                    "trend": {
+                                                        "direction": "down",
+                                                        "label": "falling"
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "type": "table",
+                                        "id": "contract-composite-ticket-table",
+                                        "props": {
+                                            "columns": [
+                                                { "id": "ticket", "label": "Ticket" },
+                                                { "id": "state", "label": "State" }
+                                            ],
+                                            "rows": [
+                                                {
+                                                    "id": "contract-composite-ticket-a",
+                                                    "cells": {
+                                                        "ticket": "1783529012",
+                                                        "state": "review"
+                                                    },
+                                                    "action": {
+                                                        "id": "contract.ticket.open",
+                                                        "payload": { "ticket_id": "1783529012" }
+                                                    }
+                                                },
+                                                {
+                                                    "id": "contract-composite-ticket-b",
+                                                    "cells": {
+                                                        "ticket": "1783529013",
+                                                        "state": "implement"
+                                                    },
+                                                    "action": {
+                                                        "id": "contract.ticket.open",
+                                                        "payload": { "ticket_id": "1783529013" }
+                                                    }
+                                                }
+                                            ],
+                                            "selection": {
+                                                "mode": "single",
+                                                "selected": ["contract-composite-ticket-a"]
+                                            },
+                                            "empty_state": {
+                                                "type": "empty_state",
+                                                "id": "contract-composite-empty-table",
+                                                "props": {
+                                                    "title": "No tickets",
+                                                    "description": "Nothing needs attention"
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "type": "list",
+                                        "id": "contract-composite-reviewers",
+                                        "props": {
+                                            "selection": {
+                                                "mode": "single",
+                                                "selected": ["contract-composite-reviewer-a"]
+                                            }
+                                        },
+                                        "children": [
+                                            {
+                                                "type": "list_item",
+                                                "id": "contract-composite-reviewer-a",
+                                                "props": {
+                                                    "value": "claude",
+                                                    "action": {
+                                                        "id": "contract.reviewer.focus"
+                                                    }
+                                                },
+                                                "slots": {
+                                                    "title": [
+                                                        {
+                                                            "type": "text",
+                                                            "id": "contract-composite-reviewer-title",
+                                                            "props": {
+                                                                "text": "Reviewer"
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "type": "form",
+                                        "id": "contract-composite-form",
+                                        "props": {
+                                            "action": {
+                                                "id": "contract.form.submit"
+                                            }
+                                        },
+                                        "children": [
+                                            {
+                                                "type": "text_input",
+                                                "id": "contract-composite-notes",
+                                                "props": {
+                                                    "name": "notes",
+                                                    "label": "Notes",
+                                                    "value": "Ready for review"
+                                                }
+                                            },
+                                            {
+                                                "type": "button",
+                                                "id": "contract-composite-submit",
+                                                "props": {
+                                                    "label": "Submit",
+                                                    "action": {
+                                                        "id": "contract.form.submit"
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "type": "empty_state",
+                                        "id": "contract-composite-empty",
+                                        "props": {
+                                            "title": "No blocked tickets",
+                                            "description": "All current work can continue"
+                                        }
+                                    }
+                                ],
+                                "actions": [
+                                    {
+                                        "type": "button",
+                                        "id": "contract-composite-action-feedback",
+                                        "props": {
+                                            "label": "Acknowledge",
+                                            "action": {
+                                                "id": "contract.feedback.ack",
+                                                "payload": { "state": "accepted" }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
             }),
             ui_tree_snapshot: None,
         }
@@ -5232,6 +5565,9 @@ mod tests {
             session_templates: Vec::new(),
             resolved_session_template: None,
             session_context: None,
+            spawn_targets: Vec::new(),
+            spawn_target_validation: None,
+            worktrees: Vec::new(),
             apps: Vec::new(),
             resolved_app_launch: None,
             resolved_package_route: None,
