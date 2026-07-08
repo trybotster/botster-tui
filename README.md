@@ -26,7 +26,7 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 This scaffold uses `botster-tui-kit` pinned to merged main revision
-`327dc64a540108cba7ce760255aa5759290292b9`. The kit owns reusable
+`8b3ea35fb9742c50919ed4e6435ef21a59019223`. The kit owns reusable
 Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
 input forwarding. `botster-tui` owns the first-party hub client app, including
 hub connection setup, dogfood state, sessions, packages, installed apps,
@@ -51,7 +51,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`27118ab75f4ff511ccdfcfa754f74b878c0b9b45`. The protocol source is
+`196d56825a93c9fe8f754e1aa8e8ce18943041b1`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -187,7 +187,10 @@ There is also an automated isolated-hub test using the merged
 `botster-hub` and `botster-session-worker` binaries from the pinned git
 dependencies, starts an isolated daemon, runs the TUI dogfood path, runs the
 plugin contract matrix conformance harness, renders the delivered fixture
-surfaces through the TUI renderer, and tears the daemon down. It also
+surfaces through the TUI renderer, and tears the daemon down. The renderer
+coverage includes the composite application primitive fixture for `metric_grid`,
+`table`, `toolbar`, `status_badge`, `section`, `empty_state`, enhanced
+panel/list semantics, and form/action feedback. It also
 installs/enables this checkout as a local package and opens `botster-tui`
 through `botster-hub apps open` with a headless dogfood env switch so the
 foreground app exits cleanly under automation:
