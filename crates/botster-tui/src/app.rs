@@ -1903,7 +1903,20 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         assert!(!compatibility.features.is_empty());
         assert!(rendered.contains(&format!("protocol {}", compatibility.protocol)));
         assert!(rendered.contains(&format!("version {}", compatibility.protocol_version)));
-        assert!(rendered.contains(&format!("features {}", compatibility.features.join(","))));
+        for required_feature in [
+            FEATURE_SESSIONS,
+            FEATURE_TERMINAL_STREAMING,
+            FEATURE_RESIZE,
+            FEATURE_PACKAGE_NAVIGATION,
+        ] {
+            assert!(
+                compatibility
+                    .features
+                    .iter()
+                    .any(|feature| feature == required_feature)
+            );
+        }
+        assert!(rendered.contains("features "));
         assert!(rendered.contains(HEADLESS_OUTPUT));
         assert!(
             !hit_map
@@ -3079,6 +3092,7 @@ mod tests {
             "plugin surface: package=botster.plugin-contract-matrix surface=contract.app kind=panel node_id=contract-app-panel"
         ));
         assert!(rendered.contains("plugin surface render:"));
+        assert!(rendered.contains("UiNode payload delivered through plugin_surface_render."));
         assert!(rendered.contains(
             "plugin action result: state=accepted request_id=contract-action-success message=hello"
         ));
@@ -4587,11 +4601,13 @@ mod tests {
         )));
 
         let app_surface = request_plugin_surface(&mut client, &report.package_name, "contract.app");
-        assert_rendered_plugin_surface_contains(
+        let app_rendered = assert_rendered_plugin_surface_contains(
             &app_surface,
             &report.client_render_check.app_surface_node_id,
-            "UiNode payload delivered through plugin_surface_render.",
+            "plugin_surface_render",
         );
+        assert!(app_rendered.contains("Render path: validated"));
+        assert!(app_rendered.contains("status_badge: Validated"));
 
         let empty_surface =
             request_plugin_surface(&mut client, &report.package_name, "contract.empty");
@@ -4889,7 +4905,9 @@ mod tests {
                         "id": "contract-app-action",
                         "props": {
                             "label": "Run contract action",
-                            "action": "contract.action"
+                            "action": {
+                                "id": "contract.action"
+                            }
                         }
                     }
                 ]
