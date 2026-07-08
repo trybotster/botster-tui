@@ -136,7 +136,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=42538009bc6f6291872c5657bedbe7370f504f8d#42538009bc6f6291872c5657bedbe7370f504f8d"
+source = "git+https://github.com/trybotster/botster-core.git?rev=978c436865c215828b02a8b0fcca5f8d89413e96#978c436865c215828b02a8b0fcca5f8d89413e96"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=42538009bc6f6291872c5657bedbe7370f504f8d#42538009bc6f6291872c5657bedbe7370f504f8d"
+source = "git+https://github.com/trybotster/botster-core.git?rev=978c436865c215828b02a8b0fcca5f8d89413e96#978c436865c215828b02a8b0fcca5f8d89413e96"
 dependencies = [
  "botster-core",
  "serde",
@@ -161,7 +161,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=3807e1388fa560940c77192f7648bf9638108ab8#3807e1388fa560940c77192f7648bf9638108ab8"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=196d56825a93c9fe8f754e1aa8e8ce18943041b1#196d56825a93c9fe8f754e1aa8e8ce18943041b1"
 dependencies = [
  "serde",
  "serde_json",
@@ -170,7 +170,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=3807e1388fa560940c77192f7648bf9638108ab8#3807e1388fa560940c77192f7648bf9638108ab8"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=196d56825a93c9fe8f754e1aa8e8ce18943041b1#196d56825a93c9fe8f754e1aa8e8ce18943041b1"
 dependencies = [
  "botster-hub-client",
  "serde",
@@ -194,7 +194,7 @@ dependencies = [
 [[package]]
 name = "botster-tui-kit"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=327dc64a540108cba7ce760255aa5759290292b9#327dc64a540108cba7ce760255aa5759290292b9"
+source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=8b3ea35fb9742c50919ed4e6435ef21a59019223#8b3ea35fb9742c50919ed4e6435ef21a59019223"
 dependencies = [
  "botster-core",
  "crossterm",
