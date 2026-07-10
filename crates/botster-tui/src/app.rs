@@ -8,14 +8,15 @@ use std::{
 
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 use botster_hub_client::{
-    DaemonApp, DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityRequirement,
-    DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint, DaemonEvent, DaemonPackage,
-    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
-    DaemonPackageNavigationEntry, DaemonPackagePin, DaemonPackageRouteDescriptor,
-    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION,
-    FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_STREAMING, PROTOCOL,
-    connect_and_hello_with_requirement, read_frame_from_reader, write_frame,
+    DaemonApp, DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
+    DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
+    DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
+    DaemonPackageInstallPlan, DaemonPackageNavigationEntry, DaemonPackagePin,
+    DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest,
+    DaemonResponse, DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
+    FEATURE_PACKAGE_NAVIGATION, FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
+    read_frame_from_reader, write_frame,
 };
 use crossterm::{
     cursor::Show,
@@ -36,6 +37,7 @@ const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r
 const HEADLESS_INPUT: &str = "botster-tui-headless\n";
 const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
+const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -83,6 +85,20 @@ pub fn smoke_message() -> &'static str {
 struct SessionRow {
     session_id: String,
     lifecycle: String,
+}
+
+#[derive(Clone, Debug)]
+struct AttachHydration {
+    session_id: String,
+    subscription_id: String,
+    deadline: Instant,
+    received_terminal_bytes: bool,
+}
+
+#[derive(Default)]
+struct HydrationEvidence {
+    history_received: bool,
+    lifecycle_ended: bool,
 }
 
 impl SessionRow {
@@ -213,6 +229,10 @@ struct DogfoodApp {
     schema_version: Option<u16>,
     subscription_id: String,
     terminal_output: String,
+    terminal_output_session_id: Option<String>,
+    read_screen_fallback: Option<String>,
+    snapshot_metadata: Option<DaemonCaptureSnapshot>,
+    attach_hydration: Option<AttachHydration>,
     command: String,
     drafts: BTreeMap<String, Value>,
     last_reconnect_attempt: Option<Instant>,
@@ -249,6 +269,10 @@ impl DogfoodApp {
             schema_version: None,
             subscription_id: format!("btui-sub-{}", short_suffix()),
             terminal_output: String::new(),
+            terminal_output_session_id: None,
+            read_screen_fallback: None,
+            snapshot_metadata: None,
+            attach_hydration: None,
             command: DEFAULT_COMMAND.to_string(),
             drafts: BTreeMap::new(),
             last_reconnect_attempt: None,
@@ -283,14 +307,19 @@ impl DogfoodApp {
         }
 
         let Some(session_id) = self
-            .attached_session
-            .clone()
+            .attach_hydration
+            .as_ref()
+            .map(|hydration| hydration.session_id.clone())
+            .or_else(|| self.attached_session.clone())
             .or_else(|| self.selected_attachable_session_id_for_poll())
         else {
             return;
         };
-        match self.request(DaemonRequest::Drain { session_id }) {
-            Ok(response) => self.apply_response(response),
+        let request = DaemonRequest::Drain { session_id };
+        #[cfg(test)]
+        self.record_request(&request);
+        match self.request(request) {
+            Ok(response) => self.apply_response_and_advance_hydration(response),
             Err(error) => self.record_transport_error(error),
         }
     }
@@ -485,6 +514,7 @@ impl DogfoodApp {
 
     fn force_reconnect(&mut self) {
         self.client = None;
+        self.attach_hydration = None;
         self.try_connect();
     }
 
@@ -598,9 +628,25 @@ impl DogfoodApp {
         self.error = None;
         self.selected_session = Some(session_id.clone());
         self.action_feedback = Some(format!("attach requested: {session_id}"));
+        self.begin_attach_hydration(&session_id);
         self.request_and_apply(DaemonRequest::Attach {
             session_id,
             subscription_id: self.subscription_id.clone(),
+        });
+    }
+
+    fn begin_attach_hydration(&mut self, session_id: &str) {
+        if self.terminal_output_session_id.as_deref() != Some(session_id) {
+            self.terminal_output.clear();
+            self.read_screen_fallback = None;
+            self.snapshot_metadata = None;
+            self.terminal_output_session_id = Some(session_id.to_string());
+        }
+        self.attach_hydration = Some(AttachHydration {
+            session_id: session_id.to_string(),
+            subscription_id: self.subscription_id.clone(),
+            deadline: Instant::now() + ATTACH_HYDRATION_TIMEOUT,
+            received_terminal_bytes: false,
         });
     }
 
@@ -650,6 +696,7 @@ impl DogfoodApp {
         };
         self.error = None;
         self.action_feedback = Some(format!("detach requested: {session_id}"));
+        self.attach_hydration = None;
         self.request_and_apply(DaemonRequest::Detach {
             session_id,
             subscription_id: self.subscription_id.clone(),
@@ -698,7 +745,7 @@ impl DogfoodApp {
         #[cfg(test)]
         self.record_request(&request);
         match self.request(request) {
-            Ok(response) => self.apply_response(response),
+            Ok(response) => self.apply_response_and_advance_hydration(response),
             Err(error) => self.record_transport_error(error),
         }
     }
@@ -812,6 +859,15 @@ impl DogfoodApp {
                 session_id: session_id.clone(),
                 subscription_id: subscription_id.clone(),
             }),
+            DaemonRequest::Drain { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::Drain(session_id.clone())),
+            DaemonRequest::ReadScreen { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::ReadScreen(session_id.clone())),
+            DaemonRequest::CaptureSnapshot { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::CaptureSnapshot(session_id.clone())),
             _ => {}
         }
     }
@@ -819,6 +875,7 @@ impl DogfoodApp {
     fn record_transport_error(&mut self, error: DaemonTransportError) {
         self.client = None;
         self.attached_session = None;
+        self.attach_hydration = None;
         match error {
             // Defensive for malformed protocol frames outside the hello
             // compatibility path, which now surfaces as Compatibility below.
@@ -851,6 +908,30 @@ impl DogfoodApp {
     }
 
     fn apply_response(&mut self, response: DaemonResponse) {
+        self.apply_response_and_advance_hydration(response);
+    }
+
+    fn apply_response_and_advance_hydration(&mut self, response: DaemonResponse) {
+        let evidence = self.apply_response_state(response);
+        if evidence.lifecycle_ended {
+            self.attach_hydration = None;
+            return;
+        }
+        if evidence.history_received {
+            self.complete_attach_hydration(false);
+            return;
+        }
+        if self
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| Instant::now() >= hydration.deadline)
+        {
+            self.complete_attach_hydration(true);
+        }
+    }
+
+    fn apply_response_state(&mut self, response: DaemonResponse) -> HydrationEvidence {
+        let mut hydration_evidence = HydrationEvidence::default();
         self.record_diagnostics(response.diagnostics);
 
         if let Some(error) = response.error {
@@ -859,7 +940,7 @@ impl DogfoodApp {
                 "{} (code={} operation={})",
                 error.message, error.code, error.operation
             ));
-            return;
+            return hydration_evidence;
         }
 
         if let Some(status) = response.status {
@@ -931,32 +1012,162 @@ impl DogfoodApp {
 
         for event in response.events {
             match event {
-                DaemonEvent::TerminalOutput { data, .. } => {
+                DaemonEvent::TerminalOutput {
+                    session_id,
+                    subscription_id,
+                    data,
+                } => {
+                    self.note_hydration_terminal_bytes(&session_id, &subscription_id, &data);
                     self.append_terminal_output(&data);
                 }
-                DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. } => {
+                DaemonEvent::Snapshot {
+                    session_id,
+                    subscription_id,
+                    data,
+                    ..
+                }
+                | DaemonEvent::Scrollback {
+                    session_id,
+                    subscription_id,
+                    data,
+                    ..
+                } => {
+                    if !data.is_empty() && self.hydration_matches(&session_id, &subscription_id) {
+                        hydration_evidence.history_received = true;
+                    }
+                    self.note_hydration_terminal_bytes(&session_id, &subscription_id, &data);
                     self.append_terminal_output(&data);
                 }
-                DaemonEvent::ProcessExit { code, .. } => {
+                DaemonEvent::ProcessExit {
+                    session_id,
+                    subscription_id,
+                    code,
+                } => {
                     self.status = format!("process exited {}", code.unwrap_or_default());
                     self.attached_session = None;
+                    if self.hydration_matches(&session_id, &subscription_id) {
+                        hydration_evidence.lifecycle_ended = true;
+                    }
                 }
                 DaemonEvent::AttachState {
-                    session_id, state, ..
+                    session_id,
+                    subscription_id,
+                    state,
                 } => {
                     self.action_feedback = Some(format!("attach {state}: {session_id}"));
-                    if state == "attached" || state == "subscribed" || state == "ready" {
+                    if state == "attached" {
                         self.attached_session = Some(session_id);
-                    } else if state == "detached" || state == "closed" || state == "unsubscribed" {
+                    } else if state == "detached" {
                         self.attached_session = None;
+                        if self.hydration_matches(&session_id, &subscription_id) {
+                            hydration_evidence.lifecycle_ended = true;
+                        }
                     }
                 }
                 _ => {}
             }
         }
+        hydration_evidence
+    }
+
+    fn hydration_matches(&self, session_id: &str, subscription_id: &str) -> bool {
+        self.attach_hydration.as_ref().is_some_and(|hydration| {
+            hydration.session_id == session_id && hydration.subscription_id == subscription_id
+        })
+    }
+
+    fn note_hydration_terminal_bytes(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        data: &str,
+    ) {
+        if !data.is_empty()
+            && let Some(hydration) = self.attach_hydration.as_mut()
+            && hydration.session_id == session_id
+            && hydration.subscription_id == subscription_id
+        {
+            hydration.received_terminal_bytes = true;
+        }
+    }
+
+    fn complete_attach_hydration(&mut self, deadline_expired: bool) {
+        let Some(hydration) = self.attach_hydration.take() else {
+            return;
+        };
+        if deadline_expired
+            && self.terminal_output.is_empty()
+            && self
+                .read_screen_fallback
+                .as_deref()
+                .is_none_or(str::is_empty)
+            && !hydration.received_terminal_bytes
+        {
+            self.request_optional_readback(
+                DaemonRequest::ReadScreen {
+                    session_id: hydration.session_id.clone(),
+                },
+                "read_screen",
+            );
+        }
+        self.request_optional_readback(
+            DaemonRequest::CaptureSnapshot {
+                session_id: hydration.session_id,
+            },
+            "capture_snapshot",
+        );
+    }
+
+    fn request_optional_readback(&mut self, request: DaemonRequest, operation: &str) {
+        #[cfg(test)]
+        self.record_request(&request);
+        if self.client.is_none() {
+            return;
+        }
+        match self.request(request) {
+            Ok(response) => self.apply_optional_readback_response(response, operation),
+            Err(error) => {
+                self.action_feedback = Some(format!("{operation} unavailable: {error}"));
+                self.record_transport_error(error);
+            }
+        }
+    }
+
+    fn apply_optional_readback_response(&mut self, response: DaemonResponse, operation: &str) {
+        self.record_diagnostics(response.diagnostics);
+        if let Some(error) = response.error {
+            self.record_diagnostics(error.diagnostics);
+            self.action_feedback = Some(format!("{operation} unavailable: {}", error.message));
+            return;
+        }
+        match response.kind {
+            DaemonResponseKind::ReadScreen => {
+                if self.terminal_output.is_empty()
+                    && let Some(screen) = response.read_screen
+                    && !screen.text.is_empty()
+                    && self.terminal_output_session_id.as_deref()
+                        == Some(screen.session_id.as_str())
+                {
+                    self.read_screen_fallback = Some(screen.text);
+                }
+            }
+            DaemonResponseKind::CaptureSnapshot => {
+                if let Some(snapshot) = response.capture_snapshot
+                    && self.terminal_output_session_id.as_deref()
+                        == Some(snapshot.session_id.as_str())
+                {
+                    self.snapshot_metadata = Some(snapshot);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn append_terminal_output(&mut self, data: &str) {
+        if data.is_empty() {
+            return;
+        }
+        self.read_screen_fallback = None;
         self.terminal_output.push_str(data);
         if self.terminal_output.len() > 8_000 {
             self.terminal_output = self
@@ -1186,6 +1397,22 @@ impl DogfoodApp {
                 UiNodeKind::Text,
                 "dogfood-action-feedback",
                 json!({ "text": format!("action: {feedback}") }),
+            )));
+        }
+        if let Some(snapshot) = &self.snapshot_metadata {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-terminal-snapshot-metadata",
+                json!({
+                    "text": format!(
+                        "terminal snapshot: session={} rows={} cols={} format={} payload_bytes={}",
+                        snapshot.session_id,
+                        snapshot.rows,
+                        snapshot.cols,
+                        snapshot.payload_format.as_deref().unwrap_or("none"),
+                        snapshot.payload_bytes
+                    )
+                }),
             )));
         }
         if let Some(error) = &self.error {
@@ -1628,6 +1855,9 @@ impl DogfoodApp {
         if !self.terminal_output.is_empty() {
             return self.terminal_output.clone();
         }
+        if let Some(fallback) = &self.read_screen_fallback {
+            return fallback.clone();
+        }
         match (&self.attached_session, &self.selected_session) {
             (Some(session_id), _) => format!("waiting for terminal output from {session_id}"),
             (None, Some(session_id)) => {
@@ -1686,6 +1916,9 @@ enum ObservedRequest {
         session_id: String,
         subscription_id: String,
     },
+    Drain(String),
+    ReadScreen(String),
+    CaptureSnapshot(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1908,6 +2141,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
             FEATURE_TERMINAL_STREAMING,
             FEATURE_RESIZE,
             FEATURE_PACKAGE_NAVIGATION,
+            FEATURE_TERMINAL_READBACK,
         ] {
             assert!(
                 compatibility
@@ -2015,6 +2249,7 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_TERMINAL_STREAMING.to_string(),
             FEATURE_RESIZE.to_string(),
             FEATURE_PACKAGE_NAVIGATION.to_string(),
+            FEATURE_TERMINAL_READBACK.to_string(),
         ],
         minimum_conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
@@ -4109,6 +4344,259 @@ mod tests {
     }
 
     #[test]
+    fn shared_late_attach_history_waits_through_empty_drain_and_renders_once_in_order() {
+        let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
+        let mut app = DogfoodApp::new(None);
+        app.subscription_id = scenario.subscription_id.clone();
+        app.begin_attach_hydration(&scenario.session_id);
+        app.observed_requests.clear();
+
+        app.apply_response(events_response(Vec::new()));
+        assert!(app.attach_hydration.is_some());
+        assert!(app.observed_requests.is_empty());
+
+        app.apply_response(events_response(vec![scenario.history_then_live[0].clone()]));
+        assert!(app.attach_hydration.is_some());
+        assert!(app.observed_requests.is_empty());
+
+        app.apply_response(events_response(vec![
+            scenario.history_then_live[1].clone(),
+            scenario.history_then_live[2].clone(),
+        ]));
+
+        let restored = match &scenario.history_then_live[1] {
+            DaemonEvent::Snapshot { data, .. } => data,
+            other => panic!("expected shared snapshot event, got {other:?}"),
+        };
+        let live = match &scenario.history_then_live[2] {
+            DaemonEvent::TerminalOutput { data, .. } => data,
+            other => panic!("expected shared live event, got {other:?}"),
+        };
+        assert_eq!(app.terminal_output, format!("{restored}{live}"));
+        assert_eq!(app.terminal_output.matches(restored).count(), 1);
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::CaptureSnapshot(scenario.session_id)]
+        );
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.find(restored.trim()).unwrap() < rendered.find(live.trim()).unwrap());
+    }
+
+    #[test]
+    fn shared_no_history_live_bytes_suppress_deadline_fallback_before_later_exit() {
+        let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
+        let mut app = DogfoodApp::new(None);
+        app.subscription_id = scenario.no_history_subscription_id.clone();
+        app.begin_attach_hydration(&scenario.no_history_session_id);
+        app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
+        app.observed_requests.clear();
+
+        app.apply_response(events_response(vec![
+            scenario.no_history_then_live[0].clone(),
+            scenario.no_history_then_live[1].clone(),
+        ]));
+
+        assert!(app.attach_hydration.is_none());
+        assert!(!app.terminal_output.is_empty());
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::CaptureSnapshot(
+                scenario.no_history_session_id.clone()
+            )]
+        );
+
+        app.apply_response(events_response(vec![
+            scenario.no_history_then_live[2].clone(),
+        ]));
+        assert_eq!(app.observed_requests.len(), 1);
+        assert!(app.attached_session.is_none());
+    }
+
+    #[test]
+    fn expired_empty_hydration_requests_one_screen_and_snapshot_with_attach_identity() {
+        let mut app = DogfoodApp::new(None);
+        app.subscription_id = "sub-captured".to_string();
+        app.begin_attach_hydration("session-captured");
+        app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
+        app.attached_session = None;
+        app.observed_requests.clear();
+
+        app.apply_response(events_response(Vec::new()));
+        app.apply_response(events_response(Vec::new()));
+
+        assert_eq!(
+            app.observed_requests,
+            vec![
+                ObservedRequest::ReadScreen("session-captured".to_string()),
+                ObservedRequest::CaptureSnapshot("session-captured".to_string()),
+            ]
+        );
+        assert!(app.attach_hydration.is_none());
+
+        app.apply_optional_readback_response(
+            read_screen_response("session-captured", "fallback screen"),
+            "read_screen",
+        );
+        assert!(app.terminal_output.is_empty());
+        assert_eq!(app.read_screen_fallback.as_deref(), Some("fallback screen"));
+        assert!(
+            renderer::render_to_lines(&app.surface(), 120, 48)
+                .0
+                .join("\n")
+                .contains("fallback screen")
+        );
+    }
+
+    #[test]
+    fn late_screen_response_cannot_replace_restored_history() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output_session_id = Some("session-alpha".to_string());
+        app.terminal_output = "ordered history".to_string();
+
+        app.apply_optional_readback_response(
+            read_screen_response("session-alpha", "stale screen"),
+            "read_screen",
+        );
+
+        assert_eq!(app.terminal_output, "ordered history");
+        assert!(app.read_screen_fallback.is_none());
+    }
+
+    #[test]
+    fn authoritative_bytes_after_screen_fallback_replace_it_without_duplication() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output_session_id = Some("session-alpha".to_string());
+        app.apply_optional_readback_response(
+            read_screen_response("session-alpha", "fallback-only"),
+            "read_screen",
+        );
+
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            data: "authoritative-live".to_string(),
+        }]));
+
+        assert!(app.read_screen_fallback.is_none());
+        assert_eq!(app.terminal_output, "authoritative-live");
+        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
+            .0
+            .join("\n");
+        assert!(!rendered.contains("fallback-only"));
+        assert_eq!(rendered.matches("authoritative-live").count(), 1);
+    }
+
+    #[test]
+    fn snapshot_readback_is_metadata_only_and_renders_status() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output_session_id = Some("session-alpha".to_string());
+
+        app.apply_optional_readback_response(
+            capture_snapshot_response("session-alpha", 24, 80, Some("ghostty-page"), 4096),
+            "capture_snapshot",
+        );
+
+        assert!(app.terminal_output.is_empty());
+        assert!(app.read_screen_fallback.is_none());
+        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
+            .0
+            .join("\n");
+        assert!(rendered.contains("rows=24 cols=80"));
+        assert!(rendered.contains("format=ghostty-page"));
+        assert!(rendered.contains("payload_bytes=4096"));
+    }
+
+    #[test]
+    fn optional_readback_operator_error_is_non_fatal() {
+        let mut app = DogfoodApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.terminal_output = "preserved".to_string();
+
+        app.apply_optional_readback_response(
+            operator_error_response("session exited during capture"),
+            "capture_snapshot",
+        );
+
+        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
+        assert_eq!(app.terminal_output, "preserved");
+        assert!(app.error.is_none());
+        assert!(
+            app.action_feedback
+                .as_deref()
+                .unwrap()
+                .contains("capture_snapshot unavailable")
+        );
+
+        app.apply_optional_readback_response(
+            operator_error_response("session exited during screen read"),
+            "read_screen",
+        );
+        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
+        assert_eq!(app.terminal_output, "preserved");
+        assert!(app.error.is_none());
+        assert!(
+            app.action_feedback
+                .as_deref()
+                .unwrap()
+                .contains("read_screen unavailable")
+        );
+    }
+
+    #[test]
+    fn session_switch_clears_owned_terminal_state_while_reconnect_preserves_it() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output_session_id = Some("session-alpha".to_string());
+        app.terminal_output = "alpha history".to_string();
+        app.read_screen_fallback = Some("alpha fallback".to_string());
+        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
+            session_id: "session-alpha".to_string(),
+            rows: 24,
+            cols: 80,
+            payload_format: None,
+            payload_bytes: 1,
+        });
+
+        app.begin_attach_hydration("session-alpha");
+        assert_eq!(app.terminal_output, "alpha history");
+        assert!(app.snapshot_metadata.is_some());
+
+        app.begin_attach_hydration("session-beta");
+        assert!(app.terminal_output.is_empty());
+        assert!(app.read_screen_fallback.is_none());
+        assert!(app.snapshot_metadata.is_none());
+        assert_eq!(
+            app.terminal_output_session_id.as_deref(),
+            Some("session-beta")
+        );
+    }
+
+    #[test]
+    fn process_exit_applies_same_response_bytes_and_suppresses_readbacks() {
+        let mut app = DogfoodApp::new(None);
+        app.subscription_id = "sub-alpha".to_string();
+        app.begin_attach_hydration("session-alpha");
+        app.observed_requests.clear();
+
+        app.apply_response(events_response(vec![
+            DaemonEvent::TerminalOutput {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-alpha".to_string(),
+                data: "final bytes".to_string(),
+            },
+            DaemonEvent::ProcessExit {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-alpha".to_string(),
+                code: Some(0),
+            },
+        ]));
+
+        assert_eq!(app.terminal_output, "final bytes");
+        assert!(app.attach_hydration.is_none());
+        assert!(app.observed_requests.is_empty());
+    }
+
+    #[test]
     fn empty_history_event_data_is_non_fatal() {
         let mut app = DogfoodApp::new(None);
         app.terminal_output = "existing output\n".to_string();
@@ -4446,6 +4934,8 @@ mod tests {
         })
         .expect("headless dogfood surface completes a real hub round trip");
 
+        assert_live_attach_history_readback(&hub);
+
         let foreground_conformance =
             botster_hub_test_support::run_foreground_terminal_app_open_conformance(&hub)
                 .expect("foreground terminal app-open conformance passes");
@@ -4549,6 +5039,119 @@ mod tests {
         assert!(rendered.contains("botster-tui-future-feature"));
 
         hub.shutdown().expect("isolated hub shuts down cleanly");
+    }
+
+    fn assert_live_attach_history_readback(hub: &botster_hub_test_support::IsolatedHub) {
+        let mut daemon =
+            HubConnection::connect(hub.endpoint()).expect("connect direct daemon client");
+        let prior_session_id = format!("tui-history-{}", short_suffix());
+        let prior_marker = format!("history-before-tui-{}", short_suffix());
+        let later_marker = format!("live-after-tui-{}", short_suffix());
+        daemon
+            .request(&DaemonRequest::Spawn {
+                session_id: prior_session_id.clone(),
+                command: format!("printf '{prior_marker}\\n'; while IFS= read -r line; do :; done"),
+            })
+            .expect("spawn history-producing session before TUI attach");
+        thread::sleep(Duration::from_millis(150));
+
+        let mut app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        app.selected_session = Some(prior_session_id.clone());
+        app.observed_requests.clear();
+        app.attach_selected_or_first();
+        wait_for_app_output(&mut app, &prior_marker).expect("late TUI attach renders prior output");
+        let hydration_deadline = Instant::now() + Duration::from_secs(7);
+        while app.attach_hydration.is_some() && Instant::now() < hydration_deadline {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(app.terminal_output.matches(&prior_marker).count(), 1);
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::CaptureSnapshot(prior_session_id.clone()))
+        );
+        assert!(
+            !app.observed_requests
+                .contains(&ObservedRequest::ReadScreen(prior_session_id.clone()))
+        );
+        assert!(app.observed_requests.iter().any(
+            |request| matches!(request, ObservedRequest::Drain(id) if id == &prior_session_id)
+        ));
+        assert!(app.observed_requests.iter().all(|request| {
+            !matches!(request, ObservedRequest::Drain(id) if id != &prior_session_id)
+        }));
+
+        daemon
+            .request(&DaemonRequest::SendInput {
+                session_id: prior_session_id.clone(),
+                data: format!("{later_marker}\n"),
+            })
+            .expect("send later live marker through direct daemon request");
+        wait_for_app_output(&mut app, &later_marker).expect("TUI renders later live output");
+        assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
+        let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(
+            rendered.find(&prior_marker).unwrap() < rendered.find(&later_marker).unwrap(),
+            "restored history must render before later live output: {rendered}"
+        );
+        daemon
+            .request(&DaemonRequest::ShutdownSession {
+                session_id: prior_session_id,
+            })
+            .expect("shut down history-producing session");
+
+        let empty_session_id = format!("tui-empty-{}", short_suffix());
+        daemon
+            .request(&DaemonRequest::Spawn {
+                session_id: empty_session_id.clone(),
+                command: "while IFS= read -r line; do :; done".to_string(),
+            })
+            .expect("spawn empty session");
+        thread::sleep(Duration::from_millis(150));
+
+        let mut empty_app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        empty_app.selected_session = Some(empty_session_id.clone());
+        empty_app.observed_requests.clear();
+        empty_app.attach_selected_or_first();
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while empty_app.attach_hydration.is_some() && Instant::now() < deadline {
+            empty_app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(empty_app.attach_hydration.is_none());
+        assert_eq!(
+            empty_app
+                .observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::ReadScreen(id) if id == &empty_session_id))
+                .count(),
+            1
+        );
+        assert!(empty_app.observed_requests.iter().any(
+            |request| matches!(request, ObservedRequest::Drain(id) if id == &empty_session_id)
+        ));
+        assert!(empty_app.observed_requests.iter().all(|request| {
+            !matches!(request, ObservedRequest::Drain(id) if id != &empty_session_id)
+        }));
+        assert_eq!(
+            empty_app
+                .observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::CaptureSnapshot(id) if id == &empty_session_id))
+                .count(),
+            1
+        );
+        let rendered = renderer::render_to_lines(&empty_app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(rendered.contains("terminal snapshot: session="));
+        daemon
+            .request(&DaemonRequest::ShutdownSession {
+                session_id: empty_session_id,
+            })
+            .expect("shut down empty session");
     }
 
     fn assert_plugin_contract_matrix_renders_through_tui(
@@ -4807,6 +5410,7 @@ mod tests {
                     FEATURE_TERMINAL_STREAMING.to_string(),
                     FEATURE_RESIZE.to_string(),
                     FEATURE_PACKAGE_NAVIGATION.to_string(),
+                    FEATURE_TERMINAL_READBACK.to_string(),
                 ],
                 conformance_fixture_revision: 1,
             },
@@ -5557,6 +6161,33 @@ mod tests {
         response
     }
 
+    fn read_screen_response(session_id: &str, text: &str) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::ReadScreen);
+        response.read_screen = Some(botster_hub_client::DaemonReadScreen {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+        });
+        response
+    }
+
+    fn capture_snapshot_response(
+        session_id: &str,
+        rows: u16,
+        cols: u16,
+        payload_format: Option<&str>,
+        payload_bytes: usize,
+    ) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::CaptureSnapshot);
+        response.capture_snapshot = Some(DaemonCaptureSnapshot {
+            session_id: session_id.to_string(),
+            rows,
+            cols,
+            payload_format: payload_format.map(str::to_string),
+            payload_bytes,
+        });
+        response
+    }
+
     fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
         DaemonResponse {
             kind,
@@ -5565,6 +6196,8 @@ mod tests {
             session_templates: Vec::new(),
             resolved_session_template: None,
             session_context: None,
+            read_screen: None,
+            capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
             worktrees: Vec::new(),
