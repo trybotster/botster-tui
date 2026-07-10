@@ -1033,7 +1033,7 @@ impl DogfoodApp {
                 } => {
                     self.status = format!("process exited {}", code.unwrap_or_default());
                     self.attached_session = None;
-                    self.clear_readback_presentation_for(&session_id);
+                    self.clear_snapshot_metadata_for(&session_id);
                     if self.hydration_matches(&session_id, &subscription_id) {
                         hydration_evidence.lifecycle_ended = true;
                     }
@@ -1048,7 +1048,7 @@ impl DogfoodApp {
                         self.attached_session = Some(session_id);
                     } else if state == "detached" {
                         self.attached_session = None;
-                        self.clear_readback_presentation_for(&session_id);
+                        self.clear_snapshot_metadata_for(&session_id);
                         if self.hydration_matches(&session_id, &subscription_id) {
                             hydration_evidence.lifecycle_ended = true;
                         }
@@ -1066,9 +1066,8 @@ impl DogfoodApp {
         })
     }
 
-    fn clear_readback_presentation_for(&mut self, session_id: &str) {
+    fn clear_snapshot_metadata_for(&mut self, session_id: &str) {
         if self.terminal_output_session_id.as_deref() == Some(session_id) {
-            self.read_screen_fallback = None;
             self.snapshot_metadata = None;
         }
     }
@@ -4552,7 +4551,6 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.subscription_id = "sub-alpha".to_string();
         app.begin_attach_hydration("session-alpha");
-        app.read_screen_fallback = Some("stale fallback".to_string());
         app.snapshot_metadata = Some(DaemonCaptureSnapshot {
             session_id: "session-alpha".to_string(),
             rows: 24,
@@ -4577,16 +4575,48 @@ mod tests {
 
         assert_eq!(app.terminal_output, "final bytes");
         assert!(app.attach_hydration.is_none());
-        assert!(app.read_screen_fallback.is_none());
         assert!(app.snapshot_metadata.is_none());
         assert!(app.observed_requests.is_empty());
     }
 
     #[test]
-    fn detach_clears_owned_fallback_and_snapshot_metadata() {
+    fn process_exit_preserves_owned_fallback_and_clears_snapshot_metadata() {
+        let mut app = DogfoodApp::new(None);
+        app.subscription_id = "sub-alpha".to_string();
+        app.begin_attach_hydration("session-alpha");
+        app.read_screen_fallback = Some("last visible screen".to_string());
+        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
+            session_id: "session-alpha".to_string(),
+            rows: 24,
+            cols: 80,
+            payload_format: None,
+            payload_bytes: 1,
+        });
+
+        app.apply_response(events_response(vec![DaemonEvent::ProcessExit {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            code: Some(0),
+        }]));
+
+        assert_eq!(
+            app.read_screen_fallback.as_deref(),
+            Some("last visible screen")
+        );
+        assert!(app.snapshot_metadata.is_none());
+        assert!(
+            renderer::render_to_lines(&app.surface(), 120, 48)
+                .0
+                .join("\n")
+                .contains("last visible screen")
+        );
+    }
+
+    #[test]
+    fn detach_preserves_owned_fallback_and_clears_snapshot_metadata() {
         let mut app = DogfoodApp::new(None);
         app.terminal_output_session_id = Some("session-alpha".to_string());
-        app.read_screen_fallback = Some("stale fallback".to_string());
+        app.read_screen_fallback = Some("last visible screen".to_string());
         app.snapshot_metadata = Some(DaemonCaptureSnapshot {
             session_id: "session-alpha".to_string(),
             rows: 24,
@@ -4597,7 +4627,10 @@ mod tests {
 
         app.apply_response(attach_state_response("session-alpha", "detached"));
 
-        assert!(app.read_screen_fallback.is_none());
+        assert_eq!(
+            app.read_screen_fallback.as_deref(),
+            Some("last visible screen")
+        );
         assert!(app.snapshot_metadata.is_none());
     }
 
@@ -5103,6 +5136,15 @@ mod tests {
         );
 
         app.force_reconnect();
+        let reconnect_deadline = Instant::now() + Duration::from_secs(7);
+        while app.attach_hydration.is_some() && Instant::now() < reconnect_deadline {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            app.attach_hydration.is_none(),
+            "same-session reconnect hydration must finish"
+        );
         wait_for_app_output(&mut app, &prior_marker)
             .expect("same-session reconnect restores prior output");
         wait_for_app_output(&mut app, &later_marker)
