@@ -92,7 +92,6 @@ struct AttachHydration {
     session_id: String,
     subscription_id: String,
     deadline: Instant,
-    received_terminal_bytes: bool,
 }
 
 #[derive(Default)]
@@ -319,7 +318,7 @@ impl DogfoodApp {
         #[cfg(test)]
         self.record_request(&request);
         match self.request(request) {
-            Ok(response) => self.apply_response_and_advance_hydration(response),
+            Ok(response) => self.apply_response(response),
             Err(error) => self.record_transport_error(error),
         }
     }
@@ -636,17 +635,16 @@ impl DogfoodApp {
     }
 
     fn begin_attach_hydration(&mut self, session_id: &str) {
-        if self.terminal_output_session_id.as_deref() != Some(session_id) {
-            self.terminal_output.clear();
-            self.read_screen_fallback = None;
-            self.snapshot_metadata = None;
-            self.terminal_output_session_id = Some(session_id.to_string());
-        }
+        // Every Attach creates a new subscription and replays full history, so
+        // preserving the previous presentation would duplicate it on reconnect.
+        self.terminal_output.clear();
+        self.read_screen_fallback = None;
+        self.snapshot_metadata = None;
+        self.terminal_output_session_id = Some(session_id.to_string());
         self.attach_hydration = Some(AttachHydration {
             session_id: session_id.to_string(),
             subscription_id: self.subscription_id.clone(),
             deadline: Instant::now() + ATTACH_HYDRATION_TIMEOUT,
-            received_terminal_bytes: false,
         });
     }
 
@@ -745,7 +743,7 @@ impl DogfoodApp {
         #[cfg(test)]
         self.record_request(&request);
         match self.request(request) {
-            Ok(response) => self.apply_response_and_advance_hydration(response),
+            Ok(response) => self.apply_response(response),
             Err(error) => self.record_transport_error(error),
         }
     }
@@ -908,10 +906,6 @@ impl DogfoodApp {
     }
 
     fn apply_response(&mut self, response: DaemonResponse) {
-        self.apply_response_and_advance_hydration(response);
-    }
-
-    fn apply_response_and_advance_hydration(&mut self, response: DaemonResponse) {
         let evidence = self.apply_response_state(response);
         if evidence.lifecycle_ended {
             self.attach_hydration = None;
@@ -1012,12 +1006,7 @@ impl DogfoodApp {
 
         for event in response.events {
             match event {
-                DaemonEvent::TerminalOutput {
-                    session_id,
-                    subscription_id,
-                    data,
-                } => {
-                    self.note_hydration_terminal_bytes(&session_id, &subscription_id, &data);
+                DaemonEvent::TerminalOutput { data, .. } => {
                     self.append_terminal_output(&data);
                 }
                 DaemonEvent::Snapshot {
@@ -1035,7 +1024,6 @@ impl DogfoodApp {
                     if !data.is_empty() && self.hydration_matches(&session_id, &subscription_id) {
                         hydration_evidence.history_received = true;
                     }
-                    self.note_hydration_terminal_bytes(&session_id, &subscription_id, &data);
                     self.append_terminal_output(&data);
                 }
                 DaemonEvent::ProcessExit {
@@ -1045,6 +1033,7 @@ impl DogfoodApp {
                 } => {
                     self.status = format!("process exited {}", code.unwrap_or_default());
                     self.attached_session = None;
+                    self.clear_readback_presentation_for(&session_id);
                     if self.hydration_matches(&session_id, &subscription_id) {
                         hydration_evidence.lifecycle_ended = true;
                     }
@@ -1059,6 +1048,7 @@ impl DogfoodApp {
                         self.attached_session = Some(session_id);
                     } else if state == "detached" {
                         self.attached_session = None;
+                        self.clear_readback_presentation_for(&session_id);
                         if self.hydration_matches(&session_id, &subscription_id) {
                             hydration_evidence.lifecycle_ended = true;
                         }
@@ -1076,18 +1066,10 @@ impl DogfoodApp {
         })
     }
 
-    fn note_hydration_terminal_bytes(
-        &mut self,
-        session_id: &str,
-        subscription_id: &str,
-        data: &str,
-    ) {
-        if !data.is_empty()
-            && let Some(hydration) = self.attach_hydration.as_mut()
-            && hydration.session_id == session_id
-            && hydration.subscription_id == subscription_id
-        {
-            hydration.received_terminal_bytes = true;
+    fn clear_readback_presentation_for(&mut self, session_id: &str) {
+        if self.terminal_output_session_id.as_deref() == Some(session_id) {
+            self.read_screen_fallback = None;
+            self.snapshot_metadata = None;
         }
     }
 
@@ -1101,7 +1083,6 @@ impl DogfoodApp {
                 .read_screen_fallback
                 .as_deref()
                 .is_none_or(str::is_empty)
-            && !hydration.received_terminal_bytes
         {
             self.request_optional_readback(
                 DaemonRequest::ReadScreen {
@@ -1119,11 +1100,11 @@ impl DogfoodApp {
     }
 
     fn request_optional_readback(&mut self, request: DaemonRequest, operation: &str) {
-        #[cfg(test)]
-        self.record_request(&request);
         if self.client.is_none() {
             return;
         }
+        #[cfg(test)]
+        self.record_request(&request);
         match self.request(request) {
             Ok(response) => self.apply_optional_readback_response(response, operation),
             Err(error) => {
@@ -4374,10 +4355,8 @@ mod tests {
         };
         assert_eq!(app.terminal_output, format!("{restored}{live}"));
         assert_eq!(app.terminal_output.matches(restored).count(), 1);
-        assert_eq!(
-            app.observed_requests,
-            vec![ObservedRequest::CaptureSnapshot(scenario.session_id)]
-        );
+        assert!(app.attach_hydration.is_none());
+        assert!(app.observed_requests.is_empty());
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.find(restored.trim()).unwrap() < rendered.find(live.trim()).unwrap());
@@ -4399,22 +4378,17 @@ mod tests {
 
         assert!(app.attach_hydration.is_none());
         assert!(!app.terminal_output.is_empty());
-        assert_eq!(
-            app.observed_requests,
-            vec![ObservedRequest::CaptureSnapshot(
-                scenario.no_history_session_id.clone()
-            )]
-        );
+        assert!(app.observed_requests.is_empty());
 
         app.apply_response(events_response(vec![
             scenario.no_history_then_live[2].clone(),
         ]));
-        assert_eq!(app.observed_requests.len(), 1);
+        assert!(app.observed_requests.is_empty());
         assert!(app.attached_session.is_none());
     }
 
     #[test]
-    fn expired_empty_hydration_requests_one_screen_and_snapshot_with_attach_identity() {
+    fn expired_empty_hydration_finishes_before_synthetic_screen_response_renders() {
         let mut app = DogfoodApp::new(None);
         app.subscription_id = "sub-captured".to_string();
         app.begin_attach_hydration("session-captured");
@@ -4425,14 +4399,8 @@ mod tests {
         app.apply_response(events_response(Vec::new()));
         app.apply_response(events_response(Vec::new()));
 
-        assert_eq!(
-            app.observed_requests,
-            vec![
-                ObservedRequest::ReadScreen("session-captured".to_string()),
-                ObservedRequest::CaptureSnapshot("session-captured".to_string()),
-            ]
-        );
         assert!(app.attach_hydration.is_none());
+        assert!(app.observed_requests.is_empty());
 
         app.apply_optional_readback_response(
             read_screen_response("session-captured", "fallback screen"),
@@ -4544,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    fn session_switch_clears_owned_terminal_state_while_reconnect_preserves_it() {
+    fn every_attach_cycle_clears_owned_terminal_and_readback_state() {
         let mut app = DogfoodApp::new(None);
         app.terminal_output_session_id = Some("session-alpha".to_string());
         app.terminal_output = "alpha history".to_string();
@@ -4558,8 +4526,16 @@ mod tests {
         });
 
         app.begin_attach_hydration("session-alpha");
-        assert_eq!(app.terminal_output, "alpha history");
-        assert!(app.snapshot_metadata.is_some());
+        assert!(app.terminal_output.is_empty());
+        assert!(app.read_screen_fallback.is_none());
+        assert!(app.snapshot_metadata.is_none());
+        assert_eq!(
+            app.terminal_output_session_id.as_deref(),
+            Some("session-alpha")
+        );
+
+        app.terminal_output = "replayed alpha history".to_string();
+        app.read_screen_fallback = Some("alpha fallback".to_string());
 
         app.begin_attach_hydration("session-beta");
         assert!(app.terminal_output.is_empty());
@@ -4576,6 +4552,14 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.subscription_id = "sub-alpha".to_string();
         app.begin_attach_hydration("session-alpha");
+        app.read_screen_fallback = Some("stale fallback".to_string());
+        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
+            session_id: "session-alpha".to_string(),
+            rows: 24,
+            cols: 80,
+            payload_format: None,
+            payload_bytes: 1,
+        });
         app.observed_requests.clear();
 
         app.apply_response(events_response(vec![
@@ -4593,7 +4577,28 @@ mod tests {
 
         assert_eq!(app.terminal_output, "final bytes");
         assert!(app.attach_hydration.is_none());
+        assert!(app.read_screen_fallback.is_none());
+        assert!(app.snapshot_metadata.is_none());
         assert!(app.observed_requests.is_empty());
+    }
+
+    #[test]
+    fn detach_clears_owned_fallback_and_snapshot_metadata() {
+        let mut app = DogfoodApp::new(None);
+        app.terminal_output_session_id = Some("session-alpha".to_string());
+        app.read_screen_fallback = Some("stale fallback".to_string());
+        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
+            session_id: "session-alpha".to_string(),
+            rows: 24,
+            cols: 80,
+            payload_format: None,
+            payload_bytes: 1,
+        });
+
+        app.apply_response(attach_state_response("session-alpha", "detached"));
+
+        assert!(app.read_screen_fallback.is_none());
+        assert!(app.snapshot_metadata.is_none());
     }
 
     #[test]
@@ -5096,6 +5101,21 @@ mod tests {
             rendered.find(&prior_marker).unwrap() < rendered.find(&later_marker).unwrap(),
             "restored history must render before later live output: {rendered}"
         );
+
+        app.force_reconnect();
+        wait_for_app_output(&mut app, &prior_marker)
+            .expect("same-session reconnect restores prior output");
+        wait_for_app_output(&mut app, &later_marker)
+            .expect("same-session reconnect restores later output");
+        assert_eq!(app.terminal_output.matches(&prior_marker).count(), 1);
+        assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
+        let reconnected = renderer::render_to_lines(&app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(
+            reconnected.find(&prior_marker).unwrap() < reconnected.find(&later_marker).unwrap(),
+            "same-session reconnect must render one ordered replay: {reconnected}"
+        );
         daemon
             .request(&DaemonRequest::ShutdownSession {
                 session_id: prior_session_id,
@@ -5143,6 +5163,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(empty_app.read_screen_fallback.is_none());
         let rendered = renderer::render_to_lines(&empty_app.surface(), 200, 80)
             .0
             .join("\n");
