@@ -111,4 +111,3 @@ Botster layers touched: Rust TUI and the public Rust hub-client/test-support dep
 - Candidate durable pattern after runtime proof: a first-party terminal client smoke must send input through the client's production ownership/dispatch boundary; direct protocol `SendInput` proves the hub but not the client. Capture through the vault inbox/pipeline only after the revised live smoke validates the claim.
 - No new readiness-order note is needed: [[terminal subscribe readiness gates on sessionio initial snapshot delivery]], [[initial terminal snapshots must precede live output activation]], and the existing shared-fixture notes already hold the durable contract.
 - Preserve the already-known operational gap [[project pipelines checklist worker timeouts require artifact evidence fallback]]; this run reproduced it, but repetition alone does not require a duplicate note.
-

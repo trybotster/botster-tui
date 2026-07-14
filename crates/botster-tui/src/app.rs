@@ -2168,8 +2168,13 @@ fn wait_for_app_output(app: &mut DogfoodApp, needle: &str) -> DaemonTransportRes
         thread::sleep(Duration::from_millis(25));
     }
 
-    eprintln!("terminal-output-observed: {:?}", app.terminal_output);
-    Err(DaemonTransportError::ClientDisconnected)
+    let observed_prefix = app.terminal_output.chars().take(256).collect::<String>();
+    eprintln!(
+        "timed out waiting for terminal output {needle:?}; terminal-output-prefix: {observed_prefix:?}"
+    );
+    Err(DaemonTransportError::Protocol(
+        "timed out waiting for terminal output",
+    ))
 }
 
 fn node(kind: UiNodeKind, id: &str, props: Value) -> UiNode {
@@ -5319,7 +5324,6 @@ mod tests {
             rendered.find(&prior_marker).unwrap() < rendered.find(&later_marker).unwrap(),
             "restored history must render before later live output: {rendered}"
         );
-        assert!(rendered.contains(&later_marker));
 
         app.force_reconnect();
         let reconnect_deadline = Instant::now() + Duration::from_secs(7);
