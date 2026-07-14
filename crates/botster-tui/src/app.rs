@@ -866,6 +866,12 @@ impl DogfoodApp {
             DaemonRequest::CaptureSnapshot { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::CaptureSnapshot(session_id.clone())),
+            DaemonRequest::SendInput { session_id, data } => {
+                self.observed_requests.push(ObservedRequest::SendInput {
+                    session_id: session_id.clone(),
+                    data: data.clone(),
+                })
+            }
             _ => {}
         }
     }
@@ -1899,6 +1905,10 @@ enum ObservedRequest {
     Drain(String),
     ReadScreen(String),
     CaptureSnapshot(String),
+    SendInput {
+        session_id: String,
+        data: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4326,6 +4336,37 @@ mod tests {
     #[test]
     fn shared_late_attach_history_waits_through_empty_drain_and_renders_once_in_order() {
         let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
+        assert_eq!(scenario.conformance_fixture_revision, 12);
+        let attaching_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
+            })
+            .expect("shared fixture includes attaching state");
+        let history_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. } if !data.is_empty())
+            })
+            .expect("shared fixture includes renderable history");
+        let attached_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
+            })
+            .expect("shared fixture includes attached state");
+        let live_index = scenario
+            .history_then_live
+            .iter()
+            .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
+            .expect("shared fixture includes live output");
+        assert!(attaching_index < history_index);
+        assert!(history_index < attached_index);
+        assert!(attached_index < live_index);
+
         let mut app = DogfoodApp::new(None);
         app.subscription_id = scenario.subscription_id.clone();
         app.begin_attach_hydration(&scenario.session_id);
@@ -4335,20 +4376,36 @@ mod tests {
         assert!(app.attach_hydration.is_some());
         assert!(app.observed_requests.is_empty());
 
-        app.apply_response(events_response(vec![scenario.history_then_live[0].clone()]));
+        app.apply_response(events_response(vec![
+            scenario.history_then_live[attaching_index].clone(),
+        ]));
         assert!(app.attach_hydration.is_some());
+        assert!(app.attached_session.is_none());
         assert!(app.observed_requests.is_empty());
 
         app.apply_response(events_response(vec![
-            scenario.history_then_live[1].clone(),
-            scenario.history_then_live[2].clone(),
+            scenario.history_then_live[history_index].clone(),
         ]));
 
-        let restored = match &scenario.history_then_live[1] {
-            DaemonEvent::Snapshot { data, .. } => data,
-            other => panic!("expected shared snapshot event, got {other:?}"),
+        let restored = match &scenario.history_then_live[history_index] {
+            DaemonEvent::Snapshot { data, .. } | DaemonEvent::Scrollback { data, .. } => data,
+            other => panic!("expected shared history event, got {other:?}"),
         };
-        let live = match &scenario.history_then_live[2] {
+        assert_eq!(app.terminal_output, *restored);
+        assert!(app.attach_hydration.is_none());
+
+        app.apply_response(events_response(vec![
+            scenario.history_then_live[attached_index].clone(),
+        ]));
+        assert_eq!(
+            app.attached_session.as_deref(),
+            Some(scenario.session_id.as_str())
+        );
+
+        app.apply_response(events_response(vec![
+            scenario.history_then_live[live_index].clone(),
+        ]));
+        let live = match &scenario.history_then_live[live_index] {
             DaemonEvent::TerminalOutput { data, .. } => data,
             other => panic!("expected shared live event, got {other:?}"),
         };
@@ -4362,28 +4419,100 @@ mod tests {
     }
 
     #[test]
-    fn shared_no_history_live_bytes_suppress_deadline_fallback_before_later_exit() {
+    fn shared_no_history_attached_owns_input_while_bounded_hydration_continues() {
         let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
+        let attaching_index = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
+            })
+            .expect("idle fixture includes attaching state");
+        let attached_index = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| {
+                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
+            })
+            .expect("idle fixture includes attached state");
+        let live_index = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
+            .expect("idle fixture includes live output");
+        assert!(attaching_index < attached_index);
+        assert!(attached_index < live_index);
+        assert!(scenario.no_history_then_live.iter().all(|event| !matches!(
+            event,
+            DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. }
+        )));
+
         let mut app = DogfoodApp::new(None);
         app.subscription_id = scenario.no_history_subscription_id.clone();
         app.begin_attach_hydration(&scenario.no_history_session_id);
-        app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
         app.observed_requests.clear();
 
         app.apply_response(events_response(vec![
-            scenario.no_history_then_live[0].clone(),
-            scenario.no_history_then_live[1].clone(),
+            scenario.no_history_then_live[attaching_index].clone(),
+            scenario.no_history_then_live[attached_index].clone(),
         ]));
 
-        assert!(app.attach_hydration.is_none());
-        assert!(!app.terminal_output.is_empty());
-        assert!(app.observed_requests.is_empty());
+        assert_eq!(
+            app.attached_session.as_deref(),
+            Some(scenario.no_history_session_id.as_str())
+        );
+        assert!(app.attach_hydration.is_some());
 
         app.apply_response(events_response(vec![
-            scenario.no_history_then_live[2].clone(),
+            scenario.no_history_then_live[live_index].clone(),
         ]));
+        assert!(!app.terminal_output.is_empty());
+        assert!(app.attach_hydration.is_some());
         assert!(app.observed_requests.is_empty());
+
+        app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
+        app.apply_response(events_response(Vec::new()));
+        assert!(app.attach_hydration.is_none());
+        assert!(app.observed_requests.is_empty());
+
+        let exit = scenario
+            .no_history_then_live
+            .iter()
+            .find(|event| matches!(event, DaemonEvent::ProcessExit { .. }))
+            .expect("idle fixture includes process exit")
+            .clone();
+        app.apply_response(events_response(vec![exit]));
         assert!(app.attached_session.is_none());
+    }
+
+    #[test]
+    fn opaque_empty_snapshot_does_not_finish_visible_history_hydration() {
+        let mut app = DogfoodApp::new(None);
+        app.subscription_id = "sub-opaque".to_string();
+        app.begin_attach_hydration("session-opaque");
+
+        app.apply_response(events_response(vec![
+            DaemonEvent::AttachState {
+                session_id: "session-opaque".to_string(),
+                subscription_id: "sub-opaque".to_string(),
+                state: "attaching".to_string(),
+            },
+            DaemonEvent::Snapshot {
+                session_id: "session-opaque".to_string(),
+                subscription_id: "sub-opaque".to_string(),
+                data: String::new(),
+                bytes: 128,
+            },
+            DaemonEvent::AttachState {
+                session_id: "session-opaque".to_string(),
+                subscription_id: "sub-opaque".to_string(),
+                state: "attached".to_string(),
+            },
+        ]));
+
+        assert!(app.terminal_output.is_empty());
+        assert!(app.attach_hydration.is_some());
+        assert_eq!(app.attached_session.as_deref(), Some("session-opaque"));
     }
 
     #[test]
@@ -4706,6 +4835,48 @@ mod tests {
         app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
 
         assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
+    }
+
+    #[test]
+    fn focused_terminal_key_routes_through_production_input_dispatch() {
+        let mut app = DogfoodApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let terminal = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "dogfood-terminal")
+            .expect("terminal should be focusable");
+        let mut router = InputRouter::new(renderer::action_request_context());
+
+        router.dispatch_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: terminal.rect.x.saturating_add(1),
+                row: terminal.rect.y.saturating_add(1),
+                modifiers: KeyModifiers::NONE,
+            }),
+            &hit_map,
+        );
+        assert_eq!(router.focused_node_id(), Some("dogfood-terminal"));
+
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            &hit_map,
+        );
+        assert_eq!(
+            dispatch,
+            InputDispatch::TerminalForward {
+                node_id: "dogfood-terminal".to_string(),
+                bytes: b"x".to_vec(),
+            }
+        );
+
+        app.handle_dispatch(dispatch);
+        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
+            session_id: "session-alpha".to_string(),
+            data: "x".to_string(),
+        }));
     }
 
     #[test]
@@ -5119,12 +5290,26 @@ mod tests {
             !matches!(request, ObservedRequest::Drain(id) if id != &prior_session_id)
         }));
 
-        daemon
-            .request(&DaemonRequest::SendInput {
-                session_id: prior_session_id.clone(),
-                data: format!("{later_marker}\n"),
-            })
-            .expect("send later live marker through direct daemon request");
+        let attached_deadline = Instant::now() + Duration::from_secs(7);
+        while app.attached_session.as_deref() != Some(prior_session_id.as_str())
+            && Instant::now() < attached_deadline
+        {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            app.attached_session.as_deref(),
+            Some(prior_session_id.as_str()),
+            "TUI must observe Attached before forwarding terminal input"
+        );
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "dogfood-terminal".to_string(),
+            bytes: format!("{later_marker}\n").into_bytes(),
+        });
+        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
+            session_id: prior_session_id.clone(),
+            data: format!("{later_marker}\n"),
+        }));
         wait_for_app_output(&mut app, &later_marker).expect("TUI renders later live output");
         assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
         let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
@@ -5134,6 +5319,7 @@ mod tests {
             rendered.find(&prior_marker).unwrap() < rendered.find(&later_marker).unwrap(),
             "restored history must render before later live output: {rendered}"
         );
+        assert!(rendered.contains(&later_marker));
 
         app.force_reconnect();
         let reconnect_deadline = Instant::now() + Duration::from_secs(7);
