@@ -3067,6 +3067,15 @@ mod tests {
     use super::*;
     use botster_core::{RequestId, UiActionId, UiActionKind, UiActionRequest, UiSurfaceId};
 
+    fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
     #[test]
     fn smoke_message_names_the_scaffold() {
         assert_eq!(smoke_message(), "botster-tui smoke ok");
@@ -3470,26 +3479,43 @@ mod tests {
     fn composite_table_mouse_selection_dispatches_exact_row_action() {
         let surface = composite_application_primitives_plugin_surface();
         let node = plugin_surface_body_node(&surface).expect("composite surface validates for TUI");
-        let (_lines, hit_map) = renderer::render_to_lines(&node, 100, 36);
-        let row = hit_map
+        let (_lines, frame_n_hit_map) = renderer::render_to_lines(&node, 100, 36);
+        let row = frame_n_hit_map
             .regions()
             .iter()
             .find(|region| region.node_id == "contract-composite-ticket-a")
             .expect("bordered composite table row should be hit-testable");
+        let (column, row) = (row.rect.x, row.rect.y);
         let mut router = InputRouter::new(renderer::action_request_context());
 
-        let dispatch = router.dispatch_event(
-            Event::Mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column: row.rect.x,
-                row: row.rect.y,
-                modifiers: KeyModifiers::NONE,
-            }),
-            &hit_map,
+        let down_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &frame_n_hit_map,
+        );
+        assert_eq!(
+            down_dispatch,
+            InputDispatch::Focus {
+                node_id: "contract-composite-ticket-a".to_string()
+            }
+        );
+        assert_eq!(router.selected_row("contract-composite-ticket-table"), None);
+
+        let (_lines, frame_n_plus_one_hit_map) = renderer::render_to_lines(&node, 100, 36);
+        let up_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &frame_n_plus_one_hit_map,
         );
 
         assert!(matches!(
-            dispatch,
+            up_dispatch,
             InputDispatch::Action(request)
                 if request.action_id == botster_core::ui::UiActionId("contract.ticket.open".to_string())
                     && request.node_id == Some(UiNodeId("contract-composite-ticket-a".to_string()))
@@ -5037,15 +5063,37 @@ mod tests {
             .find(|region| region.node_id == "dogfood-session-session-alpha")
             .expect("first session row should be focusable");
 
-        router.dispatch_event(
-            Event::Mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column: first_row.rect.x,
-                row: first_row.rect.y,
-                modifiers: KeyModifiers::NONE,
-            }),
+        let (column, row) = (first_row.rect.x, first_row.rect.y);
+        let down_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
             &hit_map,
         );
+        assert!(matches!(down_dispatch, InputDispatch::Focus { .. }));
+        assert_eq!(router.selected_row("dogfood-session-list"), None);
+
+        let up_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        assert!(matches!(
+            up_dispatch,
+            InputDispatch::Action(_) | InputDispatch::Focus { .. }
+        ));
+        assert_eq!(
+            router
+                .selected_row_value("dogfood-session-list")
+                .and_then(Value::as_str),
+            Some("session-alpha")
+        );
+
         router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             &hit_map,
@@ -5056,28 +5104,109 @@ mod tests {
     }
 
     #[test]
-    fn focused_terminal_key_routes_through_production_input_dispatch() {
+    fn session_click_cancels_when_redraw_reorders_another_row_under_release() {
         let mut app = DogfoodApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
+        app.selected_session = Some("session-alpha".to_string());
+        let (_lines, frame_n_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let first_row = frame_n_hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "dogfood-session-session-alpha")
+            .expect("alpha row should be hit-testable");
+        let (column, row) = (first_row.rect.x, first_row.rect.y);
+        let mut router = InputRouter::new(renderer::action_request_context());
+
+        assert!(matches!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    column,
+                    row,
+                ),
+                &frame_n_hit_map,
+            ),
+            InputDispatch::Focus { .. }
+        ));
+
+        app.sessions.reverse();
+        let (_lines, frame_n_plus_one_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let moved_under_pointer = frame_n_plus_one_hit_map
+            .lookup(column, row)
+            .expect("reordered row should remain under the pointer");
+        assert_eq!(moved_under_pointer.node_id, "dogfood-session-session-beta");
+
+        assert_eq!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left,),
+                    column,
+                    row,
+                ),
+                &frame_n_plus_one_hit_map,
+            ),
+            InputDispatch::Ignored
+        );
+        assert_eq!(router.selected_row("dogfood-session-list"), None);
+        app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
+        assert_eq!(app.selected_session.as_deref(), Some("session-alpha"));
+    }
+
+    #[test]
+    fn focused_terminal_mouse_pair_attaches_once_and_preserves_key_forwarding() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec![SessionRow::running("session-alpha")];
+        app.selected_session = Some("session-alpha".to_string());
+        app.observed_requests.clear();
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
         let terminal = hit_map
             .regions()
             .iter()
             .find(|region| region.node_id == "dogfood-terminal")
             .expect("terminal should be focusable");
+        let (column, row) = (
+            terminal.rect.x.saturating_add(1),
+            terminal.rect.y.saturating_add(1),
+        );
         let mut router = InputRouter::new(renderer::action_request_context());
 
-        router.dispatch_event(
-            Event::Mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column: terminal.rect.x.saturating_add(1),
-                row: terminal.rect.y.saturating_add(1),
-                modifiers: KeyModifiers::NONE,
-            }),
+        let down_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
             &hit_map,
         );
+        assert!(matches!(
+            &down_dispatch,
+            InputDispatch::Action(request)
+                if request.action_id
+                    == UiActionId("botster.terminal.focus".to_string())
+        ));
         assert_eq!(router.focused_node_id(), Some("dogfood-terminal"));
+        app.handle_dispatch(down_dispatch);
+
+        let up_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        assert_eq!(up_dispatch, InputDispatch::Ignored);
+        app.handle_dispatch(up_dispatch);
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
+                .count(),
+            1
+        );
+
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
 
         let dispatch = router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
@@ -5096,6 +5225,56 @@ mod tests {
             session_id: "session-alpha".to_string(),
             data: "x".to_string(),
         }));
+    }
+
+    #[test]
+    fn mouse_mode_terminal_release_is_ignored_without_duplicate_focus_action() {
+        let terminal = node(
+            UiNodeKind::TerminalView,
+            "mouse-mode-terminal",
+            json!({
+                "session_id": "session-alpha",
+                "mouse_mode": true
+            }),
+        );
+        let (_lines, hit_map) = renderer::render_to_lines(&terminal, 40, 10);
+        let region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "mouse-mode-terminal")
+            .expect("mouse-mode terminal should be hit-testable");
+        let (column, row) = (
+            region.rect.x.saturating_add(1),
+            region.rect.y.saturating_add(1),
+        );
+        let mut router = InputRouter::new(renderer::action_request_context());
+
+        assert!(matches!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column,
+                    row,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Action(request)
+                if request.action_id
+                    == UiActionId("botster.terminal.focus".to_string())
+        ));
+        assert_eq!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left,),
+                    column,
+                    row,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Ignored
+        );
     }
 
     #[test]
@@ -5187,16 +5366,30 @@ mod tests {
             .find(|region| region.node_id == "dogfood-session-session-beta")
             .expect("exited session row should be focusable");
 
-        let mouse_dispatch = router.dispatch_event(
-            Event::Mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column: session_row.rect.x,
-                row: session_row.rect.y,
-                modifiers: KeyModifiers::NONE,
-            }),
+        let (column, row) = (session_row.rect.x, session_row.rect.y);
+        let down_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
             &hit_map,
         );
-        app.handle_dispatch(mouse_dispatch);
+        assert!(matches!(down_dispatch, InputDispatch::Focus { .. }));
+        app.handle_dispatch(down_dispatch);
+        let up_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        assert!(matches!(
+            up_dispatch,
+            InputDispatch::Action(_) | InputDispatch::Focus { .. }
+        ));
+        app.handle_dispatch(up_dispatch);
         let key_dispatch = router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &hit_map,
