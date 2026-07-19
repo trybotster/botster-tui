@@ -26,11 +26,14 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 This scaffold uses `botster-tui-kit` pinned to merged main revision
-`8b3ea35fb9742c50919ed4e6435ef21a59019223`. The kit owns reusable
+`fa0a728297c51d659b675f7d4201a3910a25bd82`. The kit owns reusable
 Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
-input forwarding. `botster-tui` owns the first-party hub client app, including
-hub connection setup, dogfood state, sessions, packages, installed apps,
-marketplace diagnostics, and terminal attach/input/resize/drain behavior.
+input forwarding. Semantic controls focus and capture on left Down, then
+activate only on matching-node left Up; `terminal_view` deliberately keeps its
+left-Down focus/attach behavior and forwards input when focused.
+`botster-tui` owns the first-party hub client app, including hub connection
+setup, dogfood state, sessions, packages, installed apps, marketplace
+diagnostics, and terminal attach/input/resize/drain behavior.
 
 ## Commands
 
