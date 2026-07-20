@@ -40,6 +40,7 @@ const HEADLESS_INPUT: &str = "botster-tui-headless\n";
 const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 14;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -179,6 +180,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
 
         let mut hit_map = HitMap::default();
         terminal.draw(|frame| draw(frame, &mut hit_map, &app))?;
+        app.apply_terminal_mouse_mode(&mut hit_map);
 
         if event::poll(Duration::from_millis(100))? {
             let event = event::read()?;
@@ -237,6 +239,10 @@ struct DogfoodApp {
     terminal_output_session_id: Option<String>,
     snapshot_metadata: Option<DaemonCaptureSnapshot>,
     attach_hydration: Option<AttachHydration>,
+    terminal_mouse_mode: u8,
+    terminal_mouse_mode_attachment: Option<(String, String)>,
+    terminal_mouse_mode_refresh_due: bool,
+    last_terminal_mouse_mode_probe: Option<Instant>,
     command: String,
     drafts: BTreeMap<String, Value>,
     last_reconnect_attempt: Option<Instant>,
@@ -277,6 +283,10 @@ impl DogfoodApp {
             terminal_output_session_id: None,
             snapshot_metadata: None,
             attach_hydration: None,
+            terminal_mouse_mode: 0,
+            terminal_mouse_mode_attachment: None,
+            terminal_mouse_mode_refresh_due: false,
+            last_terminal_mouse_mode_probe: None,
             command: DEFAULT_COMMAND.to_string(),
             drafts: BTreeMap::new(),
             last_reconnect_attempt: None,
@@ -326,6 +336,7 @@ impl DogfoodApp {
             Ok(response) => self.apply_response(response),
             Err(error) => self.record_transport_error(error),
         }
+        self.refresh_terminal_mouse_mode_if_due();
     }
 
     fn handle_dispatch(&mut self, dispatch: InputDispatch) {
@@ -528,6 +539,7 @@ impl DogfoodApp {
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
+        self.clear_terminal_mouse_mode();
         self.try_connect();
     }
 
@@ -655,6 +667,7 @@ impl DogfoodApp {
         self.subscription_id = subscription_id.to_string();
         self.attached_session = None;
         self.attached_subscription_id = None;
+        self.clear_terminal_mouse_mode();
         self.terminal_output.clear();
         self.snapshot_metadata = None;
         self.terminal_output_session_id = Some(session_id.to_string());
@@ -718,6 +731,7 @@ impl DogfoodApp {
         self.error = None;
         self.action_feedback = Some(format!("detach requested: {session_id}"));
         self.attach_hydration = None;
+        self.clear_terminal_mouse_mode();
         self.request_and_apply(DaemonRequest::Detach {
             session_id,
             subscription_id,
@@ -886,6 +900,9 @@ impl DogfoodApp {
             DaemonRequest::ReadScreen { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::ReadScreen(session_id.clone())),
+            DaemonRequest::ReadModeFlags { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::ReadModeFlags(session_id.clone())),
             DaemonRequest::CaptureSnapshot { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::CaptureSnapshot(session_id.clone())),
@@ -904,6 +921,7 @@ impl DogfoodApp {
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
+        self.clear_terminal_mouse_mode();
         match error {
             // Defensive for malformed protocol frames outside the hello
             // compatibility path, which now surfaces as Compatibility below.
@@ -1049,6 +1067,7 @@ impl DogfoodApp {
                         }
                     } else if self.attached_matches(&session_id, &subscription_id) {
                         self.append_terminal_output(&data);
+                        self.terminal_mouse_mode_refresh_due = true;
                     }
                 }
                 DaemonEvent::Snapshot {
@@ -1078,6 +1097,7 @@ impl DogfoodApp {
                     self.status = format!("process exited {}", code.unwrap_or_default());
                     self.attached_session = None;
                     self.attached_subscription_id = None;
+                    self.clear_terminal_mouse_mode();
                     self.clear_snapshot_metadata_for(&session_id);
                 }
                 DaemonEvent::AttachState {
@@ -1092,11 +1112,13 @@ impl DogfoodApp {
                     }
                     self.action_feedback = Some(format!("attach {state}: {session_id}"));
                     if state == "attached" && hydration_matches {
-                        self.attached_session = Some(session_id);
+                        self.attached_session = Some(session_id.clone());
                         self.attached_subscription_id = Some(subscription_id);
+                        self.probe_terminal_mouse_mode(&session_id);
                     } else if state == "detached" {
                         self.attached_session = None;
                         self.attached_subscription_id = None;
+                        self.clear_terminal_mouse_mode();
                         self.clear_snapshot_metadata_for(&session_id);
                         if hydration_matches {
                             hydration_evidence.lifecycle_ended = true;
@@ -1156,6 +1178,64 @@ impl DogfoodApp {
             },
             "capture_snapshot",
         );
+        if self.attached_session.as_deref() == Some(session_id) {
+            self.probe_terminal_mouse_mode(session_id);
+        }
+    }
+
+    fn probe_terminal_mouse_mode(&mut self, session_id: &str) {
+        self.last_terminal_mouse_mode_probe = Some(Instant::now());
+        self.terminal_mouse_mode_refresh_due = false;
+        self.request_optional_readback(
+            DaemonRequest::ReadModeFlags {
+                session_id: session_id.to_string(),
+            },
+            "read_mode_flags",
+        );
+    }
+
+    fn refresh_terminal_mouse_mode_if_due(&mut self) {
+        if !self.terminal_mouse_mode_refresh_due {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_terminal_mouse_mode_probe
+            .is_some_and(|last| now.duration_since(last) < TERMINAL_MOUSE_MODE_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        let Some(session_id) = self.attached_session.clone() else {
+            self.clear_terminal_mouse_mode();
+            return;
+        };
+        self.probe_terminal_mouse_mode(&session_id);
+    }
+
+    fn clear_terminal_mouse_mode(&mut self) {
+        self.terminal_mouse_mode = 0;
+        self.terminal_mouse_mode_attachment = None;
+        self.terminal_mouse_mode_refresh_due = false;
+        self.last_terminal_mouse_mode_probe = None;
+    }
+
+    fn current_terminal_mouse_mode(&self) -> u8 {
+        match (
+            self.terminal_mouse_mode_attachment.as_ref(),
+            self.attached_session.as_ref(),
+            self.attached_subscription_id.as_ref(),
+        ) {
+            (Some((mode_session, mode_subscription)), Some(session), Some(subscription))
+                if mode_session == session && mode_subscription == subscription =>
+            {
+                self.terminal_mouse_mode
+            }
+            _ => 0,
+        }
+    }
+
+    fn apply_terminal_mouse_mode(&self, hit_map: &mut HitMap) {
+        hit_map.set_terminal_mouse_mode("dogfood-terminal", self.current_terminal_mouse_mode());
     }
 
     fn request_optional_readback(&mut self, request: DaemonRequest, operation: &str) {
@@ -1178,6 +1258,9 @@ impl DogfoodApp {
         if let Some(error) = response.error {
             self.record_diagnostics(error.diagnostics);
             self.action_feedback = Some(format!("{operation} unavailable: {}", error.message));
+            if operation == "read_mode_flags" {
+                self.clear_terminal_mouse_mode();
+            }
             if operation == "read_screen"
                 && let Some(session_id) = self
                     .attach_hydration
@@ -1202,7 +1285,28 @@ impl DogfoodApp {
                     self.snapshot_metadata = Some(snapshot);
                 }
             }
-            _ => {}
+            DaemonResponseKind::ReadModeFlags => {
+                let Some(mode_flags) = response.mode_flags else {
+                    self.clear_terminal_mouse_mode();
+                    return;
+                };
+                let Some(subscription_id) = self.attached_subscription_id.clone() else {
+                    self.clear_terminal_mouse_mode();
+                    return;
+                };
+                if self.attached_session.as_deref() != Some(mode_flags.session_id.as_str()) {
+                    self.clear_terminal_mouse_mode();
+                    return;
+                }
+                self.terminal_mouse_mode = mode_flags.mouse_mode;
+                self.terminal_mouse_mode_attachment =
+                    Some((mode_flags.session_id, subscription_id));
+            }
+            _ => {
+                if operation == "read_mode_flags" {
+                    self.clear_terminal_mouse_mode();
+                }
+            }
         }
     }
 
@@ -1957,6 +2061,7 @@ enum ObservedRequest {
     },
     Drain(String),
     ReadScreen(String),
+    ReadModeFlags(String),
     CaptureSnapshot(String),
     SendInput {
         session_id: String,
@@ -4536,7 +4641,10 @@ mod tests {
     #[test]
     fn shared_late_attach_history_waits_through_empty_drain_and_renders_once_in_order() {
         let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
-        assert_eq!(scenario.conformance_fixture_revision, 14);
+        assert!(
+            scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION,
+            "shared fixture must satisfy the TUI's minimum conformance revision"
+        );
         let attaching_index = scenario
             .history_then_live
             .iter()
@@ -5236,12 +5344,13 @@ mod tests {
         let terminal = node(
             UiNodeKind::TerminalView,
             "mouse-mode-terminal",
-            json!({
-                "session_id": "session-alpha",
-                "mouse_mode": true
-            }),
+            json!({ "session_id": "session-alpha" }),
         );
-        let (_lines, hit_map) = renderer::render_to_lines(&terminal, 40, 10);
+        terminal
+            .validate()
+            .expect("mouse-mode routing fixture should remain schema-valid");
+        let (_lines, mut hit_map) = renderer::render_to_lines(&terminal, 40, 10);
+        hit_map.set_terminal_mouse_mode("mouse-mode-terminal", 9);
         let region = hit_map
             .regions()
             .iter()
@@ -5315,6 +5424,109 @@ mod tests {
             session_id: "session-alpha".to_string(),
             data: String::from_utf8(sgr_release.to_vec()).expect("SGR release should be UTF-8"),
         }));
+    }
+
+    #[test]
+    fn authoritative_mouse_mode_is_attachment_scoped_and_reapplied_after_render() {
+        let mut app = DogfoodApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some("sub-alpha".to_string());
+        app.subscription_id = "sub-alpha".to_string();
+
+        app.apply_optional_readback_response(
+            mode_flags_response("session-alpha", 9),
+            "read_mode_flags",
+        );
+        assert_eq!(app.current_terminal_mouse_mode(), 9);
+
+        for _ in 0..2 {
+            let (_lines, mut hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+            let terminal = hit_map
+                .regions()
+                .iter()
+                .find(|region| region.node_id == "dogfood-terminal")
+                .expect("production terminal should be hit-testable");
+            assert!(!terminal.terminal_mouse_mode);
+
+            app.apply_terminal_mouse_mode(&mut hit_map);
+            let terminal = hit_map
+                .regions()
+                .iter()
+                .find(|region| region.node_id == "dogfood-terminal")
+                .expect("production terminal should still be hit-testable");
+            assert!(terminal.terminal_mouse_mode);
+        }
+
+        app.apply_optional_readback_response(
+            mode_flags_response("session-alpha", 0),
+            "read_mode_flags",
+        );
+        assert_eq!(app.current_terminal_mouse_mode(), 0);
+
+        app.apply_optional_readback_response(
+            mode_flags_response("session-alpha", 9),
+            "read_mode_flags",
+        );
+
+        app.apply_optional_readback_response(
+            mode_flags_response("session-stale", 9),
+            "read_mode_flags",
+        );
+        assert_eq!(app.current_terminal_mouse_mode(), 0);
+    }
+
+    #[test]
+    fn terminal_output_refresh_is_bounded_and_malformed_readback_is_safe_off() {
+        let mut app = DogfoodApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some("sub-alpha".to_string());
+        app.subscription_id = "sub-alpha".to_string();
+        app.apply_optional_readback_response(
+            mode_flags_response("session-alpha", 9),
+            "read_mode_flags",
+        );
+        app.last_terminal_mouse_mode_probe = Some(Instant::now());
+
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            data: "output".to_string(),
+        }]));
+        assert!(app.terminal_mouse_mode_refresh_due);
+        app.refresh_terminal_mouse_mode_if_due();
+        assert!(app.terminal_mouse_mode_refresh_due);
+
+        app.last_terminal_mouse_mode_probe =
+            Some(Instant::now() - TERMINAL_MOUSE_MODE_REFRESH_INTERVAL);
+        app.refresh_terminal_mouse_mode_if_due();
+        assert!(!app.terminal_mouse_mode_refresh_due);
+
+        app.apply_optional_readback_response(
+            base_response(DaemonResponseKind::ReadModeFlags),
+            "read_mode_flags",
+        );
+        assert_eq!(app.current_terminal_mouse_mode(), 0);
+    }
+
+    #[test]
+    fn sgr_encoding_bit_alone_does_not_enable_terminal_mouse_tracking() {
+        let mut app = DogfoodApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some("sub-alpha".to_string());
+        app.subscription_id = "sub-alpha".to_string();
+        app.apply_optional_readback_response(
+            mode_flags_response("session-alpha", 8),
+            "read_mode_flags",
+        );
+
+        let (_lines, mut hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        app.apply_terminal_mouse_mode(&mut hit_map);
+        let terminal = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "dogfood-terminal")
+            .expect("production terminal should be hit-testable");
+        assert!(!terminal.terminal_mouse_mode);
     }
 
     #[test]
@@ -5716,7 +5928,9 @@ mod tests {
         daemon
             .request(&DaemonRequest::Spawn {
                 session_id: prior_session_id.clone(),
-                command: format!("printf '{prior_marker}\\n'; while IFS= read -r line; do :; done"),
+                command: format!(
+                    "printf '{prior_marker}\\n'; sleep 1; printf '\\033[?1000h\\033[?1006h'; while IFS= read -r line; do case \"$line\" in enable-mouse) printf '\\033[?1000h\\033[?1006h' ;; disable-mouse) printf '\\033[?1000l\\033[?1006l' ;; esac; done"
+                ),
             })
             .expect("spawn history-producing session before TUI attach");
         thread::sleep(Duration::from_millis(150));
@@ -5765,6 +5979,90 @@ mod tests {
             Some(prior_session_id.as_str()),
             "TUI must observe Attached before forwarding terminal input"
         );
+        let mode_on_deadline = Instant::now() + Duration::from_secs(3);
+        while app.current_terminal_mouse_mode() != 9 && Instant::now() < mode_on_deadline {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            app.current_terminal_mouse_mode(),
+            9,
+            "real Ghostty mode flags must reach the attachment shadow"
+        );
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::ReadModeFlags(prior_session_id.clone())),
+            "the production attachment path must issue targeted mode readback"
+        );
+
+        let (_lines, mut mouse_hit_map) = renderer::render_to_lines(&app.surface(), 200, 80);
+        app.apply_terminal_mouse_mode(&mut mouse_hit_map);
+        let terminal = mouse_hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "dogfood-terminal")
+            .expect("production terminal should be hit-testable");
+        assert!(terminal.terminal_mouse_mode);
+        let (column, row) = (
+            terminal.rect.x.saturating_add(1),
+            terminal.rect.y.saturating_add(1),
+        );
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let focus = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &mouse_hit_map,
+        );
+        assert!(matches!(focus, InputDispatch::Action(_)));
+        let sgr_release = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &mouse_hit_map,
+        );
+        assert!(matches!(
+            &sgr_release,
+            InputDispatch::TerminalForward { bytes, .. } if bytes == b"\x1b[<0;1;1m"
+        ));
+        app.handle_dispatch(sgr_release);
+        assert!(app.observed_requests.iter().any(|request| {
+            matches!(request, ObservedRequest::SendInput { session_id, data }
+                if session_id == &prior_session_id && data == "\x1b[<0;1;1m")
+        }));
+
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "dogfood-terminal".to_string(),
+            bytes: b"\ndisable-mouse\n".to_vec(),
+        });
+        thread::sleep(TERMINAL_MOUSE_MODE_REFRESH_INTERVAL);
+        let mode_off_deadline = Instant::now() + Duration::from_secs(3);
+        while app.current_terminal_mouse_mode() != 0 && Instant::now() < mode_off_deadline {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            app.current_terminal_mouse_mode(),
+            0,
+            "real DECRST output must restore outer mouse routing"
+        );
+
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "dogfood-terminal".to_string(),
+            bytes: b"enable-mouse\n".to_vec(),
+        });
+        thread::sleep(TERMINAL_MOUSE_MODE_REFRESH_INTERVAL);
+        let mode_reenabled_deadline = Instant::now() + Duration::from_secs(3);
+        while app.current_terminal_mouse_mode() != 9 && Instant::now() < mode_reenabled_deadline {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(app.current_terminal_mouse_mode(), 9);
+
         app.handle_dispatch(InputDispatch::TerminalForward {
             node_id: "dogfood-terminal".to_string(),
             bytes: format!("{later_marker}\n").into_bytes(),
@@ -5801,6 +6099,16 @@ mod tests {
         assert!(
             app.attach_hydration.is_none(),
             "same-session reconnect hydration must finish"
+        );
+        let restored_mode_deadline = Instant::now() + Duration::from_secs(3);
+        while app.current_terminal_mouse_mode() != 9 && Instant::now() < restored_mode_deadline {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            app.current_terminal_mouse_mode(),
+            9,
+            "reattach must restore current authoritative mouse mode"
         );
         wait_for_app_output(&mut app, &prior_marker)
             .expect("same-session reconnect restores prior output");
@@ -6889,6 +7197,15 @@ mod tests {
         response
     }
 
+    fn mode_flags_response(session_id: &str, mouse_mode: u8) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::ReadModeFlags);
+        response.mode_flags = Some(botster_hub_client::DaemonModeFlags {
+            session_id: session_id.to_string(),
+            mouse_mode,
+        });
+        response
+    }
+
     fn capture_snapshot_response(
         session_id: &str,
         rows: u16,
@@ -6916,6 +7233,7 @@ mod tests {
             resolved_session_template: None,
             session_context: None,
             read_screen: None,
+            mode_flags: None,
             capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,

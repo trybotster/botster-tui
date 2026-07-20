@@ -287,3 +287,27 @@ waive runtime-path acceptance without a human decision.
 - No new architecture decision is otherwise needed: the authoritative Ghostty
   query, exact bit mapping, closed schema, synced-readback posture, and post-render
   kit hook are already durable vault knowledge.
+
+## Implementation evidence
+
+- Implemented the approved client-owned attachment shadow without a schema,
+  pushed-event, parser, scheduler, or upstream-repository change.
+- `run_loop` reapplies the exact current shadow to `dogfood-terminal` after each
+  draw and before `InputRouter` dispatch; `TerminalForward` still reaches the
+  attached session through the existing hub-client `SendInput` request.
+- `CARGO_TARGET_DIR=/tmp/botster-tui-ticket-mouse script/fmt` passed.
+- `CARGO_TARGET_DIR=/tmp/botster-tui-ticket-mouse script/test` passed 86 unit
+  tests and one package-manifest integration test.
+- `CARGO_TARGET_DIR=/tmp/botster-tui-ticket-mouse script/clippy` passed.
+- `CARGO_TARGET_DIR=/tmp/botster-tui-ticket-mouse-live
+  BOTSTER_LIVE_HUB_TARGET_DIR=/tmp/botster-tui-ticket-mouse-hub
+  ZIG_LOCAL_CACHE_DIR=/tmp/botster-tui-ticket-zig-cache script/test-live-hub`
+  passed against hub `06f1fa7` carrying core `7ce1f70`. The isolated production
+  path observed real mode `9`, forwarded an SGR release through
+  `TerminalForward`/`SendInput`, observed real mode `0` after DECRST, and restored
+  mode `9` after reconnect/reattach.
+- Lock inspection found only the approved hub-client, hub-test-support, and kit
+  git-source revisions changed. Cargo tree inspection found one shared
+  botster-core `978c436` identity for the app and kit `UiNode` boundary.
+- Final diff, invalid-prop, pushed-event/parser, and path/PII scans passed. No
+  `mouse_mode` prop remains in a `terminal_view` fixture or production tree.
