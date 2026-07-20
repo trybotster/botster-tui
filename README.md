@@ -26,8 +26,8 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 This scaffold uses `botster-tui-kit` pinned to merged main revision
-`bc066e2581b01fb9e5271794c9a67ba1ace36e42`, which includes kit PRs #12-#16.
-PR #13 supplies complete terminal SGR mouse reports for
+`16c6035dd06ffb5ec0704f1a3603c3e4bc5c81bf`, which includes the client-owned
+terminal mouse-mode hook. The kit supplies complete terminal SGR mouse reports for
 press/release/drag/move/wheel; the later revisions also supply scroll
 normalization, multi-click/drag tracking, and `HitMap` occlusion barriers. The
 kit owns reusable
@@ -39,10 +39,13 @@ mouse mode is focused.
 
 The app does not yet display multi-click counts or drive the optional scroll
 normalizer poll/deadline clock, and it needs no app-specific occlusion helpers
-beyond the kit's `HitMap` behavior. The kit's boolean mouse-mode contract also
-cannot distinguish xterm mode 1002 from 1003, so it forwards no-button movement
-while mouse mode owns focus; production schema-valid mouse-mode enablement must
-account for that limitation.
+beyond the kit's `HitMap` behavior. Production mouse-mode ownership is split
+deliberately: core keeps the closed `terminal_view` contract (`session_id` plus
+optional `title`), the hub exposes authoritative emulator mode flags, this client
+keeps an attachment-scoped `u8` shadow and reapplies it after every render, and
+the kit converts tracking bits `1|2|4` into full-stream SGR routing. Bit `8` alone
+selects SGR encoding but does not enable tracking. Failed, malformed, stale, or
+detached readback clears the client shadow to safe-off.
 `botster-tui` owns the first-party hub client app, including hub connection
 setup, dogfood state, sessions, packages, installed apps, marketplace
 diagnostics, and terminal attach/input/resize/drain behavior.
@@ -66,7 +69,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`196d56825a93c9fe8f754e1aa8e8ce18943041b1`. The protocol source is
+`06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
