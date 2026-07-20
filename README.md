@@ -26,11 +26,23 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 This scaffold uses `botster-tui-kit` pinned to merged main revision
-`fa0a728297c51d659b675f7d4201a3910a25bd82`. The kit owns reusable
+`bc066e2581b01fb9e5271794c9a67ba1ace36e42`, which includes kit PRs #12-#16.
+PR #13 supplies complete terminal SGR mouse reports for
+press/release/drag/move/wheel; the later revisions also supply scroll
+normalization, multi-click/drag tracking, and `HitMap` occlusion barriers. The
+kit owns reusable
 Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
 input forwarding. Semantic controls focus and capture on left Down, then
 activate only on matching-node left Up; `terminal_view` deliberately keeps its
-left-Down focus/attach behavior and forwards input when focused.
+left-Down focus/attach behavior and forwards the trailing SGR release when
+mouse mode is focused.
+
+The app does not yet display multi-click counts or drive the optional scroll
+normalizer poll/deadline clock, and it needs no app-specific occlusion helpers
+beyond the kit's `HitMap` behavior. The kit's boolean mouse-mode contract also
+cannot distinguish xterm mode 1002 from 1003, so it forwards no-button movement
+while mouse mode owns focus; production schema-valid mouse-mode enablement must
+account for that limitation.
 `botster-tui` owns the first-party hub client app, including hub connection
 setup, dogfood state, sessions, packages, installed apps, marketplace
 diagnostics, and terminal attach/input/resize/drain behavior.

@@ -5228,7 +5228,11 @@ mod tests {
     }
 
     #[test]
-    fn mouse_mode_terminal_release_is_ignored_without_duplicate_focus_action() {
+    fn mouse_mode_terminal_release_forwards_sgr_once_without_duplicate_focus_action() {
+        let mut app = DogfoodApp::new(None);
+        app.sessions = vec![SessionRow::running("session-alpha")];
+        app.selected_session = Some("session-alpha".to_string());
+        app.observed_requests.clear();
         let terminal = node(
             UiNodeKind::TerminalView,
             "mouse-mode-terminal",
@@ -5249,32 +5253,68 @@ mod tests {
         );
         let mut router = InputRouter::new(renderer::action_request_context());
 
-        assert!(matches!(
-            router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Down(
-                        crossterm::event::MouseButton::Left,
-                    ),
-                    column,
-                    row,
-                ),
-                &hit_map,
+        let down_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
             ),
+            &hit_map,
+        );
+        assert!(matches!(
+            &down_dispatch,
             InputDispatch::Action(request)
                 if request.action_id
                     == UiActionId("botster.terminal.focus".to_string())
         ));
+        app.handle_dispatch(down_dispatch);
         assert_eq!(
-            router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left,),
-                    column,
-                    row,
-                ),
-                &hit_map,
-            ),
-            InputDispatch::Ignored
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
+                .count(),
+            1
         );
+
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+
+        let up_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        let sgr_release = b"\x1b[<0;1;1m";
+        assert_eq!(
+            up_dispatch,
+            InputDispatch::TerminalForward {
+                node_id: "mouse-mode-terminal".to_string(),
+                bytes: sgr_release.to_vec(),
+            }
+        );
+        app.handle_dispatch(up_dispatch);
+
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::SendInput { .. }))
+                .count(),
+            1
+        );
+        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
+            session_id: "session-alpha".to_string(),
+            data: String::from_utf8(sgr_release.to_vec()).expect("SGR release should be UTF-8"),
+        }));
     }
 
     #[test]
