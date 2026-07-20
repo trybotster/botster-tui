@@ -15,6 +15,18 @@ Ticket: Production terminal mouse-mode enablement (client-owned, schema-valid)
   rejects a pushed `ModeChanged` stream, a TUI-local DECSET/DECRST parser, and
   any expansion of the core `terminal_view` UiNode schema. Probe failure or
   unknown state means mouse mode is off.
+- Plan Review `review_1784564219_724937` returned changes required after proving
+  that the authoritative producer substrate is absent, not merely unwired.
+  Human decision `question_1784563519_602413` selected route A2: run a cheap
+  libghostty feasibility spike before committing to a multi-repository
+  implementation.
+- Canonical blocking spike: `ticket_1784564069_340152`, target botster-core
+  `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`, run
+  `run_1784564384_511975`. This ticket produces no botster-tui implementation
+  until that spike closes with concrete feasibility evidence.
+- A duplicate spike ordering edge created during a worker-timeout retry was
+  removed. The duplicate ticket record remains for operator cleanup, but only
+  `ticket_1784564069_340152` blocks this ticket.
 - Planning authority: [[planner-playbook]], [[botster-planner-playbook]],
   [[botster-architecture]], [[cli-patterns]], and [[spa-patterns]].
 - Ticket-specific vault constraints:
@@ -23,6 +35,8 @@ Ticket: Production terminal mouse-mode enablement (client-owned, schema-valid)
   [[focused mouse mode terminal passthrough needs complete sgr reports]],
   [[synced state types are allowed while pushed event variants are forbidden]],
   [[terminal accessory reattach must restore nested tui input passthrough]],
+  [[ghostty shadow terminal integration belongs outside botster core]],
+  [[cross repo dependency registration must use dependency repo target]],
   [[terminal-capability-propagation-alacritty-eventlistener-is-integration-point]],
   [[botster tui consumes tui kit through a thin app policy adapter]], and
   [[botster tui uinode event routing captures hit regions during draw]].
@@ -45,24 +59,37 @@ Ticket: Production terminal mouse-mode enablement (client-owned, schema-valid)
   - botster-tui has no mouse-mode shadow;
   - the pinned hub-client exposes `ReadScreen` and `CaptureSnapshot`, but no
     `ModeFlags` probe;
-  - core already defines targeted `SessionIoRequest::GetModeFlags` and
-    `ModeFlagsReady`, but the inspected production adapters currently return
-    `ModeFlags::default()` rather than emulator truth.
+  - core has `SessionIoRequest::GetModeFlags`, `ModeFlagsReady`, and the
+    `ModeFlags.mouse_mode` vocabulary, but no authoritative producer:
+    `TerminalScreenRuntime` has no mode-flags method,
+    `TerminalScreenState::new` hardcodes defaults,
+    botster-terminal-ghostty exposes no mouse-mode state, production adapters
+    return defaults, and `managed_session_runtime` explicitly rejects
+    `GetModeFlags` as unsupported;
+  - feasibility may therefore require a change in the separate Ghostty target,
+    not only core/hub/kit/TUI plumbing.
 
 ## Product decisions and assumptions
 
 - The mode source is authoritative session/runtime state. botster-tui consumes
   it; it does not parse terminal output to recreate emulator state.
-- Extend the existing targeted `GetModeFlags` request/response path. Do not add
-  a server-pushed mode event variant.
+- Route A2 is binding: first determine whether libghostty can expose mouse
+  tracking. Do not begin core, hub, kit, web, or TUI implementation from this
+  ticket while the spike is open.
+- If feasibility is positive, extend the backend-neutral core seam and existing
+  targeted `GetModeFlags` vocabulary. Concrete Ghostty queries stay behind
+  botster-terminal-ghostty per
+  [[ghostty shadow terminal integration belongs outside botster core]]. Do not
+  add a server-pushed mode event variant.
 - The external hub-client result should carry `session_id` and the existing
   `mouse_mode: u8` value. botster-tui needs only `mouse_mode != 0`; preserving
   the existing value avoids inventing a second mode encoding while keeping the
   ticket's routing behavior boolean.
-- Query after attach/focus and reattach hydration. Also refresh after a
-  non-empty terminal drain batch so a child that later enables or disables
-  tracking updates the client shadow without byte parsing or an unconditional
-  high-frequency request loop.
+- A later implementation plan must specify bounded query scheduling. Baseline
+  requirement: probe on attach/focus and reattach hydration, suppress duplicate
+  in-flight probes, and rate-limit output-triggered refreshes to at most one per
+  second per attached session. This bound must be revisited after the spike
+  identifies query cost, but unbounded per-drain probing is forbidden.
 - Store mode against the attached session identity and ignore stale responses.
   Detach, process exit, session switch, transport failure, query failure, and
   unknown state clear the shadow to off.
@@ -78,15 +105,16 @@ Ticket: Production terminal mouse-mode enablement (client-owned, schema-valid)
   production backend has no truthful mode query at its pinned revision, the
   substrate work must add that narrow backend read. It must not substitute
   default flags or infer state from botster-tui output bytes.
-- Assumption: coordinated upstream work will land in botster-core,
-  botster-hub, and botster-tui-kit before this repo updates immutable git pins.
-  Because this run's worktree is botster-tui-only, Implement must register
-  explicit dependency tickets/targets or obtain pipeline coordination for
-  those repositories rather than editing ambient sibling checkouts.
-- Unknown: the exact production terminal backend API that exposes mouse mode.
-  Implement must trace the backend used by the session worker and prove its
-  enable/disable values. A fake-only `ModeFlagsReady` result does not satisfy
-  this plan.
+- Cross-repo targets are resolved now, not deferred to Implement:
+  - botster-core: `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`
+  - Ghostty: `tgt_fa66a1b4bd92472c8b000fb031a1fd0b`
+  - botster-hub: `tgt_7e208a0c76a44980a83b63af976b1f22`
+  - botster-tui-kit: `tgt_3dfae49c02454037bf13554f552baf7f`
+  - botster-web: `tgt_40abcf71ccf049f4ac0c99953a799869`
+  - botster-tui: `tgt_c3d470bab78549df920a41e8fb0e58d8`
+- Unknown delegated to the spike: whether mouse mode is already readable,
+  needs a small Ghostty FFI addition, or needs larger Ghostty work. A fake-only
+  `ModeFlagsReady` result does not answer the spike or satisfy this ticket.
 - Unknown: whether exposing the existing query through CoreDaemon requires a
   core public-facade addition or can reuse an existing readback result. Choose
   the narrowest facade path parallel to `ReadScreen`; do not expose raw actor
@@ -94,25 +122,27 @@ Ticket: Production terminal mouse-mode enablement (client-owned, schema-valid)
 
 ## Scope
 
-Botster layers touched: terminal backend/session worker and CoreDaemon
-readback substrate, Rust hub/client protocol, reusable TUI-kit hit-map
-mechanics, botster-tui client policy/state, tests, dependency pins, and docs.
+Current Plan/run scope:
 
-1. Make the existing targeted core mode-flags request return authoritative
-   production terminal state, including mouse tracking enable/disable.
-2. Expose one hub/client request-response operation for reading a session's
-   mode flags, parallel to the existing read-screen/capture-snapshot path.
-3. Add one narrow kit API that sets `terminal_mouse_mode` on a rendered
-   terminal hit region by node id. Default remains off.
-4. Remove kit rendering/tests/examples that treat `mouse_mode` as a UiNode prop;
-   test harnesses set the hit-region flag through the explicit kit API.
-5. Add botster-tui attached-session mode shadow and lifecycle probes. Apply the
-   shadow to the production `dogfood-terminal` hit region after render and
-   before input dispatch.
-6. Update immutable core, hub-client/test-support, and kit pins only after their
-   upstream changes merge; audit `Cargo.lock` for explained movement.
-7. Document ownership and failure behavior in the botster-tui README and
-   affected upstream contract docs.
+1. Keep this botster-tui ticket blocked on canonical spike
+   `ticket_1784564069_340152`.
+2. Produce no botster-tui code while feasibility is unknown.
+3. Preserve the locked design preference: authoritative mode state,
+   client-owned shadow, safe-off unknown/error behavior, no pushed event,
+   no client parser, and no UiNode schema expansion.
+4. Re-plan the concrete implementation DAG after the spike classifies
+   feasibility.
+
+Conditional delivery scope after a positive spike:
+
+1. Ghostty change only if the spike classifies it as necessary.
+2. Backend-neutral core trait/runtime/CoreDaemon reporting, including removal
+   or narrowing of the explicit `get_mode_flags` unsupported rejection.
+3. Hub/hub-client request-response plus generated TypeScript surface and
+   downstream botster-web drift handling.
+4. Kit hit-map mutation hook and migration away from invalid renderer props.
+5. botster-tui client shadow, bounded probes, production routing, immutable pin
+   updates, tests, and docs.
 
 ## Non-scope
 
@@ -130,11 +160,19 @@ mechanics, botster-tui client policy/state, tests, dependency pins, and docs.
 - No speculative general capability registry, observer framework, service
   object, feature flag, optional configuration, or compatibility dual path.
 - No unrelated dependency upgrades or broad core/hub/TUI refactors.
+- No implementation work in this ticket before the spike closes and the
+  conditional DAG is replaced by an evidence-backed concrete plan.
 
 ## Affected surfaces and files
 
-Expected upstream botster-core surfaces (exact filenames may narrow after the
-backend trace):
+Current branch:
+
+- `docs/plans/tui-production-terminal-mouse-mode-enablement-plan.md`
+  - records the review correction, blocking spike, explicit target ids, and
+    conditional DAG.
+- No production source files are changed before spike completion.
+
+Conditional botster-core surfaces if the spike is positive:
 
 - `crates/botster-core/src/engine/managed_session_runtime.rs` and facade files
   such as `engine/botster.rs`: expose targeted mode-flags readback parallel to
@@ -143,24 +181,41 @@ backend trace):
   if the daemon facade does not already surface `GetModeFlags`.
 - `crates/botster-core/src/runtime/...`,
   `crates/botster-core/src/bin/botster-session-worker.rs`, and the production
-  terminal backend (currently under `crates/botster-terminal-ghostty/...` at
-  the inspected pin): return real `TerminalScreenState.mode_flags` rather than
-  defaults and preserve it across snapshot/reattach.
+  runtime adapters: stop fabricating default mode state.
+- `crates/botster-core/src/engine/managed_session_runtime.rs`: remove or narrow
+  the explicit `unsupported("get_mode_flags")` rejection and prove the targeted
+  request reaches the backend-neutral seam.
+- `crates/botster-terminal-ghostty/src/sys.rs` and `src/lib.rs`: conditional
+  concrete backend reporting only if the spike proves the existing FFI can
+  supply it without a separate Ghostty change.
+- `trybotster/ghostty` on target `tgt_fa66a1b4bd92472c8b000fb031a1fd0b`:
+  conditional FFI work only for spike outcome (b); outcome (c) returns to a
+  human product decision before any implementation.
 - Core unit, worker-process, daemon integration, and downstream conformance
   tests for enable, disable, reattach, and unknown/error behavior.
 
-Expected upstream botster-hub surfaces:
+Conditional botster-hub surfaces:
 
 - `src/runtime.rs` and `src/client_api.rs`: route the targeted CoreDaemon
   mode-flags probe through the existing hub client facade.
 - `src/daemon_transport.rs`: map one daemon request to one response and preserve
   session identity/error semantics.
 - `crates/botster-hub-client/src/lib.rs`: add the serializable request,
-  response kind, and `session_id` plus `mouse_mode` DTO.
+  response kind, `session_id` plus `mouse_mode` DTO, and request/response
+  wire-name maps.
+- `crates/botster-hub-client/src/typescript.rs`: add the generated TypeScript
+  request, response, DTO, and discriminator mappings.
 - Hub runtime/client API/daemon transport tests and
   botster-hub-test-support fixtures for real on/off values and failures.
 
-Expected upstream botster-tui-kit surfaces:
+Conditional botster-web surface:
+
+- Generated protocol artifacts and drift tests on target
+  `tgt_40abcf71ccf049f4ac0c99953a799869`. The post-spike DAG must decide from
+  actual hub-client generation output whether regeneration is required; it may
+  not silently leave a new response kind out of browser conformance.
+
+Conditional botster-tui-kit surfaces:
 
 - `crates/botster-tui-kit/src/hit_map.rs`: add and test a narrow
   `set_terminal_mouse_mode(node_id, enabled)`-style API.
@@ -172,7 +227,7 @@ Expected upstream botster-tui-kit surfaces:
   replace invalid prop fixtures with direct hit-map setup and document that
   client adapters own mode application.
 
-This botster-tui repository:
+Conditional botster-tui surfaces after upstream dependencies merge:
 
 - `crates/botster-tui/src/app.rs`
   - store the attached session's mouse-mode shadow;
@@ -191,57 +246,70 @@ This botster-tui repository:
   - document session/runtime authority, client shadow, kit hit-region
     application, closed UiNode contract, probe points, and safe-off failures.
 - `docs/plans/tui-production-terminal-mouse-mode-enablement-plan.md`
-  - this reviewable Plan-stage artifact.
+  - update conditional surfaces and executable acceptance commands from the
+    spike finding before implementation begins.
 
 ## Implementation sequence
 
-1. Register/confirm explicit cross-repo dependency work for botster-core,
-   botster-hub, and botster-tui-kit so each change lands in its own target and
-   worktree. Do not work in ambient sibling checkouts.
-2. In core, trace the production session worker's terminal backend and make the
-   existing `GetModeFlags -> ModeFlagsReady` request return actual mouse-mode
-   state. Add a facade readback parallel to `ReadScreen`, including reattach
-   state restoration and a real enable/disable backend test.
-3. In hub/hub-client, expose one targeted mode-flags request/response. Prove the
-   daemon transport uses the production runtime facade, returns the requested
-   session id/value, propagates errors, and introduces no pushed event.
-4. In kit, add the explicit hit-map mode setter, make terminal render default
-   to off, remove `mouse_mode` prop consumption, and migrate fixtures/examples
-   to direct hit-map state.
-5. Pin the merged upstream revisions in botster-tui and inspect the lockfile
-   before adding client behavior.
-6. In `DogfoodApp`, add the smallest attached-session mode shadow. Probe at the
-   decided lifecycle points, refresh after non-empty drain batches, reject
-   stale-session results, and fail closed to off.
-7. After every production draw, apply the shadow to `dogfood-terminal` in the
-   rendered `HitMap` before dispatching input.
-8. Replace the current invalid-prop app test with a schema-valid production
-   surface test that drives:
-   authoritative on -> hit-region on -> exact kit SGR `TerminalForward` ->
-   app `SendInput`, then authoritative off -> hit-region off -> no terminal
-   mouse forwarding. Cover attach/reattach and failure clearing.
-9. Update docs, run focused upstream and consumer tests, then run every
-   repo-approved full gate. Inspect diffs and dependency revisions before
-   handing off.
+1. Run and close feasibility spike `ticket_1784564069_340152` on botster-core
+   target `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`.
+2. Branch the ticket DAG from the spike finding:
+   - Outcome (a), no Ghostty repo change: create core implementation work on
+     `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`.
+   - Outcome (b), small Ghostty FFI change: create Ghostty work on
+     `tgt_fa66a1b4bd92472c8b000fb031a1fd0b`; core implementation depends on it.
+   - Outcome (c), larger Ghostty work: keep this ticket blocked and ask a human
+     to choose investment, alternate authoritative substrate, or ticket
+     cancellation. Do not fall back to a TUI parser.
+3. For positive outcomes, register every dependency before this ticket enters
+   Implement:
+   - core implementation on `tgt_1f7bce66eb304881980f9b4a2a5ae3fe`;
+   - hub/hub-client work on `tgt_7e208a0c76a44980a83b63af976b1f22`
+     depending on core;
+   - kit hit-map work on `tgt_3dfae49c02454037bf13554f552baf7f`,
+     which may proceed in parallel after feasibility is positive;
+   - botster-web protocol drift work on
+     `tgt_40abcf71ccf049f4ac0c99953a799869` only if generated artifacts change,
+     depending on hub;
+   - this botster-tui ticket depends on merged core, hub, kit, and any required
+     web drift work.
+4. Re-run Plan with the spike artifact and registered DAG. Replace conditional
+   surfaces with exact APIs/files and executable per-repo commands.
+5. Only then enter Implement in this worktree. Migrate the existing test-local
+   `mouse_mode` harness to the explicit hit-map API; production is already
+   schema-valid, so its validation assertion is a regression guard, not a fix.
+6. Implement the client shadow and bounded probes, apply it after render, prove
+   on/off and reattach through the real path, update pins/docs, and run all
+   repository gates.
 
 ## Risks
 
+- Feasibility risk: the required authority may not be exposed by the pinned
+  libghostty API, or may require larger upstream work than this ticket can
+  justify. Mitigation: the canonical spike classifies the work before any
+  delivery tickets or client code are started; outcome (c) returns to a human.
 - False authority: existing production adapters return default mode flags, so
   plumbing the query without backend truth would silently ship permanent off.
-  Mitigation: require a real child/backend enable/disable test, not only fake
-  DTO fixtures.
+  The explicit `managed_session_runtime` unsupported path also proves that
+  vocabulary alone is not a usable substrate. Mitigation: require the positive
+  spike result, remove or narrow that rejection, and prove a real
+  child/backend enable/disable path rather than only fake DTO fixtures.
 - Cross-repo ordering: botster-tui cannot consume unmerged core/hub/kit APIs.
-  Mitigation: explicit dependency tickets/targets, immutable merged pins, and
-  per-consumer revision verification.
+  Mitigation: use the resolved target ids, register the conditional dependency
+  DAG after the spike, use immutable merged pins, and verify each consumer
+  revision.
 - Reattach drift: visible screen restoration can succeed while mouse mode stays
   stale or off. Mitigation: probe after hydration and test detach/reattach with
   mode already enabled.
 - Stale-session race: an old probe response could enable routing for a newly
   selected session. Mitigation: bind results to session id and clear state at
   detach/switch/failure boundaries.
-- Disable lag: mode can change after initial attach. Mitigation: refresh after
-  non-empty drain batches so child-generated mode changes are observed without
-  parsing bytes or adding an unconditional request loop.
+- Disable lag and probe pressure: mode can change after initial attach, while a
+  request after every non-empty drain can degenerate into per-frame traffic
+  under sustained output. Mitigation: attach/focus and reattach probes,
+  one-in-flight suppression, and an output-triggered rate limit of at most one
+  request per second per attached session, revised only from measured spike
+  cost.
 - Schema regression: a convenient prop could reappear in production or kit
   examples. Mitigation: renderer defaults off, explicit hit-map API, core
   validation tests, and repository scans for `mouse_mode` in UiNode fixtures.
@@ -257,7 +325,22 @@ This botster-tui repository:
 
 ## Acceptance checks and tests
 
-Core/substrate evidence:
+Current Plan/spike acceptance:
+
+- Canonical spike `ticket_1784564069_340152` runs on botster-core target
+  `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` and records the exact inspected
+  libghostty/core symbols, commands, and revisions.
+- Its artifact classifies exactly one outcome: (a) already feasible without a
+  Ghostty repo change, (b) feasible with a bounded Ghostty FFI change and
+  estimated line/files surface, or (c) larger Ghostty work.
+- The spike proposes an explicit target-aware dependency DAG for its outcome.
+  No botster-tui production source or test harness changes occur while it is
+  open.
+- This Plan is re-run after the spike closes. Conditional files, APIs,
+  dependencies, commands, and acceptance checks are replaced with evidence-
+  backed specifics before an Implement gate is requested.
+
+Conditional core/substrate evidence after a positive spike:
 
 - A production terminal-backend test starts or feeds a child that enables mouse
   tracking, observes nonzero authoritative `mouse_mode`, disables it, and
@@ -265,17 +348,22 @@ Core/substrate evidence:
 - The same state is available after the supported snapshot/reattach path.
 - CoreDaemon/facade tests prove targeted request-response behavior and error
   attribution without a pushed mode event.
+- A test proves the former `managed_session_runtime` unsupported
+  `GetModeFlags` path now reaches the authoritative backend seam, or documents
+  the narrowly removed obsolete branch.
 
-Hub/client evidence:
+Conditional hub/client evidence:
 
 - Hub client serialization/TypeScript drift tests include the new request,
-  response kind, session id, and `mouse_mode`.
+  response kind, session id, `mouse_mode`, and Rust wire-name mappings.
 - Runtime/client API and daemon transport tests prove real on/off values and
   unknown-session/error behavior through the public client boundary.
 - Hub test-support fixture/conformance tests can drive deterministic on/off
   mode without teaching clients an event stream.
+- botster-web regeneration/drift checks either consume the generated protocol
+  change or prove from generator output that no repository change is needed.
 
-Kit evidence:
+Conditional kit evidence:
 
 - A schema-valid terminal render creates a hit region with mouse mode off.
 - The explicit hit-map hook turns the matching terminal on and off without
@@ -286,7 +374,7 @@ Kit evidence:
 - A scan confirms kit production renderer/examples no longer rely on a
   `mouse_mode` UiNode prop.
 
-botster-tui focused evidence:
+Conditional botster-tui focused evidence:
 
 - `DogfoodApp::surface().validate()` passes with only `session_id` and `title`
   on `dogfood-terminal`.
@@ -300,6 +388,10 @@ botster-tui focused evidence:
   probe error all leave mode off.
 - Attach and reattach/hydration each trigger a probe; reattach with an already
   mouse-enabled child restores passthrough.
+- Under sustained non-empty terminal drains, instrumentation or a deterministic
+  clock test proves no more than one mode request per second per attached
+  session and never more than one in-flight request; attach/reattach probes
+  remain prompt.
 - Focused terminal key forwarding and one-attach mouse focus behavior remain
   green.
 
@@ -338,18 +430,29 @@ source and botster-tui input path.
 
 ## Pipeline gates and artifacts
 
-- Plan artifact: this file.
-- Plan gate: attach every required section from this artifact to
-  `botster_plan_gate`.
+- Plan artifact: this file, revised after Plan Review
+  `review_1784564219_724937`.
+- Current gate state: do not resubmit `botster_plan_gate` and do not request
+  step advancement while canonical spike `ticket_1784564069_340152` is open.
+  The parent remains at Plan with no production edits.
+- After the spike closes, reload Project Pipelines current context and the spike
+  artifact, register the outcome-specific DAG, replace conditional details,
+  complete fresh workflow/vault checklists, and then submit the Plan gate.
 - Product decision ledger: human answer `question_1784561631_624748` binds the
   authoritative targeted-probe design, safe-off default, and rejected parser/
   pushed-event/schema-expansion alternatives.
+- Feasibility decision ledger: human answer
+  `question_1784563519_602413` binds route A2 and forbids implementation before
+  the spike result.
 - Plan Review must verify:
-  - cross-repo dependencies and target/worktree ownership are explicit;
-  - the selected core backend returns real mode state rather than defaults;
+  - the spike outcome and cross-repo dependencies/target ownership are
+    explicit;
+  - the selected core/backend design can return real mode state rather than
+    defaults or an unsupported result;
   - the hub surface is request/response only;
+  - hub-client TypeScript/wire-name and botster-web drift are accounted for;
   - kit mode application is outside UiNode props;
-  - on/off and reattach tests cross the production path.
+  - on/off, bounded-probe, and reattach tests cross the production path.
 - Implement must attach:
   - upstream PR/revision links and dependency registration;
   - exact files and contracts changed per repo;
@@ -367,9 +470,16 @@ source and botster-tui input path.
 
 - Durable gap confirmed: the vault says targeted synced terminal-mode state is
   allowed and reattach must restore it, but the inspected current production
-  core adapters return default `ModeFlags` and the public hub-client has no
-  probe. After implementation, capture an atomic note describing the shipped
-  authoritative request/response path and its safe-off client semantics.
+  core adapters return default `ModeFlags`, one path explicitly rejects the
+  request, the Ghostty adapter exposes no mode query, and the public hub-client
+  has no probe. Capture the spike's verified feasibility as a durable atomic
+  note, then separately capture the shipped request/response path after
+  implementation.
+- The plan confirms [[ghostty shadow terminal integration belongs outside
+  botster core]] constrains ownership: core owns a backend-neutral terminal
+  runtime contract while concrete Ghostty FFI belongs in
+  botster-terminal-ghostty/trybotster/ghostty. Capture any verified exception
+  or refinement revealed by the spike.
 - Reconcile [[terminal accessory reattach must restore nested tui input passthrough]]
   after implementation: its `ModeChanged` wording conflicts with the newer
   [[synced state types are allowed while pushed event variants are forbidden]]
