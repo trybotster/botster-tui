@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io::{self, Stdout},
     path::PathBuf,
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -12,13 +13,14 @@ use botster_hub_client::DaemonOpaqueHistoryPayload;
 use botster_hub_client::{
     DaemonApp, DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
     DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
-    DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
-    DaemonPackageInstallPlan, DaemonPackageNavigationEntry, DaemonPackagePin,
-    DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
-    FEATURE_PACKAGE_NAVIGATION, FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    DaemonEntityFrame, DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
+    DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonTransportError,
+    DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION, FEATURE_RESIZE,
+    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
     FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
-    read_frame_from_reader, write_frame,
+    read_frame_from_reader, subscribe_session_entities, write_frame,
 };
 use crossterm::{
     cursor::Show,
@@ -41,7 +43,7 @@ const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 14;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -89,6 +91,8 @@ pub fn smoke_message() -> &'static str {
 struct SessionRow {
     session_id: String,
     lifecycle: String,
+    failure_reason: Option<String>,
+    pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -107,16 +111,161 @@ struct HydrationEvidence {
 }
 
 impl SessionRow {
+    #[cfg(test)]
     fn running(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
             lifecycle: "running".to_string(),
+            failure_reason: None,
+            pending: false,
+        }
+    }
+
+    fn pending(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            lifecycle: "pending".to_string(),
+            failure_reason: None,
+            pending: true,
+        }
+    }
+
+    fn from_entity(entity: &DaemonSessionEntity) -> Self {
+        Self {
+            session_id: entity.session_uuid.clone(),
+            lifecycle: entity
+                .lifecycle
+                .clone()
+                .unwrap_or_else(|| entity.registry_state.clone()),
+            failure_reason: entity.failure_reason.clone(),
+            pending: false,
         }
     }
 
     fn is_attachable(&self) -> bool {
-        self.lifecycle == "running"
+        !self.pending && self.lifecycle == "running"
     }
+}
+
+#[derive(Default)]
+struct SessionEntityState {
+    subscription_id: Option<String>,
+    has_snapshot: bool,
+    snapshot_seq: Option<u64>,
+    entities: BTreeMap<String, DaemonSessionEntity>,
+}
+
+impl SessionEntityState {
+    fn begin_generation(&mut self, subscription_id: String) {
+        self.subscription_id = Some(subscription_id);
+        self.has_snapshot = false;
+        self.snapshot_seq = None;
+        self.entities.clear();
+    }
+
+    fn apply(&mut self, frame: DaemonEntityFrame) -> Result<bool, String> {
+        match frame {
+            DaemonEntityFrame::Snapshot {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                items,
+                ..
+            } => {
+                if !self.matches(&subscription_id, &entity_type) {
+                    return Ok(false);
+                }
+                self.entities = items
+                    .into_iter()
+                    .map(|entity| (entity.session_uuid.clone(), entity))
+                    .collect();
+                self.has_snapshot = true;
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+            DaemonEntityFrame::Upsert {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                id,
+                entity,
+            } => {
+                if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
+                    return Ok(false);
+                }
+                if id != entity.session_uuid {
+                    return Err(format!(
+                        "session entity id mismatch: frame={id} entity={}",
+                        entity.session_uuid
+                    ));
+                }
+                self.entities.insert(id, entity);
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+            DaemonEntityFrame::Patch {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                id,
+                patch,
+            } => {
+                if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
+                    return Ok(false);
+                }
+                let Some(entity) = self.entities.get(&id) else {
+                    return Ok(false);
+                };
+                let mut value = serde_json::to_value(entity).map_err(|error| error.to_string())?;
+                let Some(target) = value.as_object_mut() else {
+                    return Err("session entity did not serialize as an object".to_string());
+                };
+                let Some(fields) = patch.as_object() else {
+                    return Err("session entity patch was not an object".to_string());
+                };
+                for (key, value) in fields {
+                    target.insert(key.clone(), value.clone());
+                }
+                let entity = serde_json::from_value(value).map_err(|error| error.to_string())?;
+                self.entities.insert(id, entity);
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+            DaemonEntityFrame::Remove {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                id,
+            } => {
+                if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
+                    return Ok(false);
+                }
+                self.entities.remove(&id);
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+        }
+    }
+
+    fn matches(&self, subscription_id: &str, entity_type: &str) -> bool {
+        entity_type == "session" && self.subscription_id.as_deref() == Some(subscription_id)
+    }
+
+    fn accepts_delta(&self, subscription_id: &str, entity_type: &str, snapshot_seq: u64) -> bool {
+        self.has_snapshot
+            && self.matches(subscription_id, entity_type)
+            && self
+                .snapshot_seq
+                .is_none_or(|current| snapshot_seq > current)
+    }
+}
+
+enum SessionSubscriptionMessage {
+    Frame(DaemonEntityFrame),
+    Disconnected {
+        subscription_id: String,
+        error: String,
+    },
 }
 
 pub fn run(args: AppArgs) -> io::Result<()> {
@@ -229,6 +378,9 @@ struct DogfoodApp {
     package_decision: Option<botster_hub_client::DaemonPackageDecision>,
     plugin_surface: Option<DaemonPluginSurface>,
     plugin_action_result: Option<Value>,
+    session_entities: SessionEntityState,
+    pending_sessions: BTreeMap<String, SessionRow>,
+    session_subscription: Option<Receiver<SessionSubscriptionMessage>>,
     sessions: Vec<SessionRow>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -273,6 +425,9 @@ impl DogfoodApp {
             package_decision: None,
             plugin_surface: None,
             plugin_action_result: None,
+            session_entities: SessionEntityState::default(),
+            pending_sessions: BTreeMap::new(),
+            session_subscription: None,
             sessions: Vec::new(),
             selected_session: None,
             attached_session: None,
@@ -315,6 +470,9 @@ impl DogfoodApp {
     }
 
     fn poll_hub(&mut self) {
+        if self.drain_session_subscription() {
+            return;
+        }
         if self.client.is_none() {
             self.try_connect_throttled();
             return;
@@ -536,6 +694,7 @@ impl DogfoodApp {
 
     fn force_reconnect(&mut self) {
         self.client = None;
+        self.invalidate_session_generation();
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
@@ -557,7 +716,9 @@ impl DogfoodApp {
                 self.status = "connected".to_string();
                 self.connection_error = None;
                 self.refresh_read_models();
-                self.restore_after_connect();
+                if let Err(error) = self.start_session_subscription() {
+                    self.record_transport_error(error);
+                }
             }
             Err(error) => {
                 self.record_transport_error(error);
@@ -565,15 +726,8 @@ impl DogfoodApp {
         }
     }
 
-    fn restore_after_connect(&mut self) {
-        if self.selected_session.is_some() {
-            self.attach_selected_or_first();
-        }
-    }
-
     fn refresh_read_models(&mut self) {
         self.refresh_status();
-        self.refresh_sessions();
         self.refresh_apps();
         self.refresh_package_navigation();
         self.refresh_packages();
@@ -581,10 +735,6 @@ impl DogfoodApp {
 
     fn refresh_status(&mut self) {
         self.request_and_apply(DaemonRequest::Status);
-    }
-
-    fn refresh_sessions(&mut self) {
-        self.request_and_apply(DaemonRequest::ListSessions);
     }
 
     fn refresh_apps(&mut self) {
@@ -597,6 +747,118 @@ impl DogfoodApp {
 
     fn refresh_packages(&mut self) {
         self.request_and_apply(DaemonRequest::ListPackages);
+    }
+
+    fn start_session_subscription(&mut self) -> DaemonTransportResult<()> {
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or(DaemonTransportError::NotRunning)?;
+        let subscription_id = format!("btui-sessions-{}", short_suffix());
+        let mut subscription = subscribe_session_entities(endpoint, subscription_id.clone())?;
+        subscription.set_read_timeout(Some(Duration::from_millis(250)))?;
+        let (sender, receiver) = mpsc::channel();
+        self.session_entities
+            .begin_generation(subscription_id.clone());
+        self.session_subscription = Some(receiver);
+        self.rebuild_session_rows();
+
+        thread::Builder::new()
+            .name("botster-tui-session-entities".to_string())
+            .spawn(move || {
+                loop {
+                    match subscription.next_frame() {
+                        Ok(frame) => {
+                            if sender
+                                .send(SessionSubscriptionMessage::Frame(frame))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(DaemonTransportError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => {
+                            let _ = sender.send(SessionSubscriptionMessage::Disconnected {
+                                subscription_id,
+                                error: error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(DaemonTransportError::Io)?;
+        Ok(())
+    }
+
+    fn drain_session_subscription(&mut self) -> bool {
+        let messages = self
+            .session_subscription
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                SessionSubscriptionMessage::Frame(frame) => {
+                    match self.session_entities.apply(frame) {
+                        Ok(true) => self.rebuild_session_rows(),
+                        Ok(false) => {}
+                        Err(error) => self.error = Some(format!("session sync: {error}")),
+                    }
+                }
+                SessionSubscriptionMessage::Disconnected {
+                    subscription_id,
+                    error,
+                } if self.session_entities.subscription_id.as_deref()
+                    == Some(subscription_id.as_str()) =>
+                {
+                    self.client = None;
+                    self.invalidate_session_generation();
+                    self.attached_session = None;
+                    self.attached_subscription_id = None;
+                    self.attach_hydration = None;
+                    self.clear_terminal_mouse_mode();
+                    self.status = "session subscription disconnected; reconnecting".to_string();
+                    self.connection_error = Some(error);
+                    return true;
+                }
+                SessionSubscriptionMessage::Disconnected { .. } => {}
+            }
+        }
+        false
+    }
+
+    fn invalidate_session_generation(&mut self) {
+        self.session_subscription = None;
+        self.session_entities = SessionEntityState::default();
+        self.rebuild_session_rows();
+    }
+
+    fn rebuild_session_rows(&mut self) {
+        self.pending_sessions
+            .retain(|session_id, _| !self.session_entities.entities.contains_key(session_id));
+        self.sessions = self
+            .session_entities
+            .entities
+            .values()
+            .map(SessionRow::from_entity)
+            .chain(self.pending_sessions.values().cloned())
+            .collect();
+        if self.selected_session.as_ref().is_none_or(|selected| {
+            !self
+                .sessions
+                .iter()
+                .any(|session| session.session_id == *selected)
+        }) {
+            self.selected_session = self
+                .sessions
+                .first()
+                .map(|session| session.session_id.clone());
+        }
     }
 
     fn open_package_navigation(
@@ -624,26 +886,35 @@ impl DogfoodApp {
         self.error = None;
         let session_id = format!("btui-{}", short_suffix());
         let command = self.command.clone();
+        self.pending_sessions
+            .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
+        self.selected_session = Some(session_id.clone());
+        self.rebuild_session_rows();
+        self.action_feedback = Some(format!("spawn pending: {session_id}"));
         match self.request(DaemonRequest::Spawn {
             session_id: session_id.clone(),
             command,
         }) {
-            Ok(response) => self.apply_response(response),
+            Ok(response) => {
+                let failed = response.error.is_some();
+                self.apply_response(response);
+                if failed {
+                    self.pending_sessions.remove(&session_id);
+                    self.rebuild_session_rows();
+                }
+            }
             Err(error) => {
+                self.pending_sessions.remove(&session_id);
+                self.rebuild_session_rows();
                 self.record_transport_error(error);
                 return;
             }
         }
-        self.selected_session = Some(session_id.clone());
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.session_id == session_id)
-        {
-            self.sessions.push(SessionRow::running(session_id.clone()));
+        if self.pending_sessions.contains_key(&session_id) {
+            self.action_feedback = Some(format!(
+                "spawn accepted: {session_id}; waiting for authoritative session"
+            ));
         }
-        self.action_feedback = Some(format!("spawned {session_id}; attach requested"));
-        self.attach_selected_or_first();
     }
 
     fn attach_selected_or_first(&mut self) {
@@ -796,9 +1067,6 @@ impl DogfoodApp {
     fn record_request(&mut self, request: &DaemonRequest) {
         match request {
             DaemonRequest::Status => self.observed_requests.push(ObservedRequest::Status),
-            DaemonRequest::ListSessions => {
-                self.observed_requests.push(ObservedRequest::ListSessions)
-            }
             DaemonRequest::ListApps => self.observed_requests.push(ObservedRequest::ListApps),
             DaemonRequest::ListPackageNavigation => self
                 .observed_requests
@@ -918,6 +1186,7 @@ impl DogfoodApp {
 
     fn record_transport_error(&mut self, error: DaemonTransportError) {
         self.client = None;
+        self.invalidate_session_generation();
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
@@ -996,31 +1265,6 @@ impl DogfoodApp {
             self.status = format!("connected ({})", status.lifecycle_state);
             self.package_count = status.package_count;
             self.enabled_package_count = status.enabled_package_count;
-        }
-
-        if matches!(
-            response.kind,
-            DaemonResponseKind::Sessions | DaemonResponseKind::Spawned
-        ) {
-            self.sessions = response
-                .sessions
-                .into_iter()
-                .map(|session| SessionRow {
-                    session_id: session.session_id,
-                    lifecycle: session.lifecycle,
-                })
-                .collect();
-            if self.selected_session.as_ref().is_none_or(|selected| {
-                !self
-                    .sessions
-                    .iter()
-                    .any(|session| session.session_id == *selected)
-            }) {
-                self.selected_session = self
-                    .sessions
-                    .first()
-                    .map(|session| session.session_id.clone());
-            }
         }
 
         if matches!(
@@ -1897,7 +2141,7 @@ impl DogfoodApp {
             )),
             child(button(
                 "dogfood-spawn",
-                "Spawn and attach",
+                "Spawn",
                 "botster.tui.spawn",
                 json!({}),
             )),
@@ -1913,6 +2157,9 @@ impl DogfoodApp {
             .map(|session| {
                 let session_id = &session.session_id;
                 let mut title = format!("{session_id} [{}]", session.lifecycle);
+                if let Some(failure_reason) = &session.failure_reason {
+                    title.push_str(&format!(" failure={failure_reason}"));
+                }
                 if self.attached_session.as_deref() == Some(session_id.as_str()) {
                     title.push_str(" (attached)");
                 } else if self.selected_session.as_deref() == Some(session_id.as_str()) {
@@ -1933,15 +2180,17 @@ impl DogfoodApp {
                         json!({ "text": title }),
                     ))],
                 );
-                item.slots.insert(
-                    "actions".to_string(),
-                    vec![child(button(
-                        &format!("dogfood-session-{session_id}-attach"),
-                        "Attach",
-                        "botster.tui.attach",
-                        json!({ "session_id": session_id }),
-                    ))],
-                );
+                if session.is_attachable() {
+                    item.slots.insert(
+                        "actions".to_string(),
+                        vec![child(button(
+                            &format!("dogfood-session-{session_id}-attach"),
+                            "Attach",
+                            "botster.tui.attach",
+                            json!({ "session_id": session_id }),
+                        ))],
+                    );
+                }
                 child(item)
             })
             .collect();
@@ -2015,7 +2264,6 @@ impl DogfoodApp {
 #[derive(Debug, PartialEq, Eq)]
 enum ObservedRequest {
     Status,
-    ListSessions,
     ListApps,
     ListPackageNavigation,
     ListPackages,
@@ -2253,6 +2501,14 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         eprintln!("headless-dogfood-error: {error}");
         return Err(DaemonTransportError::Protocol("headless dogfood app error"));
     }
+    #[cfg(test)]
+    {
+        let rendered = renderer::render_to_lines(&app.surface(), 200, 48)
+            .0
+            .join("\n");
+        assert!(rendered.contains("[pending]"));
+        assert_eq!(app.attached_session, None);
+    }
     let session_id = app
         .selected_session
         .clone()
@@ -2260,6 +2516,8 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
             "headless session was not selected",
         ))?;
 
+    wait_for_authoritative_session(&mut app, &session_id)?;
+    app.attach_selected_or_first();
     wait_for_app_output(&mut app, "botster-tui-ready")?;
     app.request_and_apply(DaemonRequest::Resize {
         session_id: session_id.clone(),
@@ -2290,6 +2548,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
             FEATURE_RESIZE,
             FEATURE_PACKAGE_NAVIGATION,
             FEATURE_TERMINAL_READBACK,
+            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
         ] {
             assert!(
                 compatibility
@@ -2310,6 +2569,25 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
     println!("terminal-output: {HEADLESS_OUTPUT}");
     app.request_and_apply(DaemonRequest::ShutdownSession { session_id });
     Ok(())
+}
+
+fn wait_for_authoritative_session(
+    app: &mut DogfoodApp,
+    session_id: &str,
+) -> DaemonTransportResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        app.poll_hub();
+        if app.sessions.iter().any(|session| {
+            session.session_id == session_id && session.is_attachable() && !session.pending
+        }) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(DaemonTransportError::Protocol(
+        "timed out waiting for authoritative session entity",
+    ))
 }
 
 fn wait_for_app_output(app: &mut DogfoodApp, needle: &str) -> DaemonTransportResult<()> {
@@ -2416,6 +2694,7 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_RESIZE.to_string(),
             FEATURE_PACKAGE_NAVIGATION.to_string(),
             FEATURE_TERMINAL_READBACK.to_string(),
+            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
         ],
         minimum_conformance_fixture_revision: MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
@@ -3255,27 +3534,173 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_revision_14_and_terminal_readback() {
+    fn tui_requires_revision_16_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
             requirement.minimum_conformance_fixture_revision,
             MINIMUM_CONFORMANCE_FIXTURE_REVISION
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 14);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 16);
         assert!(
             requirement
                 .required_features
                 .iter()
                 .any(|feature| feature == FEATURE_TERMINAL_READBACK)
         );
+        assert!(
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
+        );
 
         let mut older_hub = DaemonCompatibility::current();
-        older_hub.conformance_fixture_revision = 13;
+        older_hub.conformance_fixture_revision = 15;
         let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-            .expect_err("revision 13 hub must be rejected");
-        assert!(error.diagnostic.contains("revision 13"));
-        assert!(error.diagnostic.contains("requires at least 14"));
+            .expect_err("revision 15 hub must be rejected");
+        assert!(error.diagnostic.contains("revision 15"));
+        assert!(error.diagnostic.contains("requires at least 16"));
+    }
+
+    #[test]
+    fn session_reducer_consumes_shared_lifecycle_conformance_frames() {
+        let scenario =
+            botster_hub_test_support::session_lifecycle_subscription_conformance_scenario();
+        assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
+        let generation = match &scenario.normalized_frames[0] {
+            DaemonEntityFrame::Snapshot {
+                subscription_id, ..
+            } => subscription_id.clone(),
+            other => panic!("first conformance frame must be a snapshot, got {other:?}"),
+        };
+        let mut state = SessionEntityState::default();
+        state.begin_generation(generation);
+
+        for frame in scenario.normalized_frames {
+            assert!(state.apply(frame).expect("conformance frame applies"));
+        }
+        assert!(state.entities.is_empty(), "remove deletes the session");
+        assert_eq!(state.snapshot_seq, Some(4));
+        assert!(
+            state
+                .apply(scenario.overflow.resync_snapshot)
+                .expect("overflow resync snapshot applies")
+        );
+        assert!(state.entities.is_empty());
+
+        let fresh = scenario.fresh_subscription.snapshot;
+        let fresh_generation = match &fresh {
+            DaemonEntityFrame::Snapshot {
+                subscription_id, ..
+            } => subscription_id.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            !state
+                .apply(fresh.clone())
+                .expect("stale generation ignored")
+        );
+        state.begin_generation(fresh_generation);
+        assert!(state.apply(fresh).expect("fresh snapshot applies"));
+        assert!(state.has_snapshot);
+    }
+
+    #[test]
+    fn session_reducer_requires_snapshot_and_strictly_advancing_active_generation() {
+        let mut state = SessionEntityState::default();
+        state.begin_generation("generation-2".to_string());
+        let upsert = DaemonEntityFrame::Upsert {
+            subscription_id: "generation-2".to_string(),
+            entity_type: "session".to_string(),
+            snapshot_seq: 1,
+            id: "session-alpha".to_string(),
+            entity: session_entity("session-alpha", Some("running")),
+        };
+        assert!(
+            !state
+                .apply(upsert.clone())
+                .expect("pre-snapshot delta ignored")
+        );
+        assert!(
+            state
+                .apply(snapshot_frame("generation-2", 1, Vec::new()))
+                .expect("baseline applies")
+        );
+        assert!(!state.apply(upsert).expect("duplicate sequence ignored"));
+        assert!(
+            !state
+                .apply(snapshot_frame("generation-1", 99, Vec::new()))
+                .expect("prior generation ignored")
+        );
+    }
+
+    #[test]
+    fn pending_spawn_is_separate_until_authoritative_upsert_and_never_auto_attaches() {
+        let mut app = DogfoodApp::new(None);
+        app.pending_sessions.insert(
+            "session-alpha".to_string(),
+            SessionRow::pending("session-alpha"),
+        );
+        app.selected_session = Some("session-alpha".to_string());
+        app.session_entities
+            .begin_generation("generation-1".to_string());
+        app.rebuild_session_rows();
+        assert!(app.sessions[0].pending);
+        assert!(!app.sessions[0].is_attachable());
+
+        app.session_entities
+            .apply(snapshot_frame("generation-1", 0, Vec::new()))
+            .expect("empty baseline applies");
+        app.rebuild_session_rows();
+        assert!(
+            app.sessions[0].pending,
+            "empty baseline keeps local pending feedback"
+        );
+
+        app.session_entities
+            .apply(DaemonEntityFrame::Upsert {
+                subscription_id: "generation-1".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                id: "session-alpha".to_string(),
+                entity: session_entity("session-alpha", Some("running")),
+            })
+            .expect("authoritative upsert applies");
+        app.rebuild_session_rows();
+        assert!(app.pending_sessions.is_empty());
+        assert!(app.sessions[0].is_attachable());
+        assert_eq!(app.attached_session, None);
+    }
+
+    #[test]
+    fn active_entity_subscription_disconnect_invalidates_attachment_and_generation() {
+        let mut app = DogfoodApp::new(None);
+        app.session_entities
+            .begin_generation("generation-1".to_string());
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some("terminal-generation".to_string());
+        app.attach_hydration = Some(AttachHydration {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "terminal-generation".to_string(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            read_screen_requested: false,
+            buffered_live_output: String::new(),
+        });
+        let (sender, receiver) = mpsc::channel();
+        app.session_subscription = Some(receiver);
+        sender
+            .send(SessionSubscriptionMessage::Disconnected {
+                subscription_id: "generation-1".to_string(),
+                error: "closed".to_string(),
+            })
+            .expect("disconnect message sends");
+
+        assert!(app.drain_session_subscription());
+        assert_eq!(app.session_entities.subscription_id, None);
+        assert_eq!(app.attached_session, None);
+        assert_eq!(app.attached_subscription_id, None);
+        assert!(app.attach_hydration.is_none());
     }
 
     #[test]
@@ -4418,11 +4843,11 @@ mod tests {
     }
 
     #[test]
-    fn action_failure_survives_unrelated_successful_session_refresh() {
+    fn action_failure_survives_unrelated_successful_status_refresh() {
         let mut app = DogfoodApp::new(None);
 
         app.apply_response(operator_error_response("spawn failed"));
-        app.apply_response(sessions_response(["session-alpha"]));
+        app.apply_response(status_response("running", 1));
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         assert!(lines.join("\n").contains("error: spawn failed"));
@@ -5530,12 +5955,25 @@ mod tests {
     }
 
     #[test]
-    fn session_repull_preserves_selected_session_when_still_listed() {
+    fn authoritative_snapshot_preserves_selected_session_when_still_listed() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
+        app.session_entities
+            .begin_generation("generation-1".to_string());
         app.selected_session = Some("session-beta".to_string());
 
-        app.apply_response(sessions_response(["session-alpha", "session-beta"]));
+        assert!(
+            app.session_entities
+                .apply(snapshot_frame(
+                    "generation-1",
+                    0,
+                    vec![
+                        session_entity("session-alpha", Some("running")),
+                        session_entity("session-beta", Some("running")),
+                    ],
+                ))
+                .expect("snapshot applies")
+        );
+        app.rebuild_session_rows();
 
         assert_eq!(
             app.sessions,
@@ -5545,37 +5983,71 @@ mod tests {
     }
 
     #[test]
-    fn session_repull_resets_stale_selected_session_to_first_listed_session() {
+    fn authoritative_snapshot_resets_stale_selection_without_attaching() {
         let mut app = DogfoodApp::new(None);
-        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
+        app.session_entities
+            .begin_generation("generation-1".to_string());
         app.selected_session = Some("session-beta".to_string());
 
-        app.apply_response(sessions_response(["session-gamma", "session-delta"]));
+        app.session_entities
+            .apply(snapshot_frame(
+                "generation-1",
+                0,
+                vec![
+                    session_entity("session-delta", Some("running")),
+                    session_entity("session-gamma", Some("running")),
+                ],
+            ))
+            .expect("snapshot applies");
+        app.rebuild_session_rows();
 
         assert_eq!(
             app.sessions,
-            session_rows([("session-gamma", "running"), ("session-delta", "running"),])
+            session_rows([("session-delta", "running"), ("session-gamma", "running"),])
         );
-        assert_eq!(app.selected_session.as_deref(), Some("session-gamma"));
+        assert_eq!(app.selected_session.as_deref(), Some("session-delta"));
+        assert_eq!(app.attached_session, None);
     }
 
     #[test]
-    fn sessions_response_preserves_and_renders_lifecycle_state() {
+    fn entity_patch_preserves_and_renders_lifecycle_and_failure_state() {
         let mut app = DogfoodApp::new(None);
-
-        app.apply_response(sessions_response_with_lifecycles([
-            ("session-alpha", "running"),
-            ("session-beta", "exited"),
-        ]));
+        app.session_entities
+            .begin_generation("generation-1".to_string());
+        app.session_entities
+            .apply(snapshot_frame(
+                "generation-1",
+                0,
+                vec![session_entity("session-alpha", Some("running"))],
+            ))
+            .expect("snapshot applies");
+        app.session_entities
+            .apply(DaemonEntityFrame::Patch {
+                subscription_id: "generation-1".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                id: "session-alpha".to_string(),
+                patch: json!({
+                    "lifecycle": "failed",
+                    "failure_reason": "worker exited",
+                    "updated_at": 2
+                }),
+            })
+            .expect("patch applies");
+        app.rebuild_session_rows();
 
         assert_eq!(
             app.sessions,
-            session_rows([("session-alpha", "running"), ("session-beta", "exited"),])
+            vec![SessionRow {
+                session_id: "session-alpha".to_string(),
+                lifecycle: "failed".to_string(),
+                failure_reason: Some("worker exited".to_string()),
+                pending: false,
+            }]
         );
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("session-alpha [running]"));
-        assert!(rendered.contains("session-beta [exited]"));
+        assert!(rendered.contains("session-alpha [failed] failure=worker exited"));
     }
 
     #[test]
@@ -5603,11 +6075,13 @@ mod tests {
     }
 
     #[test]
-    fn repeated_exited_attach_attempts_render_one_deduplicated_error() {
+    fn exited_session_row_is_selectable_without_attach_affordance() {
         let mut app = DogfoodApp::new(None);
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
             lifecycle: "exited".to_string(),
+            failure_reason: None,
+            pending: false,
         }];
         app.selected_session = Some("session-beta".to_string());
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
@@ -5651,11 +6125,12 @@ mod tests {
         assert!(app.observed_requests.is_empty());
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
-        assert_eq!(
-            rendered
-                .matches("session-beta exited - cannot attach")
-                .count(),
-            1
+        assert!(rendered.contains("session-beta [exited]"));
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| { region.node_id == "dogfood-session-session-beta-attach" })
         );
         assert!(!rendered.contains("attached session disappeared"));
     }
@@ -5666,6 +6141,8 @@ mod tests {
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
             lifecycle: "stopped".to_string(),
+            failure_reason: None,
+            pending: false,
         }];
         app.selected_session = Some("session-beta".to_string());
         app.observed_requests.clear();
@@ -5688,26 +6165,23 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_restore_does_not_reattach_known_non_running_session() {
+    fn reconnect_does_not_auto_attach_known_non_running_session() {
         let mut app = DogfoodApp::new(None);
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
             lifecycle: "exited".to_string(),
+            failure_reason: None,
+            pending: false,
         }];
         app.selected_session = Some("session-beta".to_string());
         app.observed_requests.clear();
 
-        app.restore_after_connect();
-
         assert!(app.observed_requests.is_empty());
-        assert_eq!(
-            app.error.as_deref(),
-            Some("session-beta exited - cannot attach")
-        );
+        assert_eq!(app.attached_session, None);
     }
 
     #[test]
-    fn refresh_read_models_pulls_status_sessions_and_packages() {
+    fn refresh_read_models_does_not_list_sessions() {
         let mut app = DogfoodApp::new(None);
         app.observed_requests.clear();
 
@@ -5717,7 +6191,6 @@ mod tests {
             app.observed_requests,
             vec![
                 ObservedRequest::Status,
-                ObservedRequest::ListSessions,
                 ObservedRequest::ListApps,
                 ObservedRequest::ListPackageNavigation,
                 ObservedRequest::ListPackages,
@@ -5726,27 +6199,13 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_restore_reattaches_selected_session_after_read_model_refresh() {
+    fn reconnect_does_not_auto_attach_selected_running_session() {
         let mut app = DogfoodApp::new(None);
         app.observed_requests.clear();
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
-        let previous_subscription_id = app.subscription_id.clone();
-
-        app.restore_after_connect();
-
-        let [
-            ObservedRequest::Attach {
-                session_id,
-                subscription_id,
-            },
-        ] = app.observed_requests.as_slice()
-        else {
-            panic!("reconnect should issue exactly one fresh attach");
-        };
-        assert_eq!(session_id, "session-alpha");
-        assert_ne!(subscription_id, &previous_subscription_id);
-        assert_eq!(subscription_id, &app.subscription_id);
+        assert!(app.observed_requests.is_empty());
+        assert_eq!(app.attached_session, None);
     }
 
     #[test]
@@ -5756,6 +6215,8 @@ mod tests {
         assert!(source.contains("use botster_hub_client"));
         for required in [
             "connect_and_hello_with_requirement",
+            "subscribe_session_entities",
+            "DaemonEntityFrame",
             "DaemonEndpoint",
             "DaemonRequest",
             "DaemonResponse",
@@ -5782,6 +6243,10 @@ mod tests {
                 "botster-tui source must not reintroduce private hub protocol plumbing: {pattern}"
             );
         }
+        assert!(
+            !source.contains(concat!("List", "Sessions")),
+            "session synchronization must not retain the legacy list request"
+        );
     }
 
     #[test]
@@ -5803,6 +6268,23 @@ mod tests {
             .name("botster-tui-headless-dogfood")
             .start()
             .expect("isolated hub starts");
+
+        let lifecycle_report =
+            botster_hub_test_support::run_session_lifecycle_subscription_conformance(&hub)
+                .expect("session lifecycle subscription conformance passes");
+        assert!(lifecycle_report.initial_snapshot_authoritative);
+        assert!(lifecycle_report.spawn_upsert_observed);
+        assert!(lifecycle_report.lifecycle_patch_observed);
+        assert!(lifecycle_report.natural_exit_patch_observed);
+        assert!(lifecycle_report.remove_observed);
+        assert!(lifecycle_report.sequences_strictly_increasing);
+        assert!(lifecycle_report.disconnect_cleanup_released_subscription);
+        assert!(lifecycle_report.fresh_subscription_snapshot_authoritative);
+        println!(
+            "session-lifecycle-conformance: revision={} report={lifecycle_report:?}",
+            botster_hub_test_support::session_lifecycle_subscription_conformance_scenario()
+                .conformance_fixture_revision
+        );
 
         run_headless_dogfood(AppArgs {
             smoke: false,
@@ -5936,6 +6418,8 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
 
         let mut app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        wait_for_authoritative_session(&mut app, &prior_session_id)
+            .expect("external session appears through entity subscription");
         app.selected_session = Some(prior_session_id.clone());
         app.observed_requests.clear();
         app.attach_selected_or_first();
@@ -6081,16 +6565,33 @@ mod tests {
             "restored history must render before later live output: {rendered}"
         );
 
+        let prior_entity_generation = app.session_entities.subscription_id.clone();
+        let attach_count_before_reconnect = app
+            .observed_requests
+            .iter()
+            .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
+            .count();
         app.force_reconnect();
-        let reconnect_subscription_id = app.subscription_id.clone();
+        let reconnect_entity_generation = app.session_entities.subscription_id.clone();
         assert_ne!(
-            reconnect_subscription_id, first_subscription_id,
-            "reconnect must rotate the transport-local subscription ID"
+            reconnect_entity_generation, prior_entity_generation,
+            "reconnect must establish a fresh entity subscription generation"
         );
-        assert!(app.observed_requests.contains(&ObservedRequest::Attach {
-            session_id: prior_session_id.clone(),
-            subscription_id: reconnect_subscription_id,
-        }));
+        assert_eq!(app.attached_session, None, "reconnect must not auto-attach");
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
+                .count(),
+            attach_count_before_reconnect,
+            "reconnect must not issue a terminal attach request"
+        );
+        wait_for_authoritative_session(&mut app, &prior_session_id)
+            .expect("fresh generation snapshot restores the session row");
+        app.selected_session = Some(prior_session_id.clone());
+        app.attach_selected_or_first();
+        let reconnect_subscription_id = app.subscription_id.clone();
+        assert_ne!(reconnect_subscription_id, first_subscription_id);
         let reconnect_deadline = Instant::now() + Duration::from_secs(7);
         while app.attach_hydration.is_some() && Instant::now() < reconnect_deadline {
             app.poll_hub();
@@ -6125,9 +6626,48 @@ mod tests {
         );
         daemon
             .request(&DaemonRequest::ShutdownSession {
-                session_id: prior_session_id,
+                session_id: prior_session_id.clone(),
             })
             .expect("shut down history-producing session");
+        let exit_deadline = Instant::now() + Duration::from_secs(7);
+        while app
+            .sessions
+            .iter()
+            .any(|session| session.session_id == prior_session_id && session.is_attachable())
+            && Instant::now() < exit_deadline
+        {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        let exited = renderer::render_to_lines(&app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(
+            exited.contains(&format!("{prior_session_id} [exited]")),
+            "natural exit patch must render through the app surface: {exited}"
+        );
+        daemon
+            .request(&DaemonRequest::RemoveSession {
+                session_id: prior_session_id.clone(),
+            })
+            .expect("remove history-producing session");
+        let remove_deadline = Instant::now() + Duration::from_secs(7);
+        while app
+            .sessions
+            .iter()
+            .any(|session| session.session_id == prior_session_id)
+            && Instant::now() < remove_deadline
+        {
+            app.poll_hub();
+            thread::sleep(Duration::from_millis(30));
+        }
+        let removed = renderer::render_to_lines(&app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(
+            !removed.contains(&format!("{prior_session_id} [")),
+            "remove delta must delete the rendered session row: {removed}"
+        );
 
         let empty_session_id = format!("tui-empty-{}", short_suffix());
         daemon
@@ -6139,6 +6679,8 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
 
         let mut empty_app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        wait_for_authoritative_session(&mut empty_app, &empty_session_id)
+            .expect("empty external session appears through entity subscription");
         empty_app.selected_session = Some(empty_session_id.clone());
         empty_app.observed_requests.clear();
         empty_app.attach_selected_or_first();
@@ -6392,28 +6934,37 @@ mod tests {
             .map(|(session_id, lifecycle)| SessionRow {
                 session_id: session_id.to_string(),
                 lifecycle: lifecycle.to_string(),
+                failure_reason: None,
+                pending: false,
             })
             .collect()
     }
 
-    fn sessions_response<const N: usize>(session_ids: [&str; N]) -> DaemonResponse {
-        sessions_response_with_lifecycles(session_ids.map(|session_id| (session_id, "running")))
+    fn session_entity(session_id: &str, lifecycle: Option<&str>) -> DaemonSessionEntity {
+        DaemonSessionEntity {
+            session_uuid: session_id.to_string(),
+            registry_state: "active".to_string(),
+            lifecycle: lifecycle.map(str::to_string),
+            rows: 24,
+            cols: 80,
+            updated_at: 1,
+            exit_code: None,
+            failure_reason: None,
+        }
     }
 
-    fn sessions_response_with_lifecycles<const N: usize>(
-        sessions: [(&str, &str); N],
-    ) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::Sessions);
-        response.sessions = sessions
-            .into_iter()
-            .map(
-                |(session_id, lifecycle)| botster_hub_client::DaemonSession {
-                    session_id: session_id.to_string(),
-                    lifecycle: lifecycle.to_string(),
-                },
-            )
-            .collect();
-        response
+    fn snapshot_frame(
+        subscription_id: &str,
+        snapshot_seq: u64,
+        items: Vec<DaemonSessionEntity>,
+    ) -> DaemonEntityFrame {
+        DaemonEntityFrame::Snapshot {
+            subscription_id: subscription_id.to_string(),
+            entity_type: "session".to_string(),
+            snapshot_seq,
+            items,
+            resync_reason: None,
+        }
     }
 
     fn status_response(lifecycle_state: &str, schema_version: u16) -> DaemonResponse {
