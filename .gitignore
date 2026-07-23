@@ -4,3 +4,4 @@
 /.env.*
 /mise.local.toml
 *.log
+/.botster/pastes/
