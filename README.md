@@ -69,7 +69,7 @@ The interactive renderer opens the alternate terminal screen and exits with
 
 The dogfood session surface uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc`. The protocol source is
+`02bffebd0e29cb69a8e1e639e01f704f6dfffe48`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -148,8 +148,18 @@ a row changes the attach target; terminal input is sent only after an attach
 state is observed for that stream. Until then, the panel reports terminal stream
 unavailable rather than silently treating selection as an attached PTY.
 
+The sessions panel opens one explicit `session` entity subscription per hub
+connection. Its authoritative snapshot and strictly ordered upsert, patch, and
+remove frames drive the visible rows; normal synchronization does not poll a
+session list. Spawn adds an immediate client-local pending row, then the matching
+authoritative entity replaces it. Spawn, selection, and terminal attachment are
+separate actions, so neither appearance nor reconnect automatically attaches a
+PTY. A reconnect discards the prior subscription generation and waits for the
+fresh generation's snapshot before accepting deltas.
+
 The TUI uses a deliberately narrowed compatibility requirement for the dogfood
-terminal surface: sessions, terminal streaming, and resize. It does not require
+terminal surface: sessions, session entity subscriptions, terminal streaming,
+terminal readback, package navigation, and resize. It does not require
 plugin surface render/action capabilities for this path. A running but
 incompatible hub is reported as a compatibility mismatch instead of being
 collapsed into the generic unavailable/reconnecting state.
@@ -204,7 +214,8 @@ There is also an automated isolated-hub test using the merged
 `botster-hub-test-support` crate. The preferred command builds matching
 `botster-hub` and `botster-session-worker` binaries from the pinned git
 dependencies, starts an isolated daemon, runs the TUI dogfood path, runs the
-plugin contract matrix conformance harness, renders the delivered fixture
+revision-16 session lifecycle subscription conformance runner and plugin
+contract matrix conformance harness, renders the delivered fixture
 surfaces through the TUI renderer, and tears the daemon down. The renderer
 coverage includes the composite application primitive fixture for `metric_grid`,
 `table`, `toolbar`, `status_badge`, `section`, `empty_state`, enhanced
@@ -240,7 +251,8 @@ Included now:
   `UiNode`, routes semantic actions through the kit hit map/input router,
   reflects visible form drafts, and displays terminal bytes inside
   `terminal_view`.
-- Hub session spawn, attach, terminal input, resize, drain, reconnect, and
+- Push-driven hub session snapshot/delta reconciliation, pending spawn feedback,
+  explicit selection/attach, terminal input, resize, drain, reconnect, and
   validation/error states through `botster-hub-client`.
 - Automated isolated-hub bring-up and teardown coverage when matching hub
   binaries are supplied to the test harness.

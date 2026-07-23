@@ -161,7 +161,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc#06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=02bffebd0e29cb69a8e1e639e01f704f6dfffe48#02bffebd0e29cb69a8e1e639e01f704f6dfffe48"
 dependencies = [
  "base64",
  "serde",
@@ -171,7 +171,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc#06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=02bffebd0e29cb69a8e1e639e01f704f6dfffe48#02bffebd0e29cb69a8e1e639e01f704f6dfffe48"
 dependencies = [
  "botster-hub-client",
  "serde",
