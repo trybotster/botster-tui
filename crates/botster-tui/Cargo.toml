@@ -7,7 +7,7 @@ license-file = "../../LICENSE"
 
 [dependencies]
 botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "978c436865c215828b02a8b0fcca5f8d89413e96", default-features = false }
-botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", rev = "06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc" }
+botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", rev = "02bffebd0e29cb69a8e1e639e01f704f6dfffe48" }
 botster-tui-kit = { git = "https://github.com/trybotster/botster-tui-kit.git", rev = "16c6035dd06ffb5ec0704f1a3603c3e4bc5c81bf" }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
@@ -15,4 +15,4 @@ serde_json = "1.0"
 
 [dev-dependencies]
 botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "978c436865c215828b02a8b0fcca5f8d89413e96", default-features = false }
-botster-hub-test-support = { git = "https://github.com/trybotster/botster-hub.git", rev = "06f1fa7a01a542eedc5c68a52cf9ecd05da9dabc" }
+botster-hub-test-support = { git = "https://github.com/trybotster/botster-hub.git", rev = "02bffebd0e29cb69a8e1e639e01f704f6dfffe48" }
