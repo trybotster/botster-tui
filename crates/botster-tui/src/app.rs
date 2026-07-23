@@ -9,16 +9,17 @@ use std::{
 use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
 #[cfg(test)]
 use botster_hub_client::DaemonOpaqueHistoryPayload;
+#[cfg(test)]
+use botster_hub_client::DaemonPackageRouteDescriptor;
 use botster_hub_client::{
     DaemonApp, DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
     DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
     DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState,
     DaemonPackageInstallPlan, DaemonPackageNavigationEntry, DaemonPackagePin,
-    DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportError, DaemonTransportResult,
-    FEATURE_PACKAGE_NAVIGATION, FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
-    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
-    read_frame_from_reader, write_frame,
+    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION,
+    FEATURE_RESIZE, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_STREAMING,
+    PROTOCOL, connect_and_hello_with_requirement, read_frame_from_reader, write_frame,
 };
 use crossterm::{
     cursor::Show,
@@ -29,13 +30,13 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use ratatui::{Frame, Terminal, backend::CrosstermBackend, layout::Rect};
 use serde_json::{Value, json};
 
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
-const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
+const HEADLESS_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
 const HEADLESS_INPUT: &str = "botster-tui-headless\n";
 const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
@@ -52,7 +53,7 @@ pub struct AppArgs {
 }
 
 impl AppArgs {
-    pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
         let mut parsed = Self::default();
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -60,12 +61,20 @@ impl AppArgs {
                 "--smoke" => parsed.smoke = true,
                 "--headless-dogfood" => parsed.headless_dogfood = true,
                 "--hub-socket" => {
-                    parsed.hub_socket = iter.next().map(PathBuf::from);
+                    parsed.hub_socket = Some(PathBuf::from(
+                        iter.next()
+                            .ok_or_else(|| "--hub-socket requires a path".to_string())?,
+                    ));
                 }
                 "--data-dir" => {
-                    parsed.hub_data_dir = iter.next().map(PathBuf::from);
+                    parsed.hub_data_dir = Some(PathBuf::from(
+                        iter.next()
+                            .ok_or_else(|| "--data-dir requires a path".to_string())?,
+                    ));
                 }
-                _ => {}
+                "-h" | "--help" => return Ok(ParsedCommand::Help),
+                "-V" | "--version" => return Ok(ParsedCommand::Version),
+                _ => return Err(format!("unknown option: {arg}")),
             }
         }
         if parsed.hub_socket.is_none() {
@@ -77,8 +86,19 @@ impl AppArgs {
         if std::env::var_os("BOTSTER_TUI_HEADLESS_DOGFOOD").is_some() {
             parsed.headless_dogfood = true;
         }
-        parsed
+        Ok(ParsedCommand::Run(parsed))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedCommand {
+    Run(AppArgs),
+    Help,
+    Version,
+}
+
+pub const fn usage() -> &'static str {
+    "botster-tui [OPTIONS]\n\nOptions:\n  --hub-socket PATH       Connect to a hub socket\n  --data-dir PATH         Hub data directory (headless validation)\n  --smoke                 Run a startup smoke check\n  --headless-dogfood      Run the automated hub exercise\n  -h, --help              Show this help\n  -V, --version           Show the version"
 }
 
 pub fn smoke_message() -> &'static str {
@@ -186,6 +206,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
             let event = event::read()?;
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && router.focused_node_id() == Some("dogfood-terminal")
+                        && key.code != KeyCode::BackTab =>
+                {
+                    app.handle_dispatch(terminal_key_dispatch(key));
+                }
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
                     app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
@@ -199,17 +226,181 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
 }
 
 fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &DogfoodApp) {
-    let node = app.surface();
-    renderer::render_node(frame, frame.area(), &node, hit_map);
+    match app.view {
+        AppView::Sessions => draw_sessions(frame, hit_map, app),
+        AppView::Packages | AppView::Diagnostics => {
+            let node = app.surface();
+            draw_compact_panel(frame, hit_map, frame.area(), &node);
+        }
+    }
+}
+
+fn draw_sessions(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &DogfoodApp) {
+    let (sidebar_area, terminal_area) = session_columns(frame.area());
+    let sidebar = app.sessions_panel();
+    let mut shell = sidebar.clone();
+    shell.children.clear();
+    renderer::render_node(frame, sidebar_area, &shell, hit_map);
+
+    let inner = inset(sidebar_area);
+    let children = child_nodes(&sidebar);
+    let fixed_height = children
+        .iter()
+        .filter(|node| !is_session_list(node))
+        .map(|node| compact_node_height(node, inner.height))
+        .fold(0_u16, u16::saturating_add);
+    let list_height = inner.height.saturating_sub(fixed_height);
+    let mut y = inner.y;
+    for child in children {
+        let height = if is_session_list(child) {
+            list_height
+        } else {
+            compact_node_height(child, inner.height)
+        }
+        .min(inner.bottom().saturating_sub(y));
+        if height == 0 {
+            continue;
+        }
+        renderer::render_node(
+            frame,
+            Rect::new(inner.x, y, inner.width, height),
+            child,
+            hit_map,
+        );
+        y = y.saturating_add(height);
+    }
+
+    renderer::render_node(frame, terminal_area, &app.terminal_panel(), hit_map);
+}
+
+fn draw_compact_panel(frame: &mut Frame<'_>, hit_map: &mut HitMap, area: Rect, panel: &UiNode) {
+    let mut shell = panel.clone();
+    shell.children.clear();
+    renderer::render_node(frame, area, &shell, hit_map);
+
+    let inner = inset(area);
+    let mut y = inner.y;
+    for child in child_nodes(panel) {
+        let height = compact_node_height(child, inner.height).min(inner.bottom().saturating_sub(y));
+        if height == 0 {
+            break;
+        }
+        renderer::render_node(
+            frame,
+            Rect::new(inner.x, y, inner.width, height),
+            child,
+            hit_map,
+        );
+        y = y.saturating_add(height);
+    }
+}
+
+fn session_columns(area: Rect) -> (Rect, Rect) {
+    let sidebar_width = match area.width {
+        width if width >= 140 => (width / 4).clamp(36, 52),
+        width if width >= 100 => (width / 3).clamp(34, 44),
+        width => width / 2,
+    };
+    (
+        Rect::new(area.x, area.y, sidebar_width, area.height),
+        Rect::new(
+            area.x.saturating_add(sidebar_width),
+            area.y,
+            area.width.saturating_sub(sidebar_width),
+            area.height,
+        ),
+    )
+}
+
+fn inset(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn child_nodes(node: &UiNode) -> Vec<&UiNode> {
+    node.children
+        .iter()
+        .filter_map(|child| match child {
+            UiChild::Node(node) => Some(node.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_session_list(node: &UiNode) -> bool {
+    node.id
+        .as_ref()
+        .is_some_and(|id| id.0 == "dogfood-session-list" || id.0 == "dogfood-session-empty")
+}
+
+fn compact_node_height(node: &UiNode, available: u16) -> u16 {
+    if node
+        .id
+        .as_ref()
+        .is_some_and(|id| id.0 == "dogfood-error" || id.0 == "dogfood-session-connection-error")
+    {
+        return 2;
+    }
+    match node.kind {
+        UiNodeKind::EmptyState => 2,
+        UiNodeKind::Textarea => 3,
+        UiNodeKind::Panel | UiNodeKind::Section | UiNodeKind::FormSection => available.clamp(3, 8),
+        _ => 1,
+    }
 }
 
 fn should_quit(key: KeyEvent) -> bool {
-    key.code == KeyCode::Esc
-        || matches!(key.code, KeyCode::Char('q' | 'Q'))
-        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    key.code == KeyCode::Char('\\') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn terminal_key_dispatch(key: KeyEvent) -> InputDispatch {
+    let bytes = botster_tui_kit::terminal_key_bytes(key).or_else(|| {
+        let bytes = match key.code {
+            KeyCode::Esc => b"\x1b".as_slice(),
+            KeyCode::Backspace => b"\x7f".as_slice(),
+            KeyCode::Left => b"\x1b[D".as_slice(),
+            KeyCode::Right => b"\x1b[C".as_slice(),
+            KeyCode::Up => b"\x1b[A".as_slice(),
+            KeyCode::Down => b"\x1b[B".as_slice(),
+            KeyCode::Home => b"\x1b[H".as_slice(),
+            KeyCode::End => b"\x1b[F".as_slice(),
+            KeyCode::Delete => b"\x1b[3~".as_slice(),
+            KeyCode::Insert => b"\x1b[2~".as_slice(),
+            KeyCode::PageUp => b"\x1b[5~".as_slice(),
+            KeyCode::PageDown => b"\x1b[6~".as_slice(),
+            _ => return None,
+        };
+        Some(bytes.to_vec())
+    });
+    bytes.map_or(InputDispatch::Ignored, |bytes| {
+        InputDispatch::TerminalForward {
+            node_id: "dogfood-terminal".to_string(),
+            bytes,
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AppView {
+    #[default]
+    Sessions,
+    Packages,
+    Diagnostics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingConfirmation {
+    RemovePackage(String),
+    ApplyUpdate(String, DaemonPackagePin),
 }
 
 struct DogfoodApp {
+    view: AppView,
+    pending_confirmation: Option<PendingConfirmation>,
     endpoint: Option<DaemonEndpoint>,
     client: Option<HubConnection>,
     status: String,
@@ -254,6 +445,8 @@ impl DogfoodApp {
     fn new(hub_socket: Option<PathBuf>) -> Self {
         let endpoint = hub_socket.map(DaemonEndpoint::new);
         let mut app = Self {
+            view: AppView::Sessions,
+            pending_confirmation: None,
             endpoint,
             client: None,
             status: "disconnected".to_string(),
@@ -287,7 +480,7 @@ impl DogfoodApp {
             terminal_mouse_mode_attachment: None,
             terminal_mouse_mode_refresh_due: false,
             last_terminal_mouse_mode_probe: None,
-            command: DEFAULT_COMMAND.to_string(),
+            command: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
             drafts: BTreeMap::new(),
             last_reconnect_attempt: None,
             #[cfg(test)]
@@ -395,6 +588,47 @@ impl DogfoodApp {
         }
 
         match action_id.as_str() {
+            "botster.tui.view.sessions" => {
+                self.view = AppView::Sessions;
+                self.pending_confirmation = None;
+            }
+            "botster.tui.view.packages" => {
+                self.view = AppView::Packages;
+                self.pending_confirmation = None;
+            }
+            "botster.tui.view.diagnostics" => {
+                self.view = AppView::Diagnostics;
+                self.pending_confirmation = None;
+            }
+            "botster.tui.confirm.cancel" => self.pending_confirmation = None,
+            "botster.tui.confirm.remove" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.pending_confirmation =
+                        Some(PendingConfirmation::RemovePackage(package_name));
+                }
+            }
+            "botster.tui.confirm.remove.apply" => {
+                if let Some(PendingConfirmation::RemovePackage(package_name)) =
+                    self.pending_confirmation.take()
+                {
+                    self.action_feedback = Some(format!("removing {package_name}"));
+                    self.request_and_apply(DaemonRequest::RemovePackage { package_name });
+                }
+            }
+            "botster.tui.confirm.update" => {
+                if let Some((package_name, pin)) = package_name_and_pin_from_payload(&payload) {
+                    self.pending_confirmation =
+                        Some(PendingConfirmation::ApplyUpdate(package_name, pin));
+                }
+            }
+            "botster.tui.confirm.update.apply" => {
+                if let Some(PendingConfirmation::ApplyUpdate(package_name, pin)) =
+                    self.pending_confirmation.take()
+                {
+                    self.action_feedback = Some(format!("updating {package_name}"));
+                    self.request_and_apply(DaemonRequest::ApplyPackageUpdate { package_name, pin });
+                }
+            }
             "botster.tui.connect" => self.force_reconnect(),
             "botster.tui.spawn" => self.spawn_session(),
             "botster.tui.attach" => {
@@ -439,8 +673,8 @@ impl DogfoodApp {
             }
             "botster.tui.package.remove" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
-                    self.action_feedback = Some(format!("remove requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::RemovePackage { package_name });
+                    self.pending_confirmation =
+                        Some(PendingConfirmation::RemovePackage(package_name));
                 }
             }
             "botster.tui.package.update_status" => {
@@ -461,8 +695,8 @@ impl DogfoodApp {
             }
             "botster.tui.package.update_apply" => {
                 if let Some((package_name, pin)) = package_name_and_pin_from_payload(&payload) {
-                    self.action_feedback = Some(format!("update apply requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::ApplyPackageUpdate { package_name, pin });
+                    self.pending_confirmation =
+                        Some(PendingConfirmation::ApplyUpdate(package_name, pin));
                 }
             }
             "botster.tui.entrypoint.start" => {
@@ -1356,17 +1590,23 @@ impl DogfoodApp {
     }
 
     fn surface(&self) -> UiNode {
-        let mut root = node(
-            UiNodeKind::Stack,
-            "dogfood-root",
-            json!({ "direction": "vertical" }),
-        );
-        root.children = vec![
-            child(self.status_panel()),
-            child(self.command_form()),
-            child(self.sessions_panel()),
-            child(self.terminal_panel()),
-        ];
+        self.surface_for(self.view)
+    }
+
+    fn surface_for(&self, view: AppView) -> UiNode {
+        let root = match view {
+            AppView::Sessions => {
+                let mut root = node(
+                    UiNodeKind::Stack,
+                    "dogfood-root",
+                    json!({ "direction": "horizontal" }),
+                );
+                root.children = vec![child(self.sessions_panel()), child(self.terminal_panel())];
+                root
+            }
+            AppView::Packages => self.packages_panel(),
+            AppView::Diagnostics => self.diagnostics_panel(),
+        };
         root.validate()
             .expect("dogfood UiNode should satisfy the core UI contract");
         renderer::tui_capabilities()
@@ -1375,43 +1615,67 @@ impl DogfoodApp {
         root
     }
 
-    fn status_panel(&self) -> UiNode {
+    fn navigation_node(&self) -> UiNode {
+        let mut toolbar = node(UiNodeKind::Toolbar, "dogfood-navigation", json!({}));
+        toolbar.slots.insert(
+            "commands".to_string(),
+            vec![
+                button(
+                    "dogfood-view-sessions",
+                    if self.view == AppView::Sessions {
+                        "• Sessions"
+                    } else {
+                        "Sessions"
+                    },
+                    "botster.tui.view.sessions",
+                    json!({}),
+                ),
+                button(
+                    "dogfood-view-packages",
+                    if self.view == AppView::Packages {
+                        "• Apps"
+                    } else {
+                        "Apps"
+                    },
+                    "botster.tui.view.packages",
+                    json!({}),
+                ),
+                button(
+                    "dogfood-view-diagnostics",
+                    if self.view == AppView::Diagnostics {
+                        "• Diagnostics"
+                    } else {
+                        "Diagnostics"
+                    },
+                    "botster.tui.view.diagnostics",
+                    json!({}),
+                ),
+            ]
+            .into_iter()
+            .map(child)
+            .collect(),
+        );
+        toolbar
+    }
+
+    fn packages_panel(&self) -> UiNode {
         let mut panel = node(
             UiNodeKind::Panel,
             "dogfood-status-panel",
-            json!({ "title": "hub" }),
+            json!({ "title": "apps & packages" }),
         );
-        let mut children = vec![
-            child(node(
-                UiNodeKind::Text,
-                "dogfood-status",
-                json!({ "text": self.status }),
-            )),
-            child(node(
-                UiNodeKind::Text,
-                "dogfood-compatibility",
-                json!({ "text": self.compatibility_text() }),
-            )),
-            child(button(
-                "dogfood-refresh",
-                "Refresh",
-                "botster.tui.refresh",
-                json!({}),
-            )),
-            child(button(
-                "dogfood-connect",
-                "Reconnect",
-                "botster.tui.connect",
-                json!({}),
-            )),
-        ];
-        if let Some(error) = &self.connection_error {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "dogfood-connection-error",
-                json!({ "text": format!("connection: {error}") }),
-            )));
-        }
+        let mut children = vec![child(self.navigation_node())];
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-status",
+            json!({ "text": format!("Hub: {}", self.status) }),
+        )));
+        children.push(child(button(
+            "dogfood-refresh",
+            "Refresh",
+            "botster.tui.refresh",
+            json!({}),
+        )));
         children.push(child(node(
             UiNodeKind::Text,
             "dogfood-package-summary",
@@ -1430,7 +1694,7 @@ impl DogfoodApp {
                 children.push(child(node(
                     UiNodeKind::Text,
                     &format!("dogfood-package-{index}"),
-                    json!({ "text": format!("package: {}", package_text(package)) }),
+                    json!({ "text": package_text(package) }),
                 )));
                 children.extend(
                     package_availability_nodes(package, index)
@@ -1475,7 +1739,7 @@ impl DogfoodApp {
                 children.push(child(node(
                     UiNodeKind::Text,
                     &format!("dogfood-available-package-{index}"),
-                    json!({ "text": format!("available package: {}", available_package_text(available_package)) }),
+                    json!({ "text": available_package_text(available_package) }),
                 )));
             }
         }
@@ -1507,11 +1771,8 @@ impl DogfoodApp {
                 "dogfood-package-decision",
                 json!({
                     "text": format!(
-                        "package decision: package={} action={} state={} classification={}",
-                        decision.package_name,
-                        decision.action,
-                        decision.state,
-                        decision.classification
+                        "{} is now {} ({})",
+                        decision.package_name, decision.state, decision.action
                     )
                 }),
             )));
@@ -1531,34 +1792,11 @@ impl DogfoodApp {
                 json!({ "text": format!("plugin action result: {}", plugin_action_result_text(result)) }),
             )));
         }
-        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
-            children.push(child(node(
-                UiNodeKind::Text,
-                &format!("dogfood-diagnostic-{index}"),
-                json!({ "text": format!("diagnostic: {}", diagnostic_text(diagnostic)) }),
-            )));
-        }
         if let Some(feedback) = &self.action_feedback {
             children.push(child(node(
                 UiNodeKind::Text,
                 "dogfood-action-feedback",
                 json!({ "text": format!("action: {feedback}") }),
-            )));
-        }
-        if let Some(snapshot) = &self.snapshot_metadata {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "dogfood-terminal-snapshot-metadata",
-                json!({
-                    "text": format!(
-                        "terminal snapshot: session={} rows={} cols={} format={} payload_bytes={}",
-                        snapshot.session_id,
-                        snapshot.rows,
-                        snapshot.cols,
-                        snapshot.payload_format.as_deref().unwrap_or("none"),
-                        snapshot.payload_bytes
-                    )
-                }),
             )));
         }
         if let Some(error) = &self.error {
@@ -1568,13 +1806,114 @@ impl DogfoodApp {
                 json!({ "text": format!("error: {error}") }),
             )));
         }
+        children.extend(self.confirmation_nodes().into_iter().map(child));
+        panel.children = children;
+        panel
+    }
+
+    fn diagnostics_panel(&self) -> UiNode {
+        let mut panel = node(
+            UiNodeKind::Panel,
+            "dogfood-diagnostics-panel",
+            json!({ "title": "diagnostics" }),
+        );
+        let mut children = vec![child(self.navigation_node())];
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-status",
+            json!({ "text": format!("Hub: {}", self.status) }),
+        )));
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-compatibility",
+            json!({ "text": self.compatibility_text() }),
+        )));
+        children.push(child(button(
+            "dogfood-refresh",
+            "Refresh",
+            "botster.tui.refresh",
+            json!({}),
+        )));
+        children.push(child(button(
+            "dogfood-connect",
+            "Reconnect",
+            "botster.tui.connect",
+            json!({}),
+        )));
+        if let Some(error) = &self.connection_error {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-connection-error",
+                json!({ "text": format!("Connection: {error}") }),
+            )));
+        }
+        if self.diagnostics.is_empty() && self.error.is_none() {
+            children.push(child(node(
+                UiNodeKind::EmptyState,
+                "dogfood-diagnostics-empty",
+                json!({ "title": "No active diagnostics", "description": "The client has not reported any operational problems." }),
+            )));
+        }
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            children.push(child(node(
+                UiNodeKind::Text,
+                &format!("dogfood-diagnostic-{index}"),
+                json!({ "text": diagnostic_text(diagnostic) }),
+            )));
+        }
+        if let Some(error) = &self.error {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-error",
+                json!({ "text": format!("Error: {error}") }),
+            )));
+        }
+        if let Some(snapshot) = &self.snapshot_metadata {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-terminal-snapshot-metadata",
+                json!({ "text": format!("Terminal snapshot: {}×{} · {} bytes", snapshot.cols, snapshot.rows, snapshot.payload_bytes) }),
+            )));
+        }
         children.push(child(node(
             UiNodeKind::Text,
             "dogfood-hints",
-            json!({ "text": "hints: Tab focus | up/down select | Enter/Space activate | terminal focus forwards keys" }),
+            json!({ "text": "Tab/Shift-Tab move focus · Enter activates · Ctrl-\\ exits Botster" }),
         )));
         panel.children = children;
         panel
+    }
+
+    fn confirmation_nodes(&self) -> Vec<UiNode> {
+        let Some(pending) = &self.pending_confirmation else {
+            return Vec::new();
+        };
+        let (message, action_id, payload) = match pending {
+            PendingConfirmation::RemovePackage(package_name) => (
+                format!("Remove {package_name}? This removes the installed package."),
+                "botster.tui.confirm.remove.apply",
+                json!({ "package_name": package_name }),
+            ),
+            PendingConfirmation::ApplyUpdate(package_name, pin) => (
+                format!("Apply the available update to {package_name}?"),
+                "botster.tui.confirm.update.apply",
+                json!({ "package_name": package_name, "pin": pin }),
+            ),
+        };
+        vec![
+            node(
+                UiNodeKind::Text,
+                "dogfood-confirmation-message",
+                json!({ "text": message }),
+            ),
+            button("dogfood-confirmation-apply", "Confirm", action_id, payload),
+            button(
+                "dogfood-confirmation-cancel",
+                "Cancel",
+                "botster.tui.confirm.cancel",
+                json!({}),
+            ),
+        ]
     }
 
     fn package_summary_text(&self) -> String {
@@ -1603,12 +1942,12 @@ impl DogfoodApp {
             nodes.push(node(
                 UiNodeKind::Text,
                 &format!("dogfood-app-{app_index}"),
-                json!({ "text": format!("app: {}", app_text(app)) }),
+                json!({ "text": app_text(app) }),
             ));
             nodes.push(node(
                 UiNodeKind::Text,
                 &format!("dogfood-app-{app_index}-launch-target"),
-                json!({ "text": format!("launch target: {}", app_launch_target_text(app)) }),
+                json!({ "text": app_launch_target_text(app) }),
             ));
             for (reason_index, reason) in app.blocked_reasons.iter().enumerate() {
                 nodes.push(node(
@@ -1624,21 +1963,7 @@ impl DogfoodApp {
                     json!({ "text": format!("app diagnostic: {}", package_diagnostic_text(diagnostic)) }),
                 ));
             }
-            nodes.extend(
-                action_state_nodes(
-                    &app.actions,
-                    "app action",
-                    &format!("dogfood-app-{app_index}"),
-                )
-                .into_iter(),
-            );
-            if let Some(route) = &app.route {
-                nodes.push(node(
-                    UiNodeKind::Text,
-                    &format!("dogfood-app-{app_index}-route"),
-                    json!({ "text": format!("app route: {}", route_text(route)) }),
-                ));
-            }
+            nodes.extend(action_summary_nodes(app, app_index));
         }
         nodes
     }
@@ -1658,7 +1983,7 @@ impl DogfoodApp {
             nodes.push(node(
                 UiNodeKind::Text,
                 &format!("dogfood-package-navigation-{index}"),
-                json!({ "text": format!("navigation entry: {}", navigation_entry_text(entry)) }),
+                json!({ "text": navigation_entry_text(entry) }),
             ));
             for (diagnostic_index, diagnostic) in entry.diagnostics.iter().enumerate() {
                 nodes.push(node(
@@ -1817,16 +2142,16 @@ impl DogfoodApp {
                 )
             }
             "secret" => {
-                props["checked"] = draft.cloned().unwrap_or(Value::Bool(false));
                 let state = configuration_secret_state(effective);
-                props["label"] = Value::String(format!(
-                    "{} secret ({state}; Space marks write-only update)",
-                    field.label
-                ));
                 node(
-                    UiNodeKind::Checkbox,
+                    UiNodeKind::Text,
                     &format!("dogfood-package-{index}-configuration-{}", field.key),
-                    props,
+                    json!({
+                        "text": format!(
+                            "{}: {state}. Secrets are managed through the hub's credential flow.",
+                            field.label
+                        )
+                    }),
                 )
             }
             "string" | "path" | "url" => {
@@ -1874,37 +2199,6 @@ impl DogfoodApp {
         }
     }
 
-    fn command_form(&self) -> UiNode {
-        let command = self
-            .drafts
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.command);
-        let mut panel = node(
-            UiNodeKind::Panel,
-            "dogfood-command-panel",
-            json!({ "title": "spawn" }),
-        );
-        panel.children = vec![
-            child(node(
-                UiNodeKind::TextInput,
-                "dogfood-command",
-                json!({
-                    "name": "command",
-                    "label": "command",
-                    "value": command
-                }),
-            )),
-            child(button(
-                "dogfood-spawn",
-                "Spawn and attach",
-                "botster.tui.spawn",
-                json!({}),
-            )),
-        ];
-        panel
-    }
-
     fn sessions_panel(&self) -> UiNode {
         let mut list = node(UiNodeKind::List, "dogfood-session-list", json!({}));
         list.children = self
@@ -1912,17 +2206,15 @@ impl DogfoodApp {
             .iter()
             .map(|session| {
                 let session_id = &session.session_id;
-                let mut title = format!("{session_id} [{}]", session.lifecycle);
-                if self.attached_session.as_deref() == Some(session_id.as_str()) {
-                    title.push_str(" (attached)");
-                } else if self.selected_session.as_deref() == Some(session_id.as_str()) {
-                    title.push_str(" (selected)");
-                }
+                let attached = self.attached_session.as_deref() == Some(session_id.as_str());
+                let selected = self.selected_session.as_deref() == Some(session_id.as_str());
+                let title = session_row_title(session, attached);
                 let mut item = node(
                     UiNodeKind::ListItem,
                     &format!("dogfood-session-{session_id}"),
                     json!({
-                        "value": session_id
+                        "value": session_id,
+                        "selected": selected
                     }),
                 );
                 item.slots.insert(
@@ -1950,25 +2242,65 @@ impl DogfoodApp {
             "dogfood-sessions-panel",
             json!({ "title": "sessions" }),
         );
-        panel.children = vec![
-            child(node(
+        let command = self
+            .drafts
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.command);
+        let mut children = vec![child(self.navigation_node())];
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-session-status",
+            json!({ "text": format!("Hub: {}", self.status) }),
+        )));
+        if self.connection_error.is_some() {
+            children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-selected-session",
-                json!({ "text": format!("selected: {}", self.selected_session.as_deref().unwrap_or("none")) }),
-            )),
-            child(node(
-                UiNodeKind::Text,
-                "dogfood-attached-session",
-                json!({ "text": format!("attached: {}", self.attached_session.as_deref().unwrap_or("none")) }),
-            )),
-            child(list),
-            child(button(
+                "dogfood-session-connection-error",
+                json!({ "text": "Hub unavailable. Open Diagnostics for details." }),
+            )));
+        }
+        children.push(child(node(
+            UiNodeKind::TextInput,
+            "dogfood-command",
+            json!({ "name": "command", "label": "New session command", "value": command }),
+        )));
+        children.push(child(button(
+            "dogfood-spawn",
+            "New session",
+            "botster.tui.spawn",
+            json!({}),
+        )));
+        if self.sessions.is_empty() {
+            children.push(child(node(
+                UiNodeKind::EmptyState,
+                "dogfood-session-empty",
+                json!({ "title": "No sessions", "description": "Start a session to open a terminal." }),
+            )));
+        } else {
+            children.push(child(list));
+        }
+        if self.attached_session.is_some() {
+            children.push(child(button(
                 "dogfood-detach",
-                "Detach",
+                "Detach current",
                 "botster.tui.detach",
                 json!({}),
-            )),
-        ];
+            )));
+        }
+        if let Some(error) = &self.error {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "dogfood-error",
+                json!({ "text": format!("error: {error}") }),
+            )));
+        }
+        children.push(child(node(
+            UiNodeKind::Text,
+            "dogfood-session-hints",
+            json!({ "text": "Shift-Tab: UI · Ctrl-\\: quit" }),
+        )));
+        panel.children = children;
         panel
     }
 
@@ -1991,9 +2323,9 @@ impl DogfoodApp {
 
     fn terminal_title(&self) -> String {
         match (&self.attached_session, &self.selected_session) {
-            (Some(attached), _) => format!("terminal attached: {attached}"),
-            (None, Some(selected)) => format!("terminal stream unavailable: selected {selected}"),
-            (None, None) => "terminal stream unavailable: no session selected".to_string(),
+            (Some(attached), _) => format!("terminal · {}", session_display_name(attached)),
+            (None, Some(selected)) => format!("terminal · {}", session_display_name(selected)),
+            (None, None) => "terminal".to_string(),
         }
     }
 
@@ -2004,9 +2336,11 @@ impl DogfoodApp {
         match (&self.attached_session, &self.selected_session) {
             (Some(session_id), _) => format!("waiting for terminal output from {session_id}"),
             (None, Some(session_id)) => {
-                format!("terminal stream unavailable: attach selected session {session_id}")
+                format!("Select Attach to open {session_id}")
             }
-            (None, None) => "terminal stream unavailable: no session selected".to_string(),
+            (None, None) => {
+                "No terminal open. Start a session from the Sessions panel.".to_string()
+            }
         }
     }
 }
@@ -2194,12 +2528,7 @@ fn package_configuration_submit_value(
             "type": "multiline_text",
             "value": draft.as_str().unwrap_or_default()
         })),
-        "secret" => draft.as_bool().unwrap_or_default().then(|| {
-            json!({
-                "type": "secret",
-                "state": "write_only"
-            })
-        }),
+        "secret" => None,
         "string" | "path" | "url" => Some(json!({
             "type": field.field_type,
             "value": draft.as_str().unwrap_or_default()
@@ -2247,7 +2576,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         println!("hub-data-dir: configured");
     }
     let mut app = DogfoodApp::new(Some(socket));
-    app.command = DEFAULT_COMMAND.to_string();
+    app.command = HEADLESS_COMMAND.to_string();
     app.spawn_session();
     if let Some(error) = &app.error {
         eprintln!("headless-dogfood-error: {error}");
@@ -2483,16 +2812,13 @@ fn package_name_and_pin_from_payload(
 }
 
 fn package_text(package: &DaemonPackage) -> String {
+    let availability = match package.availability.state {
+        DaemonPackageAvailabilityState::Available => "ready",
+        DaemonPackageAvailabilityState::Blocked => "needs attention",
+    };
     format!(
-        "{} {} classification={} state={} capabilities={} provider_profile_admitted={} availability={} surfaces={}",
-        package.package_name,
-        package.version,
-        package.classification,
-        package.state,
-        capability_text(&package.requested_capabilities),
-        package.provider_profile_admitted,
-        availability_state_text(package.availability.state),
-        package.surfaces.len()
+        "{} {} · {} · {} · {availability}",
+        package.package_name, package.version, package.classification, package.state
     )
 }
 
@@ -2551,55 +2877,36 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
     nodes
 }
 
-fn route_text(route: &DaemonPackageRouteDescriptor) -> String {
-    let mut parts = vec![
-        format!("package={}", route.package_name),
-        format!("route_id={}", route.route_id),
-        format!("path={}", route.route_path),
-        format!("target={}", route.target.kind),
-        format!("enabled={}", route.enabled),
-        format!("blocked={}", route.blocked),
-        format!("supports_settings={}", route.supports_settings),
-    ];
-    if let Some(surface_id) = &route.surface_id {
-        parts.push(format!("surface_id={surface_id}"));
-    }
-    if let Some(target_surface_id) = &route.target.surface_id {
-        parts.push(format!("target_surface_id={target_surface_id}"));
-    }
-    if let Some(app_id) = &route.app_id {
-        parts.push(format!("app_id={app_id}"));
-    }
-    parts.join(" ")
-}
-
 fn package_action_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
-    vec![
-        button(
-            &format!("dogfood-package-{index}-enable"),
-            "Enable",
-            "botster.tui.package.enable",
-            json!({ "package_name": package.package_name }),
-        ),
-        button(
+    let mut nodes = Vec::new();
+    if package.state == "enabled" {
+        nodes.push(button(
             &format!("dogfood-package-{index}-disable"),
             "Disable",
             "botster.tui.package.disable",
             json!({ "package_name": package.package_name }),
-        ),
-        button(
-            &format!("dogfood-package-{index}-remove"),
-            "Remove",
-            "botster.tui.package.remove",
+        ));
+    } else if package.availability.state == DaemonPackageAvailabilityState::Available {
+        nodes.push(button(
+            &format!("dogfood-package-{index}-enable"),
+            "Enable",
+            "botster.tui.package.enable",
             json!({ "package_name": package.package_name }),
-        ),
-        button(
-            &format!("dogfood-package-{index}-update-status"),
-            "Update status",
-            "botster.tui.package.update_status",
-            json!({ "package_name": package.package_name }),
-        ),
-    ]
+        ));
+    }
+    nodes.push(button(
+        &format!("dogfood-package-{index}-update-status"),
+        "Check for updates",
+        "botster.tui.package.update_status",
+        json!({ "package_name": package.package_name }),
+    ));
+    nodes.push(button(
+        &format!("dogfood-package-{index}-remove"),
+        "Remove…",
+        "botster.tui.package.remove",
+        json!({ "package_name": package.package_name }),
+    ));
+    nodes
 }
 
 fn entrypoint_action_nodes(
@@ -2612,127 +2919,136 @@ fn entrypoint_action_nodes(
         "package_name": package.package_name,
         "entrypoint_id": entrypoint.id,
     });
-    vec![
-        button(
-            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-start"),
-            "Start",
-            "botster.tui.entrypoint.start",
-            payload.clone(),
-        ),
-        button(
+    let mut nodes = Vec::new();
+    if entrypoint.process.state == "running" {
+        nodes.push(button(
             &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-stop"),
             "Stop",
             "botster.tui.entrypoint.stop",
             payload.clone(),
-        ),
-        button(
+        ));
+        nodes.push(button(
             &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-restart"),
             "Restart",
             "botster.tui.entrypoint.restart",
-            payload.clone(),
-        ),
-        button(
-            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-status"),
-            "Status",
-            "botster.tui.entrypoint.status",
             payload,
-        ),
-    ]
+        ));
+    } else {
+        nodes.push(button(
+            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-start"),
+            "Start",
+            "botster.tui.entrypoint.start",
+            payload,
+        ));
+    }
+    nodes
 }
 
 fn available_package_text(package: &DaemonAvailablePackage) -> String {
-    let mut parts = vec![
-        format!("entry_id={}", package.entry_id),
-        format!("package={}", package.package_name),
-        format!("version={}", package.version),
-        format!("classification={}", package.classification),
-        format!("source_kind={}", package.source_kind),
-        format!("source_label={}", package.source_label),
-        format!("first_party={}", package.first_party),
-        format!("state={}", package.state),
-        format!(
-            "capabilities={}",
-            capability_text(&package.requested_capabilities)
-        ),
-        format!(
-            "compatibility={}:{}",
-            package.compatibility.result, package.compatibility.botster_requirement
-        ),
-    ];
-    if !package.compatibility.diagnostics.is_empty() {
-        parts.push(format!(
-            "compatibility_diagnostics={}",
-            package.compatibility.diagnostics.join(",")
-        ));
-    }
-    if let Some(pin) = &package.pin {
-        parts.push(format!("pin={}", pin_text(pin)));
-    }
-    parts.join(" ")
+    let ownership = if package.first_party {
+        "first-party"
+    } else {
+        package.source_label.as_str()
+    };
+    format!(
+        "{} {} · {} · {} · {}",
+        package.package_name,
+        package.version,
+        package.classification,
+        ownership,
+        humanize(&package.state)
+    )
 }
 
 fn app_text(app: &DaemonApp) -> String {
     format!(
-        "package={} app={} entrypoint={} kind={} launch_mode={} lifecycle={}",
-        app.package_name,
+        "{} · {} · {}",
         app.app_id,
-        app.entrypoint_id,
-        app.kind,
-        app.launch_mode,
-        app.lifecycle_state
+        humanize(&app.kind),
+        humanize(&app.lifecycle_state)
     )
 }
 
 fn app_launch_target_text(app: &DaemonApp) -> String {
-    let mut parts = vec![format!("kind={}", app.launch_target.kind)];
     match app.launch_target.local_url.as_deref() {
-        Some(local_url) => {
-            parts.push(format!("local_url={local_url}"));
-            parts.push("open=copy URL or open it in a browser".to_string());
-        }
+        Some(local_url) => format!("Open in browser: {local_url}"),
         None if app.kind == "web_app" || app.launch_target.kind == "web_app" => {
-            parts.push("local_url=unavailable".to_string());
-            parts.push("open=blocked or not launched by hub".to_string());
+            "Web address unavailable. Start the app or resolve its blocked reason.".to_string()
         }
-        None => {
-            parts.push("local_url=not_applicable".to_string());
-            parts.push("open=use hub-provided terminal app action when available".to_string());
-        }
+        None => "Terminal app. Use an available launch action.".to_string(),
     }
-    parts.join(" ")
 }
 
 fn navigation_entry_text(entry: &DaemonPackageNavigationEntry) -> String {
-    let mut parts = vec![
-        format!("package={}", entry.package_name),
-        format!("item_id={}", entry.item_id),
-        format!("label={}", entry.label),
-        format!("route_id={}", entry.route_id),
-        format!("path={}", entry.route_path),
-        format!("target={}", entry.target.kind),
-        format!("source={}", entry.source.kind),
-        format!("enabled={}", entry.enabled),
-        format!("blocked={}", entry.blocked),
-    ];
-    if let Some(description) = &entry.description {
-        parts.push(format!("description={description}"));
+    entry.description.as_ref().map_or_else(
+        || entry.label.clone(),
+        |description| format!("{} — {description}", entry.label),
+    )
+}
+
+fn humanize(value: &str) -> String {
+    value.replace(['_', '-'], " ")
+}
+
+fn session_display_name(session_id: &str) -> String {
+    if let Some(suffix) = session_id.strip_prefix("btui-") {
+        let short_suffix = suffix
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        return format!("TUI session · {short_suffix}");
     }
-    if let Some(icon) = &entry.icon {
-        parts.push(format!("icon={icon}"));
+    session_id
+        .strip_suffix("-session")
+        .map(humanize)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| session_id.to_string())
+}
+
+fn session_row_title(session: &SessionRow, attached: bool) -> String {
+    let name = session_display_name(&session.session_id);
+    if attached {
+        format!("{name} · attached")
+    } else if session.lifecycle == "running" {
+        name
+    } else {
+        format!("{name} · {}", humanize(&session.lifecycle))
     }
-    if let Some(surface_id) = &entry.target.surface_id {
-        parts.push(format!("target_surface_id={surface_id}"));
-    }
-    if let Some(surface_id) = &entry.source.surface_id {
-        parts.push(format!("source_surface_id={surface_id}"));
-    }
-    if let Some(entrypoint_id) = &entry.target.entrypoint_id {
-        parts.push(format!("target_entrypoint_id={entrypoint_id}"));
-    }
-    if let Some(entrypoint_id) = &entry.source.entrypoint_id {
-        parts.push(format!("source_entrypoint_id={entrypoint_id}"));
-    }
-    parts.join(" ")
+}
+
+fn action_summary_nodes(app: &DaemonApp, app_index: usize) -> Vec<UiNode> {
+    app.actions
+        .iter()
+        .enumerate()
+        .map(|(action_index, action)| {
+            let text = match action.status {
+                botster_hub_client::DaemonPackageActionStatus::Available => {
+                    format!("Available: {}", humanize(&action.action_id))
+                }
+                botster_hub_client::DaemonPackageActionStatus::Blocked => format!(
+                    "Blocked: {}{}",
+                    humanize(&action.action_id),
+                    action
+                        .reason
+                        .as_ref()
+                        .map(|reason| format!(" — {}", humanize(reason)))
+                        .unwrap_or_default()
+                ),
+                botster_hub_client::DaemonPackageActionStatus::Unavailable => {
+                    format!("Unavailable: {}", humanize(&action.action_id))
+                }
+            };
+            node(
+                UiNodeKind::Text,
+                &format!("dogfood-app-{app_index}-action-{action_index}"),
+                json!({ "text": text }),
+            )
+        })
+        .collect()
 }
 
 fn navigation_open_payload_for_entry(entry: &DaemonPackageNavigationEntry) -> Option<Value> {
@@ -2921,88 +3237,6 @@ fn plugin_action_result_text(result: &Value) -> String {
     }
 }
 
-fn action_state_nodes(
-    actions: &[botster_hub_client::DaemonPackageActionState],
-    label: &str,
-    id_prefix: &str,
-) -> Vec<UiNode> {
-    actions
-        .iter()
-        .enumerate()
-        .map(|(action_index, action)| {
-            node(
-                UiNodeKind::Text,
-                &format!("{id_prefix}-action-{action_index}"),
-                json!({ "text": format!("{label}: {}", action_state_text(action)) }),
-            )
-        })
-        .collect()
-}
-
-fn action_state_text(action: &botster_hub_client::DaemonPackageActionState) -> String {
-    let mut parts = vec![
-        format!("action_id={}", action.action_id),
-        format!("status={}", action_status_text(action.status)),
-    ];
-    if let Some(reason) = &action.reason {
-        parts.push(format!("reason={reason}"));
-    }
-    if !action.diagnostics.is_empty() {
-        parts.push(format!(
-            "diagnostics={}",
-            action
-                .diagnostics
-                .iter()
-                .map(package_diagnostic_text)
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    if !action.required_references.is_empty() {
-        parts.push(format!(
-            "required_references={}",
-            action
-                .required_references
-                .iter()
-                .map(|reference| format!("{}:{}", reference.kind, reference.key))
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    if let Some(request) = &action.request {
-        parts.push(format!("request={}", action_request_text(request)));
-    }
-    parts.join(" ")
-}
-
-fn action_status_text(status: botster_hub_client::DaemonPackageActionStatus) -> &'static str {
-    match status {
-        botster_hub_client::DaemonPackageActionStatus::Available => "available",
-        botster_hub_client::DaemonPackageActionStatus::Blocked => "blocked",
-        botster_hub_client::DaemonPackageActionStatus::Unavailable => "unavailable",
-    }
-}
-
-fn action_request_text(request: &botster_hub_client::DaemonPackageActionRequest) -> String {
-    let mut parts = vec![format!("type={}", request.request_type)];
-    if let Some(package_name) = &request.package_name {
-        parts.push(format!("package={package_name}"));
-    }
-    if let Some(entry_id) = &request.entry_id {
-        parts.push(format!("entry_id={entry_id}"));
-    }
-    if let Some(entrypoint_id) = &request.entrypoint_id {
-        parts.push(format!("entrypoint_id={entrypoint_id}"));
-    }
-    if let Some(pin) = &request.pin {
-        parts.push(format!("pin={}", pin_text(pin)));
-    }
-    if request.registry_path.is_some() {
-        parts.push("registry_path=provided".to_string());
-    }
-    parts.join(",")
-}
-
 fn install_plan_nodes(plan: &DaemonPackageInstallPlan) -> Vec<UiNode> {
     let mut nodes = vec![node(
         UiNodeKind::Text,
@@ -3059,8 +3293,8 @@ fn update_status_nodes(status: &DaemonPackageUpdateStatus) -> Vec<UiNode> {
         ));
         nodes.push(button(
             "dogfood-update-status-apply",
-            "Apply update",
-            "botster.tui.package.update_apply",
+            "Apply update…",
+            "botster.tui.confirm.update",
             json!({ "package_name": status.package_name, "pin": pin }),
         ));
     }
@@ -3171,6 +3405,25 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 mod tests {
     use super::*;
     use botster_core::{RequestId, UiActionId, UiActionKind, UiActionRequest, UiSurfaceId};
+    use ratatui::backend::TestBackend;
+
+    fn render_app(app: &DogfoodApp, width: u16, height: u16) -> (Vec<String>, HitMap) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| draw(frame, &mut hit_map, app))
+            .expect("draw app");
+        let buffer = terminal.backend().buffer();
+        let lines = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect();
+        (lines, hit_map)
+    }
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
@@ -3187,35 +3440,177 @@ mod tests {
     }
 
     #[test]
-    fn quit_keys_match_documented_exit_path() {
-        assert!(should_quit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    fn only_explicit_client_chord_quits() {
         assert!(should_quit(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE
-        )));
-        assert!(should_quit(KeyEvent::new(
-            KeyCode::Char('c'),
+            KeyCode::Char('\\'),
             KeyModifiers::CONTROL
         )));
         assert!(!should_quit(KeyEvent::new(
-            KeyCode::Char('c'),
+            KeyCode::Esc,
             KeyModifiers::NONE
+        )));
+        assert!(!should_quit(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        assert!(!should_quit(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
         )));
     }
 
     #[test]
+    fn terminal_passthrough_preserves_shell_and_full_screen_app_keys() {
+        let cases = [
+            (KeyCode::Char('q'), KeyModifiers::NONE, b"q".as_slice()),
+            (KeyCode::Esc, KeyModifiers::NONE, b"\x1b".as_slice()),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                b"\x03".as_slice(),
+            ),
+            (KeyCode::Tab, KeyModifiers::NONE, b"\t".as_slice()),
+            (KeyCode::Up, KeyModifiers::NONE, b"\x1b[A".as_slice()),
+        ];
+        for (code, modifiers, expected) in cases {
+            assert_eq!(
+                terminal_key_dispatch(KeyEvent::new(code, modifiers)),
+                InputDispatch::TerminalForward {
+                    node_id: "dogfood-terminal".to_string(),
+                    bytes: expected.to_vec(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn parses_hub_socket_and_headless_mode() {
-        let args = AppArgs::parse([
+        let ParsedCommand::Run(args) = AppArgs::parse([
             "--hub-socket".to_string(),
             "target/hub.sock".to_string(),
             "--data-dir".to_string(),
             "target/hub-data".to_string(),
             "--headless-dogfood".to_string(),
-        ]);
+        ])
+        .expect("valid arguments") else {
+            panic!("expected run arguments");
+        };
 
         assert_eq!(args.hub_socket, Some(PathBuf::from("target/hub.sock")));
         assert_eq!(args.hub_data_dir, Some(PathBuf::from("target/hub-data")));
         assert!(args.headless_dogfood);
+    }
+
+    #[test]
+    fn cli_rejects_unknown_options_and_missing_values() {
+        assert_eq!(
+            AppArgs::parse(["--hub-sokcet".to_string()]),
+            Err("unknown option: --hub-sokcet".to_string())
+        );
+        assert_eq!(
+            AppArgs::parse(["--hub-socket".to_string()]),
+            Err("--hub-socket requires a path".to_string())
+        );
+        assert_eq!(
+            AppArgs::parse(["--help".to_string()]),
+            Ok(ParsedCommand::Help)
+        );
+    }
+
+    #[test]
+    fn production_default_is_a_focused_session_workspace_at_80_by_24() {
+        let app = DogfoodApp::new(None);
+
+        let rendered = render_app(&app, 80, 24).0.join("\n");
+
+        assert!(rendered.contains("New session"));
+        assert!(rendered.contains("No sessions"));
+        assert!(rendered.contains("No terminal open"));
+        assert!(rendered.contains("Ctrl-\\: quit"));
+        assert!(!rendered.contains("compatibility: expected protocol"));
+        assert!(!rendered.contains("packages: none reported"));
+    }
+
+    #[test]
+    fn wide_session_workspace_caps_sidebar_and_gives_terminal_remaining_width() {
+        let (sidebar, terminal) = session_columns(Rect::new(0, 0, 200, 60));
+        assert_eq!(sidebar.width, 50);
+        assert_eq!(terminal.x, 50);
+        assert_eq!(terminal.width, 150);
+
+        let mut app = DogfoodApp::new(None);
+        app.status = "connected (running)".to_string();
+        app.connection_error = None;
+        app.sessions = vec![SessionRow::running("session-alpha")];
+        let (lines, hit_map) = render_app(&app, 200, 60);
+        let rendered = lines.join("\n");
+
+        assert!(lines[1].contains("Sessions"));
+        assert!(lines[2].contains("Hub: connected (running)"));
+        assert!(lines[3].contains("New session command"));
+        assert!(lines[4].contains("New session"));
+        assert!(lines[5].contains("session-alpha"));
+        assert!(rendered.contains("terminal"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "dogfood-terminal" && region.rect.width == 150)
+        );
+    }
+
+    #[test]
+    fn medium_session_workspace_uses_one_third_sidebar() {
+        let (sidebar, terminal) = session_columns(Rect::new(0, 0, 120, 40));
+        assert_eq!(sidebar.width, 40);
+        assert_eq!(terminal.width, 80);
+    }
+
+    #[test]
+    fn generated_session_ids_render_as_stable_friendly_names() {
+        assert_eq!(
+            session_display_name("botster-web-dogfood-session"),
+            "botster web dogfood"
+        );
+        assert_eq!(
+            session_display_name("btui-832126939000"),
+            "TUI session · 939000"
+        );
+        assert_eq!(session_display_name("session-alpha"), "session-alpha");
+    }
+
+    #[test]
+    fn package_mutations_require_confirmation_before_daemon_requests() {
+        let mut app = DogfoodApp::new(None);
+        app.observed_requests.clear();
+
+        app.handle_action(
+            "botster.tui.package.remove".to_string(),
+            None,
+            Some(json!({ "package_name": "workflow.plugin" })),
+        );
+
+        assert!(app.observed_requests.is_empty());
+        assert_eq!(
+            app.pending_confirmation,
+            Some(PendingConfirmation::RemovePackage(
+                "workflow.plugin".to_string()
+            ))
+        );
+        let rendered = renderer::render_to_lines(&app.surface_for(AppView::Packages), 120, 48)
+            .0
+            .join("\n");
+        assert!(rendered.contains("Remove workflow.plugin?"));
+        assert!(rendered.contains("Confirm"));
+        assert!(rendered.contains("Cancel"));
+
+        app.handle_action("botster.tui.confirm.remove.apply".to_string(), None, None);
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::RemovePackage(
+                "workflow.plugin".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -3226,7 +3621,7 @@ mod tests {
             Value::String("printf draft\\n".to_string()),
         )]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, _) = render_app(&app, 200, 48);
         assert!(lines.join("\n").contains("printf draft"));
     }
 
@@ -3238,7 +3633,7 @@ mod tests {
         app.spawn_session();
 
         assert_eq!(app.error.as_deref(), Some("command is required"));
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, _) = render_app(&app, 200, 48);
         assert!(lines.join("\n").contains("error: command is required"));
     }
 
@@ -3246,7 +3641,7 @@ mod tests {
     fn missing_hub_socket_renders_connection_diagnostic() {
         let app = DogfoodApp::new(None);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 120, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("hub socket missing"));
@@ -3291,7 +3686,7 @@ mod tests {
 
         app.record_transport_error(DaemonTransportError::Compatibility(error));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 120, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("compatibility mismatch"));
@@ -3306,7 +3701,7 @@ mod tests {
 
         app.apply_response(status_response("running", 7));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 200, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("connected (running)"));
@@ -3323,7 +3718,7 @@ mod tests {
 
         app.apply_response(status_response_with_package_counts("running", 7, 3, 1));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 200, 48);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("packages: 3 installed; 1 enabled"));
@@ -3364,17 +3759,13 @@ mod tests {
             ),
         ]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 220);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 220);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("packages: 3 installed; 1 enabled"));
-        assert!(rendered.contains(
-            "package: local-alpha 0.1.0 classification=local state=enabled capabilities=mcp:tools,surface provider_profile_admitted=true"
-        ));
-        assert!(rendered.contains(
-            "package: local-beta 0.2.0 classification=local state=disabled capabilities=none provider_profile_admitted=false"
-        ));
-        assert!(rendered.contains("local-gamma 0.3.0 classification=local state=pending-review"));
+        assert!(rendered.contains("local-alpha 0.1.0 · local · enabled · ready"));
+        assert!(rendered.contains("local-beta 0.2.0 · local · disabled · ready"));
+        assert!(rendered.contains("local-gamma 0.3.0 · local · pending-review · ready"));
     }
 
     #[test]
@@ -3390,12 +3781,10 @@ mod tests {
             true,
         )]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
 
-        assert!(rendered.contains(
-            "package: local-alpha 0.1.0 classification=local state=enabled capabilities=none provider_profile_admitted=true"
-        ));
+        assert!(rendered.contains("local-alpha 0.1.0 · local · enabled · ready"));
         assert!(!rendered.contains("entrypoints="));
     }
 
@@ -3406,14 +3795,12 @@ mod tests {
         app.apply_response(apps_response(vec![web_app_with_url()]));
 
         assert_eq!(app.apps.len(), 1);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("apps: 1 installed"));
-        assert!(rendered.contains(
-            "app: package=workflow.plugin app=dashboard entrypoint=web kind=web_app launch_mode=supervised lifecycle=running"
-        ));
-        assert!(rendered.contains("launch target: kind=web_app local_url=http://127.0.0.1:49152 open=copy URL or open it in a browser"));
+        assert!(rendered.contains("dashboard · web app · running"));
+        assert!(rendered.contains("Open in browser: http://127.0.0.1:49152"));
     }
 
     #[test]
@@ -3427,9 +3814,9 @@ mod tests {
 
         app.apply_response(apps_response(vec![app_row]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("kind=web_app local_url=unavailable"));
+        assert!(rendered.contains("Web address unavailable"));
         assert!(rendered.contains("app blocked: missing_config: port"));
         assert!(rendered.contains("app diagnostic: blocked:launch target unavailable"));
         assert!(!rendered.contains("http://localhost"));
@@ -3449,13 +3836,11 @@ mod tests {
 
         app.apply_response(apps_response(vec![app_row]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
-        assert!(rendered.contains(
-            "app: package=botster-tui app=tui entrypoint=tui kind=terminal_app launch_mode=foreground_stdio lifecycle=launchable"
-        ));
-        assert!(rendered.contains("launch target: kind=terminal_app local_url=not_applicable open=use hub-provided terminal app action when available"));
-        assert!(rendered.contains("app action: action_id=open status=available request=type=start_entrypoint,package=botster-tui,entrypoint_id=tui"));
+        assert!(rendered.contains("tui · terminal app · launchable"));
+        assert!(rendered.contains("Terminal app. Use an available launch action."));
+        assert!(rendered.contains("Available: open"));
         assert!(!rendered.contains("http://"));
     }
 
@@ -3486,22 +3871,12 @@ mod tests {
             plugin_contract_app_navigation(),
         ]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 500, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 500, 180);
         let rendered = lines.join("\n");
-        assert!(rendered.contains(
-            "navigation entry: package=botster.plugin-contract-matrix item_id=contract.app label=Contract App route_id=surface:contract.app"
-        ));
-        assert!(
-            rendered
-                .contains("path=/packages/botster.plugin-contract-matrix/surfaces/contract.app")
-        );
-        assert!(rendered.contains("target=plugin_surface"));
-        assert!(rendered.contains("target_surface_id=contract.app"));
-        assert!(rendered.contains("source_surface_id=contract.app"));
+        assert!(rendered.contains("Contract App"));
         assert!(rendered.contains("Open"));
-        assert!(rendered.contains("app route: package=botster.plugin-contract-matrix"));
-        assert!(!rendered.contains("package route:"));
-        assert!(!rendered.contains("route_id=settings"));
+        assert!(!rendered.contains("route_id="));
+        assert!(!rendered.contains("target_surface_id="));
     }
 
     #[test]
@@ -3520,7 +3895,7 @@ mod tests {
             }
         })));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 180);
         let rendered = lines.join("\n");
         assert!(rendered.contains(
             "plugin surface: package=botster.plugin-contract-matrix surface=contract.app kind=panel node_id=contract-app-panel"
@@ -3570,7 +3945,7 @@ mod tests {
             composite_application_primitives_plugin_surface(),
         ));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 420, 220);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 420, 220);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains(
@@ -3641,7 +4016,7 @@ mod tests {
 
         app.apply_response(plugin_surface_response(invalid_table_plugin_surface()));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 180);
         let rendered = lines.join("\n");
         assert!(rendered.contains(
             "plugin surface: package=botster.plugin-contract-matrix surface=contract.invalid kind=table node_id=contract-invalid-table"
@@ -3695,11 +4070,9 @@ mod tests {
 
         app.apply_response(package_navigation_response(vec![entry]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 160);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("navigation entry: package=botster.plugin-contract-matrix"));
-        assert!(rendered.contains("enabled=false"));
-        assert!(rendered.contains("blocked=true"));
+        assert!(rendered.contains("Contract App"));
         assert!(rendered.contains("navigation diagnostic: blocked:missing configuration"));
         assert!(rendered.contains("navigation blocked: label=Contract App"));
         assert!(!rendered.contains("dogfood-package-navigation-0-open"));
@@ -3715,7 +4088,7 @@ mod tests {
 
         app.apply_response(package_navigation_response(vec![entry]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 160);
         let rendered = lines.join("\n");
         assert!(rendered.contains("navigation unsupported: label=Contract App"));
         assert!(rendered.contains("target=web_app"));
@@ -3729,7 +4102,7 @@ mod tests {
 
         app.apply_response(plugin_surface_response(iframe_plugin_surface()));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 160);
         let rendered = lines.join("\n");
         assert!(rendered.contains("plugin surface iframe unsupported"));
         assert!(rendered.contains("package=botster.plugin-contract-matrix"));
@@ -3783,12 +4156,13 @@ mod tests {
 
         app.apply_response(apps_response(vec![app_row]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 160);
         let rendered = lines.join("\n");
         assert!(rendered.contains("app blocked: missing_auth: github_token"));
         assert!(rendered.contains("app blocked: disabled_package: botster-tui"));
         assert!(rendered.contains("app diagnostic: warning:terminal app is blocked"));
-        assert!(rendered.contains("app action: action_id=install status=blocked reason=missing auth diagnostics=auth:token missing required_references=auth:github_token request=type=install_package,package=botster-tui,entry_id=botster-tui,entrypoint_id=tui,registry_path=provided"));
+        assert!(rendered.contains("Blocked: install — missing auth"));
+        assert!(!rendered.contains("required_references="));
         assert!(!rendered.contains("/redacted/catalog"));
     }
 
@@ -3808,7 +4182,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 240, 180);
         let rendered = lines.join("\n");
 
         assert!(
@@ -3837,7 +4211,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 240, 180);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("entrypoint: workflow.plugin id=web,kind=web,state=failed"));
@@ -3865,7 +4239,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 180);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 240, 180);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("id=worker,kind=worker,state=stopped"));
@@ -3893,7 +4267,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 240, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 240, 120);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("id=web,kind=web,state=running"));
@@ -3989,9 +4363,9 @@ mod tests {
 
         app.apply_response(packages_response(vec![package]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 260);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 260);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("availability=blocked"));
+        assert!(rendered.contains("workflow.plugin 1.0.0 · plugin · disabled · needs attention"));
         assert!(rendered.contains(
             "package blocked: reason=missing_config action=configure_package requirement=endpoint"
         ));
@@ -4041,19 +4415,11 @@ mod tests {
             },
         ));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
         assert!(rendered.contains("marketplace: 1 available"));
-        assert!(rendered.contains(
-            "available package: entry_id=workflow-plugin package=workflow.plugin version=1.2.0"
-        ));
-        assert!(rendered.contains("source_kind=registry source_label=first-party catalog"));
-        assert!(rendered.contains("first_party=true state=available capabilities=mcp:tools"));
-        assert!(rendered.contains("compatibility=compatible:>=0.1.0"));
-        assert!(rendered.contains("compatibility_diagnostics=requires current hub"));
-        assert!(rendered.contains("pin=revision=rev-2026,update_policy=manual,branch=main"));
+        assert!(rendered.contains("workflow.plugin 1.2.0 · plugin · first-party · available"));
         assert!(rendered.contains("install plan: package=workflow.plugin"));
-        assert!(rendered.contains("entry_id=workflow-plugin"));
         assert!(rendered.contains("mutates_registry=true"));
         assert!(rendered.contains("starts_entrypoints=true"));
         assert!(
@@ -4087,12 +4453,10 @@ mod tests {
 
         app.apply_response(response);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 80);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 80);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("package: workflow.plugin 1.0.0"));
-        assert!(rendered.contains(
-            "package decision: package=workflow.plugin action=enable state=enabled classification=plugin"
-        ));
+        assert!(rendered.contains("workflow.plugin 1.0.0 · plugin · enabled · ready"));
+        assert!(rendered.contains("workflow.plugin is now enabled (enable)"));
     }
 
     #[test]
@@ -4115,6 +4479,7 @@ mod tests {
             None,
             Some(json!({ "package_name": "workflow.plugin" })),
         );
+        app.handle_action("botster.tui.confirm.remove.apply".to_string(), None, None);
         app.handle_action(
             "botster.tui.package.update_status".to_string(),
             None,
@@ -4130,6 +4495,7 @@ mod tests {
             None,
             Some(json!({ "package_name": "workflow.plugin", "pin": pin.clone() })),
         );
+        app.handle_action("botster.tui.confirm.update.apply".to_string(), None, None);
         app.handle_action(
             "botster.tui.entrypoint.start".to_string(),
             None,
@@ -4207,10 +4573,10 @@ mod tests {
 
         app.apply_response(response);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 200, 48);
         let rendered = lines.join("\n");
 
-        assert!(rendered.contains("diagnostic: action_failure"));
+        assert!(rendered.contains("action_failure"));
         assert!(rendered.contains("operation=list_packages"));
         assert!(rendered.contains("feature=package_registry"));
         assert!(rendered.contains("package manifest failed compatibility checks"));
@@ -4222,7 +4588,7 @@ mod tests {
 
         app.apply_response(packages_response(vec![package_with_configuration()]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("configuration: schema=yes values=5 missing=1 diagnostics=1"));
@@ -4230,9 +4596,9 @@ mod tests {
         assert!(rendered.contains("Debug: [x]"));
         assert!(rendered.contains("Mode: Read"));
         assert!(rendered.contains("Notes: Line one"));
-        assert!(
-            rendered.contains("API token secret (redacted; Space marks write-only update): [ ]")
-        );
+        assert!(rendered.contains(
+            "API token: redacted. Secrets are managed through the hub's credential flow."
+        ));
         assert!(rendered.contains("configuration missing: endpoint"));
         assert!(rendered.contains("configuration diagnostic: schema:manifest warning"));
         assert!(!rendered.contains("super-secret-token"));
@@ -4265,7 +4631,7 @@ mod tests {
             ),
         ]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
         assert!(rendered.contains("Endpoint *: https://example.invalid/new"));
         assert!(rendered.contains("Debug: [ ]"));
@@ -4309,10 +4675,7 @@ mod tests {
             values["notes"],
             json!({"type":"multiline_text","value":"Line one\nLine two"})
         );
-        assert_eq!(
-            values["api_token"],
-            json!({"type":"secret","state":"write_only"})
-        );
+        assert!(!values.contains_key("api_token"));
         assert!(
             !serde_json::to_string(values)
                 .unwrap()
@@ -4329,7 +4692,7 @@ mod tests {
         app.apply_response(package_decision_response(vec![package]));
 
         assert_eq!(app.packages.len(), 1);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 120);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 320, 120);
         let rendered = lines.join("\n");
         assert!(rendered.contains("configuration: schema=yes values=5 missing=0 diagnostics=1"));
         assert!(!rendered.contains("configuration missing: endpoint"));
@@ -4343,7 +4706,7 @@ mod tests {
             "configuration field endpoint expects url",
         ));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Packages), 120, 48);
         assert!(
             lines
                 .join("\n")
@@ -4361,12 +4724,8 @@ mod tests {
 
         app.apply_response(response);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
-        assert!(
-            lines
-                .join("\n")
-                .contains("diagnostic: connected; operation=status")
-        );
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 120, 48);
+        assert!(lines.join("\n").contains("connected; operation=status"));
     }
 
     #[test]
@@ -4388,10 +4747,10 @@ mod tests {
         app.record_transport_error(DaemonTransportError::ClientDisconnected);
         app.apply_response(response);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 200, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("connected (running)"));
-        assert!(rendered.contains("diagnostic: connected; operation=status"));
+        assert!(rendered.contains("connected; operation=status"));
         assert!(!rendered.contains("compatibility_mismatch"));
         assert!(!rendered.contains("unsupported_feature"));
         assert!(!rendered.contains("disconnected"));
@@ -4410,9 +4769,9 @@ mod tests {
             )],
         ));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 120, 48);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("error: attach failed"));
+        assert!(rendered.contains("Error: attach failed"));
         assert!(rendered.contains("terminal_stream_unavailable"));
         assert!(rendered.contains("feature=terminal_streaming"));
     }
@@ -4424,7 +4783,7 @@ mod tests {
         app.apply_response(operator_error_response("spawn failed"));
         app.apply_response(sessions_response(["session-alpha"]));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         assert!(lines.join("\n").contains("error: spawn failed"));
     }
 
@@ -4438,7 +4797,7 @@ mod tests {
         app.command = "printf fixed\\n".to_string();
         app.spawn_session();
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert!(!rendered.contains("error: command is required"));
         assert!(rendered.contains("hub unavailable; reconnecting"));
@@ -4450,7 +4809,7 @@ mod tests {
 
         app.record_transport_error(DaemonTransportError::NotRunning);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("hub unavailable; reconnecting"));
         assert!(!rendered.contains("compatibility mismatch"));
@@ -4467,10 +4826,10 @@ mod tests {
             bytes: b"echo hello\n".to_vec(),
         });
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("terminal stream unavailable"));
-        assert!(rendered.contains("attached: none"));
+        assert!(!rendered.contains("Detach"));
     }
 
     #[test]
@@ -4502,12 +4861,11 @@ mod tests {
 
         app.apply_response(attach_state_response("session-beta", "attached"));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert_eq!(app.attached_session.as_deref(), Some("session-beta"));
-        assert!(rendered.contains("attached: session-beta"));
-        assert!(rendered.contains("session-beta [running] (attached)"));
-        assert!(rendered.contains("terminal attached: session-beta"));
+        assert!(rendered.contains("> session-beta · attached"));
+        assert!(rendered.contains("terminal · session-beta"));
     }
 
     #[test]
@@ -4562,7 +4920,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.terminal_output = "hello terminal".to_string();
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         assert!(lines.join("\n").contains("hello terminal"));
     }
 
@@ -4571,7 +4929,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.terminal_output = "primitive terminal bytes".to_string();
 
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, hit_map) = render_app(&app, 120, 48);
 
         assert!(lines.join("\n").contains("primitive terminal bytes"));
         assert!(
@@ -4624,7 +4982,7 @@ mod tests {
         );
         assert_eq!(app.terminal_output, "restored\nlive\n");
 
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, hit_map) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert!(!rendered.contains("snapshot"));
         assert!(!rendered.contains("scrollback"));
@@ -4740,7 +5098,7 @@ mod tests {
         );
         assert!(app.attach_hydration.is_none());
         assert!(app.observed_requests.is_empty());
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert!(
             rendered.find(scenario.read_screen_text.trim()).unwrap()
@@ -4879,7 +5237,7 @@ mod tests {
         assert!(app.attach_hydration.is_none());
         assert_eq!(app.terminal_output, "restored screen");
         assert!(
-            renderer::render_to_lines(&app.surface(), 120, 48)
+            render_app(&app, 120, 48)
                 .0
                 .join("\n")
                 .contains("restored screen")
@@ -4918,9 +5276,7 @@ mod tests {
         );
 
         assert_eq!(app.terminal_output, "restored-first\nauthoritative-live");
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
-            .0
-            .join("\n");
+        let rendered = render_app(&app, 120, 48).0.join("\n");
         assert!(
             rendered.find("restored-first").unwrap() < rendered.find("authoritative-live").unwrap()
         );
@@ -4957,12 +5313,11 @@ mod tests {
         );
 
         assert!(app.terminal_output.is_empty());
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
+        let rendered = renderer::render_to_lines(&app.surface_for(AppView::Diagnostics), 120, 48)
             .0
             .join("\n");
-        assert!(rendered.contains("rows=24 cols=80"));
-        assert!(rendered.contains("format=ghostty-page"));
-        assert!(rendered.contains("payload_bytes=4096"));
+        assert!(rendered.contains("80×24 · 4096 bytes"));
+        assert!(!rendered.contains("ghostty-page"));
     }
 
     #[test]
@@ -5089,7 +5444,7 @@ mod tests {
         assert_eq!(app.terminal_output, "last visible screen");
         assert!(app.snapshot_metadata.is_none());
         assert!(
-            renderer::render_to_lines(&app.surface(), 120, 48)
+            render_app(&app, 120, 48)
                 .0
                 .join("\n")
                 .contains("last visible screen")
@@ -5163,7 +5518,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, hit_map) = render_app(&app, 120, 48);
         let mut router = InputRouter::new(renderer::action_request_context());
         let first_row = hit_map
             .regions()
@@ -5216,7 +5571,7 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
-        let (_lines, frame_n_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, frame_n_hit_map) = render_app(&app, 120, 48);
         let first_row = frame_n_hit_map
             .regions()
             .iter()
@@ -5238,7 +5593,7 @@ mod tests {
         ));
 
         app.sessions.reverse();
-        let (_lines, frame_n_plus_one_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, frame_n_plus_one_hit_map) = render_app(&app, 120, 48);
         let moved_under_pointer = frame_n_plus_one_hit_map
             .lookup(column, row)
             .expect("reordered row should remain under the pointer");
@@ -5266,7 +5621,7 @@ mod tests {
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
         app.observed_requests.clear();
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, hit_map) = render_app(&app, 120, 48);
         let terminal = hit_map
             .regions()
             .iter()
@@ -5440,7 +5795,7 @@ mod tests {
         assert_eq!(app.current_terminal_mouse_mode(), 9);
 
         for _ in 0..2 {
-            let (_lines, mut hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+            let (_lines, mut hit_map) = render_app(&app, 120, 48);
             let terminal = hit_map
                 .regions()
                 .iter()
@@ -5519,7 +5874,7 @@ mod tests {
             "read_mode_flags",
         );
 
-        let (_lines, mut hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, mut hit_map) = render_app(&app, 120, 48);
         app.apply_terminal_mouse_mode(&mut hit_map);
         let terminal = hit_map
             .regions()
@@ -5572,10 +5927,10 @@ mod tests {
             app.sessions,
             session_rows([("session-alpha", "running"), ("session-beta", "exited"),])
         );
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("session-alpha [running]"));
-        assert!(rendered.contains("session-beta [exited]"));
+        assert!(rendered.contains("session-alpha"));
+        assert!(rendered.contains("session-beta · exited"));
     }
 
     #[test]
@@ -5610,7 +5965,7 @@ mod tests {
             lifecycle: "exited".to_string(),
         }];
         app.selected_session = Some("session-beta".to_string());
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, hit_map) = render_app(&app, 120, 48);
         let mut router = InputRouter::new(renderer::action_request_context());
         let session_row = hit_map
             .regions()
@@ -5649,14 +6004,9 @@ mod tests {
         app.handle_dispatch(key_dispatch);
 
         assert!(app.observed_requests.is_empty());
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
-        assert_eq!(
-            rendered
-                .matches("session-beta exited - cannot attach")
-                .count(),
-            1
-        );
+        assert_eq!(rendered.matches("session-beta exited").count(), 1);
         assert!(!rendered.contains("attached session disappeared"));
     }
 
@@ -5910,7 +6260,7 @@ mod tests {
             .expect_err("live hub should reject unsatisfied TUI compatibility requirement");
         let mut app = DogfoodApp::new(None);
         app.record_transport_error(error);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app(&app, 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("compatibility mismatch"));
         assert!(rendered.contains("unsupported_feature"));
@@ -5995,7 +6345,7 @@ mod tests {
             "the production attachment path must issue targeted mode readback"
         );
 
-        let (_lines, mut mouse_hit_map) = renderer::render_to_lines(&app.surface(), 200, 80);
+        let (_lines, mut mouse_hit_map) = render_app(&app, 200, 80);
         app.apply_terminal_mouse_mode(&mut mouse_hit_map);
         let terminal = mouse_hit_map
             .regions()
@@ -6073,9 +6423,7 @@ mod tests {
         }));
         wait_for_app_output(&mut app, &later_marker).expect("TUI renders later live output");
         assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
-        let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
+        let rendered = render_app(&app, 200, 80).0.join("\n");
         assert!(
             rendered.find(&prior_marker).unwrap() < rendered.find(&later_marker).unwrap(),
             "restored history must render before later live output: {rendered}"
@@ -6116,9 +6464,7 @@ mod tests {
             .expect("same-session reconnect restores later output");
         assert_eq!(app.terminal_output.matches(&prior_marker).count(), 1);
         assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
-        let reconnected = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
+        let reconnected = render_app(&app, 200, 80).0.join("\n");
         assert!(
             reconnected.find(&prior_marker).unwrap() < reconnected.find(&later_marker).unwrap(),
             "same-session reconnect must render one ordered replay: {reconnected}"
@@ -6220,7 +6566,7 @@ mod tests {
         app.apply_response(list_packages);
         app.apply_response(list_apps);
         app.apply_response(list_package_navigation);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 500, 240);
+        let (lines, _) = render_app(&app, 500, 240);
         let rendered = lines.join("\n");
         assert!(rendered.contains("navigation entry: package=botster.plugin-contract-matrix"));
         assert!(rendered.contains(&report.app_route_path));
