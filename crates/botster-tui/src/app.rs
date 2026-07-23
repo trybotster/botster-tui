@@ -43,6 +43,8 @@ const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
+const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -268,6 +270,42 @@ enum SessionSubscriptionMessage {
     },
 }
 
+struct SessionSubscriptionPump {
+    messages: Receiver<SessionSubscriptionMessage>,
+    cancel: Option<mpsc::Sender<()>>,
+    stopped: Receiver<()>,
+    stop_attempted: bool,
+    stopped_confirmed: bool,
+}
+
+impl SessionSubscriptionPump {
+    fn stop(&mut self) -> bool {
+        if self.stopped_confirmed {
+            return true;
+        }
+        if self.stop_attempted {
+            return false;
+        }
+        self.stop_attempted = true;
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.stopped_confirmed = self
+            .stopped
+            .recv_timeout(SESSION_ENTITY_STOP_TIMEOUT)
+            .is_ok();
+        self.stopped_confirmed
+    }
+}
+
+impl Drop for SessionSubscriptionPump {
+    fn drop(&mut self) {
+        if !self.stop_attempted {
+            let _ = self.stop();
+        }
+    }
+}
+
 pub fn run(args: AppArgs) -> io::Result<()> {
     if args.headless_dogfood {
         return run_headless_dogfood(args)
@@ -380,7 +418,7 @@ struct DogfoodApp {
     plugin_action_result: Option<Value>,
     session_entities: SessionEntityState,
     pending_sessions: BTreeMap<String, SessionRow>,
-    session_subscription: Option<Receiver<SessionSubscriptionMessage>>,
+    session_subscription: Option<SessionSubscriptionPump>,
     sessions: Vec<SessionRow>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -694,7 +732,9 @@ impl DogfoodApp {
 
     fn force_reconnect(&mut self) {
         self.client = None;
-        self.invalidate_session_generation();
+        if !self.invalidate_session_generation() {
+            self.error = Some("session subscription cleanup timed out".to_string());
+        }
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
@@ -756,17 +796,20 @@ impl DogfoodApp {
             .ok_or(DaemonTransportError::NotRunning)?;
         let subscription_id = format!("btui-sessions-{}", short_suffix());
         let mut subscription = subscribe_session_entities(endpoint, subscription_id.clone())?;
-        subscription.set_read_timeout(Some(Duration::from_millis(250)))?;
+        subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
         let (sender, receiver) = mpsc::channel();
-        self.session_entities
-            .begin_generation(subscription_id.clone());
-        self.session_subscription = Some(receiver);
-        self.rebuild_session_rows();
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        let reader_subscription_id = subscription_id.clone();
 
         thread::Builder::new()
             .name("botster-tui-session-entities".to_string())
             .spawn(move || {
                 loop {
+                    if cancel_receiver.try_recv().is_ok() {
+                        let _ = subscription.unsubscribe();
+                        break;
+                    }
                     match subscription.next_frame() {
                         Ok(frame) => {
                             if sender
@@ -783,15 +826,26 @@ impl DogfoodApp {
                             ) => {}
                         Err(error) => {
                             let _ = sender.send(SessionSubscriptionMessage::Disconnected {
-                                subscription_id,
+                                subscription_id: reader_subscription_id,
                                 error: error.to_string(),
                             });
                             break;
                         }
                     }
                 }
+                let _ = stopped_sender.send(());
             })
             .map_err(DaemonTransportError::Io)?;
+        self.session_entities
+            .begin_generation(subscription_id.clone());
+        self.session_subscription = Some(SessionSubscriptionPump {
+            messages: receiver,
+            cancel: Some(cancel_sender),
+            stopped: stopped_receiver,
+            stop_attempted: false,
+            stopped_confirmed: false,
+        });
+        self.rebuild_session_rows();
         Ok(())
     }
 
@@ -799,7 +853,7 @@ impl DogfoodApp {
         let messages = self
             .session_subscription
             .as_ref()
-            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .map(|pump| pump.messages.try_iter().collect::<Vec<_>>())
             .unwrap_or_default();
         for message in messages {
             match message {
@@ -817,7 +871,9 @@ impl DogfoodApp {
                     == Some(subscription_id.as_str()) =>
                 {
                     self.client = None;
-                    self.invalidate_session_generation();
+                    if !self.invalidate_session_generation() {
+                        self.error = Some("session subscription cleanup timed out".to_string());
+                    }
                     self.attached_session = None;
                     self.attached_subscription_id = None;
                     self.attach_hydration = None;
@@ -832,10 +888,14 @@ impl DogfoodApp {
         false
     }
 
-    fn invalidate_session_generation(&mut self) {
-        self.session_subscription = None;
+    fn invalidate_session_generation(&mut self) -> bool {
+        let stopped = self
+            .session_subscription
+            .take()
+            .is_none_or(|mut pump| pump.stop());
         self.session_entities = SessionEntityState::default();
         self.rebuild_session_rows();
+        stopped
     }
 
     fn rebuild_session_rows(&mut self) {
@@ -1186,7 +1246,9 @@ impl DogfoodApp {
 
     fn record_transport_error(&mut self, error: DaemonTransportError) {
         self.client = None;
-        self.invalidate_session_generation();
+        if !self.invalidate_session_generation() {
+            self.error = Some("session subscription cleanup timed out".to_string());
+        }
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
@@ -3688,7 +3750,16 @@ mod tests {
             buffered_live_output: String::new(),
         });
         let (sender, receiver) = mpsc::channel();
-        app.session_subscription = Some(receiver);
+        let (cancel_sender, _cancel_receiver) = mpsc::channel();
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        stopped_sender.send(()).expect("reader already stopped");
+        app.session_subscription = Some(SessionSubscriptionPump {
+            messages: receiver,
+            cancel: Some(cancel_sender),
+            stopped: stopped_receiver,
+            stop_attempted: false,
+            stopped_confirmed: false,
+        });
         sender
             .send(SessionSubscriptionMessage::Disconnected {
                 subscription_id: "generation-1".to_string(),
@@ -3701,6 +3772,28 @@ mod tests {
         assert_eq!(app.attached_session, None);
         assert_eq!(app.attached_subscription_id, None);
         assert!(app.attach_hydration.is_none());
+    }
+
+    #[test]
+    fn session_subscription_pump_cancellation_waits_for_reader_exit() {
+        let (_message_sender, messages) = mpsc::channel();
+        let (cancel, cancelled) = mpsc::channel();
+        let (stopped, reader_stopped) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            cancelled.recv().expect("reader receives cancellation");
+            stopped.send(()).expect("reader reports exit");
+        });
+        let mut pump = SessionSubscriptionPump {
+            messages,
+            cancel: Some(cancel),
+            stopped: reader_stopped,
+            stop_attempted: false,
+            stopped_confirmed: false,
+        };
+
+        assert!(pump.stop());
+        assert!(pump.stopped_confirmed);
+        reader.join().expect("reader exits after cancellation");
     }
 
     #[test]
@@ -6565,16 +6658,29 @@ mod tests {
             "restored history must render before later live output: {rendered}"
         );
 
-        let prior_entity_generation = app.session_entities.subscription_id.clone();
+        let prior_entity_generation = app
+            .session_entities
+            .subscription_id
+            .clone()
+            .expect("initial entity generation exists");
         let attach_count_before_reconnect = app
             .observed_requests
             .iter()
             .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
             .count();
         app.force_reconnect();
+        assert_ne!(
+            app.error.as_deref(),
+            Some("session subscription cleanup timed out")
+        );
+        subscribe_session_entities(hub.endpoint(), prior_entity_generation.clone())
+            .expect("client reconnect releases the old hub subscription id")
+            .unsubscribe()
+            .expect("cleanup probe unsubscribes");
         let reconnect_entity_generation = app.session_entities.subscription_id.clone();
         assert_ne!(
-            reconnect_entity_generation, prior_entity_generation,
+            reconnect_entity_generation.as_deref(),
+            Some(prior_entity_generation.as_str()),
             "reconnect must establish a fresh entity subscription generation"
         );
         assert_eq!(app.attached_session, None, "reconnect must not auto-attach");
