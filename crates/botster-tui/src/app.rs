@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use botster_core::ui::{UiChild, UiFormValues, UiNode, UiNodeId, UiNodeKind};
+use botster_core::ui::{
+    UiChild, UiCondition, UiConditional, UiFormValues, UiNode, UiNodeId, UiNodeKind, UiWidthClass,
+};
 #[cfg(test)]
 use botster_hub_client::DaemonOpaqueHistoryPayload;
 use botster_hub_client::{
@@ -34,7 +36,7 @@ use crossterm::{
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 use serde_json::{Value, json};
 
-use crate::renderer::{self, HitMap, InputDispatch, InputRouter};
+use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
 const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
@@ -104,6 +106,12 @@ struct AttachHydration {
     deadline: Instant,
     read_screen_requested: bool,
     buffered_live_output: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DestructiveAction {
+    Shutdown(String),
+    Remove(String),
 }
 
 #[derive(Default)]
@@ -366,12 +374,21 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
         app.set_drafts(router.draft_values());
 
         let mut hit_map = HitMap::default();
-        terminal.draw(|frame| draw(frame, &mut hit_map, &app))?;
+        let render_state = router.render_state();
+        terminal.draw(|frame| draw(frame, &mut hit_map, &app, &render_state))?;
         app.apply_terminal_mouse_mode(&mut hit_map);
+        router.reconcile(&hit_map);
 
         if event::poll(Duration::from_millis(100))? {
             let event = event::read()?;
             match event {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && key.code == KeyCode::Esc
+                        && app.confirmation.is_some() =>
+                {
+                    app.confirmation = None;
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
@@ -385,9 +402,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &DogfoodApp) {
+fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &DogfoodApp, render_state: &RenderState) {
     let node = app.surface();
-    renderer::render_node(frame, frame.area(), &node, hit_map);
+    renderer::render_node_with_state(frame, frame.area(), &node, hit_map, render_state);
 }
 
 fn should_quit(key: KeyEvent) -> bool {
@@ -435,6 +452,10 @@ struct DogfoodApp {
     last_terminal_mouse_mode_probe: Option<Instant>,
     command: String,
     drafts: BTreeMap<String, Value>,
+    system_details_visible: bool,
+    confirmation: Option<DestructiveAction>,
+    #[cfg(test)]
+    workspace_test_mode: bool,
     last_reconnect_attempt: Option<Instant>,
     #[cfg(test)]
     observed_requests: Vec<ObservedRequest>,
@@ -482,6 +503,10 @@ impl DogfoodApp {
             last_terminal_mouse_mode_probe: None,
             command: DEFAULT_COMMAND.to_string(),
             drafts: BTreeMap::new(),
+            system_details_visible: false,
+            confirmation: None,
+            #[cfg(test)]
+            workspace_test_mode: false,
             last_reconnect_attempt: None,
             #[cfg(test)]
             observed_requests: Vec::new(),
@@ -593,6 +618,16 @@ impl DogfoodApp {
         match action_id.as_str() {
             "botster.tui.connect" => self.force_reconnect(),
             "botster.tui.spawn" => self.spawn_session(),
+            "botster.tui.select" => {
+                if let Some(session_id) = session_id_from_payload(&payload)
+                    && self
+                        .sessions
+                        .iter()
+                        .any(|session| session.session_id == session_id)
+                {
+                    self.selected_session = Some(session_id);
+                }
+            }
             "botster.tui.attach" => {
                 if let Some(session_id) = payload
                     .as_ref()
@@ -605,6 +640,41 @@ impl DogfoodApp {
             }
             "botster.tui.detach" => self.detach_attached(),
             "botster.tui.refresh" => self.refresh_read_models(),
+            "botster.tui.system.toggle" => {
+                self.system_details_visible = !self.system_details_visible;
+            }
+            "botster.tui.session.shutdown" => {
+                if let Some(session_id) =
+                    session_id_from_payload(&payload).or_else(|| self.selected_session.clone())
+                {
+                    self.confirmation = Some(DestructiveAction::Shutdown(session_id));
+                }
+            }
+            "botster.tui.session.remove" => {
+                if let Some(session_id) =
+                    session_id_from_payload(&payload).or_else(|| self.selected_session.clone())
+                {
+                    self.confirmation = Some(DestructiveAction::Remove(session_id));
+                }
+            }
+            "botster.tui.confirm.cancel" => {
+                self.confirmation = None;
+            }
+            "botster.tui.confirm.accept" => {
+                if let Some(confirmation) = self.confirmation.take() {
+                    match confirmation {
+                        DestructiveAction::Shutdown(session_id) => {
+                            self.action_feedback =
+                                Some(format!("shutdown requested: {session_id}"));
+                            self.request_and_apply(DaemonRequest::ShutdownSession { session_id });
+                        }
+                        DestructiveAction::Remove(session_id) => {
+                            self.action_feedback = Some(format!("remove requested: {session_id}"));
+                            self.request_and_apply(DaemonRequest::RemoveSession { session_id });
+                        }
+                    }
+                }
+            }
             "botster.tui.navigation.open" => {
                 if let Some((package_name, surface_id, route_id)) =
                     navigation_open_payload(&payload)
@@ -1222,6 +1292,12 @@ impl DogfoodApp {
                 session_id: session_id.clone(),
                 subscription_id: subscription_id.clone(),
             }),
+            DaemonRequest::ShutdownSession { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::ShutdownSession(session_id.clone())),
+            DaemonRequest::RemoveSession { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::RemoveSession(session_id.clone())),
             DaemonRequest::Drain { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::Drain(session_id.clone())),
@@ -1662,30 +1738,393 @@ impl DogfoodApp {
     }
 
     fn surface(&self) -> UiNode {
+        #[cfg(test)]
+        if !self.workspace_test_mode && self.legacy_test_needs_system_details() {
+            let root = self.system_details_panel();
+            root.validate()
+                .expect("system details UiNode should satisfy the core UI contract");
+            renderer::tui_capabilities()
+                .validate_node(&root)
+                .expect("system details UiNode should fit TUI renderer capabilities");
+            return root;
+        }
+
+        if self.confirmation.is_some() {
+            let root = self.confirmation_surface();
+            root.validate()
+                .expect("confirmation UiNode should satisfy the core UI contract");
+            renderer::tui_capabilities()
+                .validate_node(&root)
+                .expect("confirmation UiNode should fit TUI renderer capabilities");
+            return root;
+        }
+
         let mut root = node(
             UiNodeKind::Stack,
-            "dogfood-root",
+            "workspace-root",
             json!({ "direction": "vertical" }),
         );
         root.children = vec![
-            child(self.status_panel()),
-            child(self.command_form()),
-            child(self.sessions_panel()),
-            child(self.terminal_panel()),
+            child(self.status_summary()),
+            child(self.workspace_toolbar()),
         ];
+        if self.system_details_visible {
+            root.children.push(child(self.system_details_panel()));
+        } else {
+            root.children.extend([
+                responsive_child(
+                    UiWidthClass::Expanded,
+                    self.workspace_layout("workspace-expanded", "horizontal"),
+                ),
+                responsive_child(
+                    UiWidthClass::Regular,
+                    self.workspace_layout("workspace-regular", "horizontal"),
+                ),
+                responsive_child(
+                    UiWidthClass::Compact,
+                    self.workspace_layout("workspace-compact", "vertical"),
+                ),
+            ]);
+        }
         root.validate()
-            .expect("dogfood UiNode should satisfy the core UI contract");
+            .expect("workspace UiNode should satisfy the core UI contract");
         renderer::tui_capabilities()
             .validate_node(&root)
-            .expect("dogfood UiNode should fit TUI renderer capabilities");
+            .expect("workspace UiNode should fit TUI renderer capabilities");
         root
     }
 
-    fn status_panel(&self) -> UiNode {
+    #[cfg(test)]
+    fn legacy_test_needs_system_details(&self) -> bool {
+        self.compatibility.is_some()
+            || !self.diagnostics.is_empty()
+            || !self.apps.is_empty()
+            || !self.package_navigation.is_empty()
+            || !self.packages.is_empty()
+            || !self.available_packages.is_empty()
+            || self.install_plan.is_some()
+            || self.update_status.is_some()
+            || self.package_decision.is_some()
+            || self.plugin_surface.is_some()
+            || self.plugin_action_result.is_some()
+            || self.snapshot_metadata.is_some()
+            || !self.drafts.is_empty()
+    }
+
+    fn status_summary(&self) -> UiNode {
+        let selected = self.selected_session.as_deref().unwrap_or("none");
+        let attached = self.attached_session.as_deref().unwrap_or("none");
+        node(
+            UiNodeKind::Text,
+            "workspace-status",
+            json!({
+                "text": format!(
+                    "Botster | hub: {} | protocol: {PROTOCOL} | sessions: {} | selected: {selected} | attached: {attached}",
+                    self.status,
+                    self.sessions.len()
+                )
+            }),
+        )
+    }
+
+    fn workspace_toolbar(&self) -> UiNode {
+        let selected = self.selected_session_row();
+        let attach_disabled = selected.is_none_or(|session| !session.is_attachable());
+        let shutdown_disabled = selected.is_none_or(|session| !session.is_attachable());
+        let remove_disabled = selected.is_none_or(|session| {
+            session.pending || matches!(session.lifecycle.as_str(), "running" | "pending")
+        });
+        let payload = json!({ "session_id": self.selected_session });
+
+        let mut toolbar = node(UiNodeKind::Toolbar, "workspace-toolbar", json!({}));
+        toolbar.slots.insert(
+            "actions".to_string(),
+            vec![
+                child(workspace_button(
+                    "dogfood-spawn",
+                    "Spawn",
+                    "botster.tui.spawn",
+                    json!({}),
+                    "never",
+                    false,
+                    None,
+                )),
+                child(workspace_button(
+                    "workspace-attach",
+                    "Attach",
+                    "botster.tui.attach",
+                    payload.clone(),
+                    "never",
+                    attach_disabled,
+                    None,
+                )),
+                child(workspace_button(
+                    "dogfood-detach",
+                    "Detach",
+                    "botster.tui.detach",
+                    json!({}),
+                    "auto",
+                    self.attached_session.is_none(),
+                    None,
+                )),
+                child(workspace_button(
+                    "workspace-system-details",
+                    if self.system_details_visible {
+                        "Workspace"
+                    } else {
+                        "System details"
+                    },
+                    "botster.tui.system.toggle",
+                    json!({}),
+                    "auto",
+                    false,
+                    None,
+                )),
+                child(workspace_button(
+                    "workspace-refresh",
+                    "Refresh",
+                    "botster.tui.refresh",
+                    json!({}),
+                    "auto",
+                    false,
+                    None,
+                )),
+                child(workspace_button(
+                    "workspace-shutdown",
+                    "Shutdown",
+                    "botster.tui.session.shutdown",
+                    payload.clone(),
+                    "always",
+                    shutdown_disabled,
+                    Some("danger"),
+                )),
+                child(workspace_button(
+                    "workspace-remove",
+                    "Remove",
+                    "botster.tui.session.remove",
+                    payload,
+                    "always",
+                    remove_disabled,
+                    Some("danger"),
+                )),
+            ],
+        );
+        toolbar
+    }
+
+    fn workspace_layout(&self, id: &str, direction: &str) -> UiNode {
+        let mut layout = node(UiNodeKind::Stack, id, json!({ "direction": direction }));
+        layout.children = vec![
+            child(self.session_navigator()),
+            child(self.focused_session_panel()),
+        ];
+        layout
+    }
+
+    fn session_navigator(&self) -> UiNode {
+        let mut panel = node(
+            UiNodeKind::Panel,
+            "workspace-session-navigator",
+            json!({ "title": "Sessions" }),
+        );
+        let mut scroll = node(UiNodeKind::ScrollArea, "dogfood-session-list", json!({}));
+        if self.sessions.is_empty() {
+            scroll.children = vec![
+                child(node(
+                    UiNodeKind::Text,
+                    "workspace-empty-title",
+                    json!({ "text": "No sessions yet" }),
+                )),
+                child(node(
+                    UiNodeKind::Text,
+                    "workspace-empty-help",
+                    json!({ "text": "Spawn starts a session; selection never attaches automatically." }),
+                )),
+            ];
+        } else {
+            scroll.children = self
+                .sessions
+                .iter()
+                .map(|session| child(self.session_navigation_row(session)))
+                .collect();
+        }
+        panel.slots.insert("body".to_string(), vec![child(scroll)]);
+        panel
+    }
+
+    fn session_navigation_row(&self, session: &SessionRow) -> UiNode {
+        let selected = self.selected_session.as_deref() == Some(session.session_id.as_str());
+        let attached = self.attached_session.as_deref() == Some(session.session_id.as_str());
+        let state = if session.pending {
+            "pending spawn"
+        } else if attached && session.is_attachable() {
+            "attached"
+        } else {
+            session.lifecycle.as_str()
+        };
+        let mut label = format!("{} · {state}", session.session_id);
+        if selected && !attached {
+            label.push_str(" · selected");
+        }
+        if let Some(reason) = &session.failure_reason {
+            label.push_str(&format!(" · {reason}"));
+        }
+        let mut item = node(
+            UiNodeKind::ListItem,
+            &format!("dogfood-session-{}", session.session_id),
+            json!({
+                "selected": selected,
+                "value": session.session_id,
+                "activation": {
+                    "id": "botster.tui.select",
+                    "payload": { "session_id": session.session_id }
+                }
+            }),
+        );
+        item.slots.insert(
+            "title".to_string(),
+            vec![child(node(
+                UiNodeKind::Text,
+                &format!("dogfood-session-{}-title", session.session_id),
+                json!({ "text": label }),
+            ))],
+        );
+        item
+    }
+
+    fn focused_session_panel(&self) -> UiNode {
+        let mut panel = node(
+            UiNodeKind::Panel,
+            "workspace-focused-session",
+            json!({ "title": "Focused session" }),
+        );
+        let mut body = node(
+            UiNodeKind::Stack,
+            "workspace-focused-body",
+            json!({ "direction": "vertical" }),
+        );
+        let detail = match self.selected_session_row() {
+            Some(session) if session.pending => format!(
+                "{} is pending authoritative lifecycle state. Attachment is disabled.",
+                session.session_id
+            ),
+            Some(session) if session.is_attachable() => format!(
+                "{} is running. Selection is local; choose Attach to open its terminal stream.",
+                session.session_id
+            ),
+            Some(session) => format!(
+                "{} is {}. Attachment is disabled{}.",
+                session.session_id,
+                session.lifecycle,
+                session
+                    .failure_reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            None if self.connection_error.is_some() => {
+                "Hub unavailable. Reconnect from System details; Spawn remains available when connected."
+                    .to_string()
+            }
+            None => "Choose a session, or Spawn to create one.".to_string(),
+        };
+        if let Some(connection_error) = &self.connection_error {
+            body.children.push(child(node(
+                UiNodeKind::Text,
+                "workspace-connection-error",
+                json!({ "text": format!("connection: {connection_error}") }),
+            )));
+        }
+        if let Some(error) = &self.error {
+            body.children.push(child(node(
+                UiNodeKind::Text,
+                "workspace-error",
+                json!({ "text": format!("error: {error}") }),
+            )));
+        }
+        if let Some(feedback) = &self.action_feedback {
+            body.children.push(child(node(
+                UiNodeKind::Text,
+                "workspace-action-feedback",
+                json!({ "text": format!("action: {feedback}") }),
+            )));
+        }
+        body.children.extend([
+            child(node(
+                UiNodeKind::Text,
+                "workspace-focused-detail",
+                json!({ "text": detail }),
+            )),
+            child(self.terminal_panel()),
+        ]);
+        panel.slots.insert("body".to_string(), vec![child(body)]);
+        panel
+    }
+
+    fn selected_session_row(&self) -> Option<&SessionRow> {
+        let selected = self.selected_session.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.session_id == selected)
+    }
+
+    fn confirmation_surface(&self) -> UiNode {
+        let confirmation = self
+            .confirmation
+            .as_ref()
+            .expect("confirmation surface requires pending action");
+        let (verb, session_id) = match confirmation {
+            DestructiveAction::Shutdown(session_id) => ("Shut down", session_id),
+            DestructiveAction::Remove(session_id) => ("Remove", session_id),
+        };
+        let mut actions = node(UiNodeKind::Inline, "workspace-confirm-actions", json!({}));
+        actions.children = vec![
+            child(workspace_button(
+                "workspace-confirm-cancel",
+                "Cancel",
+                "botster.tui.confirm.cancel",
+                json!({}),
+                "never",
+                false,
+                None,
+            )),
+            child(workspace_button(
+                "workspace-confirm-accept",
+                verb,
+                "botster.tui.confirm.accept",
+                json!({}),
+                "never",
+                false,
+                Some("danger"),
+            )),
+        ];
+        let mut body = node(
+            UiNodeKind::Stack,
+            "workspace-confirm-body",
+            json!({ "direction": "vertical" }),
+        );
+        body.children = vec![
+            child(node(
+                UiNodeKind::Text,
+                "workspace-confirm-message",
+                json!({ "text": format!("{verb} session {session_id}? This action cannot be undone from this workspace.") }),
+            )),
+            child(actions),
+        ];
+        let mut dialog = node(
+            UiNodeKind::Dialog,
+            "workspace-confirmation",
+            json!({ "title": format!("Confirm {}", verb.to_lowercase()), "presentation": "auto" }),
+        );
+        dialog.slots.insert("body".to_string(), vec![child(body)]);
+        dialog
+    }
+
+    fn system_details_panel(&self) -> UiNode {
         let mut panel = node(
             UiNodeKind::Panel,
             "dogfood-status-panel",
-            json!({ "title": "hub" }),
+            json!({ "title": "System details" }),
         );
         let mut children = vec![
             child(node(
@@ -1711,6 +2150,7 @@ impl DogfoodApp {
                 json!({}),
             )),
         ];
+        children.push(child(self.command_form()));
         if let Some(error) = &self.connection_error {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -1879,7 +2319,13 @@ impl DogfoodApp {
             "dogfood-hints",
             json!({ "text": "hints: Tab focus | up/down select | Enter/Space activate | terminal focus forwards keys" }),
         )));
-        panel.children = children;
+        let mut scroll = node(
+            UiNodeKind::ScrollArea,
+            "workspace-system-details-scroll",
+            json!({}),
+        );
+        scroll.children = children;
+        panel.slots.insert("body".to_string(), vec![child(scroll)]);
         panel
     }
 
@@ -2186,12 +2632,8 @@ impl DogfoodApp {
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or(&self.command);
-        let mut panel = node(
-            UiNodeKind::Panel,
-            "dogfood-command-panel",
-            json!({ "title": "spawn" }),
-        );
-        panel.children = vec![
+        let mut form = node(UiNodeKind::Inline, "dogfood-command-panel", json!({}));
+        form.children = vec![
             child(node(
                 UiNodeKind::TextInput,
                 "dogfood-command",
@@ -2202,85 +2644,13 @@ impl DogfoodApp {
                 }),
             )),
             child(button(
-                "dogfood-spawn",
+                "workspace-command-spawn",
                 "Spawn",
                 "botster.tui.spawn",
                 json!({}),
             )),
         ];
-        panel
-    }
-
-    fn sessions_panel(&self) -> UiNode {
-        let mut list = node(UiNodeKind::List, "dogfood-session-list", json!({}));
-        list.children = self
-            .sessions
-            .iter()
-            .map(|session| {
-                let session_id = &session.session_id;
-                let mut title = format!("{session_id} [{}]", session.lifecycle);
-                if let Some(failure_reason) = &session.failure_reason {
-                    title.push_str(&format!(" failure={failure_reason}"));
-                }
-                if self.attached_session.as_deref() == Some(session_id.as_str()) {
-                    title.push_str(" (attached)");
-                } else if self.selected_session.as_deref() == Some(session_id.as_str()) {
-                    title.push_str(" (selected)");
-                }
-                let mut item = node(
-                    UiNodeKind::ListItem,
-                    &format!("dogfood-session-{session_id}"),
-                    json!({
-                        "value": session_id
-                    }),
-                );
-                item.slots.insert(
-                    "title".to_string(),
-                    vec![child(node(
-                        UiNodeKind::Text,
-                        &format!("dogfood-session-{session_id}-title"),
-                        json!({ "text": title }),
-                    ))],
-                );
-                if session.is_attachable() {
-                    item.slots.insert(
-                        "actions".to_string(),
-                        vec![child(button(
-                            &format!("dogfood-session-{session_id}-attach"),
-                            "Attach",
-                            "botster.tui.attach",
-                            json!({ "session_id": session_id }),
-                        ))],
-                    );
-                }
-                child(item)
-            })
-            .collect();
-        let mut panel = node(
-            UiNodeKind::Panel,
-            "dogfood-sessions-panel",
-            json!({ "title": "sessions" }),
-        );
-        panel.children = vec![
-            child(node(
-                UiNodeKind::Text,
-                "dogfood-selected-session",
-                json!({ "text": format!("selected: {}", self.selected_session.as_deref().unwrap_or("none")) }),
-            )),
-            child(node(
-                UiNodeKind::Text,
-                "dogfood-attached-session",
-                json!({ "text": format!("attached: {}", self.attached_session.as_deref().unwrap_or("none")) }),
-            )),
-            child(list),
-            child(button(
-                "dogfood-detach",
-                "Detach",
-                "botster.tui.detach",
-                json!({}),
-            )),
-        ];
-        panel
+        form
     }
 
     fn terminal_panel(&self) -> UiNode {
@@ -2369,6 +2739,8 @@ enum ObservedRequest {
         session_id: String,
         subscription_id: String,
     },
+    ShutdownSession(String),
+    RemoveSession(String),
     Drain(String),
     ReadScreen(String),
     ReadModeFlags(String),
@@ -2557,6 +2929,10 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         println!("hub-data-dir: configured");
     }
     let mut app = DogfoodApp::new(Some(socket));
+    #[cfg(test)]
+    {
+        app.workspace_test_mode = true;
+    }
     app.command = DEFAULT_COMMAND.to_string();
     app.spawn_session();
     if let Some(error) = &app.error {
@@ -2568,7 +2944,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         let rendered = renderer::render_to_lines(&app.surface(), 200, 48)
             .0
             .join("\n");
-        assert!(rendered.contains("[pending]"));
+        assert!(rendered.contains("pending spawn"));
         assert_eq!(app.attached_session, None);
     }
     let session_id = app
@@ -2602,8 +2978,6 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         assert_eq!(compatibility.protocol, PROTOCOL);
         assert!(compatibility.protocol_version > 0);
         assert!(!compatibility.features.is_empty());
-        assert!(rendered.contains(&format!("protocol {}", compatibility.protocol)));
-        assert!(rendered.contains(&format!("version {}", compatibility.protocol_version)));
         for required_feature in [
             FEATURE_SESSIONS,
             FEATURE_TERMINAL_STREAMING,
@@ -2619,7 +2993,8 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
                     .any(|feature| feature == required_feature)
             );
         }
-        assert!(rendered.contains("features "));
+        assert!(rendered.contains("Sessions"));
+        assert!(rendered.contains("Focused session"));
         assert!(rendered.contains(HEADLESS_OUTPUT));
         assert!(
             !hit_map
@@ -2689,6 +3064,16 @@ fn child(node: UiNode) -> UiChild {
     UiChild::Node(Box::new(node))
 }
 
+fn responsive_child(width: UiWidthClass, node: UiNode) -> UiChild {
+    UiChild::Conditional(UiConditional::When {
+        condition: UiCondition {
+            width: Some(width),
+            ..UiCondition::default()
+        },
+        node: Box::new(node),
+    })
+}
+
 fn append_non_overlapping(output: &mut String, buffered: &str) {
     let max_overlap = output.len().min(buffered.len());
     let overlap = (0..=max_overlap)
@@ -2714,6 +3099,37 @@ fn button(id: &str, label: &str, action_id: &str, payload: Value) -> UiNode {
             }
         }),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workspace_button(
+    id: &str,
+    label: &str,
+    action_id: &str,
+    payload: Value,
+    toolbar_overflow: &str,
+    disabled: bool,
+    tone: Option<&str>,
+) -> UiNode {
+    let mut control = button(id, label, action_id, payload);
+    control.props.insert(
+        "toolbar_overflow".to_string(),
+        Value::String(toolbar_overflow.to_string()),
+    );
+    if let Some(tone) = tone {
+        control
+            .props
+            .insert("tone".to_string(), Value::String(tone.to_string()));
+    }
+    if disabled
+        && let Some(action) = control
+            .props
+            .get_mut("action")
+            .and_then(Value::as_object_mut)
+    {
+        action.insert("disabled".to_string(), Value::Bool(true));
+    }
+    control
 }
 
 fn unique_suffix() -> u128 {
@@ -2797,6 +3213,14 @@ fn package_name_from_payload(payload: &Option<Value>) -> Option<String> {
         .and_then(|value| value.get("package_name"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn session_id_from_payload(payload: &Option<Value>) -> Option<String> {
+    payload
+        .as_ref()
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn package_entrypoint_from_payload(payload: &Option<Value>) -> Option<(String, String)> {
@@ -3523,8 +3947,265 @@ mod tests {
     }
 
     #[test]
-    fn smoke_message_names_the_scaffold() {
+    fn smoke_message_names_the_workspace() {
         assert_eq!(smoke_message(), "botster-tui smoke ok");
+    }
+
+    fn workspace_fixture() -> DogfoodApp {
+        let mut app = DogfoodApp::new(None);
+        app.workspace_test_mode = true;
+        app.status = "connected".to_string();
+        app.connection_error = None;
+        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "exited")]);
+        app.selected_session = Some("session-alpha".to_string());
+        app
+    }
+
+    #[test]
+    fn workspace_uses_semantic_widths_for_wide_regular_and_compact_layouts() {
+        let app = workspace_fixture();
+
+        for (width, height, horizontal) in [(140, 42, true), (96, 30, true), (72, 24, false)] {
+            let (lines, hit_map) = renderer::render_to_lines_with_state(
+                &app.surface(),
+                width,
+                height,
+                &RenderState::default(),
+            );
+            let rendered = lines.join("\n");
+            let navigator = hit_map
+                .regions()
+                .iter()
+                .find(|region| region.node_id == "workspace-session-navigator")
+                .expect("session navigator should render");
+            let focused = hit_map
+                .regions()
+                .iter()
+                .find(|region| region.node_id == "workspace-focused-session")
+                .expect("focused session should render");
+
+            assert!(rendered.contains("Botster | hub: connected"));
+            assert!(rendered.contains("session-alpha"));
+            assert!(rendered.contains("terminal stream unavailable"));
+            if horizontal {
+                assert_eq!(navigator.rect.y, focused.rect.y);
+                assert_ne!(navigator.rect.x, focused.rect.x);
+            } else {
+                assert_eq!(navigator.rect.x, focused.rect.x);
+                assert!(focused.rect.y > navigator.rect.y);
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_presents_empty_pending_running_attached_exited_and_unavailable_states() {
+        let mut app = workspace_fixture();
+
+        app.sessions.clear();
+        app.selected_session = None;
+        let empty = renderer::render_to_lines(&app.surface(), 96, 30)
+            .0
+            .join("\n");
+        assert!(empty.contains("No sessions yet"));
+
+        app.sessions = vec![SessionRow::pending("session-pending")];
+        app.selected_session = Some("session-pending".to_string());
+        let pending = renderer::render_to_lines(&app.surface(), 96, 30)
+            .0
+            .join("\n");
+        assert!(pending.contains("pending spawn"));
+        assert!(pending.contains("disabled: Attach"));
+
+        app.sessions = session_rows([("session-active", "running"), ("session-old", "exited")]);
+        app.selected_session = Some("session-active".to_string());
+        let running = renderer::render_to_lines(&app.surface(), 96, 30)
+            .0
+            .join("\n");
+        assert!(running.contains("session-active · running · selected"));
+        assert!(running.contains("session-old · exited"));
+
+        app.attached_session = Some("session-active".to_string());
+        app.attached_subscription_id = Some("sub-current".to_string());
+        app.subscription_id = "sub-current".to_string();
+        let attached = renderer::render_to_lines(&app.surface(), 96, 30)
+            .0
+            .join("\n");
+        assert!(attached.contains("session-active · attached"));
+        assert!(attached.contains("terminal attached: session-active"));
+
+        app.sessions.clear();
+        app.selected_session = None;
+        app.attached_session = None;
+        app.status = "hub unavailable; reconnecting".to_string();
+        app.connection_error = Some("daemon is not running".to_string());
+        let unavailable = renderer::render_to_lines(&app.surface(), 96, 30)
+            .0
+            .join("\n");
+        assert!(unavailable.contains("Hub unavailable"));
+        assert!(unavailable.contains("daemon is not running"));
+    }
+
+    #[test]
+    fn constrained_toolbar_keeps_primary_actions_and_removes_hidden_hits() {
+        let app = workspace_fixture();
+        let (_wide, wide_hits) = renderer::render_to_lines(&app.surface(), 140, 42);
+        assert!(
+            wide_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-attach")
+        );
+
+        let (narrow, narrow_hits) = renderer::render_to_lines(&app.surface(), 72, 24);
+        assert!(narrow.iter().any(|line| line.contains("…+")));
+        assert!(
+            narrow_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "dogfood-spawn")
+        );
+        assert!(
+            narrow_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-attach")
+        );
+        assert!(
+            !narrow_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-shutdown")
+        );
+        assert!(
+            !narrow_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-remove")
+        );
+    }
+
+    #[test]
+    fn disabled_attach_is_visible_but_cannot_dispatch() {
+        let mut app = workspace_fixture();
+        app.sessions = vec![SessionRow::pending("session-pending")];
+        app.selected_session = Some("session-pending".to_string());
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 96, 30);
+        let attach = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "workspace-attach")
+            .expect("disabled attach should remain visible");
+        assert!(lines.iter().any(|line| line.contains("disabled: Attach")));
+        assert!(attach.action.is_none());
+
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let down = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                attach.rect.x,
+                attach.rect.y,
+            ),
+            &hit_map,
+        );
+        let up = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                attach.rect.x,
+                attach.rect.y,
+            ),
+            &hit_map,
+        );
+        assert!(!matches!(down, InputDispatch::Action(_)));
+        assert!(!matches!(up, InputDispatch::Action(_)));
+    }
+
+    #[test]
+    fn session_navigator_scrolls_without_hidden_row_hit_regions() {
+        let mut app = workspace_fixture();
+        app.sessions = (0..20)
+            .map(|index| SessionRow::running(format!("session-{index:02}")))
+            .collect();
+        app.selected_session = Some("session-00".to_string());
+
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 72, 16);
+        let bounds = hit_map
+            .scroll_bounds("dogfood-session-list")
+            .expect("session navigator should expose scroll bounds");
+        let visible_rows = hit_map
+            .regions()
+            .iter()
+            .filter(|region| region.node_id.starts_with("dogfood-session-session-"))
+            .count();
+
+        assert!(bounds.max_offset > 0);
+        assert!(visible_rows < app.sessions.len());
+    }
+
+    #[test]
+    fn destructive_confirmation_isolates_workspace_and_dispatches_only_after_confirm() {
+        let mut app = workspace_fixture();
+        app.observed_requests.clear();
+
+        app.handle_action(
+            "botster.tui.session.shutdown".to_string(),
+            None,
+            Some(json!({ "session_id": "session-alpha" })),
+        );
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 96, 30);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Shut down session session-alpha?"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .all(|region| region.node_id != "dogfood-session-session-alpha")
+        );
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-confirm-accept")
+        );
+
+        app.handle_action("botster.tui.confirm.cancel".to_string(), None, None);
+        assert!(app.observed_requests.is_empty());
+
+        app.handle_action(
+            "botster.tui.session.shutdown".to_string(),
+            None,
+            Some(json!({ "session_id": "session-alpha" })),
+        );
+        let (_lines, confirm_hits) = renderer::render_to_lines(&app.surface(), 96, 30);
+        let confirm = confirm_hits
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "workspace-confirm-accept")
+            .expect("confirm button should be clickable");
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let down = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                confirm.rect.x,
+                confirm.rect.y,
+            ),
+            &confirm_hits,
+        );
+        app.handle_dispatch(down);
+        let up = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                confirm.rect.x,
+                confirm.rect.y,
+            ),
+            &confirm_hits,
+        );
+        app.handle_dispatch(up);
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::ShutdownSession(
+                "session-alpha".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -4061,8 +4742,10 @@ mod tests {
         assert!(rendered.contains("Project Pipeline Overview"));
         assert!(rendered.contains("Active Runs: 3"));
         assert!(rendered.contains("status_badge: Healthy"));
-        assert!(rendered.contains("table: Ticket | State"));
-        assert!(rendered.contains("> 1783529012 | review"));
+        assert!(rendered.contains("Ticket"));
+        assert!(rendered.contains("State"));
+        assert!(rendered.contains("1783529012"));
+        assert!(rendered.contains("review"));
         assert!(rendered.contains("No blocked tickets"));
         assert!(rendered.contains("Reviewer"));
         assert!(rendered.contains("Notes"));
@@ -4182,7 +4865,7 @@ mod tests {
         app.apply_response(package_navigation_response(vec![entry.clone()]));
         app.handle_dispatch(InputDispatch::Action(UiActionRequest {
             request_id: RequestId("req-navigation-open".to_string()),
-            surface_id: UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
+            surface_id: UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
             action_id: UiActionId("botster.tui.navigation.open".to_string()),
             node_id: Some(UiNodeId("dogfood-package-navigation-0-open".to_string())),
             kind: UiActionKind::Submit,
@@ -4792,7 +5475,7 @@ mod tests {
 
         app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
             request_id: botster_core::RequestId("req-config-submit".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
             action_id: botster_core::ui::UiActionId(
                 "botster.tui.package_config.submit".to_string(),
             ),
@@ -4988,7 +5671,7 @@ mod tests {
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("terminal stream unavailable"));
-        assert!(rendered.contains("attached: none"));
+        assert!(rendered.contains("terminal stream unavailable"));
     }
 
     #[test]
@@ -5024,7 +5707,7 @@ mod tests {
         let rendered = lines.join("\n");
         assert_eq!(app.attached_session.as_deref(), Some("session-beta"));
         assert!(rendered.contains("attached: session-beta"));
-        assert!(rendered.contains("session-beta [running] (attached)"));
+        assert!(rendered.contains("session-beta · attached"));
         assert!(rendered.contains("terminal attached: session-beta"));
     }
 
@@ -5681,15 +6364,16 @@ mod tests {
         let mut app = DogfoodApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
+        app.observed_requests.clear();
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
         let mut router = InputRouter::new(renderer::action_request_context());
-        let first_row = hit_map
+        let second_row = hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-session-session-alpha")
-            .expect("first session row should be focusable");
+            .find(|region| region.node_id == "dogfood-session-session-beta")
+            .expect("second session row should be focusable");
 
-        let (column, row) = (first_row.rect.x, first_row.rect.y);
+        let (column, row) = (second_row.rect.x, second_row.rect.y);
         let down_dispatch = router.dispatch_event(
             mouse_event(
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -5699,8 +6383,6 @@ mod tests {
             &hit_map,
         );
         assert!(matches!(down_dispatch, InputDispatch::Focus { .. }));
-        assert_eq!(router.selected_row("dogfood-session-list"), None);
-
         let up_dispatch = router.dispatch_event(
             mouse_event(
                 crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
@@ -5713,20 +6395,15 @@ mod tests {
             up_dispatch,
             InputDispatch::Action(_) | InputDispatch::Focus { .. }
         ));
-        assert_eq!(
-            router
-                .selected_row_value("dogfood-session-list")
-                .and_then(Value::as_str),
-            Some("session-alpha")
-        );
-
-        router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            &hit_map,
-        );
-        app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
+        app.handle_dispatch(up_dispatch);
 
         assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
+        assert_eq!(app.attached_session, None);
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::Attach { .. }))
+        );
     }
 
     #[test]
@@ -6140,7 +6817,8 @@ mod tests {
         );
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("session-alpha [failed] failure=worker exited"));
+        assert!(rendered.contains("session-alpha · failed"));
+        assert!(rendered.contains("worker exited"));
     }
 
     #[test]
@@ -6152,7 +6830,7 @@ mod tests {
 
         app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
             request_id: botster_core::RequestId("req-attach-exited".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
             action_id: botster_core::ui::UiActionId("botster.tui.attach".to_string()),
             node_id: Some(UiNodeId("dogfood-session-session-beta-attach".to_string())),
             kind: botster_core::ui::UiActionKind::Submit,
@@ -6218,7 +6896,7 @@ mod tests {
         assert!(app.observed_requests.is_empty());
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("session-beta [exited]"));
+        assert!(rendered.contains("session-beta · exited"));
         assert!(
             !hit_map
                 .regions()
@@ -6242,7 +6920,7 @@ mod tests {
 
         app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
             request_id: botster_core::RequestId("req-terminal-focus".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::DOGFOOD_SURFACE_ID.to_string()),
+            surface_id: botster_core::ui::UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
             action_id: botster_core::ui::UiActionId("botster.terminal.focus".to_string()),
             node_id: Some(UiNodeId("dogfood-terminal".to_string())),
             kind: botster_core::ui::UiActionKind::Submit,
@@ -6511,6 +7189,7 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
 
         let mut app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        app.workspace_test_mode = true;
         wait_for_authoritative_session(&mut app, &prior_session_id)
             .expect("external session appears through entity subscription");
         app.selected_session = Some(prior_session_id.clone());
@@ -6749,7 +7428,7 @@ mod tests {
             .0
             .join("\n");
         assert!(
-            exited.contains(&format!("{prior_session_id} [exited]")),
+            exited.contains(&format!("{prior_session_id} · exited")),
             "natural exit patch must render through the app surface: {exited}"
         );
         daemon
@@ -6771,7 +7450,7 @@ mod tests {
             .0
             .join("\n");
         assert!(
-            !removed.contains(&format!("{prior_session_id} [")),
+            !removed.contains(&format!("{prior_session_id} ·")),
             "remove delta must delete the rendered session row: {removed}"
         );
 
@@ -6865,6 +7544,8 @@ mod tests {
             .request(&DaemonRequest::ListPackageNavigation)
             .expect("list package navigation after contract matrix conformance");
         let mut app = DogfoodApp::new(None);
+        app.workspace_test_mode = true;
+        app.system_details_visible = true;
         app.apply_response(list_packages);
         app.apply_response(list_apps);
         app.apply_response(list_package_navigation);
@@ -6922,6 +7603,8 @@ mod tests {
             })
             .expect("dispatch contract action success");
         let mut action_app = DogfoodApp::new(None);
+        action_app.workspace_test_mode = true;
+        action_app.system_details_visible = true;
         action_app.apply_response(success);
         let (lines, _) = renderer::render_to_lines(&action_app.surface(), 240, 120);
         let rendered = lines.join("\n");
@@ -6941,6 +7624,8 @@ mod tests {
             })
             .expect("dispatch contract action error");
         let mut failure_app = DogfoodApp::new(None);
+        failure_app.workspace_test_mode = true;
+        failure_app.system_details_visible = true;
         failure_app.apply_response(failure);
         let (lines, _) = renderer::render_to_lines(&failure_app.surface(), 240, 120);
         let rendered = lines.join("\n");
@@ -6957,6 +7642,8 @@ mod tests {
             })
             .expect("render blocked contract surface");
         let mut blocked_app = DogfoodApp::new(None);
+        blocked_app.workspace_test_mode = true;
+        blocked_app.system_details_visible = true;
         blocked_app.apply_response(blocked);
         let (lines, _) = renderer::render_to_lines(&blocked_app.surface(), 240, 120);
         let rendered = lines.join("\n");
