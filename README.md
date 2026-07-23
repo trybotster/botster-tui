@@ -1,8 +1,9 @@
 # botster-tui
 
-`botster-tui` is the first-party Rust terminal client scaffold for Botster.
-It is a hub client over core APIs and the shared TUI renderer kit, not a policy
-owner.
+`botster-tui` is Botster's first-party daily-use terminal workspace. It presents
+authoritative hub sessions, keeps selection separate from terminal attachment,
+and adapts from wide split panes to a compact stacked layout. It is a hub client
+over core APIs and the shared TUI renderer kit, not a runtime policy owner.
 
 ## Role
 
@@ -25,12 +26,12 @@ control-key input passthrough across attach and reattach paths.
 
 ## Foundation
 
-This scaffold uses `botster-tui-kit` pinned to merged main revision
-`16c6035dd06ffb5ec0704f1a3603c3e4bc5c81bf`, which includes the client-owned
-terminal mouse-mode hook. The kit supplies complete terminal SGR mouse reports for
-press/release/drag/move/wheel; the later revisions also supply scroll
-normalization, multi-click/drag tracking, and `HitMap` occlusion barriers. The
-kit owns reusable
+The workspace uses `botster-tui-kit` pinned to revision
+`fb0fdcb87d102232cb015b6da782a971903b4190` and its compatible `botster-core`
+revision `7d52fb78024b45764d6830cf4c6b131f13a83e62`. The kit supplies semantic
+viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
+focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
+occlusion barriers. The kit owns reusable
 Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
 input forwarding. Semantic controls focus and capture on left Down, then
 activate only on matching-node left Up; `terminal_view` deliberately keeps its
@@ -46,9 +47,31 @@ keeps an attachment-scoped `u8` shadow and reapplies it after every render, and
 the kit converts tracking bits `1|2|4` into full-stream SGR routing. Bit `8` alone
 selects SGR encoding but does not enable tracking. Failed, malformed, stale, or
 detached readback clears the client shadow to safe-off.
-`botster-tui` owns the first-party hub client app, including hub connection
-setup, dogfood state, sessions, packages, installed apps, marketplace
-diagnostics, and terminal attach/input/resize/drain behavior.
+`botster-tui` owns the first-party hub client app, including workspace
+composition, hub connection setup, session presentation, packages, installed
+apps, marketplace diagnostics, and terminal attach/input/resize/drain behavior.
+
+## Session workspace
+
+The default surface is session-first:
+
+- A compact status line distinguishes connected, unavailable, disconnected,
+  and reconnecting hub state.
+- The session navigator distinguishes local pending spawns, authoritative
+  running/failed/exited lifecycle, local selection, and the attached stream.
+- The focused pane explains why attachment is available or disabled and shows
+  terminal content only for the explicit attachment.
+- The contextual toolbar keeps Spawn and Attach reachable, moves secondary
+  actions into kit-owned overflow, and requires confirmation before Shutdown or
+  Remove.
+- System details contains package, app, plugin, compatibility, configuration,
+  diagnostics, and command editing in a scrollable secondary surface.
+
+Expanded (`>=120` columns) and regular (`80..119`) terminals use side-by-side
+navigation and focus panes. Compact terminals (`<80`) stack them vertically.
+Tab and Shift-Tab move focus; arrows navigate focused controls; Enter or Space
+activates; PageUp/PageDown and the mouse wheel scroll; `Esc` cancels an open
+confirmation or exits otherwise. `q` and `Ctrl-C` also exit.
 
 ## Commands
 
@@ -62,12 +85,12 @@ cargo run -p botster-tui -- --smoke
 cargo run -p botster-tui
 ```
 
-The interactive renderer opens the alternate terminal screen and exits with
-`q`, `Esc`, or `Ctrl-C`.
+The interactive renderer opens the alternate terminal screen and uses the
+workspace shortcuts documented above.
 
-## Local Hub Dogfood
+## Live hub verification
 
-The dogfood session surface uses the authoritative external hub client protocol
+The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
 `02bffebd0e29cb69a8e1e639e01f704f6dfffe48`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
@@ -91,8 +114,8 @@ BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" \
   cargo run -p botster-tui -- --headless-dogfood
 ```
 
-The visible diagnostics are intentionally local-client diagnostics, not private
-hub probes. The hub panel distinguishes:
+The visible System details diagnostics are intentionally local-client
+diagnostics, not private hub probes. They distinguish:
 
 - missing socket configuration (`--hub-socket` or `BOTSTER_HUB_SOCKET` needed);
 - local hub unavailable, disconnected, or reconnecting;
@@ -143,12 +166,12 @@ guessing a port. `terminal_app` rows show launchability from lifecycle, blocked
 reasons, diagnostics, and action descriptors; app action descriptors are
 display-only in this client path.
 
-The terminal panel distinguishes selected session from attached stream. Selecting
-a row changes the attach target; terminal input is sent only after an attach
-state is observed for that stream. Until then, the panel reports terminal stream
-unavailable rather than silently treating selection as an attached PTY.
+The focused terminal distinguishes selected session from attached stream.
+Selecting a row changes the attach target; terminal input is sent only after an
+attach state is observed for that stream. Until then, the pane reports terminal
+stream unavailable rather than silently treating selection as an attached PTY.
 
-The sessions panel opens one explicit `session` entity subscription per hub
+The session navigator opens one explicit `session` entity subscription per hub
 connection. Its authoritative snapshot and strictly ordered upsert, patch, and
 remove frames drive the visible rows; normal synchronization does not poll a
 session list. Spawn adds an immediate client-local pending row, then the matching
@@ -247,10 +270,10 @@ Included now:
 - A real binary entry point with a noninteractive `--smoke` path.
 - Consumption of `botster-tui-kit` for shared `botster-core` `UiNode`
   rendering and input routing mechanics.
-- A runtime draw path that renders the session dogfood surface as shared
-  `UiNode`, routes semantic actions through the kit hit map/input router,
-  reflects visible form drafts, and displays terminal bytes inside
-  `terminal_view`.
+- A state-aware runtime draw path that renders the responsive session workspace
+  as shared `UiNode`, reconciles focus against each new hit map, routes semantic
+  actions through the kit input router, reflects visible form drafts, and
+  displays terminal bytes inside `terminal_view`.
 - Push-driven hub session snapshot/delta reconciliation, pending spawn feedback,
   explicit selection/attach, terminal input, resize, drain, reconnect, and
   validation/error states through `botster-hub-client`.
