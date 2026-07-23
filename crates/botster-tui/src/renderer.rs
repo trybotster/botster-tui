@@ -1,15 +1,16 @@
 use botster_core::RequestId;
 use botster_core::ui::UiSurfaceId;
 
-pub const DOGFOOD_SURFACE_ID: &str = "botster-tui.dogfood";
+pub const WORKSPACE_SURFACE_ID: &str = "botster-tui.workspace";
 
 pub use botster_tui_kit::{
-    ActionRequestContext, HitMap, InputDispatch, InputRouter, render_node, tui_capabilities,
+    ActionRequestContext, HitMap, InputDispatch, InputRouter, RenderState, render_node_with_state,
+    tui_capabilities,
 };
 
 pub fn action_request_context() -> ActionRequestContext {
     ActionRequestContext::new(
-        UiSurfaceId(DOGFOOD_SURFACE_ID.to_string()),
+        UiSurfaceId(WORKSPACE_SURFACE_ID.to_string()),
         |node_id, _kind| RequestId(format!("req-{node_id}")),
     )
 }
@@ -21,4 +22,15 @@ pub fn render_to_lines(
     height: u16,
 ) -> (Vec<String>, HitMap) {
     botster_tui_kit::render_to_lines(root, width, height).expect("test backend should draw fixture")
+}
+
+#[cfg(test)]
+pub fn render_to_lines_with_state(
+    root: &botster_core::ui::UiNode,
+    width: u16,
+    height: u16,
+    state: &RenderState,
+) -> (Vec<String>, HitMap) {
+    botster_tui_kit::render_to_lines_with_state(root, width, height, state)
+        .expect("state-aware test backend should draw fixture")
 }
