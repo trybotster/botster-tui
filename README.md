@@ -27,8 +27,10 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`fb0fdcb87d102232cb015b6da782a971903b4190` and its compatible `botster-core`
-revision `7d52fb78024b45764d6830cf4c6b131f13a83e62`. The kit supplies semantic
+`fb0fdcb87d102232cb015b6da782a971903b4190` and its compatible UI-contract
+revision `7d52fb78024b45764d6830cf4c6b131f13a83e62`. Runnable-entrypoint connection
+decoding and validation consume `botster-core` revision
+`16bf08f29ec723c70c290cf995745ccbf79d4f05`. The kit supplies semantic
 viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
 focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
 occlusion barriers. The kit owns reusable
@@ -102,22 +104,25 @@ Run against a separately started isolated hub:
 ```sh
 hub_dir="$(mktemp -d /tmp/botster-tui-hub.XXXXXX)"
 botster-hub start --data-dir "$hub_dir"
-BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" cargo run -p botster-tui
+BOTSTER_HUB_CONNECTION="{\"transport\":{\"type\":\"unix_socket\",\"path\":\"$hub_dir/botster-hub.sock\"}}" \
+BOTSTER_HUB_DATA_DIR="$hub_dir" \
+  cargo run -p botster-tui
 botster-hub shutdown --data-dir "$hub_dir"
 ```
 
-The headless dogfood path proves the same client/app surface without opening the
+The headless live-runtime path proves the same client/app surface without opening the
 alternate screen:
 
 ```sh
-BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" \
-  cargo run -p botster-tui -- --headless-dogfood
+BOTSTER_HUB_CONNECTION="{\"transport\":{\"type\":\"unix_socket\",\"path\":\"$hub_dir/botster-hub.sock\"}}" \
+BOTSTER_HUB_DATA_DIR="$hub_dir" \
+  cargo run -p botster-tui -- --headless-live-runtime
 ```
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes. They distinguish:
 
-- missing socket configuration (`--hub-socket` or `BOTSTER_HUB_SOCKET` needed);
+- missing, malformed, or invalid `BOTSTER_HUB_CONNECTION` configuration;
 - local hub unavailable, disconnected, or reconnecting;
 - compatibility mismatch and unsupported feature diagnostics from the
   `botster-hub-client` compatibility handshake;
@@ -180,7 +185,7 @@ separate actions, so neither appearance nor reconnect automatically attaches a
 PTY. A reconnect discards the prior subscription generation and waits for the
 fresh generation's snapshot before accepting deltas.
 
-The TUI uses a deliberately narrowed compatibility requirement for the dogfood
+The TUI uses a deliberately narrowed compatibility requirement for the live-runtime
 terminal surface: sessions, session entity subscriptions, terminal streaming,
 terminal readback, package navigation, and resize. It does not require
 plugin surface render/action capabilities for this path. A running but
@@ -203,7 +208,7 @@ of being treated as a passing render.
 `terminal_app` with `foreground_stdio` launch mode. It is a foreground terminal
 client contract, not a background supervised web process.
 
-For source-checkout dogfood, build the binary and install the checkout as a
+For source-checkout live-runtime, build the binary and install the checkout as a
 local package:
 
 ```sh
@@ -218,25 +223,30 @@ opening the app. `script/test-live-hub` does this staging when it uses an
 external `CARGO_TARGET_DIR`.
 
 The app-open flow launches the checked-in runnable entrypoint through the
-hub-resolved foreground terminal contract. The hub supplies canonical
-foreground launch environment such as `BOTSTER_HUB_SOCKET` and
-`BOTSTER_HUB_DATA_DIR`, and the TUI consumes both launch inputs:
+hub-resolved foreground terminal contract. The hub supplies
+`BOTSTER_HUB_CONNECTION` as the canonical foreground launch environment and
+`BOTSTER_HUB_DATA_DIR` as package storage context. The TUI decodes and validates
+the Core-owned connection descriptor, shows whether storage context was supplied
+in System details, and never uses storage context to infer an endpoint:
 
 ```sh
 botster-hub apps open --data-dir "$hub_dir" botster-tui
 ```
 
-For lower-level client debugging, the direct foreground dogfood command remains
+For lower-level client debugging, the direct foreground live-runtime command remains
 available:
 
 ```sh
-BOTSTER_HUB_SOCKET="$hub_dir/botster-hub.sock" cargo run -p botster-tui
+BOTSTER_HUB_CONNECTION="{\"transport\":{\"type\":\"unix_socket\",\"path\":\"$hub_dir/botster-hub.sock\"}}" \
+BOTSTER_HUB_DATA_DIR="$hub_dir" \
+  cargo run -p botster-tui
 ```
 
-There is also an automated isolated-hub test using the merged
-`botster-hub-test-support` crate. The preferred command builds matching
-`botster-hub` and `botster-session-worker` binaries from the pinned git
-dependencies, starts an isolated daemon, runs the TUI dogfood path, runs the
+There is also an automated isolated-Hub test using
+`botster-hub-test-support`. The wrapper accepts explicit matching
+`botster-hub` and `botster-session-worker` binaries, or resolves those command
+names from `PATH`; it does not discover or build a sibling Hub checkout. It
+starts an isolated daemon, runs the TUI live-runtime path, runs the
 revision-16 session lifecycle subscription conformance runner and plugin
 contract matrix conformance harness, renders the delivered fixture
 surfaces through the TUI renderer, and tears the daemon down. The renderer
@@ -244,19 +254,26 @@ coverage includes the composite application primitive fixture for `metric_grid`,
 `table`, `toolbar`, `status_badge`, `section`, `empty_state`, enhanced
 panel/list semantics, and form/action feedback. It also
 installs/enables this checkout as a local package and opens `botster-tui`
-through `botster-hub apps open` with a headless dogfood env switch so the
+through `botster-hub apps open` with a headless live-runtime env switch so the
 foreground app exits cleanly under automation:
 
 ```sh
-CARGO_TARGET_DIR=/tmp/botster-tui-impl-target script/test-live-hub
+BOTSTER_HUB_BIN=/path/to/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
+CARGO_TARGET_DIR=/tmp/botster-tui-live-target \
+  script/test-live-hub
 ```
 
 Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
 `BOTSTER_SESSION_WORKER_BIN` paths because `botster-tui` does not own those
-binaries. The wrapper script supplies those paths internally. Without the two
-binary path variables, the test is skipped during the normal unit test suite.
-With `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, missing binaries fail the test instead of
-silently skipping it. The live-hub test also asserts non-default compatibility
+binaries. If a variable is omitted, the wrapper looks up the corresponding
+command on `PATH` and fails with a setup diagnostic if it is unavailable.
+`CARGO_TARGET_DIR` is optional; omitting it creates and cleans up a fresh
+temporary target. `BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` may point to an
+explicit Hub contract-matrix fixture directory to include live plugin-surface
+proof. Normal unit tests skip the isolated runtime when the binary variables are
+absent; the wrapper sets `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing binaries
+cannot silently pass. The live-Hub test also asserts non-default compatibility
 descriptor values from the isolated daemon and exercises a compatibility
 mismatch through `connect_and_hello_with_requirement` with an unsatisfied
 required feature.
