@@ -13,7 +13,7 @@ run: run_1782404671_259486
 - Dependency context: dependency ticket `ticket_1782361545_680661` ("Expose installed app registry and structured app launch DTOs in botster-hub") is closed.
 - Worktree/target context: run target is `tgt_c3d470bab78549df920a41e8fb0e58d8`, base ref is `main`, and this plan is for the assigned checkout only.
 - Repo context: this is a Rust TUI workspace. The main production surface is `crates/botster-tui/src/app.rs`; docs and command expectations live in `README.md`; dependency pins live in `crates/botster-tui/Cargo.toml` and `Cargo.lock`.
-- Current TUI context: `DogfoodApp` already connects through `botster-hub-client`, refreshes status/sessions/packages, renders package rows and diagnostics in the existing hub/status panel, and has focused tests in `crates/botster-tui/src/app.rs`.
+- Current TUI context: `TuiApp` already connects through `botster-hub-client`, refreshes status/sessions/packages, renders package rows and diagnostics in the existing hub/status panel, and has focused tests in `crates/botster-tui/src/app.rs`.
 - Current dependency observation: this repo pins `botster-hub-client` to `3c7a44890cb26793d97cf87a1c7f866add2b15d9`, which does not expose `DaemonRequest::ListApps`, `DaemonResponseKind::Apps`, `DaemonResponse.apps`, or `DaemonApp`.
 - Fresh hub protocol observation: `trybotster/botster-hub` main resolves to `b91d774f31fabe1d8f0d28d538dca8e372988298`. A read-only shallow checkout of that revision exposes `DaemonRequest::ListApps`, `DaemonResponseKind::Apps`, `DaemonResponse.apps: Vec<DaemonApp>`, and `DaemonApp { package_name, app_id, entrypoint_id, kind, launch_mode, lifecycle_state, diagnostics, actions, blocked_reasons, launch_target }`.
 - Fresh DTO semantics: `DaemonApp.launch_target.kind` mirrors `web_app` or `terminal_app`; `launch_target.local_url` is optional and hub-provided only for eligible web apps. Clients must not derive it from stdout, stderr, command args, package names, known ports, diagnostics, environment, or paths.
@@ -24,14 +24,14 @@ run: run_1782404671_259486
 
 - Keep the implementation inside `botster-tui`.
 - Bump `botster-hub-client` and `botster-hub-test-support` to a hub revision that includes the closed installed-app registry dependency, expected at or after `b91d774f31fabe1d8f0d28d538dca8e372988298` unless implementation finds a newer compatible main revision at start.
-- Add app registry state to `DogfoodApp`, populated only from `DaemonResponseKind::Apps` / `DaemonResponse.apps`.
+- Add app registry state to `TuiApp`, populated only from `DaemonResponseKind::Apps` / `DaemonResponse.apps`.
 - Issue `DaemonRequest::ListApps` from the existing hub refresh path so the production TUI user path receives app rows from the running hub.
 - Render installed apps in the existing hub/status diagnostics panel, near package/runtime diagnostics rather than as a new dashboard.
 - For each app row, display hub-provided package/app/entrypoint ids, `kind`, `launch_mode`, `lifecycle_state`, blocked reasons, diagnostics, and action descriptors.
 - For `web_app` launch targets, show the hub-provided `launch_target.local_url` when present, plus terse copy/open instructions if the TUI cannot launch a browser itself.
 - For `terminal_app` launch targets, show launchability through the hub-provided action descriptors, blocked reasons, lifecycle state, and diagnostics. Do not invent a background URL.
 - Preserve existing session, terminal, package registry, configuration, lifecycle/dependency/update, and diagnostics rendering.
-- Update `README.md` only as needed to document local dogfood app registry display and the current direct/open flow.
+- Update `README.md` only as needed to document local live-runtime app registry display and the current direct/open flow.
 - Add focused tests proving production response handling and rendering use authoritative hub-client DTO data.
 
 ## Non-Scope
@@ -45,7 +45,7 @@ run: run_1782404671_259486
 
 ## Assumptions and Unknowns
 
-- Assumption: the app registry should be displayed in the existing dogfood hub/status panel because this is the smallest surface already used for package and diagnostic state.
+- Assumption: the app registry should be displayed in the existing live-runtime hub/status panel because this is the smallest surface already used for package and diagnostic state.
 - Assumption: `DaemonApp.actions` are read-only descriptors for this ticket. The TUI should render action availability and mapped request metadata, but should not add new command buttons unless the existing TUI action plumbing already supports the request safely and narrowly.
 - Assumption: copy/open instructions can be text instructions. Native clipboard or browser launch is out of scope because the ticket asks for copyable/open instructions, not OS integration.
 - Unknown: the exact newest compatible hub main revision at implementation time. The implementer must verify `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/main` before bumping pins.
@@ -55,16 +55,16 @@ run: run_1782404671_259486
 
 ## Botster Layers Touched
 
-- TUI: primary layer; app state storage, refresh sequencing, rendering, and tests in `DogfoodApp`.
+- TUI: primary layer; app state storage, refresh sequencing, rendering, and tests in `TuiApp`.
 - Hub client boundary: dependency pins updated to consume public app DTOs from `botster-hub-client`.
-- Docs: local dogfood README wording and this plan artifact.
+- Docs: local live-runtime README wording and this plan artifact.
 - Pipeline artifacts: Plan gate evidence plus checklist fallback evidence.
 
 ## Affected Surfaces and Files
 
 - `crates/botster-tui/src/app.rs`
   - Import `DaemonApp` and any needed app/action DTOs from `botster-hub-client`.
-  - Add `apps: Vec<DaemonApp>` to `DogfoodApp`.
+  - Add `apps: Vec<DaemonApp>` to `TuiApp`.
   - Send `DaemonRequest::ListApps` in the existing refresh path, alongside status/sessions/packages.
   - Apply `DaemonResponseKind::Apps` by replacing `self.apps` from `response.apps`.
   - Render an app summary and rows from `self.apps`.
@@ -75,7 +75,7 @@ run: run_1782404671_259486
 - `Cargo.lock`
   - Update only the lockfile changes caused by the required hub dependency bump.
 - `README.md`
-  - Update the Local Package / local hub dogfood section to describe TUI app registry display, web app URL instructions, and terminal app launchability from hub DTOs.
+  - Update the Local Package / local hub live-runtime section to describe TUI app registry display, web app URL instructions, and terminal app launchability from hub DTOs.
 - `docs/plans/tui-installed-app-registry-plan.md`
   - Reviewable plan artifact for this ticket.
 
@@ -98,7 +98,7 @@ run: run_1782404671_259486
 - `cargo run -p botster-tui -- --smoke`
 - `CARGO_TARGET_DIR=/tmp/botster-tui-apps-target script/test-live-hub`, unless required hub/session-worker binaries or fixture support are unavailable; record the exact reason if skipped.
 - Focused tests in `crates/botster-tui/src/app.rs` must prove:
-  - `DaemonResponseKind::Apps` updates `DogfoodApp.apps` from `DaemonResponse.apps`.
+  - `DaemonResponseKind::Apps` updates `TuiApp.apps` from `DaemonResponse.apps`.
   - the refresh path issues `DaemonRequest::ListApps` through the same production request path as other hub reads.
   - a `web_app` row renders package/app/entrypoint ids, `launch_mode`, lifecycle, and the hub-provided `launch_target.local_url`.
   - a `web_app` row without `local_url` remains visible and shows diagnostics or blocked reasons instead of deriving a URL.
@@ -107,7 +107,7 @@ run: run_1782404671_259486
   - action descriptors render `action_id`, status, reason/diagnostics, required references, and request mapping fields that are safe to show.
   - package, session, terminal, compatibility, and existing package diagnostics tests continue to pass.
   - no fixture local paths, socket paths, raw env values, auth values, or tokens appear in rendered app output.
-- Runtime-path proof: tests should drive `DogfoodApp::apply_response`, the real refresh request method, and `surface()`/rendered text extraction, not only pure formatting helpers.
+- Runtime-path proof: tests should drive `TuiApp::apply_response`, the real refresh request method, and `surface()`/rendered text extraction, not only pure formatting helpers.
 
 ## Pipeline Gates and Artifacts
 

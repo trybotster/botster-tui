@@ -7,12 +7,12 @@
 - Repo context: current branch is `project-pipelines/ticket_1781046658_155987`; worktree is clean before planning; current `botster-hub-client` pin is `e97fc3779488ab8adedb98708898e7106254331e`.
 - Current upstream context: `botster-hub` main resolves to `24453ef448fb4c89ed63e784ed518de7ca301cd7`; the current public client crate exposes `DaemonCompatibilityRequirement`, `DaemonCompatibility`, `DaemonDiagnostic`, `DaemonDiagnosticKind`, `DaemonTransportError::Compatibility`, feature constants, and diagnostics on hello/status/response/operator errors.
 - Required vault/playbook context: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan steps need reviewable plan artifacts]], [[project pipelines checklist worker timeouts require artifact evidence fallback]].
-- Current TUI code context: `crates/botster-tui/src/app.rs` already owns the dogfood app state, connection retry, status panel rendering, terminal attach state, and focused tests for missing socket, protocol branch, status schema, terminal stream availability, and live isolated hub dogfood.
+- Current TUI code context: `crates/botster-tui/src/app.rs` already owns the live-runtime app state, connection retry, status panel rendering, terminal attach state, and focused tests for missing socket, protocol branch, status schema, terminal stream availability, and live isolated hub live-runtime.
 
 ## Scope
 
 - Update `botster-tui`'s `botster-hub-client` and `botster-hub-test-support` git revisions to a main revision that includes the compatibility/diagnostic client API, expected to be `24453ef448fb4c89ed63e784ed518de7ca301cd7` unless implementation finds a newer compatible main revision at start.
-- Adjust `DogfoodApp` connection setup to use the public compatibility requirement path with `client_name = "botster-tui"` and a deliberately narrowed TUI requirement: sessions, terminal streaming, and resize. Do not require plugin surface render/action features for this dogfood terminal surface, and do not add private protocol parsing.
+- Adjust `TuiApp` connection setup to use the public compatibility requirement path with `client_name = "botster-tui"` and a deliberately narrowed TUI requirement: sessions, terminal streaming, and resize. Do not require plugin surface render/action features for this live-runtime terminal surface, and do not add private protocol parsing.
 - Store and render authoritative compatibility/diagnostic state from hub-client structures:
   - `DaemonStatus.compatibility`
   - top-level `DaemonResponse.diagnostics`
@@ -20,7 +20,7 @@
   - `DaemonTransportError::Compatibility(error).diagnostics`
   - client-side `DaemonDiagnostic::disconnected` for post-connect disconnect classification where applicable.
 - Update the existing status/diagnostics surface so hub unavailable, compatibility mismatch, unsupported feature, terminal stream unavailable, action failure, reconnecting/disconnected, and connected are distinguishable in rendered output.
-- Refresh `README.md` Local Hub Dogfood documentation to describe the real compatibility handshake and diagnostics path instead of the old "descriptor pending" limitation.
+- Refresh `README.md` Local Hub Production documentation to describe the real compatibility handshake and diagnostics path instead of the old "descriptor pending" limitation.
 - Add/adjust tests in `crates/botster-tui/src/app.rs` that prove rendering is driven by structured hub-client diagnostics and compatibility data, not hardcoded demo-only text.
 
 ## Non-Scope
@@ -28,7 +28,7 @@
 - No edits to `botster-hub`, `botster-core`, web, Rails, Project Pipelines plugin, or hub protocol internals from this branch.
 - No new local protocol DTOs, socket frame readers, or private daemon/session-worker frame handling in `botster-tui`.
 - No terminal data-plane refactor, terminal byte ownership change, PTY input transformation, or scrollback ownership change.
-- No broad renderer redesign or generic diagnostics framework beyond what the existing dogfood status surface needs.
+- No broad renderer redesign or generic diagnostics framework beyond what the existing live-runtime status surface needs.
 - No mutation of real Botster identity, device state, or private protocol details in tests/docs.
 
 ## Assumptions And Unknowns
@@ -45,7 +45,7 @@
 - `Cargo.lock`: update locked hub dependency source revisions and any transitive changes from that exact hub revision.
 - `crates/botster-tui/src/app.rs`: consume compatibility requirement, compatibility descriptors, diagnostics, transport classifications, status panel text, and app tests.
 - `crates/botster-tui/src/app.rs`: update the stale protocol-branch tests and comments for the new reachable `DaemonTransportError::Compatibility` path, while preserving the negative assertion that `NotRunning` does not render as a compatibility mismatch.
-- `README.md`: update Local Hub Dogfood diagnostics docs and remove stale pending-descriptor language.
+- `README.md`: update Local Hub Production diagnostics docs and remove stale pending-descriptor language.
 - Possibly `script/test-live-hub` only if the updated hub revision changes binary package names or invocation requirements; otherwise leave it untouched.
 
 ## Risks
@@ -82,7 +82,7 @@
 
 ## Runtime Path Proof
 
-The production path to prove is `run_loop` -> `DogfoodApp::new` -> `try_connect` / `force_reconnect` -> `connect_and_hello_with_requirement` or `DaemonConnection::connect` from `botster_hub_client`, then `refresh_status` / `request_and_apply` -> `apply_response` -> `status_panel`. Tests that construct only static strings are insufficient unless they exercise the same `record_transport_error` / `apply_response` paths used by `poll_hub`, reconnect, and request handling.
+The production path to prove is `run_loop` -> `TuiApp::new` -> `try_connect` / `force_reconnect` -> `connect_and_hello_with_requirement` or `DaemonConnection::connect` from `botster_hub_client`, then `refresh_status` / `request_and_apply` -> `apply_response` -> `status_panel`. Tests that construct only static strings are insufficient unless they exercise the same `record_transport_error` / `apply_response` paths used by `poll_hub`, reconnect, and request handling.
 
 For compatibility mismatch specifically, proof must go through a live isolated daemon with an unsatisfiable `DaemonCompatibilityRequirement`; direct injection of `DaemonTransportError::Compatibility` may remain as focused unit coverage, but it cannot be the only evidence. For compatibility success, proof must assert descriptor values returned by the real hub are non-default and rendered.
 

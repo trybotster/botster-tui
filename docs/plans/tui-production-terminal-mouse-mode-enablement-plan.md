@@ -55,12 +55,12 @@ Ticket: Production terminal mouse-mode enablement (client-owned, schema-valid)
     representability but adds no browser caller. No botster-web work is needed
     here.
 - Current botster-tui production entry point is `run_loop`: poll the hub, render
-  `DogfoodApp::surface()` into a fresh `HitMap`, dispatch Crossterm input through
+  `TuiApp::surface()` into a fresh `HitMap`, dispatch Crossterm input through
   kit `InputRouter`, then map `TerminalForward` to hub-client `SendInput` for the
-  current attachment. `surface()` emits `dogfood-terminal` with only the valid
+  current attachment. `surface()` emits `live-runtime-terminal` with only the valid
   `session_id` and `title` props and validates the tree before rendering.
 - Current missing link is entirely in the consumer: Cargo pins predate the hub
-  probe and kit hook; `DogfoodApp` owns no attachment-scoped mode shadow; and
+  probe and kit hook; `TuiApp` owns no attachment-scoped mode shadow; and
   `run_loop` does not reapply mode to the newly rendered hit map. A test-only
   fixture still injects invalid `mouse_mode`; that fixture must move to the
   schema-valid hook.
@@ -78,7 +78,7 @@ TUI-kit dependency pins, client tests/live-hub acceptance, and local docs.
    unchanged because it is the UiNode type identity shared with the kit; the
    production hub build carries the authoritative core revision behind the
    hub-client boundary.
-2. Add one attachment-scoped `u8` mouse-mode shadow to `DogfoodApp`, keyed or
+2. Add one attachment-scoped `u8` mouse-mode shadow to `TuiApp`, keyed or
    guarded by the current session/subscription generation. Keep `0`/absence as
    the safe-off state. Clear it before a new attach and on detach, process exit,
    reconnect/transport failure, session switch, stale identity, malformed
@@ -93,7 +93,7 @@ TUI-kit dependency pins, client tests/live-hub acceptance, and local docs.
    today, so this cadence also prevents duplicate outstanding work without a new
    async abstraction.
 4. After every production render and before input dispatch, call
-   `HitMap::set_terminal_mouse_mode("dogfood-terminal", current_bits)`. The
+   `HitMap::set_terminal_mouse_mode("live-runtime-terminal", current_bits)`. The
    shared UiNode remains unchanged and the kit remains the sole owner of SGR
    mouse encoding and full-stream routing.
 5. Replace the invalid test fixture prop with the public hit-map hook and add
@@ -104,7 +104,7 @@ TUI-kit dependency pins, client tests/live-hub acceptance, and local docs.
    describes production enablement as deferred or a Boolean prop contract.
 
 Every implementation line must trace to one of those six items. In particular,
-prefer small methods on `DogfoodApp` over a new mode manager, service object,
+prefer small methods on `TuiApp` over a new mode manager, service object,
 event bus, or generic polling framework.
 
 ## Non-scope
@@ -137,7 +137,7 @@ event bus, or generic polling framework.
 - DECSET/DECRST writes are terminal output, so a matching output event plus a
   bounded one-second refresh is the smallest dynamic transition mechanism.
   Immediate attach/rehydration probes cover already-active modes after restore.
-- There is one production terminal node, `dogfood-terminal`, representing the
+- There is one production terminal node, `live-runtime-terminal`, representing the
   current attachment. The kit hook deliberately no-ops for a missing id; a test
   must assert this production id is actually updated so string drift is visible.
 - Unknown but non-blocking: exact helper names and whether attach-active and
@@ -173,13 +173,13 @@ event bus, or generic polling framework.
    resolves one compatible `botster-core` identity for app/kit UiNode values and
    that the isolated hub binaries build from the hub revision carrying core PR
    #106.
-2. Introduce the smallest `DogfoodApp` mode-shadow fields and helpers. Centralize
+2. Introduce the smallest `TuiApp` mode-shadow fields and helpers. Centralize
    clearing so every attachment/connection terminal path uses the same safe-off
    invariant.
 3. Add targeted probe scheduling and `ReadModeFlags` response handling beside
    the existing optional `ReadScreen` and `CaptureSnapshot` flow. Guard every
    write by current attachment identity and rate-limit output-driven refresh.
-4. Reapply the exact shadow to `dogfood-terminal` immediately after each render,
+4. Reapply the exact shadow to `live-runtime-terminal` immediately after each render,
    before `InputRouter::dispatch_event` receives that hit map.
 5. Convert the invalid-prop fixture and add focused tests that ablate the hook,
    distinguish SGR bit-only from tracking bits, prove stale/error clearing, and
@@ -207,7 +207,7 @@ event bus, or generic polling framework.
 - **Fresh render silently disables mode.** Mitigation: apply the shadow after
   every draw, and render twice in a regression test before dispatching.
 - **String node-id drift silently no-ops.** Mitigation: assert the production
-  `dogfood-terminal` region changes through the hook in app coverage.
+  `live-runtime-terminal` region changes through the hook in app coverage.
 - **Invalid prop survives in tests and is copied back into production.**
   Mitigation: remove the fixture and run a zero-hit scan for `mouse_mode` inside
   `terminal_view` JSON plus real `UiNode::validate()` coverage.
@@ -224,7 +224,7 @@ event bus, or generic polling framework.
    intended hub/client/test-support and kit pin changes, with no unrequested
    dependency refresh.
 2. Focused Rust tests prove:
-   - the production `DogfoodApp::surface()` validates with only `session_id` and
+   - the production `TuiApp::surface()` validates with only `session_id` and
      `title` on `terminal_view`;
    - a matching `ReadModeFlags { mouse_mode: 9 }` owns only the current
      attachment, while `0`, bit `8` alone, errors, wrong ids, detach, exit,
@@ -292,7 +292,7 @@ waive runtime-path acceptance without a human decision.
 
 - Implemented the approved client-owned attachment shadow without a schema,
   pushed-event, parser, scheduler, or upstream-repository change.
-- `run_loop` reapplies the exact current shadow to `dogfood-terminal` after each
+- `run_loop` reapplies the exact current shadow to `live-runtime-terminal` after each
   draw and before `InputRouter` dispatch; `TerminalForward` still reaches the
   attached session through the existing hub-client `SendInput` request.
 - `CARGO_TARGET_DIR=/tmp/botster-tui-ticket-mouse script/fmt` passed.
