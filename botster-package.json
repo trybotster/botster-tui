@@ -39,7 +39,7 @@
             "name": "BOTSTER_HUB_DATA_DIR"
           },
           "required": true,
-          "description": "Hub data directory supplied by the host."
+          "description": "Hub-owned package storage context shown in System details."
         }
       ]
     }
