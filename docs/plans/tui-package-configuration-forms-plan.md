@@ -11,7 +11,7 @@ run: run_1782266926_142717
 
 - Pipeline context: `ticket_1782257640_505199`, run `run_1782266926_142717`, active step `botster_plan`, gate `botster_plan_gate`; no prior artifacts, findings, reviews, questions, or answers.
 - Dependency context: dependency ticket `ticket_1782257625_477566` ("Persist and expose package configuration values in botster-hub") is closed.
-- Repo context: clean worktree before planning. This repo is a compact Rust TUI workspace with one client crate at `crates/botster-tui`; the production dogfood app, hub requests, package rendering, action handling, and most app tests live in `crates/botster-tui/src/app.rs`; generic ratatui form primitives and keyboard/mouse input routing live in `crates/botster-tui/src/renderer.rs`.
+- Repo context: clean worktree before planning. This repo is a compact Rust TUI workspace with one client crate at `crates/botster-tui`; the production live-runtime app, hub requests, package rendering, action handling, and most app tests live in `crates/botster-tui/src/app.rs`; generic ratatui form primitives and keyboard/mouse input routing live in `crates/botster-tui/src/renderer.rs`.
 - Current dependency context: `crates/botster-tui/Cargo.toml` pins `botster-hub-client` and `botster-hub-test-support` to `1f4c6e9b8d0deef5ed101a99e644d2bd2e9dd0cf`. Local inspection of that pinned `crates/botster-hub-client/src/lib.rs` shows package listing/process DTOs but no package configuration DTOs or set-configuration request.
 - Fresh hub-client context: `trybotster/botster-hub` main at `b1be4f53e2baf17f0c0e645ee0cd4fa139e3c8ea` exposes `DaemonPackage.configuration: DaemonPackageConfiguration` and `DaemonRequest::SetPackageConfiguration { package_name, values: BTreeMap<String, Value> }`. `DaemonPackageConfiguration` carries `schema: Option<Value>`, `effective_values`, `missing_required`, and `diagnostics`; secret values are redacted/write-only marker JSON, not raw secret material.
 - Vault context loaded: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], plus identity/goals context.
@@ -21,14 +21,14 @@ run: run_1782266926_142717
 
 - Keep this a `botster-tui` client feature over public `botster-hub-client` DTOs.
 - Bump the `botster-hub-client` and `botster-hub-test-support` git revs to a commit that includes the closed dependency's package configuration API, expected to be current main `b1be4f53e2baf17f0c0e645ee0cd4fa139e3c8ea` unless implementation finds a better merged commit.
-- Consume `DaemonPackage.configuration` from `ListPackages` / package responses and render package configuration forms inside the existing hub/package dogfood surface.
+- Consume `DaemonPackage.configuration` from `ListPackages` / package responses and render package configuration forms inside the existing hub/package live-runtime surface.
 - Build form fields from hub-provided schema/value DTOs only. Support the ticketed field set: string, boolean, enum/select, multiline text, and secret placeholders.
 - Submit updates through `DaemonRequest::SetPackageConfiguration`, wrapping field drafts into the hub value JSON shape expected by the package configuration API, for example string/select/multiline values with `{ "type": "...", "value": ... }` and secret updates with `{ "type": "secret", "state": "write_only" }`.
 - Display hub validation state from `configuration.missing_required` and `configuration.diagnostics` near the relevant package fields, while preserving existing public `DaemonDiagnostic` rendering.
 - Preserve keyboard-first flow through the existing `InputRouter`: Tab focus, text editing, checkbox/select changes, and Enter/Space submit. Keep existing mouse hit-map behavior compatible for clickable buttons/fields where it already works.
 - Redact secrets in rendered text, stored drafts, submitted fixtures, and tests. Existing redacted secrets should render as placeholders/states, not as editable raw values.
-- Add focused tests that drive the production app path: fixture `DaemonPackage` DTOs -> `DogfoodApp::apply_response` -> `surface()` / renderer output -> `handle_dispatch` submit request observation.
-- Update `README.md` Local Hub Dogfood docs if the visible TUI capabilities change.
+- Add focused tests that drive the production app path: fixture `DaemonPackage` DTOs -> `TuiApp::apply_response` -> `surface()` / renderer output -> `handle_dispatch` submit request observation.
+- Update `README.md` Local Hub Production docs if the visible TUI capabilities change.
 
 ## Non-Scope
 
@@ -52,9 +52,9 @@ run: run_1782266926_142717
 
 ## Botster Layers Touched
 
-- TUI: primary layer, including dogfood app state, package form construction, keyboard form interaction, rendering, and tests.
+- TUI: primary layer, including live-runtime app state, package form construction, keyboard form interaction, rendering, and tests.
 - Hub client boundary: dependency rev bump and public `botster-hub-client` request/response/DTO consumption.
-- Docs: README dogfood capability text and this plan artifact.
+- Docs: README live-runtime capability text and this plan artifact.
 - Not touched: plugin/Lua core, Rust hub implementation, session/client worker data plane, React SPA, Rails relay, MCP tools.
 
 ## Affected Surfaces and Files
@@ -73,7 +73,7 @@ run: run_1782266926_142717
   - Extend existing form/input routing only as needed for editable multiline text and secret placeholder behavior.
   - Preserve existing generic shared UI primitives and semantic action dispatch.
 - `README.md`
-  - Update Local Hub Dogfood docs to mention configuration schema/value rendering, update submission, validation display, and secret redaction if implementation changes the visible surface.
+  - Update Local Hub Production docs to mention configuration schema/value rendering, update submission, validation display, and secret redaction if implementation changes the visible surface.
 - `docs/plans/tui-package-configuration-forms-plan.md`
   - Reviewable Plan-stage artifact.
 
@@ -85,7 +85,7 @@ run: run_1782266926_142717
 - Validation feedback placement: hub validation may arrive as configuration diagnostics, missing-required arrays, operator errors, or public diagnostics. Mitigation: cover each public DTO path with focused tests and render a package-level fallback when field-level mapping is unavailable.
 - Input routing regression: touching `renderer.rs` can break existing text input, checkbox/select, action, mouse, or terminal forwarding behavior. Mitigation: keep edits small and run the existing renderer/app tests, especially form and terminal dispatch coverage.
 - Layout density: rendering all package fields in the existing hub panel can become noisy. Mitigation: prefer a compact per-package form under the existing package row and avoid a larger navigation redesign in this ticket.
-- Live fixture gap: this repo may not have a ready local package fixture with configuration schema. Mitigation: unit tests prove the production app/render/submit path from public DTO fixtures; live hub dogfood remains a compatibility smoke/runtime proof.
+- Live fixture gap: this repo may not have a ready local package fixture with configuration schema. Mitigation: unit tests prove the production app/render/submit path from public DTO fixtures; live hub live-runtime remains a compatibility smoke/runtime proof.
 
 ## Acceptance Checks and Tests
 

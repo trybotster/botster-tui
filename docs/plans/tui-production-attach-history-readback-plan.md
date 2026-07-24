@@ -4,7 +4,7 @@
 
 - Pipeline context: ticket `ticket_1783552998_357315`, run `run_1783636083_459002`, Plan step `botster_plan`, gate `botster_plan_gate`, target `tgt_c3d470bab78549df920a41e8fb0e58d8`. The only dependency, `ticket_1783552997_403516` (hub terminal readback), is closed; there were no prior artifacts, reviews, findings, or answers when planning began.
 - Repo context: branch `project-pipelines/ticket_1783552998_357315` at `77a3605`; the worktree was clean before this plan was added. `botster-tui` currently pins `botster-hub-client` and `botster-hub-test-support` to `196d56825a93c9fe8f754e1aa8e8ce18943041b1`.
-- Existing TUI path: `DogfoodApp::attach_selected_or_first` sends public `DaemonRequest::Attach`; `poll_hub` sends `DaemonRequest::Drain`; `apply_response` appends ordered `TerminalOutput`, `Snapshot`, and `Scrollback` data to `terminal_output`; `surface` renders that buffer through the existing `TerminalView`. Reconnect refreshes session rows and calls the same attach method.
+- Existing TUI path: `TuiApp::attach_selected_or_first` sends public `DaemonRequest::Attach`; `poll_hub` sends `DaemonRequest::Drain`; `apply_response` appends ordered `TerminalOutput`, `Snapshot`, and `Scrollback` data to `terminal_output`; `surface` renders that buffer through the existing `TerminalView`. Reconnect refreshes session rows and calls the same attach method.
 - Closed hub dependency: merged hub PR #128 at `333b75fc66de7eda521e05bea5dcc5eb91b8884c` adds public `DaemonRequest::{ReadScreen,CaptureSnapshot}`, `DaemonResponseKind::{ReadScreen,CaptureSnapshot}`, `DaemonResponse.{read_screen,capture_snapshot}`, `DaemonReadScreen`, `DaemonCaptureSnapshot`, and the `terminal_readback` compatibility feature. `ReadScreen` carries renderable current-screen text; `CaptureSnapshot` carries `rows`, `cols`, optional `payload_format`, and `payload_bytes`, but not opaque snapshot bytes. Attach/drain remains the source of renderable ordered history.
 - Compatibility delta verified by Plan Review: `CONFORMANCE_FIXTURE_REVISION` moves from 8 to 10, and `FEATURE_TERMINAL_READBACK` is present in both required and supported first-party feature lists. This is a required first-party capability at the new pin, not optional configurability.
 - Shared conformance context: the pinned test-support revision already exposes `late_attach_history_conformance_scenario`; the hub merge retains that fixture and adds terminal-readback support to the first-party matrix. The shared scenario contains both history-then-live and no-history-then-live cases, but it is a single event vector and does not define daemon drain boundaries.
@@ -18,7 +18,7 @@
 - Keep the change in the standalone `botster-tui` client and its public hub-client dependency boundary.
 - Bump `botster-hub-client` and `botster-hub-test-support` together to merged hub revision `333b75fc66de7eda521e05bea5dcc5eb91b8884c` (or a later verified main revision only if required at implementation time), updating the lockfile narrowly.
 - Add the public terminal-readback feature to the TUI compatibility expectation and consume only the new typed request/response DTOs.
-- Model one bounded attach/reconnect restoration cycle in `DogfoodApp`:
+- Model one bounded attach/reconnect restoration cycle in `TuiApp`:
   - begin the cycle with the `session_id` already resolved by `attach_selected_or_first`, the current `subscription_id`, and a monotonic `Instant` deadline five seconds after that method sends `DaemonRequest::Attach`; never source hydration/readback identity from `self.attached_session`, because the production daemon path does not emit the `AttachState` event that sets it;
   - track which session owns the displayed terminal buffer and clear `terminal_output`, the fallback slot, and session-scoped snapshot metadata before every attach hydration cycle. Each `DaemonRequest::Attach` creates a new subscription whose full history replay repopulates the buffer; preserving same-session presentation would duplicate that replay on reconnect;
   - keep issuing normal `DaemonRequest::Drain` requests at the TUI run-loop cadence while hydration is pending; the live harness should use 30 ms polling to mirror the upstream regression, and an empty drain never completes the cycle by itself;
@@ -32,7 +32,7 @@
   - guarantee the cycle terminates once on ordered history, deadline, or terminal lifecycle end, and reset its deadline state on detach, session exit, transport failure, and a new reconnect attach. Every new attach cycle resets session-owned terminal/readback presentation before the new subscription replay.
 - Reuse `append_terminal_output` and the existing `TerminalView`; add only the minimal state/helper methods needed to keep the fallback one-shot and history-first.
 - Consume `botster_hub_test_support::late_attach_history_conformance_scenario` directly in Rust tests instead of copying event JSON or inventing TUI-specific fixtures.
-- Extend the isolated live-hub dogfood so an already-running session produces output before a new TUI attachment, then prove the real socket attach/readback path renders prior output and remains usable for later live output.
+- Extend the isolated live-hub live-runtime so an already-running session produces output before a new TUI attachment, then prove the real socket attach/readback path renders prior output and remains usable for later live output.
 
 ## Non-Scope
 
@@ -64,14 +64,14 @@
 
 - TUI/client state and production path — `crates/botster-tui/src/app.rs`
   - import terminal-readback public DTOs/feature;
-  - update the live-hub required-feature assertion near the headless dogfood compatibility checks to include `FEATURE_TERMINAL_READBACK`;
+  - update the live-hub required-feature assertion near the headless live-runtime compatibility checks to include `FEATURE_TERMINAL_READBACK`;
   - keep the production minimum conformance requirement derived from the client crate's bumped revision (8 -> 10), and update the hard-coded low-revision compatibility test fixture near the existing compatibility tests so it still tests the intended mismatch rather than accidentally passing;
   - add hydration-cycle `session_id`/`subscription_id`, the five-second deadline/completion state, terminal-buffer owner session id, separate read-screen fallback slot, and snapshot-metadata state;
   - route attach, bounded drains, deadline-only read-screen fallback, and capture-snapshot through the existing persistent `HubConnection` request path;
   - apply typed response bodies without clobbering ordered history;
   - reset restoration state on lifecycle/transport boundaries;
   - add focused state-machine, renderer, compatibility, request-observation, and shared-fixture tests;
-  - strengthen the existing isolated-hub headless dogfood with a real late-attach/reconnect history proof.
+  - strengthen the existing isolated-hub headless live-runtime with a real late-attach/reconnect history proof.
 - Public dependency boundary — `crates/botster-tui/Cargo.toml`
   - update `botster-hub-client` and `botster-hub-test-support` to the same merged revision.
 - Dependency resolution — `Cargo.lock`
@@ -119,11 +119,11 @@
 - Real runtime proof in the existing isolated-hub test:
   - start a real hub and session worker through `botster-hub-test-support`;
   - create a session and produce a unique prior-output marker before constructing/attaching the TUI client;
-  - attach through the production `DogfoodApp` path and poll drains at 30 ms intervals until prior history is rendered or the five-second deadline expires;
+  - attach through the production `TuiApp` path and poll drains at 30 ms intervals until prior history is rendered or the five-second deadline expires;
   - assert the prior marker appears exactly once and the observed request log contains no `ReadScreen` on this history-present path;
   - send a distinct later-live marker through a direct daemon `DaemonRequest::SendInput`, as the hub regression does, and prove it renders exactly once after the restored marker. Do not use `InputDispatch::TerminalForward`; its pre-existing dependency on never-set `attached_session` is out of scope and tracked separately;
-  - reconnect the same `DogfoodApp` to the same session through the production reconnect path and prove both prior and later markers are still rendered in order exactly once after the hub's full replay;
-  - use a fresh `DogfoodApp` (or an explicitly proven different-session clear) for a second real-daemon attachment whose terminal buffer remains empty through the bounded window; prove the cycle reaches its finished state, exactly one `ReadScreen` and one `CaptureSnapshot` target that cycle's attach-time session id, and non-empty returned screen text (when present) is shown by `renderer::render_to_lines`; if the real empty screen is empty, assert the honest empty fallback plus finished/request state and retain the synthetic non-empty render proof rather than fabricating text;
+  - reconnect the same `TuiApp` to the same session through the production reconnect path and prove both prior and later markers are still rendered in order exactly once after the hub's full replay;
+  - use a fresh `TuiApp` (or an explicitly proven different-session clear) for a second real-daemon attachment whose terminal buffer remains empty through the bounded window; prove the cycle reaches its finished state, exactly one `ReadScreen` and one `CaptureSnapshot` target that cycle's attach-time session id, and non-empty returned screen text (when present) is shown by `renderer::render_to_lines`; if the real empty screen is empty, assert the honest empty fallback plus finished/request state and retain the synthetic non-empty render proof rather than fabricating text;
   - require both request and rendered-state evidence, not either/or: observed requests must show typed `CaptureSnapshot` on both completion paths and typed `ReadScreen` only on the expired empty-buffer path, while `renderer::render_to_lines` must show resulting snapshot metadata and any screen fallback through production surface state;
   - assert `terminal_readback` compatibility;
   - detach/shutdown cleanly so the harness does not leak a session.
@@ -134,7 +134,7 @@
   - `script/clippy`
   - `script/test-live-hub`
   - `git diff --check`
-- Review must inspect the real path: `run_loop` -> `DogfoodApp::attach_selected_or_first` -> public `HubConnection::request(Attach)` plus five-second monotonic deadline -> repeated `Drain` in `poll_hub` -> complete-on-ordered-history or deadline while preserving live bytes -> optional typed `ReadScreen` plus typed `CaptureSnapshot` -> non-fatal optional-response/restoration helper -> authoritative `terminal_output` or separate fallback slot plus snapshot metadata -> `surface` -> ratatui renderer. `AttachState` is not a hydration boundary. Code-existence or direct field mutation alone is insufficient.
+- Review must inspect the real path: `run_loop` -> `TuiApp::attach_selected_or_first` -> public `HubConnection::request(Attach)` plus five-second monotonic deadline -> repeated `Drain` in `poll_hub` -> complete-on-ordered-history or deadline while preserving live bytes -> optional typed `ReadScreen` plus typed `CaptureSnapshot` -> non-fatal optional-response/restoration helper -> authoritative `terminal_output` or separate fallback slot plus snapshot metadata -> `surface` -> ratatui renderer. `AttachState` is not a hydration boundary. Code-existence or direct field mutation alone is insufficient.
 
 ## Pipeline Gates, Checklist Evidence, And Artifacts
 

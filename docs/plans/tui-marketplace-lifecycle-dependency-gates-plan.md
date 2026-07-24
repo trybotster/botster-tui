@@ -11,7 +11,7 @@ run: run_1782348887_199357
 
 - Pipeline context: `ticket_1782338823_663615`, run `run_1782348887_199357`, active step `botster_plan`, gate `botster_plan_gate`; no prior artifacts, findings, reviews, questions, or answers were present.
 - Dependency context: both upstream dependencies are closed. PR #72 "Resolve package dependency and feature availability matrices" merged at `74fb6dd72b559ae9eef0c830cc1dd558102a36f9` on 2026-06-25, and PR #73 "Complete hub package lifecycle actions for marketplace v1" merged at `3c7a44890cb26793d97cf87a1c7f866add2b15d9` on 2026-06-25. `trybotster/botster-hub` main currently resolves to `3c7a44890cb26793d97cf87a1c7f866add2b15d9`.
-- Repo context: clean worktree before planning. This repo is a compact Rust TUI workspace. The production dogfood app, hub requests, package rows, package configuration, package entrypoint process display, action handling, and most tests live in `crates/botster-tui/src/app.rs`; generic ratatui form/action/input routing lives in `crates/botster-tui/src/renderer.rs`.
+- Repo context: clean worktree before planning. This repo is a compact Rust TUI workspace. The production live-runtime app, hub requests, package rows, package configuration, package entrypoint process display, action handling, and most tests live in `crates/botster-tui/src/app.rs`; generic ratatui form/action/input routing lives in `crates/botster-tui/src/renderer.rs`.
 - Current dependency context: `crates/botster-tui/Cargo.toml` pins `botster-hub-client` and `botster-hub-test-support` to `b1be4f53e2baf17f0c0e645ee0cd4fa139e3c8ea`, which predates PR #72/#73. The current pin has package listing/configuration/entrypoint state, but not marketplace available package DTOs, install/update plan/status DTOs, or package/dependency/feature availability DTOs.
 - Fresh hub-client context from `3c7a44890cb26793d97cf87a1c7f866add2b15d9`: public DTOs add `DaemonRequest::ListAvailablePackages`, `InspectAvailablePackage`, `PreviewPackageInstall`, `InstallPackageRegistryEntry`, `CheckPackageUpdate`, `PreviewPackageUpdate`, `ApplyPackageUpdate`; `DaemonResponse.available_packages`, `install_plan`, and `update_status`; `DaemonPackage.availability`, `dependency_availability`, `feature_availability`, `surfaces`; and related `DaemonAvailablePackage`, `DaemonPackageInstallPlan`, `DaemonPackageUpdateStatus`, `DaemonPackageAvailabilityReason`, and `DaemonPackagePin` types.
 - Vault context loaded: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], and the `botster-customize-tui` skill.
@@ -25,9 +25,9 @@ run: run_1782348887_199357
 - Render package-level blocked reasons, dependency rows, feature rows, reason/action vocabulary, package names, capability requirements, and config/auth requirement labels exactly from hub DTO fields. The TUI must not infer blocked/auth/update/dependency state from package state, config schema, or capability lists.
 - Render marketplace/available package rows from `DaemonResponse.available_packages` when list/inspect/preview/install requests are applied, including entry id, package name, version, classification, source kind/label, first-party flag, installed-vs-available state, compatibility, requested capabilities, and pin/update metadata when present.
 - Render lifecycle action results from `DaemonPackageDecision`, `DaemonPackageInstallPlan`, and `DaemonPackageUpdateStatus`, including install/update effects, diagnostics, mutates-registry, starts-entrypoints, update availability, reload-required, and restart-required.
-- Add keyboard/mouse-accessible actions where the current dogfood surface can support them without a larger navigation redesign: installed package enable/disable/remove, entrypoint start/stop/restart/status, and refresh/update status actions should use existing shared `ui.button` action dispatch. Registry install/update preview actions may require a test-only or configurable registry path; if no operator-safe path source exists, render preview/install results from DTO fixtures and document the runtime limitation instead of inventing a hidden path convention.
+- Add keyboard/mouse-accessible actions where the current live-runtime surface can support them without a larger navigation redesign: installed package enable/disable/remove, entrypoint start/stop/restart/status, and refresh/update status actions should use existing shared `ui.button` action dispatch. Registry install/update preview actions may require a test-only or configurable registry path; if no operator-safe path source exists, render preview/install results from DTO fixtures and document the runtime limitation instead of inventing a hidden path convention.
 - Preserve the existing package registry, configuration, entrypoint process, terminal, compatibility, and diagnostics behavior.
-- Update README local hub dogfood docs to mention marketplace available rows, availability gates, blocked reasons, lifecycle actions, and that the TUI consumes hub-resolved state.
+- Update README local hub live-runtime docs to mention marketplace available rows, availability gates, blocked reasons, lifecycle actions, and that the TUI consumes hub-resolved state.
 
 ## Non-Scope
 
@@ -42,18 +42,18 @@ run: run_1782348887_199357
 
 - Assumption: the authoritative source for dependency gates and lifecycle action availability is the merged `botster-hub-client` DTO surface at `3c7a44890cb26793d97cf87a1c7f866add2b15d9`, not local TUI policy.
 - Assumption: reason/action strings such as `missing_package/install_package`, `disabled_package/enable_package`, `missing_provider/install_provider`, `missing_capability/grant_capability`, `missing_config/configure_package`, `missing_auth/authenticate`, `package_disabled/enable_package`, and `fix_configuration` are stable display vocabulary supplied by the hub.
-- Assumption: the existing dogfood hub panel is the smallest viable place to render lifecycle and gate state because it already renders package list/config/process state and public diagnostics.
+- Assumption: the existing live-runtime hub panel is the smallest viable place to render lifecycle and gate state because it already renders package list/config/process state and public diagnostics.
 - Unknown: how the TUI should discover an operator-selected marketplace registry path. Implementation should avoid adding speculative config. If no existing CLI arg/env/test-support path exists, keep registry path actions out of runtime UI and prove available package rendering from public DTO fixtures.
 - Unknown: whether all lifecycle action requests return refreshed `packages`, only `package_decision`, or operator errors in every branch. Implementation must inspect compile errors and add tests around the observed public response shapes after the dependency bump.
-- Unknown: whether live hub test support includes marketplace registry fixtures for list/preview/install/update. If not, unit tests should prove the production TUI rendering/action path from public DTO fixtures, while live-hub dogfood remains the runtime compatibility smoke.
+- Unknown: whether live hub test support includes marketplace registry fixtures for list/preview/install/update. If not, unit tests should prove the production TUI rendering/action path from public DTO fixtures, while live-hub live-runtime remains the runtime compatibility smoke.
 - Worktree/target assumption: this run is bound to `target_id=tgt_c3d470bab78549df920a41e8fb0e58d8` and this checkout is the assigned worktree.
 - Convention conflict status: none. The plan follows Botster's public hub-client boundary, keeps package policy in the hub, uses existing shared UI primitives, and limits scope to the TUI client surface.
 
 ## Botster Layers Touched
 
-- TUI: primary layer; `DogfoodApp` state, package formatting, package action handling, hub/status package panel, and focused tests.
+- TUI: primary layer; `TuiApp` state, package formatting, package action handling, hub/status package panel, and focused tests.
 - Hub client boundary: dependency rev bump and consumption of public `botster-hub-client` request/response/DTO types only.
-- Docs: README local dogfood capability text and this plan artifact.
+- Docs: README local live-runtime capability text and this plan artifact.
 - Not touched: Rust hub implementation, core package resolution, Lua plugin runtime, session/client worker data plane, React SPA, Rails relay, MCP tools, Project Pipelines plugin policy.
 
 ## Affected Surfaces And Files
@@ -69,11 +69,11 @@ run: run_1782348887_199357
   - Extend package row rendering with availability, dependency availability, feature availability, and reason/action text.
   - Render marketplace rows and lifecycle/update/install plan summaries.
   - Add action handling for supported lifecycle requests through existing semantic action buttons.
-  - Add focused tests that drive `DogfoodApp::apply_response`, `surface()`, renderer output, and `handle_dispatch` request observation.
+  - Add focused tests that drive `TuiApp::apply_response`, `surface()`, renderer output, and `handle_dispatch` request observation.
 - `crates/botster-tui/src/renderer.rs`
   - No planned changes. Touch only if existing button/action routing cannot express required keyboard/mouse-accessible lifecycle actions.
 - `README.md`
-  - Update Local Hub Dogfood docs to mention hub-resolved marketplace rows, package lifecycle action results, dependency/feature gates, blocked reasons, and no TUI-side inference.
+  - Update Local Hub Production docs to mention hub-resolved marketplace rows, package lifecycle action results, dependency/feature gates, blocked reasons, and no TUI-side inference.
 - `docs/plans/tui-marketplace-lifecycle-dependency-gates-plan.md`
   - Reviewable Plan-stage artifact.
 

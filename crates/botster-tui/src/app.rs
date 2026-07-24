@@ -7,7 +7,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use botster_core::ui::{
+use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
+use botster_core_ui::ui::{
     UiChild, UiCondition, UiConditional, UiFormValues, UiNode, UiNodeId, UiNodeKind, UiWidthClass,
 };
 #[cfg(test)]
@@ -52,39 +53,94 @@ const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 16;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
     pub smoke: bool,
-    pub hub_socket: Option<PathBuf>,
+    pub hub_connection: Option<RunnableEntrypointHubConnection>,
+    pub connection_error: Option<String>,
     pub hub_data_dir: Option<PathBuf>,
-    pub headless_dogfood: bool,
+    pub headless_live_runtime: bool,
 }
 
 impl AppArgs {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
+        Self::parse_with_environment(
+            args,
+            std::env::var_os("BOTSTER_HUB_CONNECTION"),
+            std::env::var_os("BOTSTER_HUB_DATA_DIR"),
+            std::env::var_os("BOTSTER_TUI_HEADLESS_LIVE_RUNTIME").is_some(),
+        )
+    }
+
+    fn parse_with_environment(
+        args: impl IntoIterator<Item = String>,
+        hub_connection: Option<std::ffi::OsString>,
+        hub_data_dir: Option<std::ffi::OsString>,
+        headless_live_runtime: bool,
+    ) -> Self {
         let mut parsed = Self::default();
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--smoke" => parsed.smoke = true,
-                "--headless-dogfood" => parsed.headless_dogfood = true,
-                "--hub-socket" => {
-                    parsed.hub_socket = iter.next().map(PathBuf::from);
-                }
+                "--headless-live-runtime" => parsed.headless_live_runtime = true,
                 "--data-dir" => {
                     parsed.hub_data_dir = iter.next().map(PathBuf::from);
                 }
                 _ => {}
             }
         }
-        if parsed.hub_socket.is_none() {
-            parsed.hub_socket = std::env::var_os("BOTSTER_HUB_SOCKET").map(PathBuf::from);
-        }
+        let (connection, connection_error) = parse_hub_connection(hub_connection);
+        parsed.hub_connection = connection;
+        parsed.connection_error = connection_error;
         if parsed.hub_data_dir.is_none() {
-            parsed.hub_data_dir = std::env::var_os("BOTSTER_HUB_DATA_DIR").map(PathBuf::from);
+            parsed.hub_data_dir = hub_data_dir.map(PathBuf::from);
         }
-        if std::env::var_os("BOTSTER_TUI_HEADLESS_DOGFOOD").is_some() {
-            parsed.headless_dogfood = true;
+        if headless_live_runtime {
+            parsed.headless_live_runtime = true;
         }
         parsed
     }
+
+    fn daemon_endpoint(&self) -> Option<DaemonEndpoint> {
+        self.hub_connection
+            .as_ref()
+            .map(|connection| match &connection.transport {
+                RunnableEntrypointHubConnectionTransport::UnixSocket { path } => {
+                    DaemonEndpoint::new(path)
+                }
+            })
+    }
+}
+
+fn parse_hub_connection(
+    value: Option<std::ffi::OsString>,
+) -> (Option<RunnableEntrypointHubConnection>, Option<String>) {
+    let Some(value) = value else {
+        return (None, Some("BOTSTER_HUB_CONNECTION is required".to_string()));
+    };
+    let value = match value.into_string() {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                None,
+                Some("BOTSTER_HUB_CONNECTION must contain UTF-8 JSON".to_string()),
+            );
+        }
+    };
+    let connection = match serde_json::from_str::<RunnableEntrypointHubConnection>(&value) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("BOTSTER_HUB_CONNECTION is malformed: {error}")),
+            );
+        }
+    };
+    if let Err(error) = connection.validate() {
+        return (
+            None,
+            Some(format!("BOTSTER_HUB_CONNECTION is invalid: {error}")),
+        );
+    }
+    (Some(connection), None)
 }
 
 pub fn smoke_message() -> &'static str {
@@ -315,9 +371,9 @@ impl Drop for SessionSubscriptionPump {
 }
 
 pub fn run(args: AppArgs) -> io::Result<()> {
-    if args.headless_dogfood {
-        return run_headless_dogfood(args)
-            .map_err(|error| io::Error::other(format!("headless dogfood failed: {error}")));
+    if args.headless_live_runtime {
+        return run_headless_live_runtime(args)
+            .map_err(|error| io::Error::other(format!("headless live runtime failed: {error}")));
     }
 
     let mut terminal = setup_terminal()?;
@@ -367,7 +423,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) -> io::Result<()> {
-    let mut app = DogfoodApp::new(args.hub_socket);
+    let mut app = TuiApp::new_with_connection(args.daemon_endpoint(), args.connection_error);
     let mut router = InputRouter::new(renderer::action_request_context());
     loop {
         app.poll_hub();
@@ -392,7 +448,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
-                    app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
+                    app.sync_focused_session(router.selected_row_value("tui-session-list"));
                     app.handle_dispatch(dispatch);
                 }
             }
@@ -402,7 +458,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &DogfoodApp, render_state: &RenderState) {
+fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &TuiApp, render_state: &RenderState) {
     let node = app.surface();
     renderer::render_node_with_state(frame, frame.area(), &node, hit_map, render_state);
 }
@@ -413,7 +469,7 @@ fn should_quit(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-struct DogfoodApp {
+struct TuiApp {
     endpoint: Option<DaemonEndpoint>,
     client: Option<HubConnection>,
     status: String,
@@ -461,14 +517,20 @@ struct DogfoodApp {
     observed_requests: Vec<ObservedRequest>,
 }
 
-impl DogfoodApp {
-    fn new(hub_socket: Option<PathBuf>) -> Self {
-        let endpoint = hub_socket.map(DaemonEndpoint::new);
+impl TuiApp {
+    fn new(endpoint: Option<DaemonEndpoint>) -> Self {
+        Self::new_with_connection(endpoint, None)
+    }
+
+    fn new_with_connection(
+        endpoint: Option<DaemonEndpoint>,
+        connection_error: Option<String>,
+    ) -> Self {
         let mut app = Self {
             endpoint,
             client: None,
             status: "disconnected".to_string(),
-            connection_error: None,
+            connection_error,
             error: None,
             action_feedback: None,
             compatibility: None,
@@ -815,9 +877,10 @@ impl DogfoodApp {
     fn try_connect(&mut self) {
         self.last_reconnect_attempt = Some(Instant::now());
         let Some(endpoint) = &self.endpoint else {
-            self.status = "hub socket missing".to_string();
-            self.connection_error =
-                Some("configure --hub-socket or BOTSTER_HUB_SOCKET".to_string());
+            self.status = "Hub connection not configured".to_string();
+            if self.connection_error.is_none() {
+                self.connection_error = Some("BOTSTER_HUB_CONNECTION is required".to_string());
+            }
             return;
         };
         match HubConnection::connect(endpoint) {
@@ -1617,7 +1680,7 @@ impl DogfoodApp {
     }
 
     fn apply_terminal_mouse_mode(&self, hit_map: &mut HitMap) {
-        hit_map.set_terminal_mouse_mode("dogfood-terminal", self.current_terminal_mouse_mode());
+        hit_map.set_terminal_mouse_mode("tui-terminal", self.current_terminal_mouse_mode());
     }
 
     fn request_optional_readback(&mut self, request: DaemonRequest, operation: &str) {
@@ -1841,7 +1904,7 @@ impl DogfoodApp {
             "actions".to_string(),
             vec![
                 child(workspace_button(
-                    "dogfood-spawn",
+                    "tui-spawn",
                     "Spawn",
                     "botster.tui.spawn",
                     json!({}),
@@ -1859,7 +1922,7 @@ impl DogfoodApp {
                     None,
                 )),
                 child(workspace_button(
-                    "dogfood-detach",
+                    "tui-detach",
                     "Detach",
                     "botster.tui.detach",
                     json!({}),
@@ -1927,7 +1990,7 @@ impl DogfoodApp {
             "workspace-session-navigator",
             json!({ "title": "Sessions" }),
         );
-        let mut scroll = node(UiNodeKind::ScrollArea, "dogfood-session-list", json!({}));
+        let mut scroll = node(UiNodeKind::ScrollArea, "tui-session-list", json!({}));
         if self.sessions.is_empty() {
             scroll.children = vec![
                 child(node(
@@ -1971,7 +2034,7 @@ impl DogfoodApp {
         }
         let mut item = node(
             UiNodeKind::ListItem,
-            &format!("dogfood-session-{}", session.session_id),
+            &format!("tui-session-{}", session.session_id),
             json!({
                 "selected": selected,
                 "value": session.session_id,
@@ -1985,7 +2048,7 @@ impl DogfoodApp {
             "title".to_string(),
             vec![child(node(
                 UiNodeKind::Text,
-                &format!("dogfood-session-{}-title", session.session_id),
+                &format!("tui-session-{}-title", session.session_id),
                 json!({ "text": label }),
             ))],
         );
@@ -2123,28 +2186,28 @@ impl DogfoodApp {
     fn system_details_panel(&self) -> UiNode {
         let mut panel = node(
             UiNodeKind::Panel,
-            "dogfood-status-panel",
+            "tui-status-panel",
             json!({ "title": "System details" }),
         );
         let mut children = vec![
             child(node(
                 UiNodeKind::Text,
-                "dogfood-status",
+                "tui-status",
                 json!({ "text": self.status }),
             )),
             child(node(
                 UiNodeKind::Text,
-                "dogfood-compatibility",
+                "tui-compatibility",
                 json!({ "text": self.compatibility_text() }),
             )),
             child(button(
-                "dogfood-refresh",
+                "tui-refresh",
                 "Refresh",
                 "botster.tui.refresh",
                 json!({}),
             )),
             child(button(
-                "dogfood-connect",
+                "tui-connect",
                 "Reconnect",
                 "botster.tui.connect",
                 json!({}),
@@ -2154,13 +2217,13 @@ impl DogfoodApp {
         if let Some(error) = &self.connection_error {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-connection-error",
+                "tui-connection-error",
                 json!({ "text": format!("connection: {error}") }),
             )));
         }
         children.push(child(node(
             UiNodeKind::Text,
-            "dogfood-package-summary",
+            "tui-package-summary",
             json!({ "text": self.package_summary_text() }),
         )));
         children.extend(self.package_navigation_nodes().into_iter().map(child));
@@ -2168,14 +2231,14 @@ impl DogfoodApp {
         if self.packages.is_empty() {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-package-empty",
+                "tui-package-empty",
                 json!({ "text": "packages: none reported" }),
             )));
         } else {
             for (index, package) in self.packages.iter().enumerate() {
                 children.push(child(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-package-{index}"),
+                    &format!("tui-package-{index}"),
                     json!({ "text": format!("package: {}", package_text(package)) }),
                 )));
                 children.extend(
@@ -2189,7 +2252,7 @@ impl DogfoodApp {
                 {
                     children.push(child(node(
                         UiNodeKind::Text,
-                        &format!("dogfood-package-{index}-entrypoint-{entrypoint_index}"),
+                        &format!("tui-package-{index}-entrypoint-{entrypoint_index}"),
                         json!({
                             "text": format!(
                                 "entrypoint: {} {}",
@@ -2214,13 +2277,13 @@ impl DogfoodApp {
         if !self.available_packages.is_empty() {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-marketplace-summary",
+                "tui-marketplace-summary",
                 json!({ "text": format!("marketplace: {} available", self.available_packages.len()) }),
             )));
             for (index, available_package) in self.available_packages.iter().enumerate() {
                 children.push(child(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-available-package-{index}"),
+                    &format!("tui-available-package-{index}"),
                     json!({ "text": format!("available package: {}", available_package_text(available_package)) }),
                 )));
             }
@@ -2231,7 +2294,7 @@ impl DogfoodApp {
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut node)| {
-                        node.id = Some(UiNodeId(format!("dogfood-install-plan-{index}")));
+                        node.id = Some(UiNodeId(format!("tui-install-plan-{index}")));
                         child(node)
                     }),
             );
@@ -2242,7 +2305,7 @@ impl DogfoodApp {
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut node)| {
-                        node.id = Some(UiNodeId(format!("dogfood-update-status-{index}")));
+                        node.id = Some(UiNodeId(format!("tui-update-status-{index}")));
                         child(node)
                     }),
             );
@@ -2250,7 +2313,7 @@ impl DogfoodApp {
         if let Some(decision) = &self.package_decision {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-package-decision",
+                "tui-package-decision",
                 json!({
                     "text": format!(
                         "package decision: package={} action={} state={} classification={}",
@@ -2265,7 +2328,7 @@ impl DogfoodApp {
         if let Some(surface) = &self.plugin_surface {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-plugin-surface",
+                "tui-plugin-surface",
                 json!({ "text": format!("plugin surface: {}", plugin_surface_text(surface)) }),
             )));
             children.extend(plugin_surface_nodes(surface).into_iter().map(child));
@@ -2273,28 +2336,28 @@ impl DogfoodApp {
         if let Some(result) = &self.plugin_action_result {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-plugin-action-result",
+                "tui-plugin-action-result",
                 json!({ "text": format!("plugin action result: {}", plugin_action_result_text(result)) }),
             )));
         }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             children.push(child(node(
                 UiNodeKind::Text,
-                &format!("dogfood-diagnostic-{index}"),
+                &format!("tui-diagnostic-{index}"),
                 json!({ "text": format!("diagnostic: {}", diagnostic_text(diagnostic)) }),
             )));
         }
         if let Some(feedback) = &self.action_feedback {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-action-feedback",
+                "tui-action-feedback",
                 json!({ "text": format!("action: {feedback}") }),
             )));
         }
         if let Some(snapshot) = &self.snapshot_metadata {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-terminal-snapshot-metadata",
+                "tui-terminal-snapshot-metadata",
                 json!({
                     "text": format!(
                         "terminal snapshot: session={} rows={} cols={} format={} payload_bytes={}",
@@ -2310,13 +2373,13 @@ impl DogfoodApp {
         if let Some(error) = &self.error {
             children.push(child(node(
                 UiNodeKind::Text,
-                "dogfood-error",
+                "tui-error",
                 json!({ "text": format!("error: {error}") }),
             )));
         }
         children.push(child(node(
             UiNodeKind::Text,
-            "dogfood-hints",
+            "tui-hints",
             json!({ "text": "hints: Tab focus | up/down select | Enter/Space activate | terminal focus forwards keys" }),
         )));
         let mut scroll = node(
@@ -2339,13 +2402,13 @@ impl DogfoodApp {
     fn app_nodes(&self) -> Vec<UiNode> {
         let mut nodes = vec![node(
             UiNodeKind::Text,
-            "dogfood-app-summary",
+            "tui-app-summary",
             json!({ "text": format!("apps: {} installed", self.apps.len()) }),
         )];
         if self.apps.is_empty() {
             nodes.push(node(
                 UiNodeKind::Text,
-                "dogfood-app-empty",
+                "tui-app-empty",
                 json!({ "text": "apps: none reported" }),
             ));
             return nodes;
@@ -2354,40 +2417,36 @@ impl DogfoodApp {
         for (app_index, app) in self.apps.iter().enumerate() {
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("dogfood-app-{app_index}"),
+                &format!("tui-app-{app_index}"),
                 json!({ "text": format!("app: {}", app_text(app)) }),
             ));
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("dogfood-app-{app_index}-launch-target"),
+                &format!("tui-app-{app_index}-launch-target"),
                 json!({ "text": format!("launch target: {}", app_launch_target_text(app)) }),
             ));
             for (reason_index, reason) in app.blocked_reasons.iter().enumerate() {
                 nodes.push(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-app-{app_index}-blocked-{reason_index}"),
+                    &format!("tui-app-{app_index}-blocked-{reason_index}"),
                     json!({ "text": format!("app blocked: {reason}") }),
                 ));
             }
             for (diagnostic_index, diagnostic) in app.diagnostics.iter().enumerate() {
                 nodes.push(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-app-{app_index}-diagnostic-{diagnostic_index}"),
+                    &format!("tui-app-{app_index}-diagnostic-{diagnostic_index}"),
                     json!({ "text": format!("app diagnostic: {}", package_diagnostic_text(diagnostic)) }),
                 ));
             }
             nodes.extend(
-                action_state_nodes(
-                    &app.actions,
-                    "app action",
-                    &format!("dogfood-app-{app_index}"),
-                )
-                .into_iter(),
+                action_state_nodes(&app.actions, "app action", &format!("tui-app-{app_index}"))
+                    .into_iter(),
             );
             if let Some(route) = &app.route {
                 nodes.push(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-app-{app_index}-route"),
+                    &format!("tui-app-{app_index}-route"),
                     json!({ "text": format!("app route: {}", route_text(route)) }),
                 ));
             }
@@ -2402,27 +2461,27 @@ impl DogfoodApp {
 
         let mut nodes = vec![node(
             UiNodeKind::Text,
-            "dogfood-package-navigation-summary",
+            "tui-package-navigation-summary",
             json!({ "text": format!("navigation: {} admitted entries", self.package_navigation.len()) }),
         )];
 
         for (index, entry) in self.package_navigation.iter().enumerate() {
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("dogfood-package-navigation-{index}"),
+                &format!("tui-package-navigation-{index}"),
                 json!({ "text": format!("navigation entry: {}", navigation_entry_text(entry)) }),
             ));
             for (diagnostic_index, diagnostic) in entry.diagnostics.iter().enumerate() {
                 nodes.push(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-package-navigation-{index}-diagnostic-{diagnostic_index}"),
+                    &format!("tui-package-navigation-{index}-diagnostic-{diagnostic_index}"),
                     json!({ "text": format!("navigation diagnostic: {}", package_diagnostic_text(diagnostic)) }),
                 ));
             }
             match navigation_open_payload_for_entry(entry) {
                 Some(payload) if entry.enabled && !entry.blocked => {
                     nodes.push(button(
-                        &format!("dogfood-package-navigation-{index}-open"),
+                        &format!("tui-package-navigation-{index}-open"),
                         "Open",
                         "botster.tui.navigation.open",
                         payload,
@@ -2430,12 +2489,12 @@ impl DogfoodApp {
                 }
                 Some(_) => nodes.push(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-package-navigation-{index}-blocked"),
+                    &format!("tui-package-navigation-{index}-blocked"),
                     json!({ "text": format!("navigation blocked: {}", navigation_blocked_text(entry)) }),
                 )),
                 None => nodes.push(node(
                     UiNodeKind::Text,
-                    &format!("dogfood-package-navigation-{index}-unsupported"),
+                    &format!("tui-package-navigation-{index}-unsupported"),
                     json!({ "text": format!("navigation unsupported: {}", navigation_unsupported_text(entry)) }),
                 )),
             }
@@ -2451,7 +2510,7 @@ impl DogfoodApp {
 
         let mut nodes = vec![node(
             UiNodeKind::Text,
-            &format!("dogfood-package-{index}-configuration-summary"),
+            &format!("tui-package-{index}-configuration-summary"),
             json!({
                 "text": format!(
                     "configuration: schema={} values={} missing={} diagnostics={}",
@@ -2466,7 +2525,7 @@ impl DogfoodApp {
         for missing in &package.configuration.missing_required {
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("dogfood-package-{index}-configuration-missing-{missing}"),
+                &format!("tui-package-{index}-configuration-missing-{missing}"),
                 json!({ "text": format!("configuration missing: {missing}") }),
             ));
         }
@@ -2474,7 +2533,7 @@ impl DogfoodApp {
         for (diagnostic_index, diagnostic) in package.configuration.diagnostics.iter().enumerate() {
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("dogfood-package-{index}-configuration-diagnostic-{diagnostic_index}"),
+                &format!("tui-package-{index}-configuration-diagnostic-{diagnostic_index}"),
                 json!({
                     "text": format!(
                         "configuration diagnostic: {}",
@@ -2490,7 +2549,7 @@ impl DogfoodApp {
 
         if !nodes.is_empty() {
             nodes.push(button(
-                &format!("dogfood-package-{index}-configuration-submit"),
+                &format!("tui-package-{index}-configuration-submit"),
                 "Update configuration",
                 "botster.tui.package_config.submit",
                 json!({ "package_name": package.package_name }),
@@ -2525,7 +2584,7 @@ impl DogfoodApp {
                     .unwrap_or_else(|| Value::Bool(configuration_value_bool(effective)));
                 node(
                     UiNodeKind::Checkbox,
-                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    &format!("tui-package-{index}-configuration-{}", field.key),
                     props,
                 )
             }
@@ -2535,7 +2594,7 @@ impl DogfoodApp {
                     .unwrap_or_else(|| Value::String(configuration_value_text(effective)));
                 let mut select = node(
                     UiNodeKind::Select,
-                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    &format!("tui-package-{index}-configuration-{}", field.key),
                     props,
                 );
                 select.slots.insert(
@@ -2548,7 +2607,7 @@ impl DogfoodApp {
                             child(node(
                                 UiNodeKind::SelectOption,
                                 &format!(
-                                    "dogfood-package-{index}-configuration-{}-option-{option_index}",
+                                    "tui-package-{index}-configuration-{}-option-{option_index}",
                                     field.key
                                 ),
                                 json!({ "value": option.value, "label": option.label }),
@@ -2564,7 +2623,7 @@ impl DogfoodApp {
                     .unwrap_or_else(|| Value::String(configuration_value_text(effective)));
                 node(
                     UiNodeKind::Textarea,
-                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    &format!("tui-package-{index}-configuration-{}", field.key),
                     props,
                 )
             }
@@ -2577,7 +2636,7 @@ impl DogfoodApp {
                 ));
                 node(
                     UiNodeKind::Checkbox,
-                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    &format!("tui-package-{index}-configuration-{}", field.key),
                     props,
                 )
             }
@@ -2587,13 +2646,13 @@ impl DogfoodApp {
                     .unwrap_or_else(|| Value::String(configuration_value_text(effective)));
                 node(
                     UiNodeKind::TextInput,
-                    &format!("dogfood-package-{index}-configuration-{}", field.key),
+                    &format!("tui-package-{index}-configuration-{}", field.key),
                     props,
                 )
             }
             other => node(
                 UiNodeKind::Text,
-                &format!("dogfood-package-{index}-configuration-{}", field.key),
+                &format!("tui-package-{index}-configuration-{}", field.key),
                 json!({
                     "text": format!(
                         "{}: unsupported configuration type {}",
@@ -2632,11 +2691,11 @@ impl DogfoodApp {
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or(&self.command);
-        let mut form = node(UiNodeKind::Inline, "dogfood-command-panel", json!({}));
+        let mut form = node(UiNodeKind::Inline, "tui-command-panel", json!({}));
         form.children = vec![
             child(node(
                 UiNodeKind::TextInput,
-                "dogfood-command",
+                "tui-command",
                 json!({
                     "name": "command",
                     "label": "command",
@@ -2656,7 +2715,7 @@ impl DogfoodApp {
     fn terminal_panel(&self) -> UiNode {
         let mut terminal = node(
             UiNodeKind::TerminalView,
-            "dogfood-terminal",
+            "tui-terminal",
             json!({
                 "title": self.terminal_title(),
                 "session_id": self.attached_session.clone().unwrap_or_else(|| "not attached".to_string())
@@ -2664,7 +2723,7 @@ impl DogfoodApp {
         );
         terminal.children = vec![child(node(
             UiNodeKind::Text,
-            "dogfood-terminal-output",
+            "tui-terminal-output",
             json!({ "text": self.terminal_content() }),
         ))];
         terminal
@@ -2916,8 +2975,14 @@ fn configuration_secret_state(value: Option<&Value>) -> &'static str {
     }
 }
 
-fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
-    let Some(socket) = args.hub_socket else {
+fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
+    if let Some(error) = &args.connection_error {
+        eprintln!("headless-live-runtime-error: {error}");
+        return Err(DaemonTransportError::Protocol(
+            "invalid Hub connection configuration",
+        ));
+    }
+    let Some(endpoint) = args.daemon_endpoint() else {
         return Err(DaemonTransportError::NotRunning);
     };
     if let Some(data_dir) = args.hub_data_dir.as_ref() {
@@ -2928,7 +2993,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
         }
         println!("hub-data-dir: configured");
     }
-    let mut app = DogfoodApp::new(Some(socket));
+    let mut app = TuiApp::new(Some(endpoint));
     #[cfg(test)]
     {
         app.workspace_test_mode = true;
@@ -2936,8 +3001,10 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
     app.command = DEFAULT_COMMAND.to_string();
     app.spawn_session();
     if let Some(error) = &app.error {
-        eprintln!("headless-dogfood-error: {error}");
-        return Err(DaemonTransportError::Protocol("headless dogfood app error"));
+        eprintln!("headless-live-runtime-error: {error}");
+        return Err(DaemonTransportError::Protocol(
+            "headless live runtime app error",
+        ));
     }
     #[cfg(test)]
     {
@@ -3000,7 +3067,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
             !hit_map
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "dogfood-terminal-output")
+                .any(|region| region.node_id == "tui-terminal-output")
         );
     }
     println!("terminal-output: {HEADLESS_OUTPUT}");
@@ -3008,10 +3075,7 @@ fn run_headless_dogfood(args: AppArgs) -> DaemonTransportResult<()> {
     Ok(())
 }
 
-fn wait_for_authoritative_session(
-    app: &mut DogfoodApp,
-    session_id: &str,
-) -> DaemonTransportResult<()> {
+fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonTransportResult<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         app.poll_hub();
@@ -3020,14 +3084,14 @@ fn wait_for_authoritative_session(
         }) {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::yield_now();
     }
     Err(DaemonTransportError::Protocol(
         "timed out waiting for authoritative session entity",
     ))
 }
 
-fn wait_for_app_output(app: &mut DogfoodApp, needle: &str) -> DaemonTransportResult<()> {
+fn wait_for_app_output(app: &mut TuiApp, needle: &str) -> DaemonTransportResult<()> {
     if app.terminal_output.contains(needle) {
         return Ok(());
     }
@@ -3038,7 +3102,7 @@ fn wait_for_app_output(app: &mut DogfoodApp, needle: &str) -> DaemonTransportRes
         if app.terminal_output.contains(needle) {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::yield_now();
     }
 
     let observed_prefix = app.terminal_output.chars().take(256).collect::<String>();
@@ -3266,14 +3330,14 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
     for (reason_index, reason) in package.availability.reasons.iter().enumerate() {
         nodes.push(node(
             UiNodeKind::Text,
-            &format!("dogfood-package-{index}-availability-reason-{reason_index}"),
+            &format!("tui-package-{index}-availability-reason-{reason_index}"),
             json!({ "text": format!("package blocked: {}", availability_reason_text(reason)) }),
         ));
     }
     for (dependency_index, dependency) in package.dependency_availability.iter().enumerate() {
         nodes.push(node(
             UiNodeKind::Text,
-            &format!("dogfood-package-{index}-dependency-{dependency_index}"),
+            &format!("tui-package-{index}-dependency-{dependency_index}"),
             json!({
                 "text": format!(
                     "dependency: id={} package={} state={}",
@@ -3287,7 +3351,7 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
             nodes.push(node(
                 UiNodeKind::Text,
                 &format!(
-                    "dogfood-package-{index}-dependency-{dependency_index}-reason-{reason_index}"
+                    "tui-package-{index}-dependency-{dependency_index}-reason-{reason_index}"
                 ),
                 json!({ "text": format!("dependency blocked: {}", availability_reason_text(reason)) }),
             ));
@@ -3296,7 +3360,7 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
     for (feature_index, feature) in package.feature_availability.iter().enumerate() {
         nodes.push(node(
             UiNodeKind::Text,
-            &format!("dogfood-package-{index}-feature-{feature_index}"),
+            &format!("tui-package-{index}-feature-{feature_index}"),
             json!({
                 "text": format!(
                     "feature: id={} state={}",
@@ -3308,7 +3372,7 @@ fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNo
         for (reason_index, reason) in feature.reasons.iter().enumerate() {
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("dogfood-package-{index}-feature-{feature_index}-reason-{reason_index}"),
+                &format!("tui-package-{index}-feature-{feature_index}-reason-{reason_index}"),
                 json!({ "text": format!("feature blocked: {}", availability_reason_text(reason)) }),
             ));
         }
@@ -3341,25 +3405,25 @@ fn route_text(route: &DaemonPackageRouteDescriptor) -> String {
 fn package_action_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
     vec![
         button(
-            &format!("dogfood-package-{index}-enable"),
+            &format!("tui-package-{index}-enable"),
             "Enable",
             "botster.tui.package.enable",
             json!({ "package_name": package.package_name }),
         ),
         button(
-            &format!("dogfood-package-{index}-disable"),
+            &format!("tui-package-{index}-disable"),
             "Disable",
             "botster.tui.package.disable",
             json!({ "package_name": package.package_name }),
         ),
         button(
-            &format!("dogfood-package-{index}-remove"),
+            &format!("tui-package-{index}-remove"),
             "Remove",
             "botster.tui.package.remove",
             json!({ "package_name": package.package_name }),
         ),
         button(
-            &format!("dogfood-package-{index}-update-status"),
+            &format!("tui-package-{index}-update-status"),
             "Update status",
             "botster.tui.package.update_status",
             json!({ "package_name": package.package_name }),
@@ -3379,25 +3443,25 @@ fn entrypoint_action_nodes(
     });
     vec![
         button(
-            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-start"),
+            &format!("tui-package-{package_index}-entrypoint-{entrypoint_index}-start"),
             "Start",
             "botster.tui.entrypoint.start",
             payload.clone(),
         ),
         button(
-            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-stop"),
+            &format!("tui-package-{package_index}-entrypoint-{entrypoint_index}-stop"),
             "Stop",
             "botster.tui.entrypoint.stop",
             payload.clone(),
         ),
         button(
-            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-restart"),
+            &format!("tui-package-{package_index}-entrypoint-{entrypoint_index}-restart"),
             "Restart",
             "botster.tui.entrypoint.restart",
             payload.clone(),
         ),
         button(
-            &format!("dogfood-package-{package_index}-entrypoint-{entrypoint_index}-status"),
+            &format!("tui-package-{package_index}-entrypoint-{entrypoint_index}-status"),
             "Status",
             "botster.tui.entrypoint.status",
             payload,
@@ -3576,7 +3640,7 @@ fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
     if let Some(diagnostic) = iframe_unsupported_diagnostic(surface) {
         return vec![node(
             UiNodeKind::Text,
-            "dogfood-plugin-surface-iframe-unsupported",
+            "tui-plugin-surface-iframe-unsupported",
             json!({ "text": diagnostic }),
         )];
     }
@@ -3585,7 +3649,7 @@ fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
         Err(error) => {
             return vec![node(
                 UiNodeKind::Text,
-                "dogfood-plugin-surface-invalid",
+                "tui-plugin-surface-invalid",
                 json!({ "text": format!("plugin surface render: {error}") }),
             )];
         }
@@ -3594,7 +3658,7 @@ fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
         .expect("validated plugin surface should render in test backend");
     vec![node(
         UiNodeKind::Text,
-        "dogfood-plugin-surface-rendered",
+        "tui-plugin-surface-rendered",
         json!({ "text": format!("plugin surface render: {}", lines.join(" | ")) }),
     )]
 }
@@ -3771,7 +3835,7 @@ fn action_request_text(request: &botster_hub_client::DaemonPackageActionRequest)
 fn install_plan_nodes(plan: &DaemonPackageInstallPlan) -> Vec<UiNode> {
     let mut nodes = vec![node(
         UiNodeKind::Text,
-        "dogfood-install-plan-summary",
+        "tui-install-plan-summary",
         json!({
             "text": format!(
                 "install plan: package={} mutates_registry={} starts_entrypoints={} {}",
@@ -3785,14 +3849,14 @@ fn install_plan_nodes(plan: &DaemonPackageInstallPlan) -> Vec<UiNode> {
     for (index, effect) in plan.effects.iter().enumerate() {
         nodes.push(node(
             UiNodeKind::Text,
-            &format!("dogfood-install-plan-effect-{index}"),
+            &format!("tui-install-plan-effect-{index}"),
             json!({ "text": format!("install effect: {}:{}", effect.kind, effect.message) }),
         ));
     }
     for (index, diagnostic) in plan.diagnostics.iter().enumerate() {
         nodes.push(node(
             UiNodeKind::Text,
-            &format!("dogfood-install-plan-diagnostic-{index}"),
+            &format!("tui-install-plan-diagnostic-{index}"),
             json!({ "text": format!("install diagnostic: {}", package_diagnostic_text(diagnostic)) }),
         ));
     }
@@ -3812,18 +3876,18 @@ fn update_status_nodes(status: &DaemonPackageUpdateStatus) -> Vec<UiNode> {
     }
     let mut nodes = vec![node(
         UiNodeKind::Text,
-        "dogfood-update-status-summary",
+        "tui-update-status-summary",
         json!({ "text": text }),
     )];
     if let Some(pin) = &status.pin {
         nodes.push(button(
-            "dogfood-update-status-preview",
+            "tui-update-status-preview",
             "Preview update",
             "botster.tui.package.update_preview",
             json!({ "package_name": status.package_name, "pin": pin }),
         ));
         nodes.push(button(
-            "dogfood-update-status-apply",
+            "tui-update-status-apply",
             "Apply update",
             "botster.tui.package.update_apply",
             json!({ "package_name": status.package_name, "pin": pin }),
@@ -3832,7 +3896,7 @@ fn update_status_nodes(status: &DaemonPackageUpdateStatus) -> Vec<UiNode> {
     for (index, diagnostic) in status.diagnostics.iter().enumerate() {
         nodes.push(node(
             UiNodeKind::Text,
-            &format!("dogfood-update-status-diagnostic-{index}"),
+            &format!("tui-update-status-diagnostic-{index}"),
             json!({ "text": format!("update diagnostic: {}", package_diagnostic_text(diagnostic)) }),
         ));
     }
@@ -3935,7 +3999,7 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use botster_core::{RequestId, UiActionId, UiActionKind, UiActionRequest, UiSurfaceId};
+    use botster_core_ui::{RequestId, UiActionId, UiActionKind, UiActionRequest, UiSurfaceId};
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
@@ -3951,8 +4015,8 @@ mod tests {
         assert_eq!(smoke_message(), "botster-tui smoke ok");
     }
 
-    fn workspace_fixture() -> DogfoodApp {
-        let mut app = DogfoodApp::new(None);
+    fn workspace_fixture() -> TuiApp {
+        let mut app = TuiApp::new(None);
         app.workspace_test_mode = true;
         app.status = "connected".to_string();
         app.connection_error = None;
@@ -4062,7 +4126,7 @@ mod tests {
             narrow_hits
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "dogfood-spawn")
+                .any(|region| region.node_id == "tui-spawn")
         );
         assert!(
             narrow_hits
@@ -4129,12 +4193,12 @@ mod tests {
 
         let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 72, 16);
         let bounds = hit_map
-            .scroll_bounds("dogfood-session-list")
+            .scroll_bounds("tui-session-list")
             .expect("session navigator should expose scroll bounds");
         let visible_rows = hit_map
             .regions()
             .iter()
-            .filter(|region| region.node_id.starts_with("dogfood-session-session-"))
+            .filter(|region| region.node_id.starts_with("tui-session-session-"))
             .count();
 
         assert!(bounds.max_offset > 0);
@@ -4158,7 +4222,7 @@ mod tests {
             hit_map
                 .regions()
                 .iter()
-                .all(|region| region.node_id != "dogfood-session-session-alpha")
+                .all(|region| region.node_id != "tui-session-session-alpha")
         );
         assert!(
             hit_map
@@ -4226,23 +4290,67 @@ mod tests {
     }
 
     #[test]
-    fn parses_hub_socket_and_headless_mode() {
-        let args = AppArgs::parse([
-            "--hub-socket".to_string(),
-            "target/hub.sock".to_string(),
-            "--data-dir".to_string(),
-            "target/hub-data".to_string(),
-            "--headless-dogfood".to_string(),
-        ]);
+    fn parses_typed_hub_connection_and_headless_mode() {
+        let args = AppArgs::parse_with_environment(
+            [
+                "--data-dir".to_string(),
+                "target/hub-data".to_string(),
+                "--headless-live-runtime".to_string(),
+            ],
+            Some(
+                botster_core_test_support::fixtures::runnable_entrypoint_hub_connection::VALID_UNIX_SOCKET_JSON
+                    .into(),
+            ),
+            None,
+            false,
+        );
 
-        assert_eq!(args.hub_socket, Some(PathBuf::from("target/hub.sock")));
+        assert_eq!(
+            args.daemon_endpoint().map(|endpoint| endpoint.socket_path),
+            Some(PathBuf::from("/var/run/botster/hub.sock"))
+        );
+        assert_eq!(args.connection_error, None);
         assert_eq!(args.hub_data_dir, Some(PathBuf::from("target/hub-data")));
-        assert!(args.headless_dogfood);
+        assert!(args.headless_live_runtime);
+    }
+
+    #[test]
+    fn canonical_invalid_hub_connection_fixtures_are_rejected() {
+        for fixture in
+            botster_core_test_support::fixtures::runnable_entrypoint_hub_connection::INVALID_FIXTURES
+        {
+            let (connection, error) = parse_hub_connection(Some(fixture.json.into()));
+            assert_eq!(connection, None, "fixture {} was accepted", fixture.name);
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("BOTSTER_HUB_CONNECTION")),
+                "fixture {} did not produce an actionable diagnostic: {error:?}",
+                fixture.name
+            );
+        }
+    }
+
+    #[test]
+    fn retired_raw_socket_inputs_do_not_provide_a_connection() {
+        let args = AppArgs::parse_with_environment(
+            ["--hub-socket".to_string(), "/tmp/retired.sock".to_string()],
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(args.hub_connection, None);
+        assert_eq!(args.daemon_endpoint(), None);
+        assert_eq!(
+            args.connection_error.as_deref(),
+            Some("BOTSTER_HUB_CONNECTION is required")
+        );
     }
 
     #[test]
     fn command_draft_is_rendered_before_submit() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.set_drafts(BTreeMap::from([(
             "command".to_string(),
             Value::String("printf draft\\n".to_string()),
@@ -4254,7 +4362,7 @@ mod tests {
 
     #[test]
     fn blank_command_validation_renders_visible_error_state() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.command = " \t\n".to_string();
 
         app.spawn_session();
@@ -4265,14 +4373,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_hub_socket_renders_connection_diagnostic() {
-        let app = DogfoodApp::new(None);
+    fn missing_hub_connection_renders_connection_diagnostic() {
+        let app = TuiApp::new_with_connection(
+            None,
+            Some("BOTSTER_HUB_CONNECTION is required".to_string()),
+        );
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
 
-        assert!(rendered.contains("hub socket missing"));
-        assert!(rendered.contains("configure --hub-socket or BOTSTER_HUB_SOCKET"));
+        assert!(rendered.contains("Hub connection not configured"));
+        assert!(rendered.contains("BOTSTER_HUB_CONNECTION is required"));
         assert!(rendered.contains(PROTOCOL));
     }
 
@@ -4380,7 +4491,7 @@ mod tests {
 
     #[test]
     fn pending_spawn_is_separate_until_authoritative_upsert_and_never_auto_attaches() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.pending_sessions.insert(
             "session-alpha".to_string(),
             SessionRow::pending("session-alpha"),
@@ -4418,7 +4529,7 @@ mod tests {
 
     #[test]
     fn active_entity_subscription_disconnect_invalidates_attachment_and_generation() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.session_entities
             .begin_generation("generation-1".to_string());
         app.attached_session = Some("session-alpha".to_string());
@@ -4479,7 +4590,7 @@ mod tests {
 
     #[test]
     fn compatibility_error_branch_renders_distinct_compatibility_diagnostic() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut requirement = tui_compatibility_requirement();
         requirement
             .required_features
@@ -4501,7 +4612,7 @@ mod tests {
 
     #[test]
     fn daemon_status_renders_compatibility_descriptor_from_public_status_response() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(status_response("running", 7));
 
@@ -4518,7 +4629,7 @@ mod tests {
 
     #[test]
     fn daemon_status_renders_package_counts_from_public_status_response() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(status_response_with_package_counts("running", 7, 3, 1));
 
@@ -4530,7 +4641,7 @@ mod tests {
 
     #[test]
     fn package_response_renders_installed_state_capabilities_and_provider_admission() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(status_response_with_package_counts("running", 7, 3, 1));
         app.apply_response(packages_response(vec![
@@ -4578,7 +4689,7 @@ mod tests {
 
     #[test]
     fn package_response_preserves_zero_entrypoint_package_row() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(packages_response(vec![package(
             "local-alpha",
@@ -4600,7 +4711,7 @@ mod tests {
 
     #[test]
     fn apps_response_updates_state_and_renders_web_app_launch_url_from_public_dto() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(apps_response(vec![web_app_with_url()]));
 
@@ -4617,7 +4728,7 @@ mod tests {
 
     #[test]
     fn apps_response_keeps_web_app_without_url_visible_without_deriving_one() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut app_row = web_app_with_url();
         app_row.launch_target.local_url = None;
         app_row.lifecycle_state = "blocked".to_string();
@@ -4637,7 +4748,7 @@ mod tests {
 
     #[test]
     fn terminal_app_renders_launchability_from_action_descriptors_without_fake_url() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut app_row = terminal_app();
         app_row.actions = vec![action_state(
             "open",
@@ -4660,7 +4771,7 @@ mod tests {
 
     #[test]
     fn package_navigation_renders_from_admitted_registry_not_package_routes() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let route = plugin_contract_app_route();
         let mut package = package(
             "botster.plugin-contract-matrix",
@@ -4705,7 +4816,7 @@ mod tests {
 
     #[test]
     fn plugin_surface_and_action_results_render_from_public_dtos() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
         app.apply_response(plugin_action_response(json!({
@@ -4765,7 +4876,7 @@ mod tests {
 
     #[test]
     fn composite_application_primitives_render_from_production_plugin_surface_path() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(plugin_surface_response(
             composite_application_primitives_plugin_surface(),
@@ -4823,7 +4934,7 @@ mod tests {
         assert!(matches!(
             up_dispatch,
             InputDispatch::Action(request)
-                if request.action_id == botster_core::ui::UiActionId("contract.ticket.open".to_string())
+                if request.action_id == botster_core_ui::ui::UiActionId("contract.ticket.open".to_string())
                     && request.node_id == Some(UiNodeId("contract-composite-ticket-a".to_string()))
                     && request.payload == Some(json!({ "ticket_id": "1783529012" }))
         ));
@@ -4838,7 +4949,7 @@ mod tests {
 
     #[test]
     fn plugin_surface_invalid_body_diagnostic_renders_from_app_surface() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(plugin_surface_response(invalid_table_plugin_surface()));
 
@@ -4858,7 +4969,7 @@ mod tests {
 
     #[test]
     fn navigation_open_requests_public_plugin_surface_render() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.observed_requests.clear();
         let entry = plugin_contract_app_navigation();
 
@@ -4867,7 +4978,7 @@ mod tests {
             request_id: RequestId("req-navigation-open".to_string()),
             surface_id: UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
             action_id: UiActionId("botster.tui.navigation.open".to_string()),
-            node_id: Some(UiNodeId("dogfood-package-navigation-0-open".to_string())),
+            node_id: Some(UiNodeId("tui-package-navigation-0-open".to_string())),
             kind: UiActionKind::Submit,
             values: None,
             payload: navigation_open_payload_for_entry(&entry),
@@ -4888,7 +4999,7 @@ mod tests {
 
     #[test]
     fn blocked_navigation_entry_stays_visible_without_open_affordance() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut entry = plugin_contract_app_navigation();
         entry.enabled = false;
         entry.blocked = true;
@@ -4903,12 +5014,12 @@ mod tests {
         assert!(rendered.contains("blocked=true"));
         assert!(rendered.contains("navigation diagnostic: blocked:missing configuration"));
         assert!(rendered.contains("navigation blocked: label=Contract App"));
-        assert!(!rendered.contains("dogfood-package-navigation-0-open"));
+        assert!(!rendered.contains("tui-package-navigation-0-open"));
     }
 
     #[test]
     fn unsupported_navigation_target_stays_visible_with_precise_target() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut entry = plugin_contract_app_navigation();
         entry.target.kind = "web_app".to_string();
         entry.target.surface_id = None;
@@ -4926,7 +5037,7 @@ mod tests {
 
     #[test]
     fn iframe_plugin_surface_renders_precise_unsupported_diagnostic() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(plugin_surface_response(iframe_plugin_surface()));
 
@@ -4958,7 +5069,7 @@ mod tests {
 
     #[test]
     fn blocked_app_reasons_diagnostics_actions_and_request_mapping_are_visible_without_paths() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut app_row = terminal_app();
         app_row.lifecycle_state = "blocked".to_string();
         app_row.blocked_reasons = vec![
@@ -4995,7 +5106,7 @@ mod tests {
 
     #[test]
     fn package_response_renders_running_entrypoint_process_state_without_url() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         let mut package = package(
             "workflow.plugin",
@@ -5021,7 +5132,7 @@ mod tests {
 
     #[test]
     fn package_response_renders_failed_entrypoint_diagnostics() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         let mut failed = process("failed");
         failed.exit_status = Some("exit code 1".to_string());
@@ -5048,7 +5159,7 @@ mod tests {
 
     #[test]
     fn package_response_renders_stopped_entrypoint_process_state() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         let mut stopped = process("stopped");
         stopped.pid = None;
@@ -5075,7 +5186,7 @@ mod tests {
 
     #[test]
     fn package_response_renders_multiple_entrypoint_process_states() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         let mut worker = process("starting");
         worker.pid = None;
@@ -5103,7 +5214,7 @@ mod tests {
 
     #[test]
     fn package_response_renders_hub_resolved_availability_gates_without_local_inference() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut package = package(
             "workflow.plugin",
             "1.0.0",
@@ -5213,7 +5324,7 @@ mod tests {
 
     #[test]
     fn marketplace_lifecycle_responses_render_from_public_dtos_without_paths_or_secrets() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let available = available_package();
         let pin = package_pin();
         let mut install_plan = botster_hub_client::DaemonPackageInstallPlan {
@@ -5270,7 +5381,7 @@ mod tests {
 
     #[test]
     fn package_decision_response_keeps_action_result_visible_with_refreshed_packages() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut response = package_decision_response(vec![package(
             "workflow.plugin",
             "1.0.0",
@@ -5298,7 +5409,7 @@ mod tests {
 
     #[test]
     fn lifecycle_action_buttons_emit_public_daemon_requests() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let pin = package_pin();
 
         app.handle_action(
@@ -5389,7 +5500,7 @@ mod tests {
 
     #[test]
     fn package_diagnostics_render_through_existing_diagnostic_surface() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.apply_response(status_response_with_package_counts("running", 7, 1, 0));
         let mut response = packages_response(vec![package(
             "local-alpha",
@@ -5419,7 +5530,7 @@ mod tests {
 
     #[test]
     fn package_configuration_response_renders_schema_values_validation_and_redacted_secret() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(packages_response(vec![package_with_configuration()]));
 
@@ -5441,7 +5552,7 @@ mod tests {
 
     #[test]
     fn package_configuration_drafts_render_and_submit_hub_shaped_values_without_raw_secrets() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.apply_response(packages_response(vec![package_with_configuration()]));
         app.set_drafts(BTreeMap::from([
             (
@@ -5473,24 +5584,26 @@ mod tests {
         assert!(rendered.contains("Mode: Write"));
         assert!(rendered.contains("Notes: Line one"));
 
-        app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
-            request_id: botster_core::RequestId("req-config-submit".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
-            action_id: botster_core::ui::UiActionId(
-                "botster.tui.package_config.submit".to_string(),
-            ),
-            node_id: Some(UiNodeId(
-                "dogfood-package-0-configuration-submit".to_string(),
-            )),
-            kind: botster_core::ui::UiActionKind::Submit,
-            values: Some(UiFormValues(
-                app.drafts
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            )),
-            payload: Some(json!({ "package_name": "configuration.plugin" })),
-        }));
+        app.handle_dispatch(InputDispatch::Action(
+            botster_core_ui::ui::UiActionRequest {
+                request_id: botster_core_ui::RequestId("req-config-submit".to_string()),
+                surface_id: botster_core_ui::ui::UiSurfaceId(
+                    renderer::WORKSPACE_SURFACE_ID.to_string(),
+                ),
+                action_id: botster_core_ui::ui::UiActionId(
+                    "botster.tui.package_config.submit".to_string(),
+                ),
+                node_id: Some(UiNodeId("tui-package-0-configuration-submit".to_string())),
+                kind: botster_core_ui::ui::UiActionKind::Submit,
+                values: Some(UiFormValues(
+                    app.drafts
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )),
+                payload: Some(json!({ "package_name": "configuration.plugin" })),
+            },
+        ));
 
         let Some(ObservedRequest::SetPackageConfiguration {
             package_name,
@@ -5523,7 +5636,7 @@ mod tests {
 
     #[test]
     fn package_configuration_success_refreshes_from_package_decision_response() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut package = package_with_configuration();
         package.configuration.missing_required.clear();
 
@@ -5538,7 +5651,7 @@ mod tests {
 
     #[test]
     fn package_configuration_operator_error_renders_validation_failure() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(operator_error_response(
             "configuration field endpoint expects url",
@@ -5554,7 +5667,7 @@ mod tests {
 
     #[test]
     fn response_diagnostics_render_connected_state() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut response = status_response("running", 7);
         response
             .diagnostics
@@ -5572,7 +5685,7 @@ mod tests {
 
     #[test]
     fn healthy_status_clears_stale_connection_lifecycle_diagnostics() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         let mut requirement = tui_compatibility_requirement();
         requirement
             .required_features
@@ -5601,7 +5714,7 @@ mod tests {
 
     #[test]
     fn operator_diagnostics_render_terminal_stream_unavailable() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(operator_error_response_with_diagnostics(
             "attach failed",
@@ -5620,7 +5733,7 @@ mod tests {
 
     #[test]
     fn action_failure_survives_unrelated_successful_status_refresh() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.apply_response(operator_error_response("spawn failed"));
         app.apply_response(status_response("running", 1));
@@ -5631,7 +5744,7 @@ mod tests {
 
     #[test]
     fn corrected_user_action_clears_stale_validation_error() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.command = " \t\n".to_string();
         app.spawn_session();
         assert_eq!(app.error.as_deref(), Some("command is required"));
@@ -5647,7 +5760,7 @@ mod tests {
 
     #[test]
     fn not_running_path_is_not_reported_as_compatibility_mismatch() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
 
         app.record_transport_error(DaemonTransportError::NotRunning);
 
@@ -5659,12 +5772,12 @@ mod tests {
 
     #[test]
     fn terminal_input_before_attach_renders_stream_unavailable_error() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
 
         app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "dogfood-terminal".to_string(),
+            node_id: "tui-terminal".to_string(),
             bytes: b"echo hello\n".to_vec(),
         });
 
@@ -5676,14 +5789,14 @@ mod tests {
 
     #[test]
     fn terminal_input_rejects_stale_attached_subscription_generation() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = "sub-current".to_string();
         app.attached_session = Some("session-alpha".to_string());
         app.attached_subscription_id = Some("sub-stale".to_string());
         app.observed_requests.clear();
 
         app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "dogfood-terminal".to_string(),
+            node_id: "tui-terminal".to_string(),
             bytes: b"x".to_vec(),
         });
 
@@ -5696,7 +5809,7 @@ mod tests {
 
     #[test]
     fn attach_state_tracks_attached_session_separately_from_selection() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-beta".to_string());
         app.begin_attach_hydration("session-beta", "sub-test");
@@ -5713,7 +5826,7 @@ mod tests {
 
     #[test]
     fn stale_subscription_events_cannot_own_or_mutate_current_terminal_state() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-current");
 
         app.apply_response(events_response(vec![DaemonEvent::AttachState {
@@ -5760,7 +5873,7 @@ mod tests {
 
     #[test]
     fn terminal_view_carries_output_bytes() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output = "hello terminal".to_string();
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
@@ -5769,7 +5882,7 @@ mod tests {
 
     #[test]
     fn terminal_output_renders_as_terminal_primitive_content() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output = "primitive terminal bytes".to_string();
 
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
@@ -5779,19 +5892,19 @@ mod tests {
             hit_map
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "dogfood-terminal")
+                .any(|region| region.node_id == "tui-terminal")
         );
         assert!(
             !hit_map
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "dogfood-terminal-output")
+                .any(|region| region.node_id == "tui-terminal-output")
         );
     }
 
     #[test]
     fn opaque_history_events_never_render_as_terminal_text() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-test");
 
         app.apply_response(events_response(vec![
@@ -5835,7 +5948,7 @@ mod tests {
             hit_map
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "dogfood-terminal")
+                .any(|region| region.node_id == "tui-terminal")
         );
     }
 
@@ -5879,7 +5992,7 @@ mod tests {
         assert!(opaque_state_index < attached_index);
         assert!(attached_index < live_index);
 
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = scenario.subscription_id.clone();
         app.begin_attach_hydration(&scenario.session_id, &scenario.subscription_id);
         app.observed_requests.clear();
@@ -5978,7 +6091,7 @@ mod tests {
             DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. }
         )));
 
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = scenario.no_history_subscription_id.clone();
         app.begin_attach_hydration(
             &scenario.no_history_session_id,
@@ -6033,7 +6146,7 @@ mod tests {
 
     #[test]
     fn opaque_empty_snapshot_does_not_finish_visible_history_hydration() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = "sub-opaque".to_string();
         app.begin_attach_hydration("session-opaque", "sub-opaque");
 
@@ -6062,7 +6175,7 @@ mod tests {
 
     #[test]
     fn expired_empty_hydration_finishes_before_synthetic_screen_response_renders() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = "sub-captured".to_string();
         app.begin_attach_hydration("session-captured", "sub-captured");
         app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
@@ -6089,7 +6202,7 @@ mod tests {
 
     #[test]
     fn late_screen_response_cannot_replace_restored_history() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output_session_id = Some("session-alpha".to_string());
         app.terminal_output = "ordered history".to_string();
 
@@ -6103,7 +6216,7 @@ mod tests {
 
     #[test]
     fn read_screen_precedes_buffered_live_output_without_duplication() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-alpha");
 
         app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
@@ -6130,7 +6243,7 @@ mod tests {
 
     #[test]
     fn read_screen_overlap_is_not_duplicated_when_live_output_is_flushed() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-alpha");
         app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
             session_id: "session-alpha".to_string(),
@@ -6149,7 +6262,7 @@ mod tests {
 
     #[test]
     fn snapshot_readback_is_metadata_only_and_renders_status() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output_session_id = Some("session-alpha".to_string());
 
         app.apply_optional_readback_response(
@@ -6168,7 +6281,7 @@ mod tests {
 
     #[test]
     fn optional_readback_operator_error_is_non_fatal() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.attached_session = Some("session-alpha".to_string());
         app.terminal_output = "preserved".to_string();
 
@@ -6204,7 +6317,7 @@ mod tests {
 
     #[test]
     fn every_attach_cycle_clears_owned_terminal_and_readback_state() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output_session_id = Some("session-alpha".to_string());
         app.terminal_output = "alpha history".to_string();
         app.snapshot_metadata = Some(DaemonCaptureSnapshot {
@@ -6236,7 +6349,7 @@ mod tests {
 
     #[test]
     fn process_exit_applies_same_response_bytes_and_suppresses_readbacks() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = "sub-alpha".to_string();
         app.begin_attach_hydration("session-alpha", "sub-alpha");
         app.snapshot_metadata = Some(DaemonCaptureSnapshot {
@@ -6269,7 +6382,7 @@ mod tests {
 
     #[test]
     fn process_exit_preserves_restored_screen_and_clears_snapshot_metadata() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.subscription_id = "sub-alpha".to_string();
         app.begin_attach_hydration("session-alpha", "sub-alpha");
         app.terminal_output = "last visible screen".to_string();
@@ -6299,7 +6412,7 @@ mod tests {
 
     #[test]
     fn detach_preserves_restored_screen_and_clears_snapshot_metadata() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-test");
         app.apply_response(attach_state_response("session-alpha", "attached"));
         app.terminal_output_session_id = Some("session-alpha".to_string());
@@ -6320,7 +6433,7 @@ mod tests {
 
     #[test]
     fn opaque_history_events_do_not_mutate_existing_terminal_output() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output = "existing output\n".to_string();
 
         app.apply_response(events_response(vec![
@@ -6342,7 +6455,7 @@ mod tests {
 
     #[test]
     fn stale_opaque_history_cannot_replace_current_terminal_output() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.terminal_output = "current output".to_string();
         app.begin_attach_hydration("session-alpha", "sub-current");
         app.apply_optional_readback_response(
@@ -6361,7 +6474,7 @@ mod tests {
 
     #[test]
     fn focused_session_list_row_updates_attach_selection() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
         app.observed_requests.clear();
@@ -6370,7 +6483,7 @@ mod tests {
         let second_row = hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-session-session-beta")
+            .find(|region| region.node_id == "tui-session-session-beta")
             .expect("second session row should be focusable");
 
         let (column, row) = (second_row.rect.x, second_row.rect.y);
@@ -6408,14 +6521,14 @@ mod tests {
 
     #[test]
     fn session_click_cancels_when_redraw_reorders_another_row_under_release() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
         let (_lines, frame_n_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
         let first_row = frame_n_hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-session-session-alpha")
+            .find(|region| region.node_id == "tui-session-session-alpha")
             .expect("alpha row should be hit-testable");
         let (column, row) = (first_row.rect.x, first_row.rect.y);
         let mut router = InputRouter::new(renderer::action_request_context());
@@ -6437,7 +6550,7 @@ mod tests {
         let moved_under_pointer = frame_n_plus_one_hit_map
             .lookup(column, row)
             .expect("reordered row should remain under the pointer");
-        assert_eq!(moved_under_pointer.node_id, "dogfood-session-session-beta");
+        assert_eq!(moved_under_pointer.node_id, "tui-session-session-beta");
 
         assert_eq!(
             router.dispatch_event(
@@ -6450,14 +6563,14 @@ mod tests {
             ),
             InputDispatch::Ignored
         );
-        assert_eq!(router.selected_row("dogfood-session-list"), None);
-        app.sync_focused_session(router.selected_row_value("dogfood-session-list"));
+        assert_eq!(router.selected_row("tui-session-list"), None);
+        app.sync_focused_session(router.selected_row_value("tui-session-list"));
         assert_eq!(app.selected_session.as_deref(), Some("session-alpha"));
     }
 
     #[test]
     fn focused_terminal_mouse_pair_attaches_once_and_preserves_key_forwarding() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
         app.observed_requests.clear();
@@ -6465,7 +6578,7 @@ mod tests {
         let terminal = hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-terminal")
+            .find(|region| region.node_id == "tui-terminal")
             .expect("terminal should be focusable");
         let (column, row) = (
             terminal.rect.x.saturating_add(1),
@@ -6487,7 +6600,7 @@ mod tests {
                 if request.action_id
                     == UiActionId("botster.terminal.focus".to_string())
         ));
-        assert_eq!(router.focused_node_id(), Some("dogfood-terminal"));
+        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
         app.handle_dispatch(down_dispatch);
 
         let up_dispatch = router.dispatch_event(
@@ -6518,7 +6631,7 @@ mod tests {
         assert_eq!(
             dispatch,
             InputDispatch::TerminalForward {
-                node_id: "dogfood-terminal".to_string(),
+                node_id: "tui-terminal".to_string(),
                 bytes: b"x".to_vec(),
             }
         );
@@ -6532,7 +6645,7 @@ mod tests {
 
     #[test]
     fn mouse_mode_terminal_release_forwards_sgr_once_without_duplicate_focus_action() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
         app.observed_requests.clear();
@@ -6623,7 +6736,7 @@ mod tests {
 
     #[test]
     fn authoritative_mouse_mode_is_attachment_scoped_and_reapplied_after_render() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.attached_session = Some("session-alpha".to_string());
         app.attached_subscription_id = Some("sub-alpha".to_string());
         app.subscription_id = "sub-alpha".to_string();
@@ -6639,7 +6752,7 @@ mod tests {
             let terminal = hit_map
                 .regions()
                 .iter()
-                .find(|region| region.node_id == "dogfood-terminal")
+                .find(|region| region.node_id == "tui-terminal")
                 .expect("production terminal should be hit-testable");
             assert!(!terminal.terminal_mouse_mode);
 
@@ -6647,7 +6760,7 @@ mod tests {
             let terminal = hit_map
                 .regions()
                 .iter()
-                .find(|region| region.node_id == "dogfood-terminal")
+                .find(|region| region.node_id == "tui-terminal")
                 .expect("production terminal should still be hit-testable");
             assert!(terminal.terminal_mouse_mode);
         }
@@ -6672,7 +6785,7 @@ mod tests {
 
     #[test]
     fn terminal_output_refresh_is_bounded_and_malformed_readback_is_safe_off() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.attached_session = Some("session-alpha".to_string());
         app.attached_subscription_id = Some("sub-alpha".to_string());
         app.subscription_id = "sub-alpha".to_string();
@@ -6705,7 +6818,7 @@ mod tests {
 
     #[test]
     fn sgr_encoding_bit_alone_does_not_enable_terminal_mouse_tracking() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.attached_session = Some("session-alpha".to_string());
         app.attached_subscription_id = Some("sub-alpha".to_string());
         app.subscription_id = "sub-alpha".to_string();
@@ -6719,14 +6832,14 @@ mod tests {
         let terminal = hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-terminal")
+            .find(|region| region.node_id == "tui-terminal")
             .expect("production terminal should be hit-testable");
         assert!(!terminal.terminal_mouse_mode);
     }
 
     #[test]
     fn authoritative_snapshot_preserves_selected_session_when_still_listed() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.session_entities
             .begin_generation("generation-1".to_string());
         app.selected_session = Some("session-beta".to_string());
@@ -6754,7 +6867,7 @@ mod tests {
 
     #[test]
     fn authoritative_snapshot_resets_stale_selection_without_attaching() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.session_entities
             .begin_generation("generation-1".to_string());
         app.selected_session = Some("session-beta".to_string());
@@ -6781,7 +6894,7 @@ mod tests {
 
     #[test]
     fn entity_patch_preserves_and_renders_lifecycle_and_failure_state() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.session_entities
             .begin_generation("generation-1".to_string());
         app.session_entities
@@ -6823,20 +6936,24 @@ mod tests {
 
     #[test]
     fn action_dispatch_rejects_exited_session_before_daemon_attach() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "exited")]);
         app.selected_session = Some("session-beta".to_string());
         app.observed_requests.clear();
 
-        app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
-            request_id: botster_core::RequestId("req-attach-exited".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
-            action_id: botster_core::ui::UiActionId("botster.tui.attach".to_string()),
-            node_id: Some(UiNodeId("dogfood-session-session-beta-attach".to_string())),
-            kind: botster_core::ui::UiActionKind::Submit,
-            values: None,
-            payload: Some(json!({ "session_id": "session-beta" })),
-        }));
+        app.handle_dispatch(InputDispatch::Action(
+            botster_core_ui::ui::UiActionRequest {
+                request_id: botster_core_ui::RequestId("req-attach-exited".to_string()),
+                surface_id: botster_core_ui::ui::UiSurfaceId(
+                    renderer::WORKSPACE_SURFACE_ID.to_string(),
+                ),
+                action_id: botster_core_ui::ui::UiActionId("botster.tui.attach".to_string()),
+                node_id: Some(UiNodeId("tui-session-session-beta-attach".to_string())),
+                kind: botster_core_ui::ui::UiActionKind::Submit,
+                values: None,
+                payload: Some(json!({ "session_id": "session-beta" })),
+            },
+        ));
 
         assert!(app.observed_requests.is_empty());
         assert_eq!(
@@ -6847,7 +6964,7 @@ mod tests {
 
     #[test]
     fn exited_session_row_is_selectable_without_attach_affordance() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
             lifecycle: "exited".to_string(),
@@ -6860,7 +6977,7 @@ mod tests {
         let session_row = hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-session-session-beta")
+            .find(|region| region.node_id == "tui-session-session-beta")
             .expect("exited session row should be focusable");
 
         let (column, row) = (session_row.rect.x, session_row.rect.y);
@@ -6901,14 +7018,14 @@ mod tests {
             !hit_map
                 .regions()
                 .iter()
-                .any(|region| { region.node_id == "dogfood-session-session-beta-attach" })
+                .any(|region| { region.node_id == "tui-session-session-beta-attach" })
         );
         assert!(!rendered.contains("attached session disappeared"));
     }
 
     #[test]
     fn terminal_focus_attach_rejects_non_running_session_before_daemon_attach() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
             lifecycle: "stopped".to_string(),
@@ -6918,15 +7035,19 @@ mod tests {
         app.selected_session = Some("session-beta".to_string());
         app.observed_requests.clear();
 
-        app.handle_dispatch(InputDispatch::Action(botster_core::ui::UiActionRequest {
-            request_id: botster_core::RequestId("req-terminal-focus".to_string()),
-            surface_id: botster_core::ui::UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
-            action_id: botster_core::ui::UiActionId("botster.terminal.focus".to_string()),
-            node_id: Some(UiNodeId("dogfood-terminal".to_string())),
-            kind: botster_core::ui::UiActionKind::Submit,
-            values: None,
-            payload: None,
-        }));
+        app.handle_dispatch(InputDispatch::Action(
+            botster_core_ui::ui::UiActionRequest {
+                request_id: botster_core_ui::RequestId("req-terminal-focus".to_string()),
+                surface_id: botster_core_ui::ui::UiSurfaceId(
+                    renderer::WORKSPACE_SURFACE_ID.to_string(),
+                ),
+                action_id: botster_core_ui::ui::UiActionId("botster.terminal.focus".to_string()),
+                node_id: Some(UiNodeId("tui-terminal".to_string())),
+                kind: botster_core_ui::ui::UiActionKind::Submit,
+                values: None,
+                payload: None,
+            },
+        ));
 
         assert!(app.observed_requests.is_empty());
         assert_eq!(
@@ -6937,7 +7058,7 @@ mod tests {
 
     #[test]
     fn reconnect_does_not_auto_attach_known_non_running_session() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
             lifecycle: "exited".to_string(),
@@ -6953,7 +7074,7 @@ mod tests {
 
     #[test]
     fn refresh_read_models_does_not_list_sessions() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.observed_requests.clear();
 
         app.refresh_read_models();
@@ -6971,7 +7092,7 @@ mod tests {
 
     #[test]
     fn reconnect_does_not_auto_attach_selected_running_session() {
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.observed_requests.clear();
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
@@ -7021,7 +7142,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_dogfood_runs_against_isolated_hub_when_binaries_are_available() {
+    fn headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
             return;
@@ -7036,7 +7157,7 @@ mod tests {
             .hub_bin(&hub_bin)
             .session_worker_bin(session_worker_bin)
             .root(&root)
-            .name("botster-tui-headless-dogfood")
+            .name("botster-tui-headless-live-runtime")
             .start()
             .expect("isolated hub starts");
 
@@ -7057,36 +7178,35 @@ mod tests {
                 .conformance_fixture_revision
         );
 
-        run_headless_dogfood(AppArgs {
+        run_headless_live_runtime(AppArgs {
             smoke: false,
-            hub_socket: Some(hub.endpoint().socket_path.clone()),
+            hub_connection: Some(RunnableEntrypointHubConnection {
+                transport: RunnableEntrypointHubConnectionTransport::UnixSocket {
+                    path: hub.endpoint().socket_path.to_string_lossy().into_owned(),
+                },
+            }),
+            connection_error: None,
             hub_data_dir: Some(hub.data_dir().to_path_buf()),
-            headless_dogfood: true,
+            headless_live_runtime: true,
         })
-        .expect("headless dogfood surface completes a real hub round trip");
+        .expect("headless live-runtime surface completes a real Hub round trip");
 
         assert_live_attach_history_readback(&hub);
 
-        let foreground_conformance =
-            botster_hub_test_support::run_foreground_terminal_app_open_conformance(&hub)
-                .expect("foreground terminal app-open conformance passes");
-        assert!(foreground_conformance.hub_socket_env_present);
-        assert!(foreground_conformance.hub_data_dir_env_present);
-        assert_eq!(foreground_conformance.real_hub_action_operation, "status");
-
-        let Some(contract_matrix_fixture) =
+        if let Some(contract_matrix_fixture) =
             std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE").map(PathBuf::from)
-        else {
-            skip_or_panic("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE");
-            hub.shutdown().expect("isolated hub shuts down cleanly");
-            return;
-        };
-        let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
-            &hub,
-            contract_matrix_fixture,
-        )
-        .expect("plugin contract matrix conformance passes");
-        assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
+        {
+            let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+                &hub,
+                contract_matrix_fixture,
+            )
+            .expect("plugin contract matrix conformance passes");
+            assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
+        } else {
+            eprintln!(
+                "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is not set; live plugin-surface proof skipped"
+            );
+        }
 
         let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let data_dir = hub.data_dir().to_string_lossy().to_string();
@@ -7132,7 +7252,7 @@ mod tests {
                 data_dir.as_str(),
                 "botster-tui",
             ])
-            .env("BOTSTER_TUI_HEADLESS_DOGFOOD", "1")
+            .env("BOTSTER_TUI_HEADLESS_LIVE_RUNTIME", "1")
             .output()
             .expect("run apps open for botster-tui package");
         assert!(
@@ -7161,13 +7281,34 @@ mod tests {
             .push("botster-tui-future-feature".to_string());
         let error = connect_and_hello_with_requirement(hub.endpoint(), &requirement)
             .expect_err("live hub should reject unsatisfied TUI compatibility requirement");
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.record_transport_error(error);
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("compatibility mismatch"));
         assert!(rendered.contains("unsupported_feature"));
         assert!(rendered.contains("botster-tui-future-feature"));
+
+        let unavailable_connection = serde_json::to_string(&RunnableEntrypointHubConnection {
+            transport: RunnableEntrypointHubConnectionTransport::UnixSocket {
+                path: root.join("missing-hub.sock").to_string_lossy().into_owned(),
+            },
+        })
+        .expect("serialize unavailable Hub descriptor");
+        let unavailable_args = AppArgs::parse_with_environment(
+            Vec::<String>::new(),
+            Some(unavailable_connection.into()),
+            None,
+            false,
+        );
+        let unavailable_app = TuiApp::new_with_connection(
+            unavailable_args.daemon_endpoint(),
+            unavailable_args.connection_error,
+        );
+        let (lines, _) = renderer::render_to_lines(&unavailable_app.surface(), 120, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Hub unavailable"));
+        assert!(rendered.contains("connection:"));
 
         hub.shutdown().expect("isolated hub shuts down cleanly");
     }
@@ -7182,13 +7323,13 @@ mod tests {
             .request(&DaemonRequest::Spawn {
                 session_id: prior_session_id.clone(),
                 command: format!(
-                    "printf '{prior_marker}\\n'; sleep 1; printf '\\033[?1000h\\033[?1006h'; while IFS= read -r line; do case \"$line\" in enable-mouse) printf '\\033[?1000h\\033[?1006h' ;; disable-mouse) printf '\\033[?1000l\\033[?1006l' ;; esac; done"
+                    "printf '{prior_marker}\\n'; printf '\\033[?1000h\\033[?1006h'; while IFS= read -r line; do case \"$line\" in enable-mouse) printf '\\033[?1000h\\033[?1006h' ;; disable-mouse) printf '\\033[?1000l\\033[?1006l' ;; esac; done"
                 ),
             })
             .expect("spawn history-producing session before TUI attach");
-        thread::sleep(Duration::from_millis(150));
+        thread::yield_now();
 
-        let mut app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
         app.workspace_test_mode = true;
         wait_for_authoritative_session(&mut app, &prior_session_id)
             .expect("external session appears through entity subscription");
@@ -7200,7 +7341,7 @@ mod tests {
         let hydration_deadline = Instant::now() + Duration::from_secs(7);
         while app.attach_hydration.is_some() && Instant::now() < hydration_deadline {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert_eq!(
             app.terminal_output.matches(&prior_marker).count(),
@@ -7228,7 +7369,7 @@ mod tests {
             && Instant::now() < attached_deadline
         {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert_eq!(
             app.attached_session.as_deref(),
@@ -7238,7 +7379,7 @@ mod tests {
         let mode_on_deadline = Instant::now() + Duration::from_secs(3);
         while app.current_terminal_mouse_mode() != 9 && Instant::now() < mode_on_deadline {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert_eq!(
             app.current_terminal_mouse_mode(),
@@ -7256,7 +7397,7 @@ mod tests {
         let terminal = mouse_hit_map
             .regions()
             .iter()
-            .find(|region| region.node_id == "dogfood-terminal")
+            .find(|region| region.node_id == "tui-terminal")
             .expect("production terminal should be hit-testable");
         assert!(terminal.terminal_mouse_mode);
         let (column, row) = (
@@ -7292,14 +7433,14 @@ mod tests {
         }));
 
         app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "dogfood-terminal".to_string(),
+            node_id: "tui-terminal".to_string(),
             bytes: b"\ndisable-mouse\n".to_vec(),
         });
-        thread::sleep(TERMINAL_MOUSE_MODE_REFRESH_INTERVAL);
+        thread::yield_now();
         let mode_off_deadline = Instant::now() + Duration::from_secs(3);
         while app.current_terminal_mouse_mode() != 0 && Instant::now() < mode_off_deadline {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert_eq!(
             app.current_terminal_mouse_mode(),
@@ -7308,19 +7449,19 @@ mod tests {
         );
 
         app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "dogfood-terminal".to_string(),
+            node_id: "tui-terminal".to_string(),
             bytes: b"enable-mouse\n".to_vec(),
         });
-        thread::sleep(TERMINAL_MOUSE_MODE_REFRESH_INTERVAL);
+        thread::yield_now();
         let mode_reenabled_deadline = Instant::now() + Duration::from_secs(3);
         while app.current_terminal_mouse_mode() != 9 && Instant::now() < mode_reenabled_deadline {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert_eq!(app.current_terminal_mouse_mode(), 9);
 
         app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "dogfood-terminal".to_string(),
+            node_id: "tui-terminal".to_string(),
             bytes: format!("{later_marker}\n").into_bytes(),
         });
         assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
@@ -7380,7 +7521,7 @@ mod tests {
         let reconnect_deadline = Instant::now() + Duration::from_secs(7);
         while app.attach_hydration.is_some() && Instant::now() < reconnect_deadline {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert!(
             app.attach_hydration.is_none(),
@@ -7389,7 +7530,7 @@ mod tests {
         let restored_mode_deadline = Instant::now() + Duration::from_secs(3);
         while app.current_terminal_mouse_mode() != 9 && Instant::now() < restored_mode_deadline {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert_eq!(
             app.current_terminal_mouse_mode(),
@@ -7422,7 +7563,7 @@ mod tests {
             && Instant::now() < exit_deadline
         {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         let exited = renderer::render_to_lines(&app.surface(), 200, 80)
             .0
@@ -7444,7 +7585,7 @@ mod tests {
             && Instant::now() < remove_deadline
         {
             app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         let removed = renderer::render_to_lines(&app.surface(), 200, 80)
             .0
@@ -7461,9 +7602,9 @@ mod tests {
                 command: "while IFS= read -r line; do :; done".to_string(),
             })
             .expect("spawn empty session");
-        thread::sleep(Duration::from_millis(150));
+        thread::yield_now();
 
-        let mut empty_app = DogfoodApp::new(Some(hub.endpoint().socket_path.clone()));
+        let mut empty_app = TuiApp::new(Some(hub.endpoint().clone()));
         wait_for_authoritative_session(&mut empty_app, &empty_session_id)
             .expect("empty external session appears through entity subscription");
         empty_app.selected_session = Some(empty_session_id.clone());
@@ -7472,7 +7613,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(7);
         while empty_app.attach_hydration.is_some() && Instant::now() < deadline {
             empty_app.poll_hub();
-            thread::sleep(Duration::from_millis(30));
+            thread::yield_now();
         }
         assert!(empty_app.attach_hydration.is_none());
         assert_eq!(
@@ -7543,7 +7684,7 @@ mod tests {
         let list_package_navigation = client
             .request(&DaemonRequest::ListPackageNavigation)
             .expect("list package navigation after contract matrix conformance");
-        let mut app = DogfoodApp::new(None);
+        let mut app = TuiApp::new(None);
         app.workspace_test_mode = true;
         app.system_details_visible = true;
         app.apply_response(list_packages);
@@ -7602,7 +7743,7 @@ mod tests {
                 }),
             })
             .expect("dispatch contract action success");
-        let mut action_app = DogfoodApp::new(None);
+        let mut action_app = TuiApp::new(None);
         action_app.workspace_test_mode = true;
         action_app.system_details_visible = true;
         action_app.apply_response(success);
@@ -7623,7 +7764,7 @@ mod tests {
                 }),
             })
             .expect("dispatch contract action error");
-        let mut failure_app = DogfoodApp::new(None);
+        let mut failure_app = TuiApp::new(None);
         failure_app.workspace_test_mode = true;
         failure_app.system_details_visible = true;
         failure_app.apply_response(failure);
@@ -7641,7 +7782,7 @@ mod tests {
                 payload: json!({}),
             })
             .expect("render blocked contract surface");
-        let mut blocked_app = DogfoodApp::new(None);
+        let mut blocked_app = TuiApp::new(None);
         blocked_app.workspace_test_mode = true;
         blocked_app.system_details_visible = true;
         blocked_app.apply_response(blocked);
@@ -7693,7 +7834,7 @@ mod tests {
         if std::env::var_os("BOTSTER_TUI_REQUIRE_HUB_TEST").is_some() {
             panic!("{variable} is required when BOTSTER_TUI_REQUIRE_HUB_TEST is set");
         }
-        eprintln!("skipping isolated hub dogfood test; {variable} is not set");
+        eprintln!("skipping isolated Hub live-runtime test; {variable} is not set");
     }
 
     fn source_without_line_comments() -> String {

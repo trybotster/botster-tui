@@ -14,19 +14,19 @@ run: run_1782775153_356366
 - Worktree/target context: run target is `tgt_c3d470bab78549df920a41e8fb0e58d8`, base ref is `main`, and this plan is for the assigned checkout only.
 - Vault/playbook context: [[identity]], [[goals]], [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[plan steps need reviewable plan artifacts]], and [[project pipelines checklist worker timeouts require artifact evidence fallback]].
 - Repo context inspected: `botster-package.json`, `README.md`, `Cargo.toml`, `crates/botster-tui/Cargo.toml`, `crates/botster-tui/src/main.rs`, `crates/botster-tui/src/app.rs`, `crates/botster-tui/src/renderer.rs`, `crates/botster-tui/tests/package_manifest_test.rs`, `script/fmt`, `script/test`, `script/clippy`, and `script/test-live-hub`.
-- Current implementation context: `botster-tui` already depends on `botster-hub-client` and `botster-tui-kit`, parses `--hub-socket`/`BOTSTER_HUB_SOCKET`, lists sessions/packages/apps, renders diagnostics through `DogfoodApp::surface`, can spawn/attach/drain/send input/resize through `DaemonRequest`, and has an isolated live-hub headless dogfood test.
-- Current manifest context: `botster-package.json` already declares a `terminal_app` runnable entrypoint `tui` with `foreground_stdio`, `target/debug/botster-tui`, `--hub-socket {{hub_socket}}`, package-root working directory, and required hub connection/data-dir/hub-socket injections.
+- Current implementation context: `botster-tui` already depends on `botster-hub-client` and `botster-tui-kit`, consumes `BOTSTER_HUB_CONNECTION`, lists sessions/packages/apps, renders diagnostics through `TuiApp::surface`, can spawn/attach/drain/send input/resize through `DaemonRequest`, and has an isolated live-Hub headless live-runtime test.
+- Current manifest context: `botster-package.json` already declares a `terminal_app` runnable entrypoint `tui` with `foreground_stdio`, `target/debug/botster-tui`, package-root working directory, and required typed Hub connection/data-dir injections.
 - Checklist context: `project_pipelines_checklist_instructions` was loaded. `project_pipelines_create_vault_checklist` timed out with `plugin worker invoke timeout`, matching the known fallback note; checklist-style evidence is preserved in this plan and should also be submitted in gate evidence.
 
 ## Scope
 
 - Keep the implementation inside `botster-tui` unless acceptance exposes a missing upstream package-app contract that must be registered as a dependency rather than reimplemented here.
 - Make `botster-tui` usable as a first-party dev-stack package-launched client, with the package runnable entrypoint and README/script flow reflecting the real `botster-hub apps open botster-tui tui` path instead of a future placeholder.
-- Prove the production path consumes hub-launched connection inputs: `--hub-socket {{hub_socket}}` as the primary socket source, plus required `BOTSTER_HUB_CONNECTION` and `BOTSTER_PACKAGE_DATA_DIR` injection presence/validation where the TUI can observe them.
+- Prove the production path consumes the Hub-launched `BOTSTER_HUB_CONNECTION` descriptor plus the required data-dir injection.
 - Preserve the public `botster-hub-client` boundary for all hub communication: status, sessions, packages, apps, diagnostics, package entrypoint lifecycle, terminal attach/drain/input/resize, and any app-open/entrypoint actions supported by the pinned DTOs.
 - Render installed app/package/surface-adjacent rows only from hub-provided app/package/action/diagnostic DTOs. "Open plugin surfaces where supported" means using hub package app mechanics and hub-provided action descriptors available in the public client protocol; it does not mean inventing a private plugin UI renderer.
-- Extend the headless dogfood harness or add a sibling live-hub acceptance path so it installs/enables the local package in a persistent dev data dir, launches/opens the TUI through hub package app mechanics, and performs at least one real hub action through the launched client.
-- Update README commands so reviewers can reproduce the app-open flow against an explicit dev data dir and see the direct `BOTSTER_HUB_SOCKET cargo run` path only as a lower-level fallback.
+- Extend the headless live-runtime harness or add a sibling live-hub acceptance path so it installs/enables the local package in a persistent dev data dir, launches/opens the TUI through hub package app mechanics, and performs at least one real hub action through the launched client.
+- Update README commands so reviewers can reproduce the app-open flow against an explicit dev data dir and use the same typed descriptor for direct lower-level runs.
 
 ## Non-Scope
 
@@ -60,11 +60,11 @@ run: run_1782775153_356366
 
 - `botster-package.json`
   - Confirm or adjust the `terminal_app` runnable entrypoint so it exactly matches the hub app-open launch contract.
-  - Keep required hub socket, hub connection, and package data-dir injections aligned with actual runtime consumption.
+  - Keep required Hub connection and package data-dir injections aligned with actual runtime consumption.
 - `crates/botster-tui/src/app.rs`
   - Validate and display package-launch diagnostics for missing required injected data where the TUI can observe it.
   - Preserve `DaemonRequest` use for session/package/app actions and add only the smallest supported request handling needed for package-open acceptance.
-  - Extend headless dogfood/runtime assertions to prove the launched client performs a real hub action.
+  - Extend headless live-runtime/runtime assertions to prove the launched client performs a real hub action.
 - `crates/botster-tui/src/main.rs`
   - Only if argument handling needs a narrow package-launch mode or clearer failure path.
 - `crates/botster-tui/tests/package_manifest_test.rs`
@@ -82,7 +82,7 @@ run: run_1782775153_356366
 
 - Embedded-TUI regression risk: trying to satisfy app-open by calling hub internals could revive the old embedded TUI shape. Mitigation: use `botster-hub-client` and hub package app launcher only.
 - Unwired-manifest risk: declared injections may remain documentation if the launched process never reads or validates them. Mitigation: test argument/env consumption and include a negative diagnostic path for missing required launch data.
-- False acceptance risk: direct `cargo run -- --headless-dogfood` proves a client socket path but not package-launched app mechanics. Mitigation: add an acceptance check that goes through package install/open against a persistent data dir.
+- False acceptance risk: direct `cargo run -- --headless-live-runtime` proves a client socket path but not package-launched app mechanics. Mitigation: add an acceptance check that goes through package install/open against a persistent data dir.
 - Upstream capability risk: package app-open may be absent or incomplete in the pinned hub dependency. Mitigation: verify the public hub-client/test-support surface first, bump pins narrowly when merged support exists, or register a blocking dependency rather than implementing hub policy locally.
 - Plugin-surface ambiguity risk: "open plugin surfaces where supported" can mean app rows/action descriptors or full plugin `UiNode` rendering. Mitigation: only implement the public supported path exposed by hub-client DTOs; document unsupported richer surfaces if absent.
 - PII/path leakage risk: package-open diagnostics can expose local absolute paths, sockets, usernames, or data dirs. Mitigation: assert rendered diagnostics and README examples stay path-neutral or use placeholders.
@@ -97,14 +97,14 @@ run: run_1782775153_356366
 - `CARGO_TARGET_DIR=/tmp/botster-tui-package-client-target script/test-live-hub`
 - Focused tests should prove:
   - `botster-package.json` still validates as a package manifest and exposes exactly one foreground `terminal_app` runnable entrypoint for `botster-tui`.
-  - required `hub_socket`, `hub_connection`, and `data_dir` injections are declared and mapped to runtime-observable argument/env inputs.
-  - app startup produces clear diagnostics when the hub socket is missing and, if implemented, when required package-launch env is missing.
+  - required `hub_connection` and `data_dir` injections are declared and mapped to runtime-observable environment inputs.
+  - app startup produces clear diagnostics when the Hub connection descriptor or required package-launch environment is missing.
   - the refresh path issues `Status`, `ListSessions`, `ListPackages`, and `ListApps` through the real `botster-hub-client` request path.
   - installed app/package rows and supported action descriptors come from hub DTOs, not inferred local manifest parsing.
   - package entrypoint start/status/open actions, if wired by the public DTOs, dispatch through typed `DaemonRequest` variants.
   - the live package-open path uses a persistent dev data dir, installs/enables the local checkout as a package, launches/opens `botster-tui` via hub app mechanics, and observes at least one real hub action such as status/list/spawn/attach/drain from the launched client.
   - the live path does not require or mutate the user's real Botster home state and does not render raw local paths, tokens, auth values, or socket paths in user-facing diagnostics.
-- Runtime-path proof: acceptance must show the production entrypoint (`main` -> `AppArgs::parse` -> `app::run` or `--headless-dogfood`) is launched by hub package app mechanics. Source-code existence alone is not sufficient.
+- Runtime-path proof: acceptance must show the production entrypoint (`main` -> `AppArgs::parse` -> `app::run` or `--headless-live-runtime`) is launched by hub package app mechanics. Source-code existence alone is not sufficient.
 
 ## Pipeline Gates and Artifacts
 

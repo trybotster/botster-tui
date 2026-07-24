@@ -136,6 +136,21 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
+source = "git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05#16bf08f29ec723c70c290cf995745ccbf79d4f05"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "botster-core"
+version = "0.1.0"
 source = "git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62#7d52fb78024b45764d6830cf4c6b131f13a83e62"
 dependencies = [
  "aes-gcm",
@@ -151,9 +166,9 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62#7d52fb78024b45764d6830cf4c6b131f13a83e62"
+source = "git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05#16bf08f29ec723c70c290cf995745ccbf79d4f05"
 dependencies = [
- "botster-core",
+ "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05)",
  "serde",
  "serde_json",
 ]
@@ -182,7 +197,8 @@ dependencies = [
 name = "botster-tui"
 version = "0.1.0"
 dependencies = [
- "botster-core",
+ "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05)",
+ "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62)",
  "botster-core-test-support",
  "botster-hub-client",
  "botster-hub-test-support",
@@ -197,7 +213,7 @@ name = "botster-tui-kit"
 version = "0.1.0"
 source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=fb0fdcb87d102232cb015b6da782a971903b4190#fb0fdcb87d102232cb015b6da782a971903b4190"
 dependencies = [
- "botster-core",
+ "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62)",
  "crossterm",
  "ratatui",
  "serde_json",

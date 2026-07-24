@@ -1,5 +1,5 @@
-use botster_core::RequestId;
-use botster_core::ui::UiSurfaceId;
+use botster_core_ui::RequestId;
+use botster_core_ui::ui::UiSurfaceId;
 
 pub const WORKSPACE_SURFACE_ID: &str = "botster-tui.workspace";
 
@@ -17,7 +17,7 @@ pub fn action_request_context() -> ActionRequestContext {
 
 #[cfg(test)]
 pub fn render_to_lines(
-    root: &botster_core::ui::UiNode,
+    root: &botster_core_ui::ui::UiNode,
     width: u16,
     height: u16,
 ) -> (Vec<String>, HitMap) {
@@ -26,7 +26,7 @@ pub fn render_to_lines(
 
 #[cfg(test)]
 pub fn render_to_lines_with_state(
-    root: &botster_core::ui::UiNode,
+    root: &botster_core_ui::ui::UiNode,
     width: u16,
     height: u16,
     state: &RenderState,

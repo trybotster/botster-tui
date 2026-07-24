@@ -11,8 +11,8 @@ run: run_1781111328_232793
 
 - Pipeline context: ticket `ticket_1781065271_922662`, run `run_1781111328_232793`, active step `hotwire_plan`, gate `hotwire_plan_gate`; no prior artifacts, reviews, findings, questions, or answers were present.
 - Dependency context: dependency ticket `ticket_1781065270_520493` ("Supervise local package entrypoint processes in botster-hub") is closed. Plan Review verified that dependency PR #56 landed on `trybotster/botster-hub` at merge commit `ae73a41` on 2026-06-10, after this repo's current `botster-hub-client` pin. Updating the `botster-hub-client` git revision to a commit including PR #56 is required.
-- Repo context: this is a Rust TUI workspace, not a Hotwire Rails app. The governing repo shape is `Cargo.toml`, `crates/botster-tui`, and existing dogfood docs/scripts. The current package diagnostics surface and package DTO rendering live in `crates/botster-tui/src/app.rs`.
-- Existing local surface: `DogfoodApp` already refreshes status, sessions, and packages; renders package summary and package rows in the hub/status diagnostics panel; and tests package count, package rows, package diagnostics, and refresh request sequencing.
+- Repo context: this is a Rust TUI workspace, not a Hotwire Rails app. The governing repo shape is `Cargo.toml`, `crates/botster-tui`, and existing live-runtime docs/scripts. The current package diagnostics surface and package DTO rendering live in `crates/botster-tui/src/app.rs`.
+- Existing local surface: `TuiApp` already refreshes status, sessions, and packages; renders package summary and package rows in the hub/status diagnostics panel; and tests package count, package rows, package diagnostics, and refresh request sequencing.
 - Current dependency observation: the pinned `botster-hub-client` revision in `crates/botster-tui/Cargo.toml` predates PR #56 and does not expose the required process-state DTOs. Implementation must bump the pin and consume the real public DTOs: `DaemonPackage.runnable_entrypoints: Vec<DaemonPackageRunnableEntrypoint>`, with each entrypoint carrying `process: DaemonPackageProcess`.
 - Vault context loaded: [[identity]], [[goals]], [[planner-playbook]], [[hotwire-app-planner-playbook]] for applicability check only, [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], and [[plan agents must author vault context as wikilinks not home paths]].
 - Skill context loaded: `botster-customize-tui`, because this ticket changes the first-party Botster TUI client surface.
@@ -26,7 +26,7 @@ run: run_1781111328_232793
 - Extend the existing package/operator diagnostics surface so each package can show entrypoint id, kind, process state, pid/timestamps/exit status when present, and diagnostic/error text when present.
 - Preserve existing package registry fields already shown: package name, version, classification, state, requested capabilities, and provider profile admission.
 - Add focused tests for rendering running, failed, stopped, and no-URL-public-DTO entrypoint states from hub-client DTO fixtures.
-- Optionally add a single README local hub dogfood sentence mentioning entrypoint process-state visibility through public hub-client DTOs; avoid broader documentation cleanup.
+- Optionally add a single README local hub live-runtime sentence mentioning entrypoint process-state visibility through public hub-client DTOs; avoid broader documentation cleanup.
 - Keep dependency and lockfile changes limited to the required `botster-hub-client` bump and resulting dependency graph.
 
 ## Non-Scope
@@ -50,9 +50,9 @@ run: run_1781111328_232793
 
 ## Botster Layers Touched
 
-- TUI: primary layer; `DogfoodApp` package state formatting, hub/status diagnostics surface, and focused tests.
+- TUI: primary layer; `TuiApp` package state formatting, hub/status diagnostics surface, and focused tests.
 - Hub client boundary: required `botster-hub-client` pin update to a revision including PR #56, then public DTO consumption through `botster-hub-client`.
-- Docs: README local hub dogfood documentation and this plan artifact.
+- Docs: README local hub live-runtime documentation and this plan artifact.
 
 ## Affected Surfaces and Files
 
@@ -66,7 +66,7 @@ run: run_1781111328_232793
 - `crates/botster-tui/Cargo.toml` and `Cargo.lock`
   - Bump `botster-hub-client` to a revision including PR #56 and update the lockfile accordingly.
 - `README.md`
-  - Optional single-sentence note that local hub dogfood shows package entrypoint state and diagnostics through public hub-client DTOs.
+  - Optional single-sentence note that local hub live-runtime shows package entrypoint state and diagnostics through public hub-client DTOs.
 - `docs/plans/tui-package-entrypoint-process-state-plan.md`
   - Reviewable Plan artifact for this ticket.
 
@@ -78,8 +78,8 @@ run: run_1781111328_232793
 - URL mismatch: the public DTO has no URL field despite the ticket wording. Mitigation: do not derive or invent URL; render process details and diagnostics and test that no-URL DTOs still produce visible entrypoint state.
 - Diagnostic duplication: package process diagnostics should use the existing diagnostics surface or package row fields, not a parallel error store.
 - Terminal regression: nearby app code also owns terminal attach/input behavior. Mitigation: keep edits confined to package state formatting, package fixtures, docs, and dependency pin if needed.
-- README scope creep: docs are useful for dogfood behavior, but this ticket does not require broad documentation. Mitigation: keep docs to at most one local dogfood sentence, or skip README if tests and UI rendering are self-explanatory.
-- Live fixture gap: this repo may not have a local package fixture that launches entrypoints under an isolated hub. Mitigation: unit tests must prove the production TUI rendering path from hub-client DTOs; live-hub verification should still prove no dogfood regression.
+- README scope creep: docs are useful for live-runtime behavior, but this ticket does not require broad documentation. Mitigation: keep docs to at most one local live-runtime sentence, or skip README if tests and UI rendering are self-explanatory.
+- Live fixture gap: this repo may not have a local package fixture that launches entrypoints under an isolated hub. Mitigation: unit tests must prove the production TUI rendering path from hub-client DTOs; live-hub verification should still prove no live-runtime regression.
 
 ## Acceptance Checks and Tests
 
@@ -97,7 +97,7 @@ run: run_1781111328_232793
   - packages with multiple runnable entrypoints render each entrypoint without collapsing state;
   - existing package count/package row diagnostics still render;
   - refresh still pulls the package read model through public `DaemonRequest` paths.
-- Runtime-path proof: tests should drive `DogfoodApp::apply_response` and `surface()`/renderer output, not only call a pure formatting helper.
+- Runtime-path proof: tests should drive `TuiApp::apply_response` and `surface()`/renderer output, not only call a pure formatting helper.
 
 ## Pipeline Gates and Artifacts
 
