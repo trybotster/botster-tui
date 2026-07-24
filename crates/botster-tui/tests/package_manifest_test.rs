@@ -37,46 +37,29 @@ fn package_manifest_declares_terminal_app_foreground_stdio() {
         Some(RunnableEntrypointWorkingDirectory::PackageRoot)
     );
 
-    for required_kind in [
-        RunnableEntrypointInjectionKind::HubConnection,
-        RunnableEntrypointInjectionKind::DataDir,
-        RunnableEntrypointInjectionKind::HubSocket,
-    ] {
-        assert!(
-            entrypoint
-                .injections
-                .iter()
-                .any(|injection| injection.kind == required_kind && injection.required),
-            "missing required injection {required_kind:?}"
-        );
-    }
-
-    assert!(entrypoint.injections.iter().any(|injection| {
-        injection.kind == RunnableEntrypointInjectionKind::HubSocket
-            && injection.required
-            && injection.target
-                == RunnableEntrypointInjectionTarget::Environment {
-                    name: "BOTSTER_HUB_SOCKET".to_string(),
-                }
-    }));
-    assert!(entrypoint.injections.iter().any(|injection| {
-        injection.kind == RunnableEntrypointInjectionKind::DataDir
-            && injection.required
-            && injection.target
-                == RunnableEntrypointInjectionTarget::Environment {
+    assert_eq!(entrypoint.injections.len(), 2);
+    assert_eq!(
+        entrypoint
+            .injections
+            .iter()
+            .map(|injection| (&injection.kind, &injection.target, injection.required,))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                &RunnableEntrypointInjectionKind::HubConnection,
+                &RunnableEntrypointInjectionTarget::Environment {
+                    name: "BOTSTER_HUB_CONNECTION".to_string(),
+                },
+                true,
+            ),
+            (
+                &RunnableEntrypointInjectionKind::DataDir,
+                &RunnableEntrypointInjectionTarget::Environment {
                     name: "BOTSTER_HUB_DATA_DIR".to_string(),
-                }
-    }));
-    assert!(
-        entrypoint
-            .environment
-            .iter()
-            .any(|requirement| requirement.name == "BOTSTER_HUB_SOCKET" && !requirement.required)
+                },
+                true,
+            ),
+        ]
     );
-    assert!(
-        entrypoint
-            .environment
-            .iter()
-            .any(|requirement| requirement.name == "BOTSTER_HUB_DATA_DIR" && requirement.required)
-    );
+    assert!(entrypoint.environment.is_empty());
 }

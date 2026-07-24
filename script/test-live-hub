@@ -1,26 +1,43 @@
 #!/bin/sh
 set -eu
 
-target_dir="${CARGO_TARGET_DIR:-/tmp/botster-tui-impl-target}"
-hub_target_dir="${BOTSTER_LIVE_HUB_TARGET_DIR:-/tmp/botster-tui-live-hub-target}"
+resolve_binary() {
+  variable_name="$1"
+  command_name="$2"
+  eval "configured=\${$variable_name:-}"
+  if [ -n "$configured" ]; then
+    if [ ! -x "$configured" ]; then
+      echo "$variable_name is not executable: $configured" >&2
+      exit 1
+    fi
+    printf '%s\n' "$configured"
+    return
+  fi
 
-hub_client_manifest="$(
-  cargo metadata --format-version 1 |
-    ruby -rjson -e 'metadata = JSON.parse(STDIN.read); package = metadata["packages"].find { |entry| entry["name"] == "botster-hub-client" }; abort "botster-hub-client dependency not found" unless package; puts package["manifest_path"]'
-)"
-hub_root="$(cd "$(dirname "$hub_client_manifest")/../.." && pwd)"
-contract_matrix_fixture="$hub_root/fixtures/plugins/plugin-contract-matrix"
+  resolved="$(command -v "$command_name" || true)"
+  if [ -z "$resolved" ]; then
+    echo "set $variable_name to an explicit $command_name binary, or add $command_name to PATH" >&2
+    exit 1
+  fi
+  printf '%s\n' "$resolved"
+}
 
-cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked --bin botster-hub
-cargo build --manifest-path "$hub_root/Cargo.toml" --target-dir "$hub_target_dir" --locked -p botster-core --bin botster-session-worker
+hub_bin="$(resolve_binary BOTSTER_HUB_BIN botster-hub)"
+session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  target_dir="$CARGO_TARGET_DIR"
+else
+  target_dir="$(mktemp -d "${TMPDIR:-/tmp}/botster-tui-live-target.XXXXXX")"
+  trap 'rm -rf "$target_dir"' EXIT
+fi
+
 cargo build -p botster-tui --target-dir "$target_dir" --locked
 mkdir -p target/debug
 cp "$target_dir/debug/botster-tui" target/debug/botster-tui
 
 BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
 BOTSTER_ENV=test \
-BOTSTER_HUB_BIN="$hub_target_dir/debug/botster-hub" \
-BOTSTER_SESSION_WORKER_BIN="$hub_target_dir/debug/botster-session-worker" \
-BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="$contract_matrix_fixture" \
+BOTSTER_HUB_BIN="$hub_bin" \
+BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
 CARGO_TARGET_DIR="$target_dir" \
-cargo test -p botster-tui headless_dogfood_runs_against_isolated_hub_when_binaries_are_available -- --nocapture
+cargo test -p botster-tui headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available -- --nocapture

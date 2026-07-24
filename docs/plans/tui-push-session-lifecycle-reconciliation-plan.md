@@ -31,7 +31,7 @@ Ticket: TUI: reconcile sessions from push lifecycle entity frames
   [[tui and socket terminal streams use clientworker transport adapters]],
   [[external client hub tests use subprocess spawned hub test support]],
   [[shared conformance fixtures that contradict the core contract teach clients the wrong state machine]],
-  [[botster web dogfood session readiness can arrive as entity snapshot]], and
+  [[botster web live-runtime session readiness can arrive as entity snapshot]], and
   [[runtime client acceptance must render delivered snapshots through real registry]].
 - The Botster planner's Project Pipelines policy notes were loaded for workflow
   discipline. [[project-pipelines-playbook]] was not loaded because neither the
@@ -59,14 +59,14 @@ Ticket: TUI: reconcile sessions from push lifecycle entity frames
   `FEATURE_SESSION_ENTITY_SUBSCRIPTIONS`. The frame vocabulary is authoritative
   `Snapshot`, `Upsert`, `Patch`, and `Remove`, scoped by `subscription_id` and
   ordered by `snapshot_seq`.
-- Current TUI production flow is `run_loop -> DogfoodApp::poll_hub ->
+- Current TUI production flow is `run_loop -> TuiApp::poll_hub ->
   HubConnection::request`. `try_connect` calls `refresh_read_models`, which
   issues `ListSessions`; `spawn_session` inserts a running row locally and
   immediately attaches; `apply_response_state` replaces the session list from
   `Sessions` or `Spawned` responses. These are the exact legacy paths this
   ticket replaces.
 - Terminal selection, attach hydration, input, resize, readback, and drain are
-  already separate state in `DogfoodApp`. They remain on the public
+  already separate state in `TuiApp`. They remain on the public
   `botster-hub-client` request/event boundary.
 
 ## Scope
@@ -214,7 +214,7 @@ hub conformance proof.
    including empty and overflow snapshots, ordered deltas, sparse patches,
    removal, and stale generation/sequence rejection.
 3. Add the non-blocking subscription pump and lifecycle ownership to
-   `DogfoodApp`. Start it after control connection readiness; drain frames in
+   `TuiApp`. Start it after control connection readiness; drain frames in
    the production poll loop; make disconnect create a new generation and wait
    for its snapshot.
 4. Remove `refresh_sessions`, `ListSessions` observations/tests, and
@@ -228,7 +228,7 @@ hub conformance proof.
    lifecycle patch, remove, selection stability, attach gating, disconnect,
    fresh snapshot, and stale-frame rejection.
 7. Extend the isolated live-hub test to prove those same user-visible states
-   through `DogfoodApp::poll_hub` and `DogfoodApp::surface`, and invoke
+   through `TuiApp::poll_hub` and `TuiApp::surface`, and invoke
    `run_session_lifecycle_subscription_conformance` against the real isolated
    Hub/Core/session-worker topology.
 8. Update README ownership/runtime documentation, run all repository gates, and
@@ -291,7 +291,7 @@ Live downstream proof must use the existing isolated hub builder and real
 - drive the TUI app through empty snapshot, pending spawn, authoritative
   appearance, externally spawned visibility, lifecycle update, natural
   exit/removal, subscriber disconnect, and fresh reconnect snapshot;
-- render the converged states through `DogfoodApp::surface()` and the production
+- render the converged states through `TuiApp::surface()` and the production
   TUI renderer, not only inspect a standalone reducer;
 - explicitly attach only after authoritative appearance, then preserve the
   existing terminal input/readback/reconnect evidence.

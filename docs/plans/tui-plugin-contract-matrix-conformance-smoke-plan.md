@@ -12,7 +12,7 @@ run: run_1783289813_806661
 - Pipeline context: ticket `ticket_1783280112_685450`, run `run_1783289813_806661`, active step `botster_plan`, gate `botster_plan_gate`; no prior artifacts, reviews, findings, questions, or answers were present.
 - Dependency context: upstream dependency `ticket_1783280111_645888` ("Expose reusable plugin UI conformance harness from botster-hub-test-support") is closed.
 - Worktree/target context: run target is `tgt_c3d470bab78549df920a41e8fb0e58d8`, base ref is `main`, and this plan is for the assigned checkout only.
-- Repo context: compact Rust TUI workspace. The production dogfood app, hub requests, package/app rendering, plugin-adjacent action handling, headless live-hub test, and most assertions live in `crates/botster-tui/src/app.rs`; renderer adapter exports live in `crates/botster-tui/src/renderer.rs`; dependency pins live in `crates/botster-tui/Cargo.toml` and `Cargo.lock`.
+- Repo context: compact Rust TUI workspace. The production live-runtime app, hub requests, package/app rendering, plugin-adjacent action handling, headless live-hub test, and most assertions live in `crates/botster-tui/src/app.rs`; renderer adapter exports live in `crates/botster-tui/src/renderer.rs`; dependency pins live in `crates/botster-tui/Cargo.toml` and `Cargo.lock`.
 - Current dependency observation: this repo pins `botster-hub-client` / `botster-hub-test-support` to `b5f80286605fcb1e432e5b673b506fa124739728`. That pin has public `PluginSurfaceRender` / `PluginSurfaceAction` request types, but does not contain `run_plugin_contract_matrix_conformance` or `PluginContractMatrixConformanceReport`.
 - Fresh hub observation: `trybotster/botster-hub` main resolves to `27118ab75f4ff511ccdfcfa754f74b878c0b9b45`. A temporary read-only clone of that revision exposes `botster_hub_test_support::run_plugin_contract_matrix_conformance`, `PluginContractMatrixConformanceReport`, `PluginContractMatrixClientRenderCheck`, and the fixture path `fixtures/plugins/plugin-contract-matrix`.
 - Fresh contract-matrix semantics: the hub-owned harness installs/configures/enables `botster.plugin-contract-matrix`, verifies app/settings route descriptors, renders app/empty/settings plugin surfaces, checks a blocked/error surface, checks invalid and valid settings configuration, and exercises plugin action success/error through public `botster-hub-client` requests.
@@ -35,7 +35,7 @@ run: run_1783289813_806661
 - Extend the existing isolated-hub live test path to call `run_plugin_contract_matrix_conformance(&hub, <hub checkout>/fixtures/plugins/plugin-contract-matrix)` after the hub/test-support bump and compare the returned report against the TUI renderer output.
 - Prove app/settings surface discovery from hub-owned DTOs: installed app/package route rows must show the contract matrix app route and settings/config path from `ListApps` / `ListPackages`, not only package listing.
 - Prove action success and action error are visible in TUI terminal state from `plugin_action_result` and public diagnostics.
-- Update README local hub dogfood docs to mention plugin contract matrix conformance coverage and the precise unsupported-primitive behavior if implementation changes visible capability text.
+- Update README local hub live-runtime docs to mention plugin contract matrix conformance coverage and the precise unsupported-primitive behavior if implementation changes visible capability text.
 
 ## Non-Scope
 
@@ -48,7 +48,7 @@ run: run_1783289813_806661
 ## Assumptions And Unknowns
 
 - Assumption: the closed dependency is represented on `trybotster/botster-hub` main at `27118ab75f4ff511ccdfcfa754f74b878c0b9b45`, and this TUI branch should consume that merged harness instead of backporting a local fixture.
-- Assumption: the existing `script/test-live-hub` shape remains the right runtime proof: build the pinned hub/session-worker binaries, start an isolated hub, run headless dogfood, then run contract-matrix conformance against that same hub.
+- Assumption: the existing `script/test-live-hub` shape remains the right runtime proof: build the pinned hub/session-worker binaries, start an isolated hub, run headless live-runtime, then run contract-matrix conformance against that same hub.
 - Assumption: `botster-tui-kit` owns primitive rendering and unsupported capability validation. `botster-tui` should add client surface plumbing/assertions, not fork renderer behavior.
 - Unknown: whether the dependency bump also requires a matching `botster-core` or `botster-tui-kit` pin update. Implementation must compile first and keep any pin movement tied to public type compatibility or capability diagnostics.
 - Unknown: whether fresh `PluginSurface` response bodies deserialize directly into `UiNode` or require reading a wrapper DTO's `body` field first. Implementation must use the public `botster-hub-client` structs and avoid ad hoc string manipulation.
@@ -57,10 +57,10 @@ run: run_1783289813_806661
 
 ## Botster Layers Touched
 
-- TUI: primary layer; `DogfoodApp` response handling, plugin surface/action rendering, live conformance assertions, and tests.
+- TUI: primary layer; `TuiApp` response handling, plugin surface/action rendering, live conformance assertions, and tests.
 - Hub client boundary: dependency rev bump and public `botster-hub-client` DTO consumption.
 - Hub test support: dev/test dependency only, consuming the reusable plugin contract matrix harness.
-- Docs: README local dogfood capability text and this plan artifact.
+- Docs: README local live-runtime capability text and this plan artifact.
 - Not touched: Rust hub implementation, core package/plugin policy, Lua runtime, session/client worker data plane, React SPA, Rails relay, MCP tools.
 
 ## Affected Surfaces And Files
@@ -74,12 +74,12 @@ run: run_1783289813_806661
   - Apply and render plugin surface responses.
   - Apply and render plugin action result success/error state.
   - Render route/settings metadata from `DaemonPackage.routes` and `DaemonApp.route` if the fresh DTO exposes those fields.
-  - Add typed fixture/test helpers that drive `DogfoodApp::apply_response`, `surface()`, `renderer::render_to_lines`, `handle_dispatch`, and the existing live-hub harness.
-  - Extend `headless_dogfood_runs_against_isolated_hub_when_binaries_are_available` or add a sibling live test for `run_plugin_contract_matrix_conformance`.
+  - Add typed fixture/test helpers that drive `TuiApp::apply_response`, `surface()`, `renderer::render_to_lines`, `handle_dispatch`, and the existing live-hub harness.
+  - Extend `headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available` or add a sibling live test for `run_plugin_contract_matrix_conformance`.
 - `crates/botster-tui/src/renderer.rs`
   - No planned structural change. Touch only if exposing a small helper for validating/rendering delivered `UiNode` bodies through the existing kit path is cleaner than duplicating test code in `app.rs`.
 - `README.md`
-  - Update Local Hub Dogfood documentation for plugin surface/settings/action conformance and unsupported primitive diagnostics if visible behavior changes.
+  - Update Local Hub Production documentation for plugin surface/settings/action conformance and unsupported primitive diagnostics if visible behavior changes.
 - `docs/plans/tui-plugin-contract-matrix-conformance-smoke-plan.md`
   - Reviewable Plan-stage artifact.
 

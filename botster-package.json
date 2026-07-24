@@ -27,10 +27,10 @@
           "kind": "hub_connection",
           "target": {
             "type": "environment",
-            "name": "BOTSTER_HUB_SOCKET"
+            "name": "BOTSTER_HUB_CONNECTION"
           },
           "required": true,
-          "description": "Hub socket supplied by the host."
+          "description": "Typed Hub connection descriptor supplied by the host."
         },
         {
           "kind": "data_dir",
@@ -40,32 +40,6 @@
           },
           "required": true,
           "description": "Hub data directory supplied by the host."
-        },
-        {
-          "kind": "hub_socket",
-          "target": {
-            "type": "environment",
-            "name": "BOTSTER_HUB_SOCKET"
-          },
-          "required": true,
-          "description": "Hub socket supplied by the host."
-        }
-      ],
-      "environment": [
-        {
-          "name": "BOTSTER_HUB_SOCKET",
-          "required": false,
-          "description": "Fallback hub socket environment variable consumed by botster-tui when --hub-socket is not supplied."
-        },
-        {
-          "name": "BOTSTER_HUB_CONNECTION",
-          "required": false,
-          "description": "Legacy host-selected hub connection descriptor."
-        },
-        {
-          "name": "BOTSTER_HUB_DATA_DIR",
-          "required": true,
-          "description": "Host-selected hub data directory."
         }
       ]
     }

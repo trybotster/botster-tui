@@ -67,9 +67,9 @@ Step: Plan
   README, coverage guide, application-shell plan, widget explorer, layout
   helpers, renderer, and input router.
 - Current production path:
-  `main` -> `app::run` -> `run_loop` -> `DogfoodApp::surface` ->
+  `main` -> `app::run` -> `run_loop` -> `TuiApp::surface` ->
   kit `render_node` -> draw-derived `HitMap` -> Crossterm event ->
-  kit `InputRouter::dispatch_event` -> `DogfoodApp::handle_dispatch` ->
+  kit `InputRouter::dispatch_event` -> `TuiApp::handle_dispatch` ->
   public `botster-hub-client` request or terminal data-plane input.
 
 ## Current Baseline And Prerequisite Reconciliation
@@ -145,10 +145,10 @@ In scope:
 - Preserve terminal attach, ReadScreen hydration, buffered live output,
   resize, keyboard forwarding, authoritative mouse-mode reapplication, and
   full SGR mouse passthrough.
-- Replace user-visible and root application "dogfood scaffold" terminology
-  with session-workspace terminology where touched. Keep `--headless-dogfood`
+- Replace user-visible and root application "live-runtime scaffold" terminology
+  with session-workspace terminology where touched. Keep `--headless-live-runtime`
   naming only for the existing live-hub test mode whose purpose is still
-  dogfood verification; do not perform an unrelated repository-wide rename.
+  live-runtime verification; do not perform an unrelated repository-wide rename.
 - Update repository documentation to describe the daily-use workspace,
   responsive behavior, keyboard/mouse shortcuts, state distinctions, system
   details, and destructive confirmation.

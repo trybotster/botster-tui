@@ -35,7 +35,7 @@ Ticket: Bump botster-tui kit pin for full SGR mouse passthrough
 - Production runtime trace:
   `run_loop` reads Crossterm events, calls the kit-owned
   `InputRouter::dispatch_event` with the production draw's `HitMap`, and passes
-  the result to `DogfoodApp::handle_dispatch`.
+  the result to `TuiApp::handle_dispatch`.
   `InputDispatch::TerminalForward` then becomes
   `DaemonRequest::SendInput` for the currently attached session and
   subscription. This is an active runtime dependency update, not scaffold-only
@@ -63,11 +63,11 @@ Ticket: Bump botster-tui kit pin for full SGR mouse passthrough
   must be `TerminalForward` with SGR release bytes and must not produce another
   semantic Action.
 - Treat the test-local `mouse_mode` prop as a renderer fixture only. Production
-  `DogfoodApp::surface()` continues to validate the closed core
+  `TuiApp::surface()` continues to validate the closed core
   `terminal_view` schema and must not gain a private `mouse_mode` prop.
 - The implementation should set the app fixture's attached session and matching
   subscription after handling Down, then feed the returned Up dispatch through
-  `DogfoodApp::handle_dispatch`. This proves the real consumer write boundary
+  `TuiApp::handle_dispatch`. This proves the real consumer write boundary
   without inventing daemon state or changing attach lifecycle code.
 - `botster-core`, `botster-hub-client`, and `botster-hub-test-support` pins
   remain unchanged unless Cargo demonstrates a concrete compatibility
@@ -102,7 +102,7 @@ Ticket: Bump botster-tui kit pin for full SGR mouse passthrough
   - no additional app-specific occlusion helpers are required beyond the kit's
     existing `HitMap` behavior.
 - Preserve the thin `renderer.rs` adapter and the existing
-  `run_loop -> InputRouter -> DogfoodApp::handle_dispatch` production path.
+  `run_loop -> InputRouter -> TuiApp::handle_dispatch` production path.
 
 Botster layer touched: Rust TUI client, its pinned shared TUI-kit dependency,
 unit/regression coverage, and dependency/runtime documentation.
@@ -175,7 +175,7 @@ unit/regression coverage, and dependency/runtime documentation.
    the intended stale expectation: test-local mouse-mode Up now produces
    `TerminalForward`.
 3. Update the app-level regression to drive the complete Down+Up stream through
-   the rendered `HitMap`, kit `InputRouter`, and `DogfoodApp::handle_dispatch`.
+   the rendered `HitMap`, kit `InputRouter`, and `TuiApp::handle_dispatch`.
    Assert one Down-driven attach, exact Up SGR release bytes, one matching
    `SendInput`, and no second Action/attach.
 4. Keep and rerun the stable-node and cross-frame/cross-node activate-on-release
@@ -196,7 +196,7 @@ unit/regression coverage, and dependency/runtime documentation.
   with a second terminal focus Action. Mitigation: assert the exact Up variant,
   one attach across the pair, and one `SendInput`.
 - False runtime proof: asserting only router bytes would not prove the consumer
-  write path. Mitigation: pass the Up dispatch to `DogfoodApp::handle_dispatch`
+  write path. Mitigation: pass the Up dispatch to `TuiApp::handle_dispatch`
   with matching attached state and assert the observed send-input request.
 - Schema leakage: promoting test-local `mouse_mode` into the production surface
   would fail the closed core schema. Mitigation: leave `terminal_panel()` and
@@ -268,7 +268,7 @@ than replacing it with a static source assertion.
   unused-feature disposition.
 - Review and Verify should compare the branch diff with this plan, run the same
   strict gates, and reject router-only evidence that never reaches
-  `DogfoodApp::handle_dispatch`.
+  `TuiApp::handle_dispatch`.
 
 ## Vault gaps worth capturing
 

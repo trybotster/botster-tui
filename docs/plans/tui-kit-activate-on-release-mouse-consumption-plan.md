@@ -22,7 +22,7 @@ Ticket: Adapt botster-tui to kit activate-on-release mouse
   `project-pipelines/ticket_1784307273_949764`. `crates/botster-tui/src/renderer.rs`
   is a thin re-export of `botster-tui-kit`; it does not own input routing.
   Production input follows `run_loop` -> `crossterm::event::read` ->
-  `InputRouter::dispatch_event` -> `DogfoodApp::handle_dispatch`.
+  `InputRouter::dispatch_event` -> `TuiApp::handle_dispatch`.
 - Dependency context: the current kit pin `8b3ea35...` is the PR #10 merge.
   Activate-on-release landed in kit PR #12 at merge commit
   `fa0a728297c51d659b675f7d4201a3910a25bd82`. That revision uses the same
@@ -58,7 +58,7 @@ Ticket: Adapt botster-tui to kit activate-on-release mouse
   cancels rather than activates the newly moved row.
 - Preserve and strengthen TerminalView's intentional Down-driven attach: assert
   left Down focuses and emits `botster.terminal.focus`, feed it through
-  `DogfoodApp::handle_dispatch`, then send the matching Up and prove the pair
+  `TuiApp::handle_dispatch`, then send the matching Up and prove the pair
   causes exactly one focus action and one attach. Add a test-local mouse-mode
   assertion that Up is `Ignored`, not a second focus action; complete release
   forwarding remains owned by the separate terminal-mouse consumer work.
@@ -162,7 +162,7 @@ or plugin README behavior changes.
    the same coordinates cannot activate a different stable node.
 4. Strengthen TerminalView coverage without converting attach to release:
    prove Down focuses, emits `botster.terminal.focus`, and reaches the existing
-   `DogfoodApp` attach behavior; then dispatch Up and prove the pair produces no
+   `TuiApp` attach behavior; then dispatch Up and prove the pair produces no
    duplicate focus or attach. With a rendered `mouse_mode: true` TerminalView,
    assert Up is `Ignored` rather than a second focus action. Leave complete
    release forwarding and exact byte encoding to their owning kit consumer
@@ -183,7 +183,7 @@ or plugin README behavior changes.
   dispatch is non-Action and state has not yet mutated for at least the direct
   semantic action/selection paths.
 - Dropping the Down dispatch before Up can hide focus behavior needed by
-  `DogfoodApp::sync_focused_session`. Mitigation: dispatch both events in order
+  `TuiApp::sync_focused_session`. Mitigation: dispatch both events in order
   through the same router and current hit map, then assert selection/focus state.
 - A release sent with different coordinates or a redrawn hit map will correctly
   cancel under kit capture semantics. Mitigation: prove stable-node activation
@@ -200,7 +200,7 @@ or plugin README behavior changes.
   inspect `git diff Cargo.lock` and reject unexplained movement.
 - Static test changes alone would not prove the user path. Mitigation: trace and
   preserve production raw crossterm routing, exercise rendered HitMap ->
-  InputRouter -> DogfoodApp handling across two rendered frames, and treat the
+  InputRouter -> TuiApp handling across two rendered frames, and treat the
   production binary smoke only as a link/build check.
 
 ## Acceptance Checks And Tests
@@ -245,7 +245,7 @@ or plugin README behavior changes.
   streams, redraws between loop iterations, and sends both Down and Up into the
   upgraded kit router. The rendered-surface tests mirror that boundary by
   rebuilding the hit map between events and exercise the same `HitMap`,
-  `InputRouter`, and `DogfoodApp::handle_dispatch` boundaries; this ticket is
+  `InputRouter`, and `TuiApp::handle_dispatch` boundaries; this ticket is
   not scaffold-only. The static `--smoke` message is not runtime mouse evidence.
 
 ## Pipeline Gates And Artifacts

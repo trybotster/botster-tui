@@ -11,7 +11,7 @@ run: run_1781061911_346944
 
 - Pipeline context: `ticket_1781054950_479578`, run `run_1781061911_346944`, step `botster_plan`, gate `botster_plan_gate`; no prior artifacts, findings, reviews, questions, or answers.
 - Dependency context: dependency ticket `ticket_1781054950_975598` ("Implement local path package install enable disable remove flow") is closed, so the TUI can assume the hub package registry client-facing slice exists in the pinned hub-client dependency unless implementation proves the worktree is stale.
-- Repo context: clean worktree before planning; current repo has a single `botster-tui` crate plus docs/scripts. The dogfood app, hub connection, diagnostics rendering, package-aware status fixture fields, and tests are in `crates/botster-tui/src/app.rs`.
+- Repo context: clean worktree before planning; current repo has a single `botster-tui` crate plus docs/scripts. The live-runtime app, hub connection, diagnostics rendering, package-aware status fixture fields, and tests are in `crates/botster-tui/src/app.rs`.
 - Hub-client context from the pinned `botster-hub-client` revision `24453ef448fb4c89ed63e784ed518de7ca301cd7`: public DTOs include `DaemonRequest::ListPackages`, `DaemonResponse.packages`, `DaemonResponseKind::Packages`, `DaemonPackage { package_name, version, classification, state, requested_capabilities, provider_profile_admitted }`, `DaemonCapability { surface, scope }`, and `DaemonStatus.package_count` / `enabled_package_count`.
 - Vault context loaded: [[planner-playbook]], [[botster-planner-playbook]], [[botster-architecture]], [[cli-patterns]], [[spa-patterns]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], plus identity/goals context.
 - Checklist context: `project_pipelines_checklist_instructions` was loaded. Creating the run vault checklist timed out in the plugin worker, matching [[project pipelines checklist worker timeouts require artifact evidence fallback]], so checklist-style evidence is preserved in this plan and gate evidence instead of checklist rows.
@@ -19,15 +19,15 @@ run: run_1781061911_346944
 ## Scope
 
 - Keep this a `botster-tui` client slice.
-- Store package registry summary state in `DogfoodApp`: package count, enabled package count, and the current package list from public hub-client responses.
+- Store package registry summary state in `TuiApp`: package count, enabled package count, and the current package list from public hub-client responses.
 - Refresh package state through public hub-client requests:
   - consume `DaemonStatus.package_count` and `enabled_package_count` whenever status is applied;
   - issue `DaemonRequest::ListPackages` on connect/refresh alongside the existing status/session pulls, if the public request compiles against the pinned dependency;
   - consume `DaemonResponseKind::Packages` / `DaemonResponse.packages` without parsing strings or using hub internals.
-- Render package state inside the existing hub/status diagnostics panel so local hub dogfood shows installed/enabled/disabled states where operators already inspect hub health; package errors and compatibility failures are shown through public diagnostics.
+- Render package state inside the existing hub/status diagnostics panel so local hub live-runtime shows installed/enabled/disabled states where operators already inspect hub health; package errors and compatibility failures are shown through public diagnostics.
 - Render, per package, at least name, version, classification, state, capability summary, and provider admission state. Compatibility/capability diagnostics continue to come from public `DaemonDiagnostic` rows and package capability DTO fields.
 - Add focused tests in `crates/botster-tui/src/app.rs` that drive the production `apply_response` / refresh paths and assert visible package count, enabled count, installed/enabled/disabled package rows, verbatim package state display, capability text, and diagnostics.
-- Update `README.md` Local Hub Dogfood docs to mention package registry state and package diagnostics in local hub dogfood mode.
+- Update `README.md` Local Hub Production docs to mention package registry state and package diagnostics in local hub live-runtime mode.
 
 ## Non-Scope
 
@@ -42,26 +42,26 @@ run: run_1781061911_346944
 - Assumption: the pinned hub-client revision is fresh enough because it already exposes package count/status fields and `ListPackages`.
 - Assumption: `DaemonPackage.state` is the authoritative package state display value; the current hub protocol emits installed/enabled/disabled-like states, and the TUI should display the value verbatim instead of inventing local state mapping.
 - Assumption: package capability diagnostics are read-only display of `requested_capabilities` plus existing `DaemonDiagnostic` rows; no extra compatibility policy belongs in TUI.
-- Unknown: whether the live daemon returns `DaemonResponseKind::Packages` after `ListPackages` in all local dogfood states, including zero packages. Implementation should write tests for both empty and non-empty package responses and keep live-hub verification best-effort if constructing package fixtures through the daemon is not available in this repo.
+- Unknown: whether the live daemon returns `DaemonResponseKind::Packages` after `ListPackages` in all local live-runtime states, including zero packages. Implementation should write tests for both empty and non-empty package responses and keep live-hub verification best-effort if constructing package fixtures through the daemon is not available in this repo.
 - Current protocol fact: package errors and compatibility failures are represented through public diagnostics, not a `DaemonPackage.state == "error"` row state. The implementation should render diagnostics through the existing diagnostic path.
 - Worktree/target assumption: this run is bound to `target_id=tgt_c3d470bab78549df920a41e8fb0e58d8` and the assigned worktree is this repository checkout, not an ambient Botster checkout.
 
 ## Botster Layers Touched
 
-- TUI: primary layer, `DogfoodApp` state, hub dogfood status surface, tests.
+- TUI: primary layer, `TuiApp` state, hub live-runtime status surface, tests.
 - Hub client boundary: consumed only through `botster-hub-client` public request/response/DTO types.
-- Docs: README local hub dogfood section and this plan artifact.
+- Docs: README local hub live-runtime section and this plan artifact.
 
 ## Affected Surfaces and Files
 
 - `crates/botster-tui/src/app.rs`
-  - Add package state fields to `DogfoodApp`.
+  - Add package state fields to `TuiApp`.
   - Pull package list on connect/refresh through `DaemonRequest::ListPackages`.
   - Apply package responses and status counts in `apply_response`.
   - Render package summary and rows in `status_panel`.
   - Add package fixture helpers and focused tests.
 - `README.md`
-  - Update Local Hub Dogfood diagnostics documentation with package state, counts, capabilities, and read-only behavior.
+  - Update Local Hub Production diagnostics documentation with package state, counts, capabilities, and read-only behavior.
 - Possibly `docs/plans/tui-package-registry-display-plan.md`
   - Keep as the reviewable plan artifact.
 
@@ -72,7 +72,7 @@ run: run_1781061911_346944
 - Stale package display after status refresh: status counts without a list can diverge from rendered rows if only one request is refreshed. Mitigation: refresh status, sessions, and package list together on connect and manual refresh.
 - Diagnostic duplication or stale errors: existing diagnostic retention is keyed by kind/operation/feature. Package-related diagnostics should use the same path and not add parallel local error storage except package rows.
 - Terminal fidelity regression: changes near `handle_dispatch`, `TerminalForward`, resize, attach, or terminal output could break PTY input/data ownership. Mitigation: keep package work confined to status/package requests and rendering.
-- Live verification gap: this repo may not have package fixture installation helpers. If live hub package setup is unavailable, unit tests should still prove production rendering paths and live-hub dogfood should verify no regression to session/terminal diagnostics.
+- Live verification gap: this repo may not have package fixture installation helpers. If live hub package setup is unavailable, unit tests should still prove production rendering paths and live-hub live-runtime should verify no regression to session/terminal diagnostics.
 
 ## Acceptance Checks and Tests
 
@@ -80,7 +80,7 @@ run: run_1781061911_346944
 - `script/test`
 - `script/clippy`
 - `cargo run -p botster-tui -- --smoke`
-- Existing live-hub dogfood path remains the runtime proof:
+- Existing live-hub live-runtime path remains the runtime proof:
   - `CARGO_TARGET_DIR=/tmp/botster-tui-impl-target script/test-live-hub`
   - If live package fixture setup is unavailable in this repo, document that limitation while still proving the TUI connects through the real hub-client and package rendering is covered through `DaemonResponse` fixtures.
 - New or updated focused tests in `crates/botster-tui/src/app.rs` should prove:
