@@ -94,7 +94,8 @@ Dependency evidence:
 ## Product decision ledger
 
 - Default: the production package entrypoint receives one typed Hub connection
-  descriptor and the independently meaningful Hub data-directory context.
+  descriptor. Core-required package storage context is consumed only as
+  user-visible runtime context and never as connection identity.
 - Non-goal: retain raw socket arguments, raw socket environment fallback,
   duplicate injection kinds, or compatibility aliases.
 - Non-goal: add a TUI-owned transport, endpoint discovery protocol, lifecycle
@@ -119,14 +120,13 @@ Dependency evidence:
   malformed, unknown-field, unsupported-transport, blank-path, and relative-path
   values must produce actionable configuration diagnostics without falling back
   to a raw socket.
-- Keep `BOTSTER_HUB_DATA_DIR` only as package storage/runtime context. It must
-  not participate in endpoint inference.
-- Change `botster-package.json` to require exactly `hub_connection` and
-  `data_dir`, targeting `BOTSTER_HUB_CONNECTION` and
-  `BOTSTER_HUB_DATA_DIR`. Remove the raw-socket injection and obsolete
-  environment declarations cold turkey.
-- Update the manifest test to prove the exact two-kind injection contract and
-  exact target names against Core's current manifest model.
+- Consume `BOTSTER_HUB_DATA_DIR` as visible package storage context in System
+  details without using it for endpoint discovery.
+- Change `botster-package.json` to require `hub_connection` and Core-required
+  `data_dir` context. Remove the raw-socket injection and obsolete environment
+  declarations cold turkey.
+- Update the manifest test to prove the exact required injection contract and
+  target names against Core's current manifest model.
 
 Production wiring proof must follow:
 
@@ -237,8 +237,8 @@ Hub ticket intentionally depends on this TUI ticket.
   remains Core-owned.
 - Assumption: a direct live-runtime run and a Hub-launched package run execute
   the same binary/parser and differ only in who supplies the canonical JSON.
-- Assumption: data-directory context remains required by the package contract
-  even though it is not connection identity.
+- Assumption: package storage context is Hub-owned and not a TUI identity input;
+  it is exposed as runtime context while only the typed descriptor selects Hub.
 - Assumption: existing session lifecycle, attach, readback, reconnect, mouse,
   plugin-surface, and diagnostic behavior is correct and should be preserved
   while the harness is renamed and made timing-safe.
@@ -259,7 +259,8 @@ Hub ticket intentionally depends on this TUI ticket.
 ## Affected surfaces and files
 
 - `Cargo.toml`, `Cargo.lock` — merged Core contract/test fixtures.
-- `botster-package.json` — exact structured connection and data-dir injections.
+- `botster-package.json` — required structured connection and Core-required
+  storage-context injections.
 - `crates/botster-tui/src/app.rs` — configuration parser, root app/name/IDs,
   diagnostics, headless live-runtime flow, tests, wait behavior, and production
   runtime proof.
@@ -327,8 +328,8 @@ Focused contract checks:
   path.
 - Supplying only the retired raw-socket input does not connect or trigger a
   fallback.
-- The package manifest validates with exactly required `hub_connection` and
-  `data_dir` injections and exact declared environment targets.
+- The package manifest validates with required `hub_connection` and `data_dir`
+  injections and their exact declared environment targets.
 - Root app rendering/input tests pass with the new `tui-` IDs; terminal mouse
   forwarding still reaches `DaemonRequest::SendInput` only for the active
   attachment.
@@ -376,7 +377,7 @@ Live-runtime evidence must prove:
 - compatibility mismatch and unavailable-Hub diagnostics render through the
   production app;
 - package install/enable/open launches this binary with the canonical
-  descriptor and declared data-dir context;
+  descriptor; storage context is visible but not treated as client identity;
 - all owned sessions and the isolated runtime are cleaned up.
 
 Downstream proof required after merge:

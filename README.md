@@ -223,11 +223,11 @@ opening the app. `script/test-live-hub` does this staging when it uses an
 external `CARGO_TARGET_DIR`.
 
 The app-open flow launches the checked-in runnable entrypoint through the
-hub-resolved foreground terminal contract. The hub supplies canonical
-foreground launch environment `BOTSTER_HUB_CONNECTION` and
-`BOTSTER_HUB_DATA_DIR`, and the TUI consumes both launch inputs. The connection
-value is Core's validated JSON descriptor; the data directory is runtime
-context and is never used to infer an endpoint:
+hub-resolved foreground terminal contract. The hub supplies
+`BOTSTER_HUB_CONNECTION` as the canonical foreground launch environment and
+`BOTSTER_HUB_DATA_DIR` as package storage context. The TUI decodes and validates
+the Core-owned connection descriptor, shows whether storage context was supplied
+in System details, and never uses storage context to infer an endpoint:
 
 ```sh
 botster-hub apps open --data-dir "$hub_dir" botster-tui

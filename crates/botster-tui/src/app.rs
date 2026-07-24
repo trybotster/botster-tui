@@ -76,23 +76,17 @@ impl AppArgs {
         headless_live_runtime: bool,
     ) -> Self {
         let mut parsed = Self::default();
-        let mut iter = args.into_iter();
-        while let Some(arg) = iter.next() {
+        for arg in args {
             match arg.as_str() {
                 "--smoke" => parsed.smoke = true,
                 "--headless-live-runtime" => parsed.headless_live_runtime = true,
-                "--data-dir" => {
-                    parsed.hub_data_dir = iter.next().map(PathBuf::from);
-                }
                 _ => {}
             }
         }
         let (connection, connection_error) = parse_hub_connection(hub_connection);
         parsed.hub_connection = connection;
         parsed.connection_error = connection_error;
-        if parsed.hub_data_dir.is_none() {
-            parsed.hub_data_dir = hub_data_dir.map(PathBuf::from);
-        }
+        parsed.hub_data_dir = hub_data_dir.map(PathBuf::from);
         if headless_live_runtime {
             parsed.headless_live_runtime = true;
         }
@@ -423,7 +417,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) -> io::Result<()> {
-    let mut app = TuiApp::new_with_connection(args.daemon_endpoint(), args.connection_error);
+    let mut app = TuiApp::new_with_runtime_context(
+        args.daemon_endpoint(),
+        args.connection_error,
+        args.hub_data_dir.is_some(),
+    );
     let mut router = InputRouter::new(renderer::action_request_context());
     loop {
         app.poll_hub();
@@ -509,6 +507,7 @@ struct TuiApp {
     command: String,
     drafts: BTreeMap<String, Value>,
     system_details_visible: bool,
+    package_storage_context_configured: bool,
     confirmation: Option<DestructiveAction>,
     #[cfg(test)]
     workspace_test_mode: bool,
@@ -525,6 +524,14 @@ impl TuiApp {
     fn new_with_connection(
         endpoint: Option<DaemonEndpoint>,
         connection_error: Option<String>,
+    ) -> Self {
+        Self::new_with_runtime_context(endpoint, connection_error, false)
+    }
+
+    fn new_with_runtime_context(
+        endpoint: Option<DaemonEndpoint>,
+        connection_error: Option<String>,
+        package_storage_context_configured: bool,
     ) -> Self {
         let mut app = Self {
             endpoint,
@@ -566,6 +573,7 @@ impl TuiApp {
             command: DEFAULT_COMMAND.to_string(),
             drafts: BTreeMap::new(),
             system_details_visible: false,
+            package_storage_context_configured,
             confirmation: None,
             #[cfg(test)]
             workspace_test_mode: false,
@@ -2200,6 +2208,20 @@ impl TuiApp {
                 "tui-compatibility",
                 json!({ "text": self.compatibility_text() }),
             )),
+            child(node(
+                UiNodeKind::Text,
+                "tui-package-storage-context",
+                json!({
+                    "text": format!(
+                        "package storage context: {}",
+                        if self.package_storage_context_configured {
+                            "configured"
+                        } else {
+                            "not supplied"
+                        }
+                    )
+                }),
+            )),
             child(button(
                 "tui-refresh",
                 "Refresh",
@@ -2991,7 +3013,7 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
                 "injected hub data dir is not a directory",
             ));
         }
-        println!("hub-data-dir: configured");
+        println!("package-storage-context: configured");
     }
     let mut app = TuiApp::new(Some(endpoint));
     #[cfg(test)]
@@ -4292,16 +4314,12 @@ mod tests {
     #[test]
     fn parses_typed_hub_connection_and_headless_mode() {
         let args = AppArgs::parse_with_environment(
-            [
-                "--data-dir".to_string(),
-                "target/hub-data".to_string(),
-                "--headless-live-runtime".to_string(),
-            ],
+            ["--headless-live-runtime".to_string()],
             Some(
                 botster_core_test_support::fixtures::runnable_entrypoint_hub_connection::VALID_UNIX_SOCKET_JSON
                     .into(),
             ),
-            None,
+            Some("target/hub-data".into()),
             false,
         );
 
@@ -4312,6 +4330,20 @@ mod tests {
         assert_eq!(args.connection_error, None);
         assert_eq!(args.hub_data_dir, Some(PathBuf::from("target/hub-data")));
         assert!(args.headless_live_runtime);
+    }
+
+    #[test]
+    fn interactive_system_details_show_package_storage_context_without_using_it_as_identity() {
+        let mut app = TuiApp::new_with_runtime_context(None, None, true);
+        app.workspace_test_mode = true;
+        app.system_details_visible = true;
+
+        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
+            .0
+            .join("\n");
+
+        assert!(rendered.contains("package storage context: configured"));
+        assert_eq!(app.endpoint, None);
     }
 
     #[test]
@@ -7228,6 +7260,7 @@ mod tests {
             String::from_utf8_lossy(&package_open_output.stdout),
             String::from_utf8_lossy(&package_open_output.stderr)
         );
+        println!("package-install: ok");
         let package_enable_output = std::process::Command::new(&hub_bin)
             .args([
                 "packages",
@@ -7244,6 +7277,7 @@ mod tests {
             String::from_utf8_lossy(&package_enable_output.stdout),
             String::from_utf8_lossy(&package_enable_output.stderr)
         );
+        println!("package-enable: ok");
         let app_open_output = std::process::Command::new(&hub_bin)
             .args([
                 "apps",
@@ -7269,12 +7303,12 @@ mod tests {
             String::from_utf8_lossy(&app_open_output.stderr)
         );
         assert!(
-            app_open_stdout.contains("hub-data-dir: configured"),
+            app_open_stdout.contains("package-storage-context: configured"),
             "apps open stdout={} stderr={}",
             app_open_stdout,
             String::from_utf8_lossy(&app_open_output.stderr)
         );
-
+        println!("package-open: typed Hub connection accepted");
         let mut requirement = tui_compatibility_requirement();
         requirement
             .required_features
