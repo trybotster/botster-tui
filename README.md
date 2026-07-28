@@ -279,6 +279,7 @@ foreground app exits cleanly under automation:
 ```sh
 BOTSTER_HUB_BIN=/path/to/botster-hub \
 BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
+BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE=/path/to/hub/packages/hub-test-support/fixtures/plugin-contract-matrix \
 CARGO_TARGET_DIR=/tmp/botster-tui-live-target \
   script/test-live-hub
 ```
@@ -288,14 +289,15 @@ Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
 binaries. If a variable is omitted, the wrapper looks up the corresponding
 command on `PATH` and fails with a setup diagnostic if it is unavailable.
 `CARGO_TARGET_DIR` is optional; omitting it creates and cleans up a fresh
-temporary target. `BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` may point to an
-explicit Hub contract-matrix fixture directory to include live plugin-surface
-proof. Normal unit tests skip the isolated runtime when the binary variables are
-absent; the wrapper sets `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing binaries
-cannot silently pass. The live-Hub test also asserts non-default compatibility
-descriptor values from the isolated daemon and exercises a compatibility
-mismatch through `connect_and_hello_with_requirement` with an unsatisfied
-required feature.
+temporary target. `BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` is required and must
+name a Hub contract-matrix fixture directory containing `botster-package.json`
+and `plugin.lua`; the wrapper fails before building when it is missing or
+invalid. Normal unit tests skip the isolated runtime when the binary variables
+are absent; the wrapper sets `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
+binaries or plugin-surface proof cannot silently pass. The live-Hub test also
+asserts non-default compatibility descriptor values from the isolated daemon
+and exercises a compatibility mismatch through
+`connect_and_hello_with_requirement` with an unsatisfied required feature.
 
 ## Scope
 

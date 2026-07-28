@@ -8125,20 +8125,17 @@ mod tests {
 
         assert_live_attach_history_readback(&hub);
 
-        if let Some(contract_matrix_fixture) =
-            std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE").map(PathBuf::from)
-        {
-            let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
-                &hub,
-                contract_matrix_fixture,
-            )
-            .expect("plugin contract matrix conformance passes");
-            assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
-        } else {
-            eprintln!(
-                "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is not set; live plugin-surface proof skipped"
+        let contract_matrix_fixture = std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
+            .map(PathBuf::from)
+            .expect(
+                "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required for live plugin-surface proof",
             );
-        }
+        let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+            &hub,
+            contract_matrix_fixture,
+        )
+        .expect("plugin contract matrix conformance passes");
+        assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
 
         let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let data_dir = hub.data_dir().to_string_lossy().to_string();
