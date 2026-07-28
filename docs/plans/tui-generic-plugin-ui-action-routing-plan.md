@@ -37,7 +37,8 @@ run: run_1785260754_539439
    - consume `botster-hub-client` and `botster-hub-test-support` at `3d3623f…` or a later single verified merged revision containing the same contract/live producer;
    - replace `botster-core-ui` UI imports with the one `botster-ui-contract` source used by both dependencies;
    - update `Cargo.lock` without compatibility aliases or parallel action envelopes;
-   - raise the TUI's minimum Hub protocol from 2 to 4 with the client revision and fail through the existing compatibility-mismatch path on an older Hub; do not add a protocol fallback.
+   - raise the TUI's minimum Hub protocol from 2 to 4 and `MINIMUM_CONFORMANCE_FIXTURE_REVISION` from 16 to 19 with the client revision;
+   - update the existing guard assertion for the fixture floor and fail through the structured compatibility-mismatch path on an older protocol or fixture revision; do not add a protocol or fixture fallback.
 2. Promote one delivered plugin surface to a real active, owning TUI surface:
    - retain package name, surface ID, typed root, presentation state, and latest typed result together;
    - keep the stable TUI-owned application shell and render the typed root through `render_node_with_presentation_state` in its content region, so dialog/form/button regions enter the real hit map;
@@ -81,13 +82,13 @@ run: run_1785260754_539439
 
 ## Assumptions and unknowns
 
-- Decision ledger: human answer to Project Pipelines question `question_1785262009_418874` chose the stable shell wrapper, TUI-owned global `Esc` return path, cold protocol 4 minimum, and Plan revision while the kit repin runs.
+- Decision ledger: human answer to Project Pipelines question `question_1785262009_418874` chose the stable shell wrapper, TUI-owned global `Esc` return path, cold compatibility migration with no fallback, and Plan revision while the kit repin runs. The target Hub revision makes that cold floor protocol 4 plus conformance fixture revision 19.
 - Assumption: the alignment prerequisite changes only the kit's contract pin and lockfile, leaving the merged public kit API intact.
 - Assumption: `3d3623f…` remains the minimum Hub revision for live `set`/selected-workspace producer proof; a later merged revision is acceptable only if it preserves protocol 4, fixture revision 19+, and the same typed APIs.
 - Assumption: a single active plugin surface is the current application policy. Per-surface state therefore means state coupled to the active Hub/package/surface identity and reset on owner change, not a speculative multi-surface cache.
 - Assumption and product decision: plugin action ownership is exclusive inside the content region, while a stable, non-action-bearing TUI shell remains around it and retains the global `Esc`/quit input contract. Plugin replacements replace the content root only.
 - Assumption and product decision: from any active plugin modal/detail/root, unmodified `Esc` returns directly to the shell's System surface by clearing the active plugin scope; it does not synthesize a plugin action or locally rewrite plugin presentation operations.
-- Assumption and product decision: protocol 4 is the new cold minimum. Protocol 2 or 3 Hubs fail clearly through compatibility diagnostics, with no dual protocol path.
+- Assumption and product decision: protocol 4 and conformance fixture revision 19 are the new cold minimums. Protocol 2 or 3 Hubs, and protocol-4 Hubs at fixture revision 16–18, fail clearly through compatibility diagnostics, with no dual protocol or fixture path.
 - Ask-human threshold: stop and ask if the stable shell/content-region design cannot preserve kit modal focus, drafts, or hit-map ownership without changing `botster-tui-kit`; do not silently replace the whole application root, mix host action nodes into the plugin router, or invent a second input/presentation implementation.
 - Unknown: the exact test-support helper/report additions at the final aligned Hub/kit pins. Implementation should use the public report fields and rendered action metadata rather than parallel constants.
 - Convention conflict: none. The plan uses the authoritative Hub contract and kit mechanics, keeps product policy in the client/plugin owners, performs a cold contract switch, and registers the cross-repository prerequisite instead of broadening this run.
@@ -108,17 +109,18 @@ run: run_1785260754_539439
   - active plugin surface owner/state;
   - stable shell plus plugin content-region render/router-context selection;
   - TUI-owned `Esc` exit handling and active-scope reset before plugin dispatch;
+  - minimum conformance fixture revision 19 and its guarded compatibility requirement;
   - generic plugin action dispatch and exact request preservation;
   - typed response/result application, identity checks, accepted replacement, rejected error retention;
   - request observation and focused/live tests.
 - `README.md`
-  - authoritative contract/kit/Hub pins, the cold protocol 4 minimum and older-Hub failure behavior, stable shell/`Esc` navigation, production plugin interaction path, live conformance coverage, and removal of the stale "owner-routed plugin action execution not included" statement.
+  - authoritative contract/kit/Hub pins, the cold protocol 4/fixture revision 19 minimums and older-Hub failure behavior, stable shell/`Esc` navigation, production plugin interaction path, live conformance coverage, and removal of the stale "owner-routed plugin action execution not included" statement.
 - `docs/plans/tui-generic-plugin-ui-action-routing-plan.md`
   - this reviewable plan artifact.
 
 ## Implementation sequence
 
-1. Confirm the alignment dependency is closed and record its merged kit commit. Update the three related pins together and compile before behavior edits. Use `cargo tree -d` plus source inspection to prove there is exactly one `botster-ui-contract`.
+1. Confirm the alignment dependency is closed and record its merged kit commit. Update the three related pins, minimum protocol, and minimum conformance fixture revision together and compile before behavior edits. Change the guarded fixture-floor assertion from 16 to 19. Use `cargo tree -d` plus source inspection to prove there is exactly one `botster-ui-contract`.
 2. Migrate renderer/app/test imports from `botster_core_ui::{RequestId, ui::*}` to the Hub-owned names, including `UiActionRequestId`, and update typed `DaemonPluginSurface`/`UiActionResult` usage. Delete old JSON-deserialize/display compatibility paths rather than maintaining both.
 3. Introduce the smallest active-surface state that couples package/surface identity, current typed root, caller-scoped `PresentationState`, and latest matching result. Clear it on transport-generation invalidation and reset it on owner change.
 4. Retain the stable application shell and render the active plugin root in its content region through the presentation-aware kit path. Keep the same `InputRouter` across result redraws for draft and focus retention; recreate/rebind it only when the owning surface changes, using the owner's surface ID in canonical requests. An accepted replacement becomes the content root, not the application root.
@@ -138,7 +140,7 @@ run: run_1785260754_539439
 - Hidden replacement: storing a replacement without making it the production root would satisfy state assertions but not users. Mitigation: render and interact with the replacement after acceptance.
 - Presentation leakage: retaining state across package/surface or reconnect boundaries could reveal stale details/dialogs. Mitigation: scope/reset by Hub generation, package, and surface.
 - Regression surface: `app.rs` also owns terminal, packages, apps, and session behavior. Mitigation: surgical helpers plus full workspace tests, strict clippy, smoke, and live Hub verification.
-- Protocol floor: the Hub client repin raises the minimum daemon protocol from 2 to 4. Mitigation: document the cold minimum, retain the existing structured compatibility-mismatch path, assert the diagnostic names expected protocol/version 4 for protocol 2 and 3 Hubs, and add no fallback.
+- Compatibility floors: the Hub client repin raises the minimum daemon protocol from 2 to 4, while the live presentation producer requires conformance fixture revision 19 rather than the current TUI floor of 16. Mitigation: raise and document both cold minimums, update the constant's guard assertion, retain the existing structured compatibility-mismatch path, assert diagnostics name the expected minima for protocol 2/3 and fixture revision 16–18 Hubs, and add no fallback.
 - Live harness flake: Hub test support has documented pre-existing timing-sensitive lifecycle tests, but this repository's live wrapper is still required. Any failure needs exact branch/base attribution; it is not a blanket waiver.
 
 ## Acceptance checks and downstream proof
@@ -172,7 +174,7 @@ Required behavioral assertions:
 - The rejected form response retains the dialog, current typed root, router drafts, modal focus, field error keyed by `contract-app-message`, and form error; it applies no presentation or replacement effects.
 - The later accepted submit applies `clear`, closes the dialog, installs `contract-action-replacement` as the visible plugin content root inside the stable shell, and restores/reconciles focus according to kit mechanics.
 - Result identity mismatch and invalid replacement fixture paths remain Hub-owned structured failures and do not mutate TUI presentation/root state.
-- The compatibility requirement reports minimum protocol 4. Synthetic protocol 2 and 3 descriptors fail with a structured, rendered compatibility mismatch that names the new minimum, while protocol 4 connects; no compatibility fallback exists.
+- The compatibility requirement reports minimum protocol 4 and minimum conformance fixture revision 19. Synthetic protocol 2 and 3 descriptors, plus protocol-4 descriptors at fixture revision 16, 17, or 18, fail with a structured, rendered compatibility mismatch naming the unsatisfied minimum; protocol 4 at fixture revision 19 connects. The guard assertion pins `MINIMUM_CONFORMANCE_FIXTURE_REVISION` to 19, and no compatibility fallback exists.
 - Existing built-in workspace/session/package actions, terminal forwarding/resize/mouse behavior, remaining compatibility diagnostics, and live session lifecycle tests remain green.
 - The live test uses the merged Hub/test-support artifact and real plugin-worker fixture. Local synthetic fixtures remain focused unit aids, not the downstream oracle.
 
