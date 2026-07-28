@@ -3995,48 +3995,9 @@ fn apply_plugin_result_errors(root_node: &mut UiNode, result: &UiActionResult) {
     {
         apply_plugin_result_errors_to_child(child, result);
     }
-    if root_node.kind == UiNodeKind::Form && !result.field_errors.is_empty() {
-        insert_adjacent_field_error_rows(root_node, result);
-    }
 }
 
-fn insert_adjacent_field_error_rows(form: &mut UiNode, result: &UiActionResult) {
-    // botster-tui-kit ticket_1785275816_502282 owns reserving intrinsic field-error height.
-    // Keep this adjacent visible row until the shared renderer can display its `error` prop.
-    let form_id = form
-        .id
-        .as_ref()
-        .map_or("plugin-form", |id| id.0.as_str())
-        .to_string();
-    let mut with_errors = Vec::with_capacity(form.children.len() + result.field_errors.len());
-    for form_child in std::mem::take(&mut form.children) {
-        let field_error = static_child_node(&form_child).and_then(|field| {
-            let field_id = field.id.as_ref().map(|id| id.0.as_str());
-            let field_name = field.props.get("name").and_then(Value::as_str);
-            let (error_key, messages) = result.field_errors.iter().find(|(key, _)| {
-                Some(key.as_str()) == field_id || Some(key.as_str()) == field_name
-            })?;
-            let label = field
-                .props
-                .get("label")
-                .and_then(Value::as_str)
-                .or(field_id)
-                .or(field_name)
-                .unwrap_or(error_key);
-            Some((error_key.clone(), label.to_string(), messages.join(" | ")))
-        });
-        with_errors.push(form_child);
-        if let Some((error_key, label, messages)) = field_error {
-            with_errors.push(child(node(
-                UiNodeKind::Text,
-                &format!("{form_id}-{error_key}-error"),
-                json!({ "text": format!("{label}: {messages}") }),
-            )));
-        }
-    }
-    form.children = with_errors;
-}
-
+#[cfg(test)]
 fn static_child_node(child: &UiChild) -> Option<&UiNode> {
     match child {
         UiChild::Node(node) => Some(node),
@@ -5423,11 +5384,12 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("Message is required"), "{rendered}");
         assert!(
-            rendered.contains("Message: Message is required"),
+            rendered.contains("error: Message is required"),
             "{rendered}"
         );
-        assert!(
-            !rendered.contains("contract-message: Message is required"),
+        assert_eq!(
+            rendered.matches("Message is required").count(),
+            1,
             "{rendered}"
         );
         assert!(
@@ -5545,6 +5507,69 @@ mod tests {
             rendered.contains("ignored mismatched plugin action result"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn rejected_dialog_fields_render_one_native_error_row_per_supported_kind() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(field_error_kinds_plugin_surface()));
+        app.pending_plugin_request = Some(plugin_request(
+            "request-field-errors",
+            "contract.field-errors",
+            "contract.submit",
+            "contract-field-error-form",
+        ));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-field-errors",
+            "surface_id": "contract.field-errors",
+            "action_id": "contract.submit",
+            "node_id": "contract-field-error-form",
+            "state": "rejected",
+            "field_errors": {
+                "contract-text-input": ["Text input required"],
+                "contract-checkbox": ["Checkbox required"],
+                "contract-form-field": ["Form field required"],
+                "contract-select": ["Select required"]
+            },
+            "form_errors": ["Fix the highlighted fields"]
+        })));
+
+        let (lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            180,
+            80,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        );
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("Field error contract"), "{rendered}");
+        for message in [
+            "Text input required",
+            "Checkbox required",
+            "Form field required",
+            "Select required",
+        ] {
+            assert!(
+                rendered.contains(&format!("error: {message}")),
+                "{rendered}"
+            );
+            assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
+        }
+        for node_id in [
+            "contract-text-input",
+            "contract-checkbox",
+            "contract-form-field",
+            "contract-select",
+        ] {
+            assert!(
+                hit_map
+                    .regions()
+                    .iter()
+                    .any(|region| region.node_id == node_id),
+                "missing hit region for {node_id}: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -9191,6 +9216,84 @@ mod tests {
                         }
                     }
                 ]
+            })),
+            ui_tree_snapshot: None,
+        }
+    }
+
+    fn field_error_kinds_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.field-errors".to_string(),
+            body: ui_node(json!({
+                "type": "dialog",
+                "id": "contract-field-error-dialog",
+                "props": {
+                    "title": "Field error contract",
+                    "presentation": "auto"
+                },
+                "slots": {
+                    "body": [
+                        {
+                            "type": "form",
+                            "id": "contract-field-error-form",
+                            "props": {
+                                "submit_label": "Submit",
+                                "action": { "id": "contract.submit" }
+                            },
+                            "children": [
+                                {
+                                    "type": "text_input",
+                                    "id": "contract-text-input",
+                                    "props": {
+                                        "name": "text_input",
+                                        "label": "Text input"
+                                    }
+                                },
+                                {
+                                    "type": "checkbox",
+                                    "id": "contract-checkbox",
+                                    "props": {
+                                        "name": "checkbox",
+                                        "label": "Checkbox"
+                                    }
+                                },
+                                {
+                                    "type": "form_field",
+                                    "id": "contract-form-field",
+                                    "props": {
+                                        "schema": {
+                                            "kind": "text",
+                                            "name": "form_field",
+                                            "label": "Form field"
+                                        }
+                                    }
+                                },
+                                {
+                                    "type": "select",
+                                    "id": "contract-select",
+                                    "props": {
+                                        "name": "select",
+                                        "label": "Select",
+                                        "selected": "alpha"
+                                    },
+                                    "slots": {
+                                        "options": [
+                                            {
+                                                "type": "select_option",
+                                                "id": "contract-select-alpha",
+                                                "props": {
+                                                    "label": "Alpha",
+                                                    "value": "alpha"
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
             })),
             ui_tree_snapshot: None,
         }
