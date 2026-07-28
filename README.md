@@ -27,11 +27,15 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`39601e7` and the kit, Hub client, and this crate share `botster-ui-contract`
+`39601e7c7570a474599ab2fba7e1a85b5f006b5a` and the kit, Hub client, and this
+crate share `botster-ui-contract`
 from botster-hub revision
 `3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
-`16bf08f29ec723c70c290cf995745ccbf79d4f05`. The kit supplies semantic
+`16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
+receives a branch-tracked `botster-core` through `botster-hub-test-support`;
+`Cargo.lock` pins that dev-only source at
+`e36435f2cb583c344d6f6ba2d62c39da324c7a64`. The kit supplies semantic
 viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
 focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
 occlusion barriers. The kit owns reusable
