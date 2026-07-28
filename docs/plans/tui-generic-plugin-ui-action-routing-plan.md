@@ -17,7 +17,7 @@ run: run_1785260754_539439
 - Required TUI surface context: [[tui and browser are equal clients]], [[botster tui consumes tui kit through a thin app policy adapter]], [[botster-tui-kit-playbook]], [[tui client attach uses hub protocol not session protocol]], [[tui and socket terminal streams use clientworker transport adapters]], [[botster tui uinode event routing captures hit regions during draw]], [[tui error dedup tests must drive real input handlers]], [[botster-runtime-reviewer-playbook]], and [[botster-runtime-verifier-playbook]].
 - Targeted action/presentation context: [[plugin authored tui surfaces dispatch via action props not node id literals]], [[plugin surface actions route by explicit metadata]], [[botster plugin modal state belongs in client-local presentation state]], [[ui presentation operations are authored by accepted action results]], [[conformance helpers must dispatch the action id read from the rendered node]], [[botster core contract surface needs consumer proof]], [[botster web drops core uiaction payload and ignores interaction props]], and [[core uiaction has no label so clients must not synthesize one]].
 - Planning/workflow context: [[prefer framework and library components over custom solutions]], [[project pipeline orchestration belongs in a device-level botster plugin]], [[project pipelines needs an operator workbench not more primitives]], [[project pipelines ui contract belongs in the plugin readme]], [[botster orchestration should spawn agents with explicit target ids]], [[botster orchestration prompts must bind agents to explicit worktrees]], [[botster pipeline needs continuous product owner between agent steps]], [[plan agents must author vault context as wikilinks not home paths]], [[vault example paths are not repository placement conventions]], and [[project-pipelines-playbook]]. Project Pipelines is workflow context only; its package/plugin code is not an implementation surface.
-- Run context: plan step `botster_stack_plan`, base `main`, one required attestation gate, no prior reviews/findings/questions, and a closed dependency on `ticket_1785192700_939910`.
+- Run context: plan step `botster_stack_plan`, base `main`, one required attestation gate, a closed dependency on `ticket_1785192700_939910`, and an open blocking dependency on `ticket_1785261259_330503`. Plan Review independently validated the routing and contract seam, then returned the run for the product decisions recorded below.
 - Repository context: `README.md` defines the TUI as a hub client over shared contract and kit APIs; repository gates are `script/fmt`, `script/test`, `script/clippy`, the smoke binary, and `script/test-live-hub`; current plan artifacts live under `docs/plans`.
 - Production path: `run_loop` draws `TuiApp::surface()` through the local renderer adapter and routes real Crossterm events through `InputRouter` into `TuiApp::handle_dispatch`. Today plugin surfaces are reduced to pre-rendered text inside System details, so their hit regions never join the production hit map. `handle_dispatch` drops request identity and sends every action into the built-in `botster.tui.*` switch. Hub plugin action results remain untyped JSON display text and do not affect presentation or the visible root.
 
@@ -36,10 +36,12 @@ run: run_1785260754_539439
    - consume the aligned merged `botster-tui-kit`;
    - consume `botster-hub-client` and `botster-hub-test-support` at `3d3623f…` or a later single verified merged revision containing the same contract/live producer;
    - replace `botster-core-ui` UI imports with the one `botster-ui-contract` source used by both dependencies;
-   - update `Cargo.lock` without compatibility aliases or parallel action envelopes.
+   - update `Cargo.lock` without compatibility aliases or parallel action envelopes;
+   - raise the TUI's minimum Hub protocol from 2 to 4 with the client revision and fail through the existing compatibility-mismatch path on an older Hub; do not add a protocol fallback.
 2. Promote one delivered plugin surface to a real active, owning TUI surface:
    - retain package name, surface ID, typed root, presentation state, and latest typed result together;
-   - render the typed root through `render_node_with_presentation_state` in the production frame, so dialog/form/button regions enter the real hit map;
+   - keep the stable TUI-owned application shell and render the typed root through `render_node_with_presentation_state` in its content region, so dialog/form/button regions enter the real hit map;
+   - an accepted plugin replacement replaces only the plugin-owned content root, never the surrounding application shell;
    - reset this client-local scope when the Hub connection or package/surface owner changes, while keeping presentation and selected-detail state stable across redraws and accepted replacements within the same owner.
 3. Keep the app/kit boundary thin:
    - kit continues to own Dialog/Form/Button rendering, modal focus, drafts, keyboard/mouse routing, predicate evaluation, and accepted-only presentation mechanics;
@@ -50,6 +52,8 @@ run: run_1785260754_539439
    - reject a surface/request ownership mismatch locally;
    - do not let an arbitrary or colliding plugin action ID fall through to a `botster.tui.*` branch;
    - do not emit a plugin action request when no active owning plugin surface exists.
+   - exclusivity applies to actions emitted by the plugin content tree, not to TUI-owned global safety/navigation input;
+   - intercept a pressed, unmodified `Esc` in the application event loop before plugin action dispatch: preserve the existing confirmation cancel behavior first; otherwise, when a plugin surface is active (including a plugin modal or selected detail), clear the complete active plugin scope, reset its router/presentation state, and return to the shell's System surface without sending a plugin action; only at the base shell may the existing `Esc` quit behavior apply. `q` and `Ctrl-C` remain global quit inputs.
 5. Apply typed results only to the matching in-flight owner/request:
    - validate/correlate request, surface, action, and node identity before changing client state;
    - use kit `apply_action_result` so rejected/deferred/error results cannot mutate presentation or replace the root;
@@ -64,11 +68,12 @@ run: run_1785260754_539439
 - No duplicate `UiNode`, `UiActionRequest`, `UiActionResult`, presentation, or compatibility structs.
 - No entity-store/bound-list implementation beyond the ticketed selected-detail presentation fixture.
 - No terminal data-plane, attach, resize, scrollback, mouse passthrough, package lifecycle, or session lifecycle refactor.
+- No plugin-authored override of the TUI-owned `Esc`, `q`, or `Ctrl-C` safety/navigation contract.
 - No adjacent cleanup or broad split of the existing large `app.rs`; new local structure should be only what is necessary to make ownership and result application explicit.
 
 ## Ownership boundaries and cross-repository seams
 
-- `botster-tui` owns the active surface scope, application-mode selection, request IDs, Hub dispatch, result correlation, visible replacement selection, and user-facing diagnostics.
+- `botster-tui` owns the stable application shell, global safety/navigation input, active plugin content scope, application-mode selection, request IDs, Hub dispatch, result correlation, visible content replacement selection, and user-facing diagnostics.
 - `botster-tui-kit` owns reusable render/input/presentation mechanics. Any missing generic behavior discovered during implementation must be routed to its target, not copied locally.
 - `botster-hub` owns the daemon request/response DTOs, contract crate, plugin execution, result identity validation, shared fixtures, and isolated-Hub producer proof.
 - `botster-core` remains only for non-UI runnable-entrypoint connection types still used by this crate; it is not an alternative UI source.
@@ -76,11 +81,14 @@ run: run_1785260754_539439
 
 ## Assumptions and unknowns
 
+- Decision ledger: human answer to Project Pipelines question `question_1785262009_418874` chose the stable shell wrapper, TUI-owned global `Esc` return path, cold protocol 4 minimum, and Plan revision while the kit repin runs.
 - Assumption: the alignment prerequisite changes only the kit's contract pin and lockfile, leaving the merged public kit API intact.
 - Assumption: `3d3623f…` remains the minimum Hub revision for live `set`/selected-workspace producer proof; a later merged revision is acceptable only if it preserves protocol 4, fixture revision 19+, and the same typed APIs.
 - Assumption: a single active plugin surface is the current application policy. Per-surface state therefore means state coupled to the active Hub/package/surface identity and reset on owner change, not a speculative multi-surface cache.
-- Assumption: plugin mode is exclusive for semantic action routing. Built-in workspace controls are not mixed into the same action-bearing tree while a plugin root owns the router context.
-- Unknown: whether the cleanest implementation replaces the whole workspace root with the plugin surface or wraps it in a non-interactive local shell for feedback/back navigation. Either is acceptable only if every action-bearing hit region in that mode belongs unambiguously to the active plugin owner and the replacement is visibly rendered.
+- Assumption and product decision: plugin action ownership is exclusive inside the content region, while a stable, non-action-bearing TUI shell remains around it and retains the global `Esc`/quit input contract. Plugin replacements replace the content root only.
+- Assumption and product decision: from any active plugin modal/detail/root, unmodified `Esc` returns directly to the shell's System surface by clearing the active plugin scope; it does not synthesize a plugin action or locally rewrite plugin presentation operations.
+- Assumption and product decision: protocol 4 is the new cold minimum. Protocol 2 or 3 Hubs fail clearly through compatibility diagnostics, with no dual protocol path.
+- Ask-human threshold: stop and ask if the stable shell/content-region design cannot preserve kit modal focus, drafts, or hit-map ownership without changing `botster-tui-kit`; do not silently replace the whole application root, mix host action nodes into the plugin router, or invent a second input/presentation implementation.
 - Unknown: the exact test-support helper/report additions at the final aligned Hub/kit pins. Implementation should use the public report fields and rendered action metadata rather than parallel constants.
 - Convention conflict: none. The plan uses the authoritative Hub contract and kit mechanics, keeps product policy in the client/plugin owners, performs a cold contract switch, and registers the cross-repository prerequisite instead of broadening this run.
 
@@ -98,12 +106,13 @@ run: run_1785260754_539439
   - expose the kit presentation-aware production/test render entry points without reimplementing them.
 - `crates/botster-tui/src/app.rs`
   - active plugin surface owner/state;
-  - production root/render/router-context selection;
+  - stable shell plus plugin content-region render/router-context selection;
+  - TUI-owned `Esc` exit handling and active-scope reset before plugin dispatch;
   - generic plugin action dispatch and exact request preservation;
   - typed response/result application, identity checks, accepted replacement, rejected error retention;
   - request observation and focused/live tests.
 - `README.md`
-  - authoritative contract/kit/Hub pins, production plugin interaction path, live conformance coverage, and removal of the stale "owner-routed plugin action execution not included" statement.
+  - authoritative contract/kit/Hub pins, the cold protocol 4 minimum and older-Hub failure behavior, stable shell/`Esc` navigation, production plugin interaction path, live conformance coverage, and removal of the stale "owner-routed plugin action execution not included" statement.
 - `docs/plans/tui-generic-plugin-ui-action-routing-plan.md`
   - this reviewable plan artifact.
 
@@ -112,8 +121,8 @@ run: run_1785260754_539439
 1. Confirm the alignment dependency is closed and record its merged kit commit. Update the three related pins together and compile before behavior edits. Use `cargo tree -d` plus source inspection to prove there is exactly one `botster-ui-contract`.
 2. Migrate renderer/app/test imports from `botster_core_ui::{RequestId, ui::*}` to the Hub-owned names, including `UiActionRequestId`, and update typed `DaemonPluginSurface`/`UiActionResult` usage. Delete old JSON-deserialize/display compatibility paths rather than maintaining both.
 3. Introduce the smallest active-surface state that couples package/surface identity, current typed root, caller-scoped `PresentationState`, and latest matching result. Clear it on transport-generation invalidation and reset it on owner change.
-4. Render that root through the presentation-aware kit path and keep the same `InputRouter` across result redraws for draft and focus retention. Recreate/rebind the router only when the owning surface changes, using the owner's surface ID in canonical requests.
-5. Split `handle_dispatch` by current owner before matching action IDs. Plugin-owned action requests go intact to the Hub; workspace-owned requests retain the existing built-in switch. Add a dedicated synchronous plugin request/result path so the expected request identity is available when applying the response.
+4. Retain the stable application shell and render the active plugin root in its content region through the presentation-aware kit path. Keep the same `InputRouter` across result redraws for draft and focus retention; recreate/rebind it only when the owning surface changes, using the owner's surface ID in canonical requests. An accepted replacement becomes the content root, not the application root.
+5. Split `handle_dispatch` by current content owner before matching action IDs. Plugin-owned action requests go intact to the Hub; workspace-owned requests retain the existing built-in switch. In `run_loop`, handle unmodified `Esc` before router/plugin action dispatch so confirmation cancellation remains first, an active plugin scope returns to the System shell, and base-shell `Esc` retains its current quit behavior. Add a dedicated synchronous plugin request/result path so the expected request identity is available when applying the response.
 6. Apply matching typed results atomically through the kit transition. Surface rejected field/form errors without replacing or closing the form; accepted transitions update presentation and the visible root.
 7. Replace pre-rendered plugin text tests with real-frame/action tests and extend the isolated-Hub conformance test through the actual app/router path.
 8. Update README and run every repository gate plus the live downstream proof.
@@ -123,11 +132,13 @@ run: run_1785260754_539439
 - Duplicate contract source: different Hub revisions produce incompatible Rust types even when source text matches. Mitigation: the registered kit-alignment dependency and `cargo tree -d` proof.
 - False-green renderer proof: `render_to_lines` over a detached fixture can pass while the production app still flattens the surface to text. Mitigation: assert `TuiApp` production root, hit map, router dispatch, Hub request, result application, and redraw.
 - Ownership confusion: mixing built-in and plugin actions in one router context could execute host commands from plugin-authored IDs. Mitigation: exclusive active-owner routing and an action-ID collision regression.
+- Operator trap: exclusive plugin action routing could strand the operator if the former built-in System toggle is no longer reachable. Mitigation: a stable TUI shell and a global, non-plugin-addressable `Esc` path that clears plugin scope before dispatch.
 - Stale or mismatched results: a result for a prior surface/request could mutate current presentation. Mitigation: correlate full request identity and active owner before `apply_action_result`.
 - Draft/focus loss: recreating the router after every response would make rejection appear to retain the tree while losing operator input. Mitigation: preserve the router within one owner scope and test real keyboard focus/drafts before and after rejection.
 - Hidden replacement: storing a replacement without making it the production root would satisfy state assertions but not users. Mitigation: render and interact with the replacement after acceptance.
 - Presentation leakage: retaining state across package/surface or reconnect boundaries could reveal stale details/dialogs. Mitigation: scope/reset by Hub generation, package, and surface.
 - Regression surface: `app.rs` also owns terminal, packages, apps, and session behavior. Mitigation: surgical helpers plus full workspace tests, strict clippy, smoke, and live Hub verification.
+- Protocol floor: the Hub client repin raises the minimum daemon protocol from 2 to 4. Mitigation: document the cold minimum, retain the existing structured compatibility-mismatch path, assert the diagnostic names expected protocol/version 4 for protocol 2 and 3 Hubs, and add no fallback.
 - Live harness flake: Hub test support has documented pre-existing timing-sensitive lifecycle tests, but this repository's live wrapper is still required. Any failure needs exact branch/base attribution; it is not a blanket waiver.
 
 ## Acceptance checks and downstream proof
@@ -151,15 +162,18 @@ Required behavioral assertions:
 
 - The dependency graph contains one authoritative `botster-ui-contract`; no `botster-core-ui` import/dependency or local UI/action compatibility type remains.
 - A real delivered plugin root is rendered in the production frame with action-bearing hit regions; it is not flattened to display-only text.
+- The application shell remains present around the plugin-owned content region, contains no action node routed through the plugin context, and an accepted replacement becomes visibly interactive inside that region rather than replacing the shell.
 - Keyboard and mouse activation of the shared Dialog/Form/Button fixture pass through `InputRouter` and `TuiApp::handle_dispatch`.
 - An arbitrary plugin button action and a form submit emit `PluginSurfaceAction` with the active package plus the exact canonical request surface/action/node/kind/values/payload read from the rendered control.
 - A plugin action ID that is unknown or collides with `botster.tui.*` routes to the owning plugin and does not execute built-in application behavior.
 - With no active owner, no plugin action request is emitted. A request whose surface differs from the active owner is rejected locally.
+- Drive the real `run_loop` key branch with unmodified `Esc` from a plugin modal, selected detail, and replacement root. Each case emits no `PluginSurfaceAction`, clears the active package/surface/root/presentation/router scope, returns to the System shell, and leaves built-in workspace controls interactive. At the base shell, existing `Esc` quit behavior remains; `q` and `Ctrl-C` continue to quit globally.
 - The live fixture's open action goes through Hub → plugin worker → accepted `set`; the next real-frame render shows both the Dialog and the selected-workspace equality detail.
 - The rejected form response retains the dialog, current typed root, router drafts, modal focus, field error keyed by `contract-app-message`, and form error; it applies no presentation or replacement effects.
-- The later accepted submit applies `clear`, closes the dialog, installs `contract-action-replacement` as the shell-visible root, and restores/reconciles focus according to kit mechanics.
+- The later accepted submit applies `clear`, closes the dialog, installs `contract-action-replacement` as the visible plugin content root inside the stable shell, and restores/reconciles focus according to kit mechanics.
 - Result identity mismatch and invalid replacement fixture paths remain Hub-owned structured failures and do not mutate TUI presentation/root state.
-- Existing built-in workspace/session/package actions, terminal forwarding/resize/mouse behavior, compatibility diagnostics, and live session lifecycle tests remain green.
+- The compatibility requirement reports minimum protocol 4. Synthetic protocol 2 and 3 descriptors fail with a structured, rendered compatibility mismatch that names the new minimum, while protocol 4 connects; no compatibility fallback exists.
+- Existing built-in workspace/session/package actions, terminal forwarding/resize/mouse behavior, remaining compatibility diagnostics, and live session lifecycle tests remain green.
 - The live test uses the merged Hub/test-support artifact and real plugin-worker fixture. Local synthetic fixtures remain focused unit aids, not the downstream oracle.
 
 ## Pipeline and vault checklist evidence
