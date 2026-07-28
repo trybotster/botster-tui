@@ -448,17 +448,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
             let event = event::read()?;
             match event {
                 Event::Key(key)
-                    if key.kind == KeyEventKind::Press && app.handle_tui_owned_key(key) =>
-                {
-                    let active_surface_id = app.active_plugin_surface_id().map(ToOwned::to_owned);
-                    if active_surface_id != routed_surface_id {
-                        router = InputRouter::new(match active_surface_id.as_deref() {
-                            Some(surface_id) => renderer::action_request_context_for(surface_id),
-                            None => renderer::action_request_context(),
-                        });
-                        routed_surface_id = active_surface_id;
-                    }
-                }
+                    if key.kind == KeyEventKind::Press && app.handle_tui_owned_key(key) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
@@ -2051,11 +2041,39 @@ impl TuiApp {
                     )
                 }),
             )),
-            child(plugin_surface_render_root(
-                surface,
-                self.plugin_action_result.as_ref(),
-            )),
         ];
+        if let Some(error) = &self.connection_error {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                "plugin-shell-connection-error",
+                json!({ "text": format!("connection: {error}") }),
+            )));
+        }
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                &format!("plugin-shell-diagnostic-{index}"),
+                json!({ "text": format!("diagnostic: {}", diagnostic_text(diagnostic)) }),
+            )));
+        }
+        if let Some(feedback) = &self.action_feedback {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                "plugin-shell-action-feedback",
+                json!({ "text": format!("action: {feedback}") }),
+            )));
+        }
+        if let Some(error) = &self.error {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                "plugin-shell-error",
+                json!({ "text": format!("error: {error}") }),
+            )));
+        }
+        root.children.push(child(plugin_surface_render_root(
+            surface,
+            self.plugin_action_result.as_ref(),
+        )));
         root
     }
 
@@ -2070,8 +2088,6 @@ impl TuiApp {
             || self.install_plan.is_some()
             || self.update_status.is_some()
             || self.package_decision.is_some()
-            || self.plugin_surface.is_some()
-            || self.plugin_action_result.is_some()
             || self.snapshot_metadata.is_some()
             || !self.drafts.is_empty()
     }
@@ -2539,21 +2555,6 @@ impl TuiApp {
                         decision.classification
                     )
                 }),
-            )));
-        }
-        if let Some(surface) = &self.plugin_surface {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "tui-plugin-surface",
-                json!({ "text": format!("plugin surface: {}", plugin_surface_text(surface)) }),
-            )));
-            children.extend(plugin_surface_nodes(surface).into_iter().map(child));
-        }
-        if let Some(result) = &self.plugin_action_result {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "tui-plugin-action-result",
-                json!({ "text": format!("plugin action result: {}", plugin_action_result_text(result)) }),
             )));
         }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
@@ -3841,46 +3842,6 @@ fn navigation_unsupported_text(entry: &DaemonPackageNavigationEntry) -> String {
     parts.join(" ")
 }
 
-fn plugin_surface_text(surface: &DaemonPluginSurface) -> String {
-    let body_id = surface
-        .body
-        .id
-        .as_ref()
-        .map(|id| id.0.as_str())
-        .unwrap_or("missing");
-    format!(
-        "package={} surface={} kind={:?} node_id={}",
-        surface.package_name, surface.surface_id, surface.body.kind, body_id
-    )
-}
-
-fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
-    if let Some(diagnostic) = iframe_unsupported_diagnostic(surface) {
-        return vec![node(
-            UiNodeKind::Text,
-            "tui-plugin-surface-iframe-unsupported",
-            json!({ "text": diagnostic }),
-        )];
-    }
-    let root = match plugin_surface_body_node(surface) {
-        Ok(root) => root,
-        Err(error) => {
-            return vec![node(
-                UiNodeKind::Text,
-                "tui-plugin-surface-invalid",
-                json!({ "text": format!("plugin surface render: {error}") }),
-            )];
-        }
-    };
-    let (lines, _) = botster_tui_kit::render_to_lines(&root, 120, 20)
-        .expect("validated plugin surface should render in test backend");
-    vec![node(
-        UiNodeKind::Text,
-        "tui-plugin-surface-rendered",
-        json!({ "text": format!("plugin surface render: {}", lines.join(" | ")) }),
-    )]
-}
-
 fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, String> {
     let node = surface.body.clone();
     node.validate().map_err(|error| {
@@ -4013,30 +3974,19 @@ fn apply_plugin_result_errors(root_node: &mut UiNode, result: &UiActionResult) {
             .props
             .insert("error".to_string(), Value::String(messages.join(" | ")));
     }
-    if root_node.kind == UiNodeKind::Form
-        && (!result.form_errors.is_empty() || !result.field_errors.is_empty())
-    {
+    if root_node.kind == UiNodeKind::Form && !result.form_errors.is_empty() {
         let form_id = root_node
             .id
             .as_ref()
             .map_or("plugin-form", |id| id.0.as_str());
-        for (index, (field_id, messages)) in result.field_errors.iter().enumerate() {
-            root_node.children.push(child(node(
+        root_node.children.insert(
+            0,
+            child(node(
                 UiNodeKind::Text,
-                &format!("{form_id}-field-error-{index}"),
-                json!({ "text": format!("{field_id}: {}", messages.join(" | ")) }),
-            )));
-        }
-        if !result.form_errors.is_empty() {
-            root_node.children.insert(
-                0,
-                child(node(
-                    UiNodeKind::Text,
-                    &format!("{form_id}-result-error"),
-                    json!({ "text": format!("error: {}", result.form_errors.join(" | ")) }),
-                )),
-            );
-        }
+                &format!("{form_id}-result-error"),
+                json!({ "text": format!("error: {}", result.form_errors.join(" | ")) }),
+            )),
+        );
     }
     for child in root_node
         .children
@@ -4044,6 +3994,57 @@ fn apply_plugin_result_errors(root_node: &mut UiNode, result: &UiActionResult) {
         .chain(root_node.slots.values_mut().flatten())
     {
         apply_plugin_result_errors_to_child(child, result);
+    }
+    if root_node.kind == UiNodeKind::Form && !result.field_errors.is_empty() {
+        insert_adjacent_field_error_rows(root_node, result);
+    }
+}
+
+fn insert_adjacent_field_error_rows(form: &mut UiNode, result: &UiActionResult) {
+    // botster-tui-kit ticket_1785275816_502282 owns reserving intrinsic field-error height.
+    // Keep this adjacent visible row until the shared renderer can display its `error` prop.
+    let form_id = form
+        .id
+        .as_ref()
+        .map_or("plugin-form", |id| id.0.as_str())
+        .to_string();
+    let mut with_errors = Vec::with_capacity(form.children.len() + result.field_errors.len());
+    for form_child in std::mem::take(&mut form.children) {
+        let field_error = static_child_node(&form_child).and_then(|field| {
+            let field_id = field.id.as_ref().map(|id| id.0.as_str());
+            let field_name = field.props.get("name").and_then(Value::as_str);
+            let (error_key, messages) = result.field_errors.iter().find(|(key, _)| {
+                Some(key.as_str()) == field_id || Some(key.as_str()) == field_name
+            })?;
+            let label = field
+                .props
+                .get("label")
+                .and_then(Value::as_str)
+                .or(field_id)
+                .or(field_name)
+                .unwrap_or(error_key);
+            Some((error_key.clone(), label.to_string(), messages.join(" | ")))
+        });
+        with_errors.push(form_child);
+        if let Some((error_key, label, messages)) = field_error {
+            with_errors.push(child(node(
+                UiNodeKind::Text,
+                &format!("{form_id}-{error_key}-error"),
+                json!({ "text": format!("{label}: {messages}") }),
+            )));
+        }
+    }
+    form.children = with_errors;
+}
+
+fn static_child_node(child: &UiChild) -> Option<&UiNode> {
+    match child {
+        UiChild::Node(node) => Some(node),
+        UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. }) => Some(node),
+        UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => Some(node),
+        UiChild::BindList(_) => None,
     }
 }
 
@@ -4331,6 +4332,61 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    fn find_ui_node_by_id<'a>(root: &'a UiNode, node_id: &str) -> Option<&'a UiNode> {
+        if root.id.as_ref().is_some_and(|id| id.0 == node_id) {
+            return Some(root);
+        }
+        root.children
+            .iter()
+            .chain(root.slots.values().flatten())
+            .filter_map(static_child_node)
+            .find_map(|child| find_ui_node_by_id(child, node_id))
+    }
+
+    fn node_action(node: &UiNode) -> botster_ui_contract::UiAction {
+        serde_json::from_value(
+            node.props
+                .get("action")
+                .cloned()
+                .expect("rendered action-bearing node has action metadata"),
+        )
+        .expect("rendered action metadata follows the Hub contract")
+    }
+
+    fn find_presentation_bound_node<'a>(
+        root: &'a UiNode,
+        key: &str,
+        equals: Option<&Value>,
+    ) -> Option<&'a UiNode> {
+        for child in root.children.iter().chain(root.slots.values().flatten()) {
+            if let UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf {
+                predicate,
+                node,
+            }) = child
+            {
+                let matches = match predicate {
+                    botster_ui_contract::UiPresentationPredicate::Present {
+                        key: predicate_key,
+                    } => predicate_key.0 == key && equals.is_none(),
+                    botster_ui_contract::UiPresentationPredicate::Equals {
+                        key: predicate_key,
+                        value,
+                    } => predicate_key.0 == key && equals == Some(value),
+                    botster_ui_contract::UiPresentationPredicate::Truthy { .. } => false,
+                };
+                if matches {
+                    return Some(node);
+                }
+            }
+            if let Some(node) = static_child_node(child)
+                && let Some(found) = find_presentation_bound_node(node, key, equals)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[test]
@@ -5367,6 +5423,14 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("Message is required"), "{rendered}");
         assert!(
+            rendered.contains("Message: Message is required"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("contract-message: Message is required"),
+            "{rendered}"
+        );
+        assert!(
             rendered.contains("Fix the highlighted fields"),
             "{rendered}"
         );
@@ -5474,6 +5538,58 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("mismatched"))
         );
+        let rendered = renderer::render_to_lines(&app.surface(), 160, 60)
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("ignored mismatched plugin action result"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn plugin_shell_renders_action_failure_feedback_and_diagnostics() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.pending_plugin_request = Some(plugin_request(
+            "request-error",
+            "contract.app",
+            "contract.action",
+            "contract-app-action",
+        ));
+        let mut response = plugin_action_response(json!({
+            "request_id": "request-error",
+            "surface_id": "contract.app",
+            "action_id": "contract.action",
+            "node_id": "contract-app-action",
+            "state": "error",
+            "error": "contract action failed"
+        }));
+        response.diagnostics.push(DaemonDiagnostic {
+            kind: DaemonDiagnosticKind::ActionFailure,
+            operation: Some("plugin_surface_action".to_string()),
+            feature: Some("plugin_surface_actions".to_string()),
+            message: Some("contract action failed".to_string()),
+        });
+
+        app.apply_response(response);
+
+        let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("action: state=Error request_id=request-error"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("diagnostic: action_failure"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("operation=plugin_surface_action"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("contract action failed"), "{rendered}");
     }
 
     #[test]
@@ -5561,7 +5677,7 @@ mod tests {
             &rejected_hits,
         );
         assert!(matches!(
-            dispatch,
+            &dispatch,
             InputDispatch::Action(UiActionRequest {
                 surface_id,
                 action_id,
@@ -5570,12 +5686,94 @@ mod tests {
                 values: Some(values),
                 payload: Some(payload),
                 ..
-            }) if surface_id == UiSurfaceId("contract.presentation".to_string())
-                && action_id == UiActionId("contract.submit".to_string())
-                && node_id == Some(UiNodeId("contract-form".to_string()))
+            }) if surface_id == &UiSurfaceId("contract.presentation".to_string())
+                && action_id == &UiActionId("contract.submit".to_string())
+                && node_id == &Some(UiNodeId("contract-form".to_string()))
                 && values.0.get("message") == Some(&json!("H"))
-                && payload == json!({ "source": "dialog" })
+                && payload == &json!({ "source": "dialog" })
         ));
+        let expected_request = match &dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("expected action dispatch, got {other:?}"),
+        };
+        app.observed_requests.clear();
+        app.handle_dispatch(dispatch);
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: "botster.plugin-contract-matrix".to_string(),
+                    request: expected_request,
+                })
+        );
+    }
+
+    #[test]
+    fn rendered_plugin_button_mouse_activation_reaches_hub_request_seam() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.observed_requests.clear();
+        let mut router = InputRouter::new(renderer::action_request_context_for("contract.app"));
+        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        router.reconcile(&hit_map);
+        let action = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "contract-app-action")
+            .expect("rendered plugin button should be hit-testable");
+        let (column, row) = (action.rect.x, action.rect.y);
+        assert_eq!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column,
+                    row,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Focus {
+                node_id: "contract-app-action".to_string()
+            }
+        );
+        let dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        let expected_request = match &dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("expected action dispatch, got {other:?}"),
+        };
+
+        app.handle_dispatch(dispatch);
+
+        assert_eq!(
+            expected_request.surface_id,
+            UiSurfaceId("contract.app".to_string())
+        );
+        assert_eq!(
+            expected_request.action_id,
+            UiActionId("contract.action".to_string())
+        );
+        assert_eq!(
+            expected_request.node_id,
+            Some(UiNodeId("contract-app-action".to_string()))
+        );
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: "botster.plugin-contract-matrix".to_string(),
+                    request: expected_request,
+                })
+        );
     }
 
     #[test]
@@ -8468,11 +8666,20 @@ mod tests {
         assert!(!settings_rendered.contains("write_only"));
         assert!(!settings_rendered.contains("contract-action-secret"));
 
+        let submit_node = find_ui_node_by_id(&app_surface.body, "contract-app-form")
+            .expect("delivered app surface includes its action-bearing form");
+        let submit_action = node_action(submit_node);
+        assert_eq!(submit_action.id.0, report.submit_action_id);
+        let submit_node_id = submit_node
+            .id
+            .as_ref()
+            .expect("action-bearing form has an id")
+            .clone();
         let success_request = UiActionRequest {
             request_id: UiActionRequestId("contract-action-success".to_string()),
-            surface_id: UiSurfaceId("contract.app".to_string()),
-            action_id: UiActionId("contract.action".to_string()),
-            node_id: Some(UiNodeId("contract-action-form".to_string())),
+            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
+            action_id: submit_action.id.clone(),
+            node_id: Some(submit_node_id.clone()),
             kind: UiActionKind::Submit,
             values: Some(UiFormValues(
                 json!({ "message": "hello" })
@@ -8480,18 +8687,22 @@ mod tests {
                     .expect("values object")
                     .clone(),
             )),
-            payload: None,
+            payload: submit_action.payload.clone(),
         };
-        let success = client
-            .request(&DaemonRequest::PluginSurfaceAction {
-                package_name: report.package_name.clone(),
-                request: success_request.clone(),
-            })
-            .expect("dispatch contract action success");
         let mut action_app = TuiApp::new(None);
         action_app.apply_response(plugin_surface_response(app_surface.clone()));
-        action_app.pending_plugin_request = Some(success_request);
-        action_app.apply_response(success);
+        action_app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect action app to live hub"));
+        action_app.observed_requests.clear();
+        action_app.handle_dispatch(InputDispatch::Action(success_request.clone()));
+        assert!(
+            action_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: report.package_name.clone(),
+                    request: success_request.clone(),
+                })
+        );
         let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
             &action_app.surface(),
             240,
@@ -8524,31 +8735,117 @@ mod tests {
             Some("contract-action-success")
         );
 
-        let failure_request = UiActionRequest {
-            request_id: UiActionRequestId("contract-action-error".to_string()),
-            surface_id: UiSurfaceId("contract.app".to_string()),
-            action_id: UiActionId("contract.action".to_string()),
-            node_id: Some(UiNodeId("contract-action-form".to_string())),
+        let open_node = find_ui_node_by_id(&app_surface.body, &report.open_action_node_id)
+            .expect("delivered app surface includes the reported open control");
+        let open_action = node_action(open_node);
+        assert_eq!(open_action.id.0, report.open_action_id);
+        assert_eq!(
+            open_action.payload,
+            Some(report.open_action_payload.clone())
+        );
+        let open_request = UiActionRequest {
+            request_id: UiActionRequestId("contract-action-open-tui".to_string()),
+            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
+            action_id: open_action.id,
+            node_id: open_node.id.clone(),
             kind: UiActionKind::Submit,
             values: None,
-            payload: Some(json!({ "fail": true })),
+            payload: open_action.payload,
         };
-        let failure = client
-            .request(&DaemonRequest::PluginSurfaceAction {
-                package_name: report.package_name.clone(),
-                request: failure_request.clone(),
-            })
-            .expect("dispatch contract action error");
+        let mut open_app = TuiApp::new(None);
+        open_app.apply_response(plugin_surface_response(app_surface.clone()));
+        open_app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect open app to live hub"));
+        open_app.observed_requests.clear();
+        open_app.handle_dispatch(InputDispatch::Action(open_request.clone()));
+        assert!(
+            open_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: report.package_name.clone(),
+                    request: open_request,
+                })
+        );
+        for (key, value) in &report.open_set_values {
+            assert_eq!(
+                open_app
+                    .plugin_presentation
+                    .get(&botster_ui_contract::UiPresentationKey(key.clone())),
+                Some(value)
+            );
+        }
+        assert!(report.dialog_visible_after_open);
+        assert!(report.selected_workspace_visible_after_open);
+        let dialog_node =
+            find_presentation_bound_node(&app_surface.body, &report.dialog_presence_key, None)
+                .expect("delivered tree binds its dialog to the reported presence key");
+        let selected_node = find_presentation_bound_node(
+            &app_surface.body,
+            &report.selected_workspace_equality_key,
+            Some(&Value::String(
+                report.selected_workspace_equality_value.clone(),
+            )),
+        )
+        .expect("delivered tree binds selected detail to the reported equality");
+        let dialog_title = dialog_node
+            .props
+            .get("title")
+            .and_then(Value::as_str)
+            .expect("bound dialog has visible title");
+        let selected_text = selected_node
+            .props
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("bound selected detail has visible text");
+        let rendered = renderer::render_to_lines_with_presentation_state(
+            &open_app.surface(),
+            240,
+            120,
+            &RenderState::default(),
+            &open_app.plugin_presentation,
+        )
+        .0
+        .join("\n");
+        assert!(rendered.contains(dialog_title), "{rendered}");
+        assert!(rendered.contains(selected_text), "{rendered}");
+
+        let mut failure_payload = submit_action
+            .payload
+            .clone()
+            .expect("delivered submit action includes payload");
+        failure_payload
+            .as_object_mut()
+            .expect("delivered submit payload is an object")
+            .insert("fail".to_string(), Value::Bool(true));
+        let failure_request = UiActionRequest {
+            request_id: UiActionRequestId("contract-action-error".to_string()),
+            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
+            action_id: submit_action.id,
+            node_id: Some(submit_node_id),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: Some(failure_payload),
+        };
         let mut failure_app = TuiApp::new(None);
         failure_app.apply_response(plugin_surface_response(app_surface));
+        failure_app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect failure app to live hub"));
+        failure_app.observed_requests.clear();
         let original_root = failure_app
             .plugin_surface
             .as_ref()
             .expect("active fixture")
             .body
             .clone();
-        failure_app.pending_plugin_request = Some(failure_request);
-        failure_app.apply_response(failure);
+        failure_app.handle_dispatch(InputDispatch::Action(failure_request.clone()));
+        assert!(
+            failure_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: report.package_name.clone(),
+                    request: failure_request,
+                })
+        );
         assert_eq!(
             failure_app
                 .plugin_action_result
@@ -8568,6 +8865,14 @@ mod tests {
             diagnostic.kind == DaemonDiagnosticKind::ActionFailure
                 && diagnostic.operation.as_deref() == Some("plugin_surface_action")
         }));
+        let rendered = renderer::render_to_lines(&failure_app.surface(), 240, 120)
+            .0
+            .join("\n");
+        assert!(rendered.contains("state=Error"), "{rendered}");
+        assert!(
+            rendered.contains("diagnostic: action_failure"),
+            "{rendered}"
+        );
 
         let blocked = client
             .request(&DaemonRequest::PluginSurfaceRender {
