@@ -27,7 +27,7 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`39601e7c7570a474599ab2fba7e1a85b5f006b5a` and the kit, Hub client, and this
+`156c0872d7b221d9c85162e82b83c591afafdff8` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
 `3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729`. Runnable-entrypoint connection
