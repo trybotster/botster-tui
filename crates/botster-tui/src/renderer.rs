@@ -1,36 +1,54 @@
-use botster_core_ui::RequestId;
-use botster_core_ui::ui::UiSurfaceId;
+#[cfg(test)]
+use botster_ui_contract::UiNode;
+use botster_ui_contract::{UiActionRequestId, UiSurfaceId};
 
 pub const WORKSPACE_SURFACE_ID: &str = "botster-tui.workspace";
 
 pub use botster_tui_kit::{
-    ActionRequestContext, HitMap, InputDispatch, InputRouter, RenderState, render_node_with_state,
-    tui_capabilities,
+    ActionRequestContext, HitMap, InputDispatch, InputRouter, PresentationState, RenderState,
+    apply_action_result, render_node_with_presentation_state, tui_capabilities,
 };
 
 pub fn action_request_context() -> ActionRequestContext {
-    ActionRequestContext::new(
-        UiSurfaceId(WORKSPACE_SURFACE_ID.to_string()),
-        |node_id, _kind| RequestId(format!("req-{node_id}")),
-    )
+    action_request_context_for(WORKSPACE_SURFACE_ID)
+}
+
+pub fn action_request_context_for(surface_id: &str) -> ActionRequestContext {
+    ActionRequestContext::new(UiSurfaceId(surface_id.to_string()), |node_id, _kind| {
+        UiActionRequestId(format!("req-{node_id}-{}", crate::app::short_suffix()))
+    })
 }
 
 #[cfg(test)]
-pub fn render_to_lines(
-    root: &botster_core_ui::ui::UiNode,
-    width: u16,
-    height: u16,
-) -> (Vec<String>, HitMap) {
+pub fn render_to_lines(root: &UiNode, width: u16, height: u16) -> (Vec<String>, HitMap) {
     botster_tui_kit::render_to_lines(root, width, height).expect("test backend should draw fixture")
 }
 
 #[cfg(test)]
 pub fn render_to_lines_with_state(
-    root: &botster_core_ui::ui::UiNode,
+    root: &UiNode,
     width: u16,
     height: u16,
     state: &RenderState,
 ) -> (Vec<String>, HitMap) {
     botster_tui_kit::render_to_lines_with_state(root, width, height, state)
         .expect("state-aware test backend should draw fixture")
+}
+
+#[cfg(test)]
+pub fn render_to_lines_with_presentation_state(
+    root: &UiNode,
+    width: u16,
+    height: u16,
+    state: &RenderState,
+    presentation: &PresentationState,
+) -> (Vec<String>, HitMap) {
+    botster_tui_kit::render_to_lines_with_presentation_state(
+        root,
+        width,
+        height,
+        state,
+        presentation,
+    )
+    .expect("presentation-aware test backend should draw fixture")
 }

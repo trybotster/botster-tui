@@ -7,7 +7,7 @@ over core APIs and the shared TUI renderer kit, not a runtime policy owner.
 
 ## Role
 
-This crate consumes the shared Botster UI contract from `botster-core` and the
+This crate consumes the Hub-owned `botster-ui-contract` and the
 reusable Ratatui/Crossterm mechanics from `botster-tui-kit`:
 
 - Render `UiNode` trees with kit-owned ratatui widgets.
@@ -27,8 +27,9 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`fb0fdcb87d102232cb015b6da782a971903b4190` and its compatible UI-contract
-revision `7d52fb78024b45764d6830cf4c6b131f13a83e62`. Runnable-entrypoint connection
+`39601e7` and the kit, Hub client, and this crate share `botster-ui-contract`
+from botster-hub revision
+`3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The kit supplies semantic
 viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
@@ -73,7 +74,8 @@ Expanded (`>=120` columns) and regular (`80..119`) terminals use side-by-side
 navigation and focus panes. Compact terminals (`<80`) stack them vertically.
 Tab and Shift-Tab move focus; arrows navigate focused controls; Enter or Space
 activates; PageUp/PageDown and the mouse wheel scroll; `Esc` cancels an open
-confirmation or exits otherwise. `q` and `Ctrl-C` also exit.
+confirmation, returns from plugin-owned content to the System shell, or exits
+from the base shell. `q` and `Ctrl-C` also exit.
 
 ## Commands
 
@@ -94,7 +96,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`02bffebd0e29cb69a8e1e639e01f704f6dfffe48`. The protocol source is
+`3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -187,16 +189,29 @@ fresh generation's snapshot before accepting deltas.
 
 The TUI uses a deliberately narrowed compatibility requirement for the live-runtime
 terminal surface: sessions, session entity subscriptions, terminal streaming,
-terminal readback, package navigation, and resize. It does not require
-plugin surface render/action capabilities for this path. A running but
-incompatible hub is reported as a compatibility mismatch instead of being
-collapsed into the generic unavailable/reconnecting state.
+terminal readback, package navigation, resize, and plugin surface render/action.
+A running but incompatible hub is reported as a compatibility mismatch instead
+of being collapsed into the generic unavailable/reconnecting state.
+The cold compatibility floor is daemon protocol version 4 and conformance
+fixture revision 19. Protocol versions 2–3 and fixture revisions 16–18 fail
+through the structured compatibility diagnostic; there is no fallback path.
+
+When the Hub delivers a plugin surface, the TUI keeps a stable client-owned
+status/navigation shell and makes the plugin tree the interactive content
+owner. Button and form requests retain the kit-authored request, surface,
+action, node, kind, values, and payload identity and route through
+`PluginSurfaceAction`. Matching typed results apply accepted presentation
+operations and content replacements through the kit; rejected results retain
+the original content, router drafts, focus, and visible field/form feedback.
+Unknown or colliding plugin action IDs never enter the built-in
+`botster.tui.*` switch, and no plugin action dispatches without a matching
+active owner.
 
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
 app, empty, and settings surfaces through `botster-hub-client`. Those delivered
-surface bodies are deserialized to `botster_core::ui::UiNode`, validated against
-the core contract, checked against TUI renderer capabilities, and rendered with
+surface bodies arrive as typed `botster_ui_contract::UiNode`, are validated
+against the Hub-owned contract, checked against TUI renderer capabilities, and rendered with
 the production TUI kit. Unsupported client primitives fail with the
 capability-validation diagnostic, including the node id and primitive, instead
 of being treated as a passing render.
@@ -247,7 +262,7 @@ There is also an automated isolated-Hub test using
 `botster-hub` and `botster-session-worker` binaries, or resolves those command
 names from `PATH`; it does not discover or build a sibling Hub checkout. It
 starts an isolated daemon, runs the TUI live-runtime path, runs the
-revision-16 session lifecycle subscription conformance runner and plugin
+revision-19 session lifecycle/presentation conformance runner and plugin
 contract matrix conformance harness, renders the delivered fixture
 surfaces through the TUI renderer, and tears the daemon down. The renderer
 coverage includes the composite application primitive fixture for `metric_grid`,
@@ -285,7 +300,7 @@ Included now:
 - Root Cargo workspace.
 - One binary client crate at `crates/botster-tui`.
 - A real binary entry point with a noninteractive `--smoke` path.
-- Consumption of `botster-tui-kit` for shared `botster-core` `UiNode`
+- Consumption of `botster-tui-kit` for shared `botster-ui-contract` `UiNode`
   rendering and input routing mechanics.
 - A state-aware runtime draw path that renders the responsive session workspace
   as shared `UiNode`, reconciles focus against each new hit map, routes semantic
@@ -296,13 +311,15 @@ Included now:
   validation/error states through `botster-hub-client`.
 - Automated isolated-hub bring-up and teardown coverage when matching hub
   binaries are supplied to the test harness.
+- Generic owner-routed plugin action execution, accepted presentation and
+  replacement transitions, rejected form retention, and stable-shell `Esc`
+  navigation.
 - Deterministic format, test, and clippy scripts.
 
 Not included yet:
 
 - Pairing, remote auth, or hub provisioning inside this crate.
-- Entity-store hydration for bound plugin lists or owner-routed plugin action
-  execution.
+- Entity-store hydration for bound plugin lists.
 - Plugin execution, Project Pipelines policy, browser surfaces, or hub/core
   runtime policy.
 
