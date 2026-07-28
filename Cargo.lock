@@ -136,10 +136,11 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05#16bf08f29ec723c70c290cf995745ccbf79d4f05"
+source = "git+https://github.com/trybotster/botster-core?branch=main#e36435f2cb583c344d6f6ba2d62c39da324c7a64"
 dependencies = [
  "aes-gcm",
  "base64",
+ "portable-pty",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -151,7 +152,7 @@ dependencies = [
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62#7d52fb78024b45764d6830cf4c6b131f13a83e62"
+source = "git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05#16bf08f29ec723c70c290cf995745ccbf79d4f05"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -176,9 +177,10 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=02bffebd0e29cb69a8e1e639e01f704f6dfffe48#02bffebd0e29cb69a8e1e639e01f704f6dfffe48"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729#3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729"
 dependencies = [
  "base64",
+ "botster-ui-contract",
  "serde",
  "serde_json",
 ]
@@ -186,9 +188,11 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=02bffebd0e29cb69a8e1e639e01f704f6dfffe48#02bffebd0e29cb69a8e1e639e01f704f6dfffe48"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729#3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729"
 dependencies = [
+ "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core?branch=main)",
  "botster-hub-client",
+ "botster-ui-contract",
  "serde",
  "serde_json",
 ]
@@ -198,11 +202,11 @@ name = "botster-tui"
 version = "0.1.0"
 dependencies = [
  "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=16bf08f29ec723c70c290cf995745ccbf79d4f05)",
- "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62)",
  "botster-core-test-support",
  "botster-hub-client",
  "botster-hub-test-support",
  "botster-tui-kit",
+ "botster-ui-contract",
  "crossterm",
  "ratatui",
  "serde_json",
@@ -211,12 +215,22 @@ dependencies = [
 [[package]]
 name = "botster-tui-kit"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=fb0fdcb87d102232cb015b6da782a971903b4190#fb0fdcb87d102232cb015b6da782a971903b4190"
+source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=39601e7#39601e7c7570a474599ab2fba7e1a85b5f006b5a"
 dependencies = [
- "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core.git?rev=7d52fb78024b45764d6830cf4c6b131f13a83e62)",
+ "botster-ui-contract",
  "crossterm",
  "ratatui",
  "serde_json",
+]
+
+[[package]]
+name = "botster-ui-contract"
+version = "0.1.0"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729#3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -251,6 +265,12 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
 
 [[package]]
 name = "cfg_aliases"
@@ -487,6 +507,12 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
+
+[[package]]
+name = "downcast-rs"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "either"
@@ -882,7 +908,7 @@ version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
- "nix",
+ "nix 0.29.0",
  "winapi",
 ]
 
@@ -927,13 +953,25 @@ dependencies = [
 
 [[package]]
 name = "nix"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases 0.1.1",
+ "libc",
+]
+
+[[package]]
+name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
- "cfg_aliases",
+ "cfg_aliases 0.2.1",
  "libc",
  "memoffset",
 ]
@@ -1169,6 +1207,27 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "portable-pty"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e"
+dependencies = [
+ "anyhow",
+ "bitflags 1.3.2",
+ "downcast-rs",
+ "filedescriptor",
+ "lazy_static",
+ "libc",
+ "log",
+ "nix 0.28.0",
+ "serial2",
+ "shared_library",
+ "shell-words",
+ "winapi",
+ "winreg",
+]
 
 [[package]]
 name = "powerfmt"
@@ -1463,6 +1522,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial2"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6ea5562eeaed6936b8b54e086aa0f88b9e5b1bef45beb038e2519fa1185b1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1483,6 +1553,22 @@ dependencies = [
  "cpufeatures 0.3.0",
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "shared_library"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11"
+dependencies = [
+ "lazy_static",
+ "libc",
+]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "signal-hook"
@@ -1646,7 +1732,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix",
+ "nix 0.29.0",
  "num-derive",
  "num-traits",
  "ordered-float",
@@ -2032,6 +2118,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "winreg"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]
