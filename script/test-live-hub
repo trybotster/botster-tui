@@ -22,8 +22,26 @@ resolve_binary() {
   printf '%s\n' "$resolved"
 }
 
+resolve_contract_matrix_fixture() {
+  configured="${BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE:-}"
+  if [ -z "$configured" ]; then
+    echo "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required for live plugin-surface proof" >&2
+    exit 1
+  fi
+  if [ ! -d "$configured" ]; then
+    echo "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is not a directory: $configured" >&2
+    exit 1
+  fi
+  if [ ! -f "$configured/botster-package.json" ] || [ ! -f "$configured/plugin.lua" ]; then
+    echo "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE must contain botster-package.json and plugin.lua: $configured" >&2
+    exit 1
+  fi
+  printf '%s\n' "$configured"
+}
+
 hub_bin="$(resolve_binary BOTSTER_HUB_BIN botster-hub)"
 session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
+contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   target_dir="$CARGO_TARGET_DIR"
 else
@@ -39,5 +57,6 @@ BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
 BOTSTER_ENV=test \
 BOTSTER_HUB_BIN="$hub_bin" \
 BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="$contract_matrix_fixture" \
 CARGO_TARGET_DIR="$target_dir" \
 cargo test -p botster-tui headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available -- --nocapture

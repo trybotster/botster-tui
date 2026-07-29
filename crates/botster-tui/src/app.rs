@@ -8,9 +8,6 @@ use std::{
 };
 
 use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
-use botster_core_ui::ui::{
-    UiChild, UiCondition, UiConditional, UiFormValues, UiNode, UiNodeId, UiNodeKind, UiWidthClass,
-};
 #[cfg(test)]
 use botster_hub_client::DaemonOpaqueHistoryPayload;
 use botster_hub_client::{
@@ -20,10 +17,15 @@ use botster_hub_client::{
     DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonTransportError,
-    DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION, FEATURE_RESIZE,
-    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
-    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
-    read_frame_from_reader, subscribe_session_entities, write_frame,
+    DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_STREAMING, PROTOCOL,
+    connect_and_hello_with_requirement, read_frame_from_reader, subscribe_session_entities,
+    write_frame,
+};
+use botster_ui_contract::{
+    UiActionRequest, UiActionResult, UiChild, UiCondition, UiConditional, UiFormValues, UiNode,
+    UiNodeId, UiNodeKind, UiWidthClass,
 };
 use crossterm::{
     cursor::Show,
@@ -48,7 +50,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 16;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 19;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -423,8 +425,17 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
         args.hub_data_dir.is_some(),
     );
     let mut router = InputRouter::new(renderer::action_request_context());
+    let mut routed_surface_id = None;
     loop {
         app.poll_hub();
+        let active_surface_id = app.active_plugin_surface_id().map(ToOwned::to_owned);
+        if active_surface_id != routed_surface_id {
+            router = InputRouter::new(match active_surface_id.as_deref() {
+                Some(surface_id) => renderer::action_request_context_for(surface_id),
+                None => renderer::action_request_context(),
+            });
+            routed_surface_id = active_surface_id;
+        }
         app.set_drafts(router.draft_values());
 
         let mut hit_map = HitMap::default();
@@ -437,12 +448,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
             let event = event::read()?;
             match event {
                 Event::Key(key)
-                    if key.kind == KeyEventKind::Press
-                        && key.code == KeyCode::Esc
-                        && app.confirmation.is_some() =>
-                {
-                    app.confirmation = None;
-                }
+                    if key.kind == KeyEventKind::Press && app.handle_tui_owned_key(key) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
@@ -458,7 +464,14 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
 
 fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &TuiApp, render_state: &RenderState) {
     let node = app.surface();
-    renderer::render_node_with_state(frame, frame.area(), &node, hit_map, render_state);
+    renderer::render_node_with_presentation_state(
+        frame,
+        frame.area(),
+        &node,
+        hit_map,
+        render_state,
+        &app.plugin_presentation,
+    );
 }
 
 fn should_quit(key: KeyEvent) -> bool {
@@ -486,7 +499,9 @@ struct TuiApp {
     update_status: Option<DaemonPackageUpdateStatus>,
     package_decision: Option<botster_hub_client::DaemonPackageDecision>,
     plugin_surface: Option<DaemonPluginSurface>,
-    plugin_action_result: Option<Value>,
+    plugin_presentation: renderer::PresentationState,
+    plugin_action_result: Option<UiActionResult>,
+    pending_plugin_request: Option<UiActionRequest>,
     session_entities: SessionEntityState,
     pending_sessions: BTreeMap<String, SessionRow>,
     session_subscription: Option<SessionSubscriptionPump>,
@@ -552,7 +567,9 @@ impl TuiApp {
             update_status: None,
             package_decision: None,
             plugin_surface: None,
+            plugin_presentation: renderer::PresentationState::default(),
             plugin_action_result: None,
+            pending_plugin_request: None,
             session_entities: SessionEntityState::default(),
             pending_sessions: BTreeMap::new(),
             session_subscription: None,
@@ -633,7 +650,11 @@ impl TuiApp {
     fn handle_dispatch(&mut self, dispatch: InputDispatch) {
         match dispatch {
             InputDispatch::Action(request) => {
-                self.handle_action(request.action_id.0, request.values, request.payload);
+                if self.plugin_surface.is_some() {
+                    self.handle_plugin_action(request);
+                } else {
+                    self.handle_action(request.action_id.0, request.values, request.payload);
+                }
             }
             InputDispatch::TerminalForward { bytes, .. } => {
                 let Some(session_id) = self.attached_session.clone() else {
@@ -671,6 +692,105 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    fn active_plugin_surface_id(&self) -> Option<&str> {
+        self.plugin_surface
+            .as_ref()
+            .map(|surface| surface.surface_id.as_str())
+    }
+
+    fn clear_active_plugin_surface(&mut self) -> bool {
+        if self.plugin_surface.is_none() {
+            return false;
+        }
+        self.reset_active_plugin_surface();
+        self.system_details_visible = true;
+        self.action_feedback = Some("returned to System".to_string());
+        true
+    }
+
+    fn handle_tui_owned_key(&mut self, key: KeyEvent) -> bool {
+        if key.code != KeyCode::Esc || key.modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        if self.confirmation.is_some() {
+            self.confirmation = None;
+            return true;
+        }
+        self.clear_active_plugin_surface()
+    }
+
+    fn reset_active_plugin_surface(&mut self) {
+        self.plugin_surface = None;
+        self.plugin_presentation = renderer::PresentationState::default();
+        self.plugin_action_result = None;
+        self.pending_plugin_request = None;
+    }
+
+    fn apply_plugin_action_result(&mut self, result: UiActionResult) {
+        let Some(request) = self.pending_plugin_request.as_ref() else {
+            self.error = Some(format!(
+                "ignored plugin action result without an in-flight request: {}",
+                result.request_id.0
+            ));
+            return;
+        };
+        let Some(surface) = self.plugin_surface.as_mut() else {
+            self.error = Some("ignored plugin action result without an active owner".to_string());
+            return;
+        };
+        let identity_matches = result.request_id == request.request_id
+            && result.surface_id == request.surface_id
+            && result.action_id == request.action_id
+            && result.node_id == request.node_id
+            && result.surface_id.0 == surface.surface_id;
+        if !identity_matches {
+            self.error = Some(format!(
+                "ignored mismatched plugin action result: request={} result={}",
+                request.request_id.0, result.request_id.0
+            ));
+            return;
+        }
+
+        match renderer::apply_action_result(&mut self.plugin_presentation, &result) {
+            Ok(transition) => {
+                if let Some(replacement) = transition.replacement {
+                    surface.body = replacement;
+                }
+                self.pending_plugin_request = None;
+                self.action_feedback = Some(plugin_action_result_text(&result));
+                self.plugin_action_result = Some(result);
+            }
+            Err(error) => {
+                self.error = Some(format!("invalid plugin action result: {error}"));
+            }
+        }
+    }
+
+    fn handle_plugin_action(&mut self, request: UiActionRequest) {
+        let Some(surface) = self.plugin_surface.as_ref() else {
+            return;
+        };
+        if request.surface_id.0 != surface.surface_id {
+            self.error = Some(format!(
+                "plugin action surface mismatch: active={} request={}",
+                surface.surface_id, request.surface_id.0
+            ));
+            return;
+        }
+
+        let package_name = surface.package_name.clone();
+        self.error = None;
+        self.action_feedback = Some(format!(
+            "plugin action requested: {package_name}/{}",
+            request.action_id.0
+        ));
+        self.pending_plugin_request = Some(request.clone());
+        self.request_and_apply(DaemonRequest::PluginSurfaceAction {
+            package_name,
+            request,
+        });
     }
 
     fn handle_action(
@@ -872,6 +992,7 @@ impl TuiApp {
 
     fn force_reconnect(&mut self) {
         self.client = None;
+        self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
             self.error = Some("session subscription cleanup timed out".to_string());
         }
@@ -1356,6 +1477,15 @@ impl TuiApp {
                     package_name: package_name.clone(),
                     surface_id: surface_id.clone(),
                 }),
+            DaemonRequest::PluginSurfaceAction {
+                package_name,
+                request,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::PluginSurfaceAction {
+                    package_name: package_name.clone(),
+                    request: request.clone(),
+                }),
             DaemonRequest::Attach {
                 session_id,
                 subscription_id,
@@ -1393,6 +1523,7 @@ impl TuiApp {
 
     fn record_transport_error(&mut self, error: DaemonTransportError) {
         self.client = None;
+        self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
             self.error = Some("session subscription cleanup timed out".to_string());
         }
@@ -1500,11 +1631,24 @@ impl TuiApp {
         if matches!(response.kind, DaemonResponseKind::PackageDecision) {
             self.package_decision = response.package_decision;
         }
-        if matches!(response.kind, DaemonResponseKind::PluginSurface) {
-            self.plugin_surface = response.plugin_surface;
+        if matches!(response.kind, DaemonResponseKind::PluginSurface)
+            && let Some(surface) = response.plugin_surface
+        {
+            let owner_changed = self.plugin_surface.as_ref().is_none_or(|current| {
+                current.package_name != surface.package_name
+                    || current.surface_id != surface.surface_id
+            });
+            if owner_changed {
+                self.plugin_presentation = renderer::PresentationState::default();
+                self.plugin_action_result = None;
+                self.pending_plugin_request = None;
+            }
+            self.plugin_surface = Some(surface);
         }
-        if matches!(response.kind, DaemonResponseKind::PluginActionResult) {
-            self.plugin_action_result = response.plugin_action_result;
+        if matches!(response.kind, DaemonResponseKind::PluginActionResult)
+            && let Some(result) = response.plugin_action_result
+        {
+            self.apply_plugin_action_result(result);
         }
 
         for event in response.events {
@@ -1809,6 +1953,26 @@ impl TuiApp {
     }
 
     fn surface(&self) -> UiNode {
+        if self.confirmation.is_some() {
+            let root = self.confirmation_surface();
+            root.validate()
+                .expect("confirmation UiNode should satisfy the core UI contract");
+            renderer::tui_capabilities()
+                .validate_node(&root)
+                .expect("confirmation UiNode should fit TUI renderer capabilities");
+            return root;
+        }
+
+        if self.plugin_surface.is_some() {
+            let root = self.plugin_shell_surface();
+            root.validate()
+                .expect("plugin shell UiNode should satisfy the UI contract");
+            renderer::tui_capabilities()
+                .validate_node(&root)
+                .expect("plugin shell UiNode should fit TUI renderer capabilities");
+            return root;
+        }
+
         #[cfg(test)]
         if !self.workspace_test_mode && self.legacy_test_needs_system_details() {
             let root = self.system_details_panel();
@@ -1817,16 +1981,6 @@ impl TuiApp {
             renderer::tui_capabilities()
                 .validate_node(&root)
                 .expect("system details UiNode should fit TUI renderer capabilities");
-            return root;
-        }
-
-        if self.confirmation.is_some() {
-            let root = self.confirmation_surface();
-            root.validate()
-                .expect("confirmation UiNode should satisfy the core UI contract");
-            renderer::tui_capabilities()
-                .validate_node(&root)
-                .expect("confirmation UiNode should fit TUI renderer capabilities");
             return root;
         }
 
@@ -1865,6 +2019,64 @@ impl TuiApp {
         root
     }
 
+    fn plugin_shell_surface(&self) -> UiNode {
+        let surface = self
+            .plugin_surface
+            .as_ref()
+            .expect("plugin shell requires an active surface");
+        let mut root = node(
+            UiNodeKind::Stack,
+            "plugin-shell",
+            json!({ "direction": "vertical" }),
+        );
+        root.children = vec![
+            child(self.status_summary()),
+            child(node(
+                UiNodeKind::Text,
+                "plugin-shell-owner",
+                json!({
+                    "text": format!(
+                        "Plugin: {} / {} | Esc returns to System",
+                        surface.package_name, surface.surface_id
+                    )
+                }),
+            )),
+        ];
+        if let Some(error) = &self.connection_error {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                "plugin-shell-connection-error",
+                json!({ "text": format!("connection: {error}") }),
+            )));
+        }
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                &format!("plugin-shell-diagnostic-{index}"),
+                json!({ "text": format!("diagnostic: {}", diagnostic_text(diagnostic)) }),
+            )));
+        }
+        if let Some(feedback) = &self.action_feedback {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                "plugin-shell-action-feedback",
+                json!({ "text": format!("action: {feedback}") }),
+            )));
+        }
+        if let Some(error) = &self.error {
+            root.children.push(child(node(
+                UiNodeKind::Text,
+                "plugin-shell-error",
+                json!({ "text": format!("error: {error}") }),
+            )));
+        }
+        root.children.push(child(plugin_surface_render_root(
+            surface,
+            self.plugin_action_result.as_ref(),
+        )));
+        root
+    }
+
     #[cfg(test)]
     fn legacy_test_needs_system_details(&self) -> bool {
         self.compatibility.is_some()
@@ -1876,8 +2088,6 @@ impl TuiApp {
             || self.install_plan.is_some()
             || self.update_status.is_some()
             || self.package_decision.is_some()
-            || self.plugin_surface.is_some()
-            || self.plugin_action_result.is_some()
             || self.snapshot_metadata.is_some()
             || !self.drafts.is_empty()
     }
@@ -2347,21 +2557,6 @@ impl TuiApp {
                 }),
             )));
         }
-        if let Some(surface) = &self.plugin_surface {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "tui-plugin-surface",
-                json!({ "text": format!("plugin surface: {}", plugin_surface_text(surface)) }),
-            )));
-            children.extend(plugin_surface_nodes(surface).into_iter().map(child));
-        }
-        if let Some(result) = &self.plugin_action_result {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "tui-plugin-action-result",
-                json!({ "text": format!("plugin action result: {}", plugin_action_result_text(result)) }),
-            )));
-        }
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -2816,6 +3011,10 @@ enum ObservedRequest {
         package_name: String,
         surface_id: String,
     },
+    PluginSurfaceAction {
+        package_name: String,
+        request: UiActionRequest,
+    },
     Attach {
         session_id: String,
         subscription_id: String,
@@ -3225,7 +3424,7 @@ fn unique_suffix() -> u128 {
         .unwrap_or_default()
 }
 
-fn short_suffix() -> u64 {
+pub(crate) fn short_suffix() -> u64 {
     (unique_suffix() % 1_000_000_000_000) as u64
 }
 
@@ -3257,6 +3456,8 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_TERMINAL_STREAMING.to_string(),
             FEATURE_RESIZE.to_string(),
             FEATURE_PACKAGE_NAVIGATION.to_string(),
+            FEATURE_PLUGIN_SURFACE_RENDER.to_string(),
+            FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
             FEATURE_TERMINAL_READBACK.to_string(),
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
         ],
@@ -3641,57 +3842,8 @@ fn navigation_unsupported_text(entry: &DaemonPackageNavigationEntry) -> String {
     parts.join(" ")
 }
 
-fn plugin_surface_text(surface: &DaemonPluginSurface) -> String {
-    let body_id = surface
-        .body
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    let body_kind = surface
-        .body
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    format!(
-        "package={} surface={} kind={} node_id={}",
-        surface.package_name, surface.surface_id, body_kind, body_id
-    )
-}
-
-fn plugin_surface_nodes(surface: &DaemonPluginSurface) -> Vec<UiNode> {
-    if let Some(diagnostic) = iframe_unsupported_diagnostic(surface) {
-        return vec![node(
-            UiNodeKind::Text,
-            "tui-plugin-surface-iframe-unsupported",
-            json!({ "text": diagnostic }),
-        )];
-    }
-    let root = match plugin_surface_body_node(surface) {
-        Ok(root) => root,
-        Err(error) => {
-            return vec![node(
-                UiNodeKind::Text,
-                "tui-plugin-surface-invalid",
-                json!({ "text": format!("plugin surface render: {error}") }),
-            )];
-        }
-    };
-    let (lines, _) = botster_tui_kit::render_to_lines(&root, 120, 20)
-        .expect("validated plugin surface should render in test backend");
-    vec![node(
-        UiNodeKind::Text,
-        "tui-plugin-surface-rendered",
-        json!({ "text": format!("plugin surface render: {}", lines.join(" | ")) }),
-    )]
-}
-
 fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, String> {
-    let node: UiNode = serde_json::from_value(surface.body.clone()).map_err(|error| {
-        format!(
-            "plugin surface {}:{} failed UiNode deserialize: {error}",
-            surface.package_name, surface.surface_id
-        )
-    })?;
+    let node = surface.body.clone();
     node.validate().map_err(|error| {
         format!(
             "plugin surface {}:{} failed UiNode validate: {error}",
@@ -3712,18 +3864,18 @@ fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, Str
 fn iframe_unsupported_diagnostic(surface: &DaemonPluginSurface) -> Option<String> {
     let iframe = find_iframe_node(&surface.body)?;
     let title = iframe
-        .get("props")
-        .and_then(|props| props.get("title"))
+        .props
+        .get("title")
         .and_then(Value::as_str)
         .unwrap_or("untitled");
     let src = iframe
-        .get("props")
-        .and_then(|props| props.get("src"))
+        .props
+        .get("src")
         .and_then(Value::as_str)
         .unwrap_or("missing");
     let sandbox = iframe
-        .get("props")
-        .and_then(|props| props.get("sandbox"))
+        .props
+        .get("sandbox")
         .map(compact_json)
         .unwrap_or_else(|| "default".to_string());
     Some(format!(
@@ -3732,43 +3884,152 @@ fn iframe_unsupported_diagnostic(surface: &DaemonPluginSurface) -> Option<String
     ))
 }
 
-fn find_iframe_node(value: &Value) -> Option<&Value> {
-    if value
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind == "iframe")
-    {
-        return Some(value);
+fn find_iframe_node(node: &UiNode) -> Option<&UiNode> {
+    if node.kind == UiNodeKind::Iframe {
+        return Some(node);
     }
-    value
-        .get("children")
-        .and_then(Value::as_array)
-        .and_then(|children| children.iter().find_map(find_iframe_node))
+    node.children
+        .iter()
+        .chain(node.slots.values().flatten())
+        .find_map(find_iframe_child)
+}
+
+fn find_iframe_child(child: &UiChild) -> Option<&UiNode> {
+    match child {
+        UiChild::Node(node) => find_iframe_node(node),
+        UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. }) => find_iframe_node(node),
+        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+            item_template,
+            empty_template,
+            ..
+        }) => find_iframe_node(item_template)
+            .or_else(|| empty_template.as_deref().and_then(find_iframe_node)),
+        UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+            find_iframe_node(node)
+        }
+    }
 }
 
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn plugin_action_result_text(result: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(state) = result.get("state").and_then(Value::as_str) {
-        parts.push(format!("state={state}"));
+fn plugin_action_result_text(result: &UiActionResult) -> String {
+    let mut parts = vec![
+        format!("state={:?}", result.state),
+        format!("request_id={}", result.request_id.0),
+    ];
+    if !result.form_errors.is_empty() {
+        parts.push(format!("form_errors={}", result.form_errors.join(" | ")));
     }
-    if let Some(request_id) = result.get("request_id").and_then(Value::as_str) {
-        parts.push(format!("request_id={request_id}"));
+    if let Some(error) = &result.error {
+        parts.push(format!("error={error}"));
     }
-    if let Some(message) = result
-        .get("normalized_values")
-        .and_then(|values| values.get("message"))
-        .and_then(Value::as_str)
+    parts.join(" ")
+}
+
+fn plugin_surface_render_root(
+    surface: &DaemonPluginSurface,
+    result: Option<&UiActionResult>,
+) -> UiNode {
+    if let Some(diagnostic) = iframe_unsupported_diagnostic(surface) {
+        return node(
+            UiNodeKind::Text,
+            "tui-plugin-surface-iframe-unsupported",
+            json!({ "text": diagnostic }),
+        );
+    }
+    let mut root = match plugin_surface_body_node(surface) {
+        Ok(root) => root,
+        Err(error) => {
+            return node(
+                UiNodeKind::Text,
+                "tui-plugin-surface-invalid",
+                json!({ "text": format!("plugin surface render: {error}") }),
+            );
+        }
+    };
+    if let Some(result) = result {
+        apply_plugin_result_errors(&mut root, result);
+    }
+    root
+}
+
+fn apply_plugin_result_errors(root_node: &mut UiNode, result: &UiActionResult) {
+    let field_error = root_node
+        .id
+        .as_ref()
+        .and_then(|id| result.field_errors.get(&id.0))
+        .or_else(|| {
+            root_node
+                .props
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| result.field_errors.get(name))
+        });
+    if let Some(messages) = field_error {
+        root_node
+            .props
+            .insert("error".to_string(), Value::String(messages.join(" | ")));
+    }
+    if root_node.kind == UiNodeKind::Form && !result.form_errors.is_empty() {
+        let form_id = root_node
+            .id
+            .as_ref()
+            .map_or("plugin-form", |id| id.0.as_str());
+        root_node.children.insert(
+            0,
+            child(node(
+                UiNodeKind::Text,
+                &format!("{form_id}-result-error"),
+                json!({ "text": format!("error: {}", result.form_errors.join(" | ")) }),
+            )),
+        );
+    }
+    for child in root_node
+        .children
+        .iter_mut()
+        .chain(root_node.slots.values_mut().flatten())
     {
-        parts.push(format!("message={message}"));
+        apply_plugin_result_errors_to_child(child, result);
     }
-    if parts.is_empty() {
-        "unstructured".to_string()
-    } else {
-        parts.join(" ")
+}
+
+#[cfg(test)]
+fn static_child_node(child: &UiChild) -> Option<&UiNode> {
+    match child {
+        UiChild::Node(node) => Some(node),
+        UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. }) => Some(node),
+        UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => Some(node),
+        UiChild::BindList(_) => None,
+    }
+}
+
+fn apply_plugin_result_errors_to_child(child: &mut UiChild, result: &UiActionResult) {
+    match child {
+        UiChild::Node(node) => apply_plugin_result_errors(node, result),
+        UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. }) => {
+            apply_plugin_result_errors(node, result);
+        }
+        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+            item_template,
+            empty_template,
+            ..
+        }) => {
+            apply_plugin_result_errors(item_template, result);
+            if let Some(empty_template) = empty_template {
+                apply_plugin_result_errors(empty_template, result);
+            }
+        }
+        UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+            apply_plugin_result_errors(node, result);
+        }
     }
 }
 
@@ -4021,7 +4282,9 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use botster_core_ui::{RequestId, UiActionId, UiActionKind, UiActionRequest, UiSurfaceId};
+    use botster_ui_contract::{
+        UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
+    };
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
@@ -4030,6 +4293,61 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    fn find_ui_node_by_id<'a>(root: &'a UiNode, node_id: &str) -> Option<&'a UiNode> {
+        if root.id.as_ref().is_some_and(|id| id.0 == node_id) {
+            return Some(root);
+        }
+        root.children
+            .iter()
+            .chain(root.slots.values().flatten())
+            .filter_map(static_child_node)
+            .find_map(|child| find_ui_node_by_id(child, node_id))
+    }
+
+    fn node_action(node: &UiNode) -> botster_ui_contract::UiAction {
+        serde_json::from_value(
+            node.props
+                .get("action")
+                .cloned()
+                .expect("rendered action-bearing node has action metadata"),
+        )
+        .expect("rendered action metadata follows the Hub contract")
+    }
+
+    fn find_presentation_bound_node<'a>(
+        root: &'a UiNode,
+        key: &str,
+        equals: Option<&Value>,
+    ) -> Option<&'a UiNode> {
+        for child in root.children.iter().chain(root.slots.values().flatten()) {
+            if let UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf {
+                predicate,
+                node,
+            }) = child
+            {
+                let matches = match predicate {
+                    botster_ui_contract::UiPresentationPredicate::Present {
+                        key: predicate_key,
+                    } => predicate_key.0 == key && equals.is_none(),
+                    botster_ui_contract::UiPresentationPredicate::Equals {
+                        key: predicate_key,
+                        value,
+                    } => predicate_key.0 == key && equals == Some(value),
+                    botster_ui_contract::UiPresentationPredicate::Truthy { .. } => false,
+                };
+                if matches {
+                    return Some(node);
+                }
+            }
+            if let Some(node) = static_child_node(child)
+                && let Some(found) = find_presentation_bound_node(node, key, equals)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[test]
@@ -4420,14 +4738,15 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_revision_16_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_4_revision_19_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
             requirement.minimum_conformance_fixture_revision,
             MINIMUM_CONFORMANCE_FIXTURE_REVISION
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 16);
+        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 4);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 19);
         assert!(
             requirement
                 .required_features
@@ -4441,12 +4760,28 @@ mod tests {
                 .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
         );
 
-        let mut older_hub = DaemonCompatibility::current();
-        older_hub.conformance_fixture_revision = 15;
-        let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-            .expect_err("revision 15 hub must be rejected");
-        assert!(error.diagnostic.contains("revision 15"));
-        assert!(error.diagnostic.contains("requires at least 16"));
+        for revision in 16..19 {
+            let mut older_hub = DaemonCompatibility::current();
+            older_hub.conformance_fixture_revision = revision;
+            let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
+                .expect_err("pre-presentation fixture revision must be rejected");
+            assert!(error.diagnostic.contains(&format!("revision {revision}")));
+            assert!(error.diagnostic.contains("requires at least 19"));
+        }
+        for protocol_version in 2..4 {
+            let mut older_hub = DaemonCompatibility::current();
+            older_hub.protocol_version = protocol_version;
+            let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
+                .expect_err("older protocol must be rejected");
+            assert!(
+                error
+                    .diagnostic
+                    .contains(&format!("version {protocol_version}"))
+            );
+            assert!(error.diagnostic.contains("requires at least 4"));
+        }
+        botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
+            .expect("protocol 4 fixture revision 19 hub should connect");
     }
 
     #[test]
@@ -4851,6 +5186,15 @@ mod tests {
         let mut app = TuiApp::new(None);
 
         app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.pending_plugin_request = Some(UiActionRequest {
+            request_id: UiActionRequestId("contract-action-success".to_string()),
+            surface_id: UiSurfaceId("contract.app".to_string()),
+            action_id: UiActionId("contract.action".to_string()),
+            node_id: Some(UiNodeId("contract-app-action".to_string())),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: None,
+        });
         app.apply_response(plugin_action_response(json!({
             "request_id": "contract-action-success",
             "surface_id": "contract.app",
@@ -4864,14 +5208,600 @@ mod tests {
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
         let rendered = lines.join("\n");
-        assert!(rendered.contains(
-            "plugin surface: package=botster.plugin-contract-matrix surface=contract.app kind=panel node_id=contract-app-panel"
-        ));
-        assert!(rendered.contains("plugin surface render:"));
+        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix / contract.app"));
         assert!(rendered.contains("UiNode payload delivered through plugin_surface_render."));
-        assert!(rendered.contains(
-            "plugin action result: state=accepted request_id=contract-action-success message=hello"
+        assert!(rendered.contains("Run contract action"));
+        assert_eq!(
+            app.action_feedback.as_deref(),
+            Some("state=Accepted request_id=contract-action-success")
+        );
+    }
+
+    #[test]
+    fn active_plugin_routes_arbitrary_and_colliding_actions_with_exact_identity() {
+        let mut app = TuiApp::new(None);
+        app.observed_requests.clear();
+        app.system_details_visible = false;
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        let request = UiActionRequest {
+            request_id: UiActionRequestId("request-collision".to_string()),
+            surface_id: UiSurfaceId("contract.app".to_string()),
+            action_id: UiActionId("botster.tui.toggle_system_details".to_string()),
+            node_id: Some(UiNodeId("contract-app-action".to_string())),
+            kind: UiActionKind::Submit,
+            values: Some(UiFormValues(
+                json!({ "message": "hello" })
+                    .as_object()
+                    .expect("values object")
+                    .clone(),
+            )),
+            payload: Some(json!({ "arbitrary": true })),
+        };
+
+        app.handle_dispatch(InputDispatch::Action(request.clone()));
+
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::PluginSurfaceAction {
+                package_name: "botster.plugin-contract-matrix".to_string(),
+                request,
+            }]
+        );
+        assert!(!app.system_details_visible);
+    }
+
+    #[test]
+    fn plugin_actions_require_the_active_owning_surface() {
+        let mut app = TuiApp::new(None);
+        app.observed_requests.clear();
+        let request = plugin_request(
+            "request-without-owner",
+            "contract.app",
+            "plugin.arbitrary",
+            "contract-app-action",
+        );
+
+        app.handle_dispatch(InputDispatch::Action(request));
+        assert!(app.observed_requests.is_empty());
+
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.handle_dispatch(InputDispatch::Action(plugin_request(
+            "request-wrong-surface",
+            "contract.other",
+            "plugin.arbitrary",
+            "contract-app-action",
+        )));
+        assert!(app.observed_requests.is_empty());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("surface mismatch"))
+        );
+        assert_eq!(app.active_plugin_surface_id(), Some("contract.app"));
+    }
+
+    #[test]
+    fn tui_owned_escape_clears_plugin_scope_without_dispatch() {
+        let mut app = TuiApp::new(None);
+        app.observed_requests.clear();
+        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
+        app.plugin_presentation.set(
+            botster_ui_contract::UiPresentationKey("contract-dialog".to_string()),
+            Value::Bool(true),
+        );
+        app.pending_plugin_request = Some(plugin_request(
+            "request-pending",
+            "contract.presentation",
+            "contract.submit",
+            "contract-form",
         ));
+
+        assert!(app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+
+        assert!(app.plugin_surface.is_none());
+        assert_eq!(
+            app.plugin_presentation,
+            renderer::PresentationState::default()
+        );
+        assert!(app.pending_plugin_request.is_none());
+        assert!(app.plugin_action_result.is_none());
+        assert!(app.observed_requests.is_empty());
+        assert!(app.system_details_visible);
+        assert!(app.surface().id == Some(UiNodeId("workspace-root".to_string())));
+    }
+
+    #[test]
+    fn matching_results_apply_presentation_rejection_errors_and_replacement() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
+
+        app.pending_plugin_request = Some(plugin_request(
+            "request-open",
+            "contract.presentation",
+            "contract.open",
+            "contract-open",
+        ));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-open",
+            "surface_id": "contract.presentation",
+            "action_id": "contract.open",
+            "node_id": "contract-open",
+            "state": "accepted",
+            "presentation": [
+                { "kind": "set", "key": "contract-dialog", "value": true },
+                { "kind": "set", "key": "selected-workspace", "value": "workspace-alpha" }
+            ]
+        })));
+
+        let (lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        );
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Contract form"));
+        assert!(rendered.contains("Selected workspace: workspace-alpha"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "contract-form")
+        );
+
+        let retained_root = app.plugin_surface.as_ref().expect("owner").body.clone();
+        let retained_presentation = app.plugin_presentation.clone();
+        app.pending_plugin_request = Some(plugin_request(
+            "request-rejected",
+            "contract.presentation",
+            "contract.submit",
+            "contract-form",
+        ));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-rejected",
+            "surface_id": "contract.presentation",
+            "action_id": "contract.submit",
+            "node_id": "contract-form",
+            "state": "rejected",
+            "field_errors": {
+                "contract-message": ["Message is required"]
+            },
+            "form_errors": ["Fix the highlighted fields"]
+        })));
+        assert_eq!(
+            app.plugin_surface.as_ref().expect("owner").body,
+            retained_root
+        );
+        assert_eq!(app.plugin_presentation, retained_presentation);
+        let (lines, _) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        );
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Message is required"), "{rendered}");
+        assert!(
+            rendered.contains("error: Message is required"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("Message is required").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Fix the highlighted fields"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Contract form"));
+
+        app.pending_plugin_request = Some(plugin_request(
+            "request-accepted",
+            "contract.presentation",
+            "contract.submit",
+            "contract-form",
+        ));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-accepted",
+            "surface_id": "contract.presentation",
+            "action_id": "contract.submit",
+            "node_id": "contract-form",
+            "state": "accepted",
+            "presentation": [
+                { "kind": "clear", "key": "contract-dialog" }
+            ],
+            "replacement": {
+                "type": "button",
+                "id": "contract-action-replacement",
+                "props": {
+                    "label": "Replacement action",
+                    "action": { "id": "contract.replacement" }
+                }
+            }
+        })));
+        let surface = app.plugin_surface.as_ref().expect("owner retained");
+        assert_eq!(
+            surface.body.id,
+            Some(UiNodeId("contract-action-replacement".to_string()))
+        );
+        assert!(
+            app.plugin_presentation
+                .get(&botster_ui_contract::UiPresentationKey(
+                    "contract-dialog".to_string()
+                ))
+                .is_none()
+        );
+        let (replacement_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        );
+        let rendered = replacement_lines.join("\n");
+        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix"));
+        assert!(rendered.contains("Replacement action"));
+        assert!(!rendered.contains("Contract form"));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "contract-action-replacement")
+        );
+    }
+
+    #[test]
+    fn mismatched_plugin_result_cannot_mutate_active_scope() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
+        app.pending_plugin_request = Some(plugin_request(
+            "request-current",
+            "contract.presentation",
+            "contract.open",
+            "contract-open",
+        ));
+        let retained_root = app.plugin_surface.as_ref().expect("owner").body.clone();
+
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-stale",
+            "surface_id": "contract.presentation",
+            "action_id": "contract.open",
+            "node_id": "contract-open",
+            "state": "accepted",
+            "presentation": [
+                { "kind": "set", "key": "contract-dialog", "value": true }
+            ],
+            "replacement": {
+                "type": "text",
+                "id": "stale-replacement",
+                "props": { "text": "stale" }
+            }
+        })));
+
+        assert_eq!(
+            app.plugin_surface.as_ref().expect("owner").body,
+            retained_root
+        );
+        assert_eq!(
+            app.plugin_presentation,
+            renderer::PresentationState::default()
+        );
+        assert_eq!(
+            app.pending_plugin_request
+                .as_ref()
+                .map(|request| request.request_id.0.as_str()),
+            Some("request-current")
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("mismatched"))
+        );
+        let rendered = renderer::render_to_lines(&app.surface(), 160, 60)
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("ignored mismatched plugin action result"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn rejected_dialog_fields_render_one_native_error_row_per_supported_kind() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(field_error_kinds_plugin_surface()));
+        app.pending_plugin_request = Some(plugin_request(
+            "request-field-errors",
+            "contract.field-errors",
+            "contract.submit",
+            "contract-field-error-form",
+        ));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-field-errors",
+            "surface_id": "contract.field-errors",
+            "action_id": "contract.submit",
+            "node_id": "contract-field-error-form",
+            "state": "rejected",
+            "field_errors": {
+                "contract-text-input": ["Text input required"],
+                "contract-checkbox": ["Checkbox required"],
+                "contract-form-field": ["Form field required"],
+                "contract-textarea": ["Textarea required"],
+                "contract-select": ["Select required"]
+            },
+            "form_errors": ["Fix the highlighted fields"]
+        })));
+
+        let (lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            180,
+            80,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        );
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("Field error contract"), "{rendered}");
+        for message in [
+            "Text input required",
+            "Checkbox required",
+            "Form field required",
+            "Textarea required",
+            "Select required",
+        ] {
+            assert!(
+                rendered.contains(&format!("error: {message}")),
+                "{rendered}"
+            );
+            assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
+        }
+        for node_id in [
+            "contract-text-input",
+            "contract-checkbox",
+            "contract-form-field",
+            "contract-textarea",
+            "contract-select",
+        ] {
+            assert!(
+                hit_map
+                    .regions()
+                    .iter()
+                    .any(|region| region.node_id == node_id),
+                "missing hit region for {node_id}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_shell_renders_action_failure_feedback_and_diagnostics() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.pending_plugin_request = Some(plugin_request(
+            "request-error",
+            "contract.app",
+            "contract.action",
+            "contract-app-action",
+        ));
+        let mut response = plugin_action_response(json!({
+            "request_id": "request-error",
+            "surface_id": "contract.app",
+            "action_id": "contract.action",
+            "node_id": "contract-app-action",
+            "state": "error",
+            "error": "contract action failed"
+        }));
+        response.diagnostics.push(DaemonDiagnostic {
+            kind: DaemonDiagnosticKind::ActionFailure,
+            operation: Some("plugin_surface_action".to_string()),
+            feature: Some("plugin_surface_actions".to_string()),
+            message: Some("contract action failed".to_string()),
+        });
+
+        app.apply_response(response);
+
+        let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("action: state=Error request_id=request-error"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("diagnostic: action_failure"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("operation=plugin_surface_action"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("contract action failed"), "{rendered}");
+    }
+
+    #[test]
+    fn keyboard_dialog_rejection_retains_router_draft_focus_and_submit_identity() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
+        app.plugin_presentation.set(
+            botster_ui_contract::UiPresentationKey("contract-dialog".to_string()),
+            Value::Bool(true),
+        );
+        let mut router = InputRouter::new(renderer::action_request_context_for(
+            "contract.presentation",
+        ));
+        let (_lines, initial_hits) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        router.reconcile(&initial_hits);
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &initial_hits,
+            ),
+            InputDispatch::Focus {
+                node_id: "contract-form".to_string()
+            }
+        );
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &initial_hits,
+            ),
+            InputDispatch::Focus {
+                node_id: "contract-message".to_string()
+            }
+        );
+        router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE)),
+            &initial_hits,
+        );
+        assert_eq!(router.draft_value("message"), Some(&json!("H")));
+
+        app.pending_plugin_request = Some(plugin_request(
+            "request-keyboard-rejected",
+            "contract.presentation",
+            "contract.submit",
+            "contract-form",
+        ));
+        app.apply_response(plugin_action_response(json!({
+            "request_id": "request-keyboard-rejected",
+            "surface_id": "contract.presentation",
+            "action_id": "contract.submit",
+            "node_id": "contract-form",
+            "state": "rejected",
+            "field_errors": {
+                "contract-message": ["Message is too short"]
+            },
+            "form_errors": ["Fix the highlighted fields"]
+        })));
+        let (_lines, rejected_hits) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        router.reconcile(&rejected_hits);
+        assert_eq!(router.focused_node_id(), Some("contract-message"));
+        assert_eq!(router.draft_value("message"), Some(&json!("H")));
+
+        assert_eq!(
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &rejected_hits,
+            ),
+            InputDispatch::Focus {
+                node_id: "contract-form".to_string()
+            }
+        );
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &rejected_hits,
+        );
+        assert!(matches!(
+            &dispatch,
+            InputDispatch::Action(UiActionRequest {
+                surface_id,
+                action_id,
+                node_id,
+                kind: UiActionKind::Submit,
+                values: Some(values),
+                payload: Some(payload),
+                ..
+            }) if surface_id == &UiSurfaceId("contract.presentation".to_string())
+                && action_id == &UiActionId("contract.submit".to_string())
+                && node_id == &Some(UiNodeId("contract-form".to_string()))
+                && values.0.get("message") == Some(&json!("H"))
+                && payload == &json!({ "source": "dialog" })
+        ));
+        let expected_request = match &dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("expected action dispatch, got {other:?}"),
+        };
+        app.observed_requests.clear();
+        app.handle_dispatch(dispatch);
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: "botster.plugin-contract-matrix".to_string(),
+                    request: expected_request,
+                })
+        );
+    }
+
+    #[test]
+    fn rendered_plugin_button_mouse_activation_reaches_hub_request_seam() {
+        let mut app = TuiApp::new(None);
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        app.observed_requests.clear();
+        let mut router = InputRouter::new(renderer::action_request_context_for("contract.app"));
+        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            160,
+            60,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        router.reconcile(&hit_map);
+        let action = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "contract-app-action")
+            .expect("rendered plugin button should be hit-testable");
+        let (column, row) = (action.rect.x, action.rect.y);
+        assert_eq!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column,
+                    row,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Focus {
+                node_id: "contract-app-action".to_string()
+            }
+        );
+        let dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        let expected_request = match &dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("expected action dispatch, got {other:?}"),
+        };
+
+        app.handle_dispatch(dispatch);
+
+        assert_eq!(
+            expected_request.surface_id,
+            UiSurfaceId("contract.app".to_string())
+        );
+        assert_eq!(
+            expected_request.action_id,
+            UiActionId("contract.action".to_string())
+        );
+        assert_eq!(
+            expected_request.node_id,
+            Some(UiNodeId("contract-app-action".to_string()))
+        );
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: "botster.plugin-contract-matrix".to_string(),
+                    request: expected_request,
+                })
+        );
     }
 
     #[test]
@@ -4884,7 +5814,7 @@ mod tests {
 
         assert!(rendered.contains("Project Pipeline Overview"));
         assert!(rendered.contains("Active Runs: 3"));
-        assert!(rendered.contains("status_badge: Healthy"));
+        assert!(rendered.contains("Healthy"));
         assert!(rendered.contains("Ticket"));
         assert!(rendered.contains("State"));
         assert!(rendered.contains("1783529012"));
@@ -4917,11 +5847,9 @@ mod tests {
         let (lines, _) = renderer::render_to_lines(&app.surface(), 420, 220);
         let rendered = lines.join("\n");
 
-        assert!(rendered.contains(
-            "plugin surface: package=botster.plugin-contract-matrix surface=contract.composite kind=section node_id=contract-composite-section"
-        ));
+        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix / contract.composite"));
         assert!(rendered.contains("Project Pipeline Overview"));
-        assert!(rendered.contains("plugin surface render:"));
+        assert!(rendered.contains("Refresh"));
     }
 
     #[test]
@@ -4966,7 +5894,7 @@ mod tests {
         assert!(matches!(
             up_dispatch,
             InputDispatch::Action(request)
-                if request.action_id == botster_core_ui::ui::UiActionId("contract.ticket.open".to_string())
+                if request.action_id == botster_ui_contract::UiActionId("contract.ticket.open".to_string())
                     && request.node_id == Some(UiNodeId("contract-composite-ticket-a".to_string()))
                     && request.payload == Some(json!({ "ticket_id": "1783529012" }))
         ));
@@ -4987,9 +5915,7 @@ mod tests {
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
         let rendered = lines.join("\n");
-        assert!(rendered.contains(
-            "plugin surface: package=botster.plugin-contract-matrix surface=contract.invalid kind=table node_id=contract-invalid-table"
-        ));
+        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix / contract.invalid"));
         assert!(rendered.contains(
             "plugin surface render: plugin surface botster.plugin-contract-matrix:contract.invalid failed UiNode validate"
         ));
@@ -5007,7 +5933,7 @@ mod tests {
 
         app.apply_response(package_navigation_response(vec![entry.clone()]));
         app.handle_dispatch(InputDispatch::Action(UiActionRequest {
-            request_id: RequestId("req-navigation-open".to_string()),
+            request_id: UiActionRequestId("req-navigation-open".to_string()),
             surface_id: UiSurfaceId(renderer::WORKSPACE_SURFACE_ID.to_string()),
             action_id: UiActionId("botster.tui.navigation.open".to_string()),
             node_id: Some(UiNodeId("tui-package-navigation-0-open".to_string())),
@@ -5617,16 +6543,16 @@ mod tests {
         assert!(rendered.contains("Notes: Line one"));
 
         app.handle_dispatch(InputDispatch::Action(
-            botster_core_ui::ui::UiActionRequest {
-                request_id: botster_core_ui::RequestId("req-config-submit".to_string()),
-                surface_id: botster_core_ui::ui::UiSurfaceId(
+            botster_ui_contract::UiActionRequest {
+                request_id: botster_ui_contract::UiActionRequestId("req-config-submit".to_string()),
+                surface_id: botster_ui_contract::UiSurfaceId(
                     renderer::WORKSPACE_SURFACE_ID.to_string(),
                 ),
-                action_id: botster_core_ui::ui::UiActionId(
+                action_id: botster_ui_contract::UiActionId(
                     "botster.tui.package_config.submit".to_string(),
                 ),
                 node_id: Some(UiNodeId("tui-package-0-configuration-submit".to_string())),
-                kind: botster_core_ui::ui::UiActionKind::Submit,
+                kind: botster_ui_contract::UiActionKind::Submit,
                 values: Some(UiFormValues(
                     app.drafts
                         .iter()
@@ -6974,14 +7900,14 @@ mod tests {
         app.observed_requests.clear();
 
         app.handle_dispatch(InputDispatch::Action(
-            botster_core_ui::ui::UiActionRequest {
-                request_id: botster_core_ui::RequestId("req-attach-exited".to_string()),
-                surface_id: botster_core_ui::ui::UiSurfaceId(
+            botster_ui_contract::UiActionRequest {
+                request_id: botster_ui_contract::UiActionRequestId("req-attach-exited".to_string()),
+                surface_id: botster_ui_contract::UiSurfaceId(
                     renderer::WORKSPACE_SURFACE_ID.to_string(),
                 ),
-                action_id: botster_core_ui::ui::UiActionId("botster.tui.attach".to_string()),
+                action_id: botster_ui_contract::UiActionId("botster.tui.attach".to_string()),
                 node_id: Some(UiNodeId("tui-session-session-beta-attach".to_string())),
-                kind: botster_core_ui::ui::UiActionKind::Submit,
+                kind: botster_ui_contract::UiActionKind::Submit,
                 values: None,
                 payload: Some(json!({ "session_id": "session-beta" })),
             },
@@ -7068,14 +7994,16 @@ mod tests {
         app.observed_requests.clear();
 
         app.handle_dispatch(InputDispatch::Action(
-            botster_core_ui::ui::UiActionRequest {
-                request_id: botster_core_ui::RequestId("req-terminal-focus".to_string()),
-                surface_id: botster_core_ui::ui::UiSurfaceId(
+            botster_ui_contract::UiActionRequest {
+                request_id: botster_ui_contract::UiActionRequestId(
+                    "req-terminal-focus".to_string(),
+                ),
+                surface_id: botster_ui_contract::UiSurfaceId(
                     renderer::WORKSPACE_SURFACE_ID.to_string(),
                 ),
-                action_id: botster_core_ui::ui::UiActionId("botster.terminal.focus".to_string()),
+                action_id: botster_ui_contract::UiActionId("botster.terminal.focus".to_string()),
                 node_id: Some(UiNodeId("tui-terminal".to_string())),
-                kind: botster_core_ui::ui::UiActionKind::Submit,
+                kind: botster_ui_contract::UiActionKind::Submit,
                 values: None,
                 payload: None,
             },
@@ -7225,20 +8153,17 @@ mod tests {
 
         assert_live_attach_history_readback(&hub);
 
-        if let Some(contract_matrix_fixture) =
-            std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE").map(PathBuf::from)
-        {
-            let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
-                &hub,
-                contract_matrix_fixture,
-            )
-            .expect("plugin contract matrix conformance passes");
-            assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
-        } else {
-            eprintln!(
-                "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is not set; live plugin-surface proof skipped"
+        let contract_matrix_fixture = std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
+            .map(PathBuf::from)
+            .expect(
+                "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required for live plugin-surface proof",
             );
-        }
+        let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
+            &hub,
+            contract_matrix_fixture,
+        )
+        .expect("plugin contract matrix conformance passes");
+        assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
 
         let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let data_dir = hub.data_dir().to_string_lossy().to_string();
@@ -7593,7 +8518,7 @@ mod tests {
         while app
             .sessions
             .iter()
-            .any(|session| session.session_id == prior_session_id && session.is_attachable())
+            .any(|session| session.session_id == prior_session_id && session.lifecycle != "exited")
             && Instant::now() < exit_deadline
         {
             app.poll_hub();
@@ -7741,7 +8666,7 @@ mod tests {
             "plugin_surface_render",
         );
         assert!(app_rendered.contains("Render path: validated"));
-        assert!(app_rendered.contains("status_badge: Validated"));
+        assert!(app_rendered.contains("Validated"));
 
         let empty_surface =
             request_plugin_surface(&mut client, &report.package_name, "contract.empty");
@@ -7766,48 +8691,213 @@ mod tests {
         assert!(!settings_rendered.contains("write_only"));
         assert!(!settings_rendered.contains("contract-action-secret"));
 
-        let success = client
-            .request(&DaemonRequest::PluginSurfaceAction {
-                package_name: report.package_name.clone(),
-                surface_id: "contract.app".to_string(),
-                action_id: "contract.action".to_string(),
-                payload: json!({
-                    "request_id": "contract-action-success",
-                    "message": "hello",
-                }),
-            })
-            .expect("dispatch contract action success");
+        let submit_node = find_ui_node_by_id(&app_surface.body, "contract-app-form")
+            .expect("delivered app surface includes its action-bearing form");
+        let submit_action = node_action(submit_node);
+        assert_eq!(submit_action.id.0, report.submit_action_id);
+        let submit_node_id = submit_node
+            .id
+            .as_ref()
+            .expect("action-bearing form has an id")
+            .clone();
+        let success_request = UiActionRequest {
+            request_id: UiActionRequestId("contract-action-success".to_string()),
+            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
+            action_id: submit_action.id.clone(),
+            node_id: Some(submit_node_id.clone()),
+            kind: UiActionKind::Submit,
+            values: Some(UiFormValues(
+                json!({ "message": "hello" })
+                    .as_object()
+                    .expect("values object")
+                    .clone(),
+            )),
+            payload: submit_action.payload.clone(),
+        };
         let mut action_app = TuiApp::new(None);
-        action_app.workspace_test_mode = true;
-        action_app.system_details_visible = true;
-        action_app.apply_response(success);
-        let (lines, _) = renderer::render_to_lines(&action_app.surface(), 240, 120);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("plugin action result: state=accepted"));
-        assert!(rendered.contains("request_id=contract-action-success"));
-        assert!(rendered.contains("message=hello"));
+        action_app.apply_response(plugin_surface_response(app_surface.clone()));
+        action_app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect action app to live hub"));
+        action_app.observed_requests.clear();
+        action_app.handle_dispatch(InputDispatch::Action(success_request.clone()));
+        assert!(
+            action_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: report.package_name.clone(),
+                    request: success_request.clone(),
+                })
+        );
+        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &action_app.surface(),
+            240,
+            120,
+            &RenderState::default(),
+            &action_app.plugin_presentation,
+        );
+        assert_eq!(
+            action_app
+                .plugin_surface
+                .as_ref()
+                .expect("owner retained")
+                .body
+                .id
+                .as_ref()
+                .map(|id| id.0.as_str()),
+            Some(report.action_success_replacement_node_id.as_str())
+        );
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == report.action_success_replacement_node_id)
+        );
+        assert_eq!(
+            action_app
+                .plugin_action_result
+                .as_ref()
+                .map(|result| result.request_id.0.as_str()),
+            Some("contract-action-success")
+        );
 
-        let failure = client
-            .request(&DaemonRequest::PluginSurfaceAction {
-                package_name: report.package_name.clone(),
-                surface_id: "contract.app".to_string(),
-                action_id: "contract.action".to_string(),
-                payload: json!({
-                    "request_id": "contract-action-error",
-                    "fail": true,
-                }),
-            })
-            .expect("dispatch contract action error");
+        let open_node = find_ui_node_by_id(&app_surface.body, &report.open_action_node_id)
+            .expect("delivered app surface includes the reported open control");
+        let open_action = node_action(open_node);
+        assert_eq!(open_action.id.0, report.open_action_id);
+        assert_eq!(
+            open_action.payload,
+            Some(report.open_action_payload.clone())
+        );
+        let open_request = UiActionRequest {
+            request_id: UiActionRequestId("contract-action-open-tui".to_string()),
+            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
+            action_id: open_action.id,
+            node_id: open_node.id.clone(),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: open_action.payload,
+        };
+        let mut open_app = TuiApp::new(None);
+        open_app.apply_response(plugin_surface_response(app_surface.clone()));
+        open_app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect open app to live hub"));
+        open_app.observed_requests.clear();
+        open_app.handle_dispatch(InputDispatch::Action(open_request.clone()));
+        assert!(
+            open_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: report.package_name.clone(),
+                    request: open_request,
+                })
+        );
+        for (key, value) in &report.open_set_values {
+            assert_eq!(
+                open_app
+                    .plugin_presentation
+                    .get(&botster_ui_contract::UiPresentationKey(key.clone())),
+                Some(value)
+            );
+        }
+        assert!(report.dialog_visible_after_open);
+        assert!(report.selected_workspace_visible_after_open);
+        let dialog_node =
+            find_presentation_bound_node(&app_surface.body, &report.dialog_presence_key, None)
+                .expect("delivered tree binds its dialog to the reported presence key");
+        let selected_node = find_presentation_bound_node(
+            &app_surface.body,
+            &report.selected_workspace_equality_key,
+            Some(&Value::String(
+                report.selected_workspace_equality_value.clone(),
+            )),
+        )
+        .expect("delivered tree binds selected detail to the reported equality");
+        let dialog_title = dialog_node
+            .props
+            .get("title")
+            .and_then(Value::as_str)
+            .expect("bound dialog has visible title");
+        let selected_text = selected_node
+            .props
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("bound selected detail has visible text");
+        let rendered = renderer::render_to_lines_with_presentation_state(
+            &open_app.surface(),
+            240,
+            120,
+            &RenderState::default(),
+            &open_app.plugin_presentation,
+        )
+        .0
+        .join("\n");
+        assert!(rendered.contains(dialog_title), "{rendered}");
+        assert!(rendered.contains(selected_text), "{rendered}");
+
+        let mut failure_payload = submit_action
+            .payload
+            .clone()
+            .expect("delivered submit action includes payload");
+        failure_payload
+            .as_object_mut()
+            .expect("delivered submit payload is an object")
+            .insert("fail".to_string(), Value::Bool(true));
+        let failure_request = UiActionRequest {
+            request_id: UiActionRequestId("contract-action-error".to_string()),
+            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
+            action_id: submit_action.id,
+            node_id: Some(submit_node_id),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: Some(failure_payload),
+        };
         let mut failure_app = TuiApp::new(None);
-        failure_app.workspace_test_mode = true;
-        failure_app.system_details_visible = true;
-        failure_app.apply_response(failure);
-        let (lines, _) = renderer::render_to_lines(&failure_app.surface(), 240, 120);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("plugin action result: state=error"));
-        assert!(rendered.contains("request_id=contract-action-error"));
-        assert!(rendered.contains("action_failure"));
-        assert!(rendered.contains("operation=plugin_surface_action"));
+        failure_app.apply_response(plugin_surface_response(app_surface));
+        failure_app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect failure app to live hub"));
+        failure_app.observed_requests.clear();
+        let original_root = failure_app
+            .plugin_surface
+            .as_ref()
+            .expect("active fixture")
+            .body
+            .clone();
+        failure_app.handle_dispatch(InputDispatch::Action(failure_request.clone()));
+        assert!(
+            failure_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: report.package_name.clone(),
+                    request: failure_request,
+                })
+        );
+        assert_eq!(
+            failure_app
+                .plugin_action_result
+                .as_ref()
+                .map(|result| result.request_id.0.as_str()),
+            Some("contract-action-error")
+        );
+        assert_eq!(
+            failure_app
+                .plugin_surface
+                .as_ref()
+                .expect("owner retained")
+                .body,
+            original_root
+        );
+        assert!(failure_app.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == DaemonDiagnosticKind::ActionFailure
+                && diagnostic.operation.as_deref() == Some("plugin_surface_action")
+        }));
+        let rendered = renderer::render_to_lines(&failure_app.surface(), 240, 120)
+            .0
+            .join("\n");
+        assert!(rendered.contains("state=Error"), "{rendered}");
+        assert!(
+            rendered.contains("diagnostic: action_failure"),
+            "{rendered}"
+        );
 
         let blocked = client
             .request(&DaemonRequest::PluginSurfaceRender {
@@ -7849,10 +8939,11 @@ mod tests {
         expected_node_id: &str,
         expected_text: &str,
     ) -> String {
+        let body =
+            serde_json::to_string(&surface.body).expect("delivered surface body should serialize");
         assert!(
-            surface.body.to_string().contains(expected_node_id),
-            "delivered surface body should include node id {expected_node_id}: {}",
-            surface.body
+            body.contains(expected_node_id),
+            "delivered surface body should include node id {expected_node_id}: {body}",
         );
         let node = plugin_surface_body_node(surface).expect("delivered surface validates for TUI");
         let (lines, _) = renderer::render_to_lines(&node, 180, 80);
@@ -8028,15 +9119,203 @@ mod tests {
 
     fn plugin_action_response(result: Value) -> DaemonResponse {
         let mut response = base_response(DaemonResponseKind::PluginActionResult);
-        response.plugin_action_result = Some(result);
+        response.plugin_action_result =
+            Some(serde_json::from_value(result).expect("fixture action result should be valid"));
         response
+    }
+
+    fn ui_node(value: Value) -> UiNode {
+        serde_json::from_value(value).expect("fixture UiNode should be valid")
+    }
+
+    fn plugin_request(
+        request_id: &str,
+        surface_id: &str,
+        action_id: &str,
+        node_id: &str,
+    ) -> UiActionRequest {
+        UiActionRequest {
+            request_id: UiActionRequestId(request_id.to_string()),
+            surface_id: UiSurfaceId(surface_id.to_string()),
+            action_id: UiActionId(action_id.to_string()),
+            node_id: Some(UiNodeId(node_id.to_string())),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: None,
+        }
+    }
+
+    fn presentation_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.presentation".to_string(),
+            body: ui_node(json!({
+                "type": "stack",
+                "id": "contract-presentation-root",
+                "props": { "direction": "vertical" },
+                "children": [
+                    {
+                        "type": "button",
+                        "id": "contract-open",
+                        "props": {
+                            "label": "Open contract form",
+                            "action": { "id": "contract.open" }
+                        }
+                    },
+                    {
+                        "$kind": "presentation_if",
+                        "predicate": {
+                            "kind": "equals",
+                            "key": "selected-workspace",
+                            "value": "workspace-alpha"
+                        },
+                        "node": {
+                            "type": "text",
+                            "id": "contract-selected-workspace",
+                            "props": {
+                                "text": "Selected workspace: workspace-alpha"
+                            }
+                        }
+                    },
+                    {
+                        "$kind": "presentation_if",
+                        "predicate": {
+                            "kind": "present",
+                            "key": "contract-dialog"
+                        },
+                        "node": {
+                            "type": "dialog",
+                            "id": "contract-dialog",
+                            "props": {
+                                "title": "Contract form",
+                                "presentation": "auto"
+                            },
+                            "slots": {
+                                "body": [
+                                    {
+                                        "type": "form",
+                                        "id": "contract-form",
+                                        "props": {
+                                            "submit_label": "Submit",
+                                            "action": {
+                                                "id": "contract.submit",
+                                                "payload": { "source": "dialog" }
+                                            }
+                                        },
+                                        "children": [
+                                            {
+                                                "type": "text_input",
+                                                "id": "contract-message",
+                                                "props": {
+                                                    "name": "message",
+                                                    "label": "Message",
+                                                    "value": ""
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            })),
+            ui_tree_snapshot: None,
+        }
+    }
+
+    fn field_error_kinds_plugin_surface() -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.field-errors".to_string(),
+            body: ui_node(json!({
+                "type": "dialog",
+                "id": "contract-field-error-dialog",
+                "props": {
+                    "title": "Field error contract",
+                    "presentation": "auto"
+                },
+                "slots": {
+                    "body": [
+                        {
+                            "type": "form",
+                            "id": "contract-field-error-form",
+                            "props": {
+                                "submit_label": "Submit",
+                                "action": { "id": "contract.submit" }
+                            },
+                            "children": [
+                                {
+                                    "type": "text_input",
+                                    "id": "contract-text-input",
+                                    "props": {
+                                        "name": "text_input",
+                                        "label": "Text input"
+                                    }
+                                },
+                                {
+                                    "type": "checkbox",
+                                    "id": "contract-checkbox",
+                                    "props": {
+                                        "name": "checkbox",
+                                        "label": "Checkbox"
+                                    }
+                                },
+                                {
+                                    "type": "form_field",
+                                    "id": "contract-form-field",
+                                    "props": {
+                                        "schema": {
+                                            "kind": "text",
+                                            "name": "form_field",
+                                            "label": "Form field"
+                                        }
+                                    }
+                                },
+                                {
+                                    "type": "textarea",
+                                    "id": "contract-textarea",
+                                    "props": {
+                                        "name": "textarea",
+                                        "label": "Textarea",
+                                        "value": "line one\nline two\nline three"
+                                    }
+                                },
+                                {
+                                    "type": "select",
+                                    "id": "contract-select",
+                                    "props": {
+                                        "name": "select",
+                                        "label": "Select",
+                                        "selected": "alpha"
+                                    },
+                                    "slots": {
+                                        "options": [
+                                            {
+                                                "type": "select_option",
+                                                "id": "contract-select-alpha",
+                                                "props": {
+                                                    "label": "Alpha",
+                                                    "value": "alpha"
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })),
+            ui_tree_snapshot: None,
+        }
     }
 
     fn contract_app_plugin_surface() -> DaemonPluginSurface {
         DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.app".to_string(),
-            body: json!({
+            body: ui_node(json!({
                 "type": "panel",
                 "id": "contract-app-panel",
                 "props": {
@@ -8061,7 +9340,7 @@ mod tests {
                         }
                     }
                 ]
-            }),
+            })),
             ui_tree_snapshot: None,
         }
     }
@@ -8070,7 +9349,7 @@ mod tests {
         DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.composite".to_string(),
-            body: json!({
+            body: ui_node(json!({
                 "type": "section",
                 "id": "contract-composite-section",
                 "props": {
@@ -8238,6 +9517,7 @@ mod tests {
                                         "type": "form",
                                         "id": "contract-composite-form",
                                         "props": {
+                                            "submit_label": "Submit",
                                             "action": {
                                                 "id": "contract.form.submit"
                                             }
@@ -8290,7 +9570,7 @@ mod tests {
                         }
                     ]
                 }
-            }),
+            })),
             ui_tree_snapshot: None,
         }
     }
@@ -8299,10 +9579,10 @@ mod tests {
         DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.invalid".to_string(),
-            body: json!({
+            body: ui_node(json!({
                 "type": "table",
                 "id": "contract-invalid-table"
-            }),
+            })),
             ui_tree_snapshot: None,
         }
     }
@@ -8311,7 +9591,7 @@ mod tests {
         DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.iframe".to_string(),
-            body: json!({
+            body: ui_node(json!({
                 "type": "panel",
                 "id": "contract-iframe-panel",
                 "props": {
@@ -8328,7 +9608,7 @@ mod tests {
                         }
                     }
                 ]
-            }),
+            })),
             ui_tree_snapshot: None,
         }
     }
