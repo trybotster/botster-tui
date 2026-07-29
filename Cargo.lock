@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "botster-tui-kit"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=156c0872d7b221d9c85162e82b83c591afafdff8#156c0872d7b221d9c85162e82b83c591afafdff8"
+source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=22df68624b27e40ccd0610a65140bdf296866379#22df68624b27e40ccd0610a65140bdf296866379"
 dependencies = [
  "botster-ui-contract",
  "crossterm",
