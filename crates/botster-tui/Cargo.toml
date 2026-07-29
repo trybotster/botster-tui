@@ -8,7 +8,7 @@ license-file = "../../LICENSE"
 [dependencies]
 botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "16bf08f29ec723c70c290cf995745ccbf79d4f05", default-features = false }
 botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", rev = "3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729" }
-botster-tui-kit = { git = "https://github.com/trybotster/botster-tui-kit.git", rev = "156c0872d7b221d9c85162e82b83c591afafdff8" }
+botster-tui-kit = { git = "https://github.com/trybotster/botster-tui-kit.git", rev = "22df68624b27e40ccd0610a65140bdf296866379" }
 botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", rev = "3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729" }
 crossterm = "0.29.0"
 ratatui = "0.30.2"

@@ -5529,6 +5529,7 @@ mod tests {
                 "contract-text-input": ["Text input required"],
                 "contract-checkbox": ["Checkbox required"],
                 "contract-form-field": ["Form field required"],
+                "contract-textarea": ["Textarea required"],
                 "contract-select": ["Select required"]
             },
             "form_errors": ["Fix the highlighted fields"]
@@ -5548,6 +5549,7 @@ mod tests {
             "Text input required",
             "Checkbox required",
             "Form field required",
+            "Textarea required",
             "Select required",
         ] {
             assert!(
@@ -5560,6 +5562,7 @@ mod tests {
             "contract-text-input",
             "contract-checkbox",
             "contract-form-field",
+            "contract-textarea",
             "contract-select",
         ] {
             assert!(
@@ -8515,7 +8518,7 @@ mod tests {
         while app
             .sessions
             .iter()
-            .any(|session| session.session_id == prior_session_id && session.is_attachable())
+            .any(|session| session.session_id == prior_session_id && session.lifecycle != "exited")
             && Instant::now() < exit_deadline
         {
             app.poll_hub();
@@ -9267,6 +9270,15 @@ mod tests {
                                             "name": "form_field",
                                             "label": "Form field"
                                         }
+                                    }
+                                },
+                                {
+                                    "type": "textarea",
+                                    "id": "contract-textarea",
+                                    "props": {
+                                        "name": "textarea",
+                                        "label": "Textarea",
+                                        "value": "line one\nline two\nline three"
                                     }
                                 },
                                 {
