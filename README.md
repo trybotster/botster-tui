@@ -221,7 +221,11 @@ subscription. Snapshot, upsert, patch, remove, and reconnect baselines affect
 the next frame and hit map directly; the client does not poll or refresh the
 surface, derive lifecycle classes, or keep a second session store. Missing
 references select the authored empty template, while malformed or unsupported
-bindings render a diagnostic instead of masquerading as unavailable.
+bindings render a diagnostic instead of masquerading as unavailable. A
+multi-row expansion whose item template carries authored node IDs is also
+rejected visibly until the Hub-owned UI contract can supply distinct
+row-bound IDs; this prevents ambiguous keyboard focus and action dispatch
+instead of inventing client-local identity semantics.
 
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
