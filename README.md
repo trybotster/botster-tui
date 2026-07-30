@@ -27,10 +27,10 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`22df68624b27e40ccd0610a65140bdf296866379` and the kit, Hub client, and this
+`c66f1ae60235d7d0ce0993f4e9ed89068a12b7d2` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
-`3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729`. Runnable-entrypoint connection
+`b403bb72c1065f633ae59fd876b13024e2ab54a7`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
@@ -100,7 +100,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`3d3623f2907c78c7e4f3d4f3e3bf1dfdc09cf729`. The protocol source is
+`b403bb72c1065f633ae59fd876b13024e2ab54a7`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -139,7 +139,10 @@ diagnostics, not private hub probes. They distinguish:
   package count, enabled package count, package name, version, classification,
   package state, requested capabilities, provider profile admission, package
   availability, dependency availability, feature availability, and hub-supplied
-  blocked reason/action rows;
+  blocked reason/action rows. Each admitted package surface renders its shared
+  contract id, typed kind, title, and supported operations; the package `Show`
+  control requests the Hub-owned detail projection without deriving manifest
+  policy in the TUI;
 - installed app rows from public app registry responses, including package id,
   app id, entrypoint id, app kind, launch mode, lifecycle state, blocked reasons,
   diagnostics, hub-provided action descriptors, web app local URLs, and terminal
@@ -197,7 +200,7 @@ terminal readback, package navigation, resize, and plugin surface render/action.
 A running but incompatible hub is reported as a compatibility mismatch instead
 of being collapsed into the generic unavailable/reconnecting state.
 The cold compatibility floor is daemon protocol version 4 and conformance
-fixture revision 19. Protocol versions 2–3 and fixture revisions 16–18 fail
+fixture revision 24. Protocol versions 2–3 and fixture revisions 16–23 fail
 through the structured compatibility diagnostic; there is no fallback path.
 
 When the Hub delivers a plugin surface, the TUI keeps a stable client-owned
@@ -213,10 +216,16 @@ active owner.
 
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
-app, empty, and settings surfaces through `botster-hub-client`. Those delivered
+package list, package detail, navigation, app, empty, and settings surfaces
+through `botster-hub-client`. It renders the same typed package descriptors
+after List and Show, activates Show and resolved navigation Open through the
+production frame hit map and Crossterm input router, and restores the complete
+package list through Refresh. Those delivered
 surface bodies arrive as typed `botster_ui_contract::UiNode`, are validated
 against the Hub-owned contract, checked against TUI renderer capabilities, and rendered with
-the production TUI kit. Unsupported client primitives fail with the
+the production TUI kit. An arbitrary delivered plugin control is likewise
+activated through the real hit map/input path, and its typed action result must
+change visible presentation. Unsupported client primitives fail with the
 capability-validation diagnostic, including the node id and primitive, instead
 of being treated as a passing render.
 
@@ -266,7 +275,7 @@ There is also an automated isolated-Hub test using
 `botster-hub` and `botster-session-worker` binaries, or resolves those command
 names from `PATH`; it does not discover or build a sibling Hub checkout. It
 starts an isolated daemon, runs the TUI live-runtime path, runs the
-revision-19 session lifecycle/presentation conformance runner and plugin
+revision-24 session lifecycle/presentation conformance runner and plugin
 contract matrix conformance harness, renders the delivered fixture
 surfaces through the TUI renderer, and tears the daemon down. The renderer
 coverage includes the composite application primitive fixture for `metric_grid`,

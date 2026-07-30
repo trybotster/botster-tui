@@ -24,8 +24,9 @@ use botster_hub_client::{
     write_frame,
 };
 use botster_ui_contract::{
-    UiActionRequest, UiActionResult, UiChild, UiCondition, UiConditional, UiFormValues, UiNode,
-    UiNodeId, UiNodeKind, UiWidthClass,
+    PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest,
+    UiActionResult, UiChild, UiCondition, UiConditional, UiFormValues, UiNode, UiNodeId,
+    UiNodeKind, UiWidthClass,
 };
 use crossterm::{
     cursor::Show,
@@ -50,7 +51,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 19;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 24;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -881,6 +882,12 @@ impl TuiApp {
                     self.submit_package_configuration(package_name, values.as_ref());
                 }
             }
+            "botster.tui.package.show" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.action_feedback = Some(format!("show requested: {package_name}"));
+                    self.request_and_apply(DaemonRequest::ShowPackage { package_name });
+                }
+            }
             "botster.tui.package.enable" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("enable requested: {package_name}"));
@@ -1396,6 +1403,9 @@ impl TuiApp {
             DaemonRequest::ListPackages => {
                 self.observed_requests.push(ObservedRequest::ListPackages)
             }
+            DaemonRequest::ShowPackage { package_name } => self
+                .observed_requests
+                .push(ObservedRequest::ShowPackage(package_name.clone())),
             DaemonRequest::SetPackageConfiguration {
                 package_name,
                 values,
@@ -2473,6 +2483,7 @@ impl TuiApp {
                     &format!("tui-package-{index}"),
                     json!({ "text": format!("package: {}", package_text(package)) }),
                 )));
+                children.extend(package_surface_nodes(package, index).into_iter().map(child));
                 children.extend(
                     package_availability_nodes(package, index)
                         .into_iter()
@@ -2975,6 +2986,7 @@ enum ObservedRequest {
     ListApps,
     ListPackageNavigation,
     ListPackages,
+    ShowPackage(String),
     SetPackageConfiguration {
         package_name: String,
         values: BTreeMap<String, Value>,
@@ -3548,6 +3560,54 @@ fn package_text(package: &DaemonPackage) -> String {
     )
 }
 
+fn package_surface_nodes(package: &DaemonPackage, package_index: usize) -> Vec<UiNode> {
+    package
+        .surfaces
+        .iter()
+        .enumerate()
+        .map(|(surface_index, surface)| {
+            node(
+                UiNodeKind::Text,
+                &format!("tui-package-{package_index}-surface-{surface_index}"),
+                json!({
+                    "text": format!(
+                        "surface: package={} {}",
+                        package.package_name,
+                        package_surface_text(surface)
+                    )
+                }),
+            )
+        })
+        .collect()
+}
+
+fn package_surface_text(surface: &PackageSurfaceDescriptor) -> String {
+    let supports = if surface.supports.is_empty() {
+        "none".to_string()
+    } else {
+        surface
+            .supports
+            .iter()
+            .map(|operation| match operation {
+                PackageSurfaceOperation::Render => "render",
+                PackageSurfaceOperation::Action => "action",
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "id={} kind={} title={} supports={supports}",
+        surface.id,
+        match surface.kind {
+            PackageSurfaceKind::App => "app",
+            PackageSurfaceKind::Settings => "settings",
+            PackageSurfaceKind::DashboardWidget => "dashboard_widget",
+            PackageSurfaceKind::Diagnostics => "diagnostics",
+        },
+        surface.title
+    )
+}
+
 fn package_availability_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
     let mut nodes = Vec::new();
     for (reason_index, reason) in package.availability.reasons.iter().enumerate() {
@@ -3627,6 +3687,12 @@ fn route_text(route: &DaemonPackageRouteDescriptor) -> String {
 
 fn package_action_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
     vec![
+        button(
+            &format!("tui-package-{index}-show"),
+            "Show",
+            "botster.tui.package.show",
+            json!({ "package_name": package.package_name }),
+        ),
         button(
             &format!("tui-package-{index}-enable"),
             "Enable",
@@ -4295,6 +4361,43 @@ mod tests {
         })
     }
 
+    fn click_dispatch(hit_map: &HitMap, node_id: &str) -> InputDispatch {
+        click_dispatch_for_surface(hit_map, node_id, None)
+    }
+
+    fn click_dispatch_for_surface(
+        hit_map: &HitMap,
+        node_id: &str,
+        surface_id: Option<&str>,
+    ) -> InputDispatch {
+        let region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == node_id)
+            .unwrap_or_else(|| panic!("{node_id} should be present in the rendered hit map"));
+        let (column, row) = (region.rect.x, region.rect.y);
+        let mut router = InputRouter::new(match surface_id {
+            Some(surface_id) => renderer::action_request_context_for(surface_id),
+            None => renderer::action_request_context(),
+        });
+        let _ = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            hit_map,
+        );
+        router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            hit_map,
+        )
+    }
+
     fn find_ui_node_by_id<'a>(root: &'a UiNode, node_id: &str) -> Option<&'a UiNode> {
         if root.id.as_ref().is_some_and(|id| id.0 == node_id) {
             return Some(root);
@@ -4738,7 +4841,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_4_revision_19_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_4_revision_24_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
@@ -4746,7 +4849,7 @@ mod tests {
             MINIMUM_CONFORMANCE_FIXTURE_REVISION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 4);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 19);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 24);
         assert!(
             requirement
                 .required_features
@@ -4760,13 +4863,13 @@ mod tests {
                 .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
         );
 
-        for revision in 16..19 {
+        for revision in 16..24 {
             let mut older_hub = DaemonCompatibility::current();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-presentation fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 19"));
+            assert!(error.diagnostic.contains("requires at least 24"));
         }
         for protocol_version in 2..4 {
             let mut older_hub = DaemonCompatibility::current();
@@ -4781,7 +4884,7 @@ mod tests {
             assert!(error.diagnostic.contains("requires at least 4"));
         }
         botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 4 fixture revision 19 hub should connect");
+            .expect("protocol 4 fixture revision 24 hub should connect");
     }
 
     #[test]
@@ -5052,6 +5155,107 @@ mod tests {
             "package: local-beta 0.2.0 classification=local state=disabled capabilities=none provider_profile_admitted=false"
         ));
         assert!(rendered.contains("local-gamma 0.3.0 classification=local state=pending-review"));
+    }
+
+    #[test]
+    fn package_response_renders_hub_owned_surface_descriptors_and_show_uses_real_input() {
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.system_details_visible = true;
+        let mut package = package(
+            "botster.plugin-contract-matrix",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        package.surfaces = contract_package_surfaces();
+        app.apply_response(packages_response(vec![package]));
+        app.observed_requests.clear();
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 500, 180);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(
+            "surface: package=botster.plugin-contract-matrix id=contract.app kind=app title=Contract App supports=render,action"
+        ));
+        assert!(rendered.contains(
+            "surface: package=botster.plugin-contract-matrix id=contract.settings kind=settings title=Contract Settings supports=render"
+        ));
+
+        app.handle_dispatch(click_dispatch(&hit_map, "tui-package-0-show"));
+
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::ShowPackage(
+                    "botster.plugin-contract-matrix".to_string()
+                ))
+        );
+    }
+
+    #[test]
+    fn show_response_is_scoped_refresh_restores_list_and_errors_preserve_other_surfaces() {
+        let mut app = TuiApp::new(None);
+        let mut shown = package(
+            "botster.plugin-contract-matrix",
+            "1.0.0",
+            "plugin",
+            "enabled",
+            Vec::new(),
+            true,
+        );
+        shown.surfaces = contract_package_surfaces();
+        let other = package("local-other", "0.1.0", "local", "enabled", Vec::new(), true);
+        let full_list = vec![shown.clone(), other];
+        app.apply_response(packages_response(full_list.clone()));
+        app.apply_response(package_navigation_response(vec![
+            plugin_contract_app_navigation(),
+        ]));
+        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
+        let owner = app.plugin_surface.clone();
+
+        app.apply_response(packages_response(vec![shown.clone()]));
+
+        assert_eq!(app.packages, vec![shown]);
+        assert_eq!(
+            app.package_navigation,
+            vec![plugin_contract_app_navigation()]
+        );
+        assert_eq!(app.plugin_surface, owner);
+
+        let mut error = base_response(DaemonResponseKind::Packages);
+        error.error = Some(botster_hub_client::DaemonOperatorError {
+            code: "package_not_found".to_string(),
+            request_id: "show-missing".to_string(),
+            operation: "show_package".to_string(),
+            message: "package missing is not installed".to_string(),
+            diagnostics: Vec::new(),
+        });
+        app.apply_response(error);
+        assert_eq!(app.packages.len(), 1);
+        assert_eq!(
+            app.package_navigation,
+            vec![plugin_contract_app_navigation()]
+        );
+        assert_eq!(app.plugin_surface, owner);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("package_not_found"))
+        );
+        let rendered_error = renderer::render_to_lines(&app.surface(), 320, 120)
+            .0
+            .join("\n");
+        assert!(rendered_error.contains("package_not_found"));
+        assert!(rendered_error.contains("show_package"));
+
+        app.apply_response(packages_response(full_list.clone()));
+        assert_eq!(app.packages, full_list);
+        assert_eq!(
+            app.package_navigation,
+            vec![plugin_contract_app_navigation()]
+        );
+        assert_eq!(app.plugin_surface, owner);
     }
 
     #[test]
@@ -8643,14 +8847,43 @@ mod tests {
         let list_package_navigation = client
             .request(&DaemonRequest::ListPackageNavigation)
             .expect("list package navigation after contract matrix conformance");
+        let listed_packages = list_packages.packages.clone();
+        let listed_fixture = listed_packages
+            .iter()
+            .find(|package| package.package_name == report.package_name)
+            .expect("listed packages include the installed contract matrix fixture")
+            .clone();
+        assert_eq!(
+            listed_fixture
+                .surfaces
+                .iter()
+                .map(|surface| surface.id.clone())
+                .collect::<Vec<_>>(),
+            report.surface_ids
+        );
+        assert!(report.list_surfaces_match_enabled);
+        assert!(report.show_routes_match_list);
         let mut app = TuiApp::new(None);
         app.workspace_test_mode = true;
         app.system_details_visible = true;
         app.apply_response(list_packages);
         app.apply_response(list_apps);
         app.apply_response(list_package_navigation);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 500, 240);
+        app.client =
+            Some(HubConnection::connect(hub.endpoint()).expect("connect package app to live hub"));
+        app.observed_requests.clear();
+        let fixture_index = app
+            .packages
+            .iter()
+            .position(|package| package.package_name == report.package_name)
+            .expect("fixture package remains visible in TUI state");
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 500, 240);
         let rendered = lines.join("\n");
+        assert!(rendered.contains(&format!(
+            "id=contract.settings kind={} title=Contract Settings supports={}",
+            report.settings_surface_kind,
+            report.settings_surface_supports.join(",")
+        )));
         assert!(rendered.contains("navigation entry: package=botster.plugin-contract-matrix"));
         assert!(rendered.contains(&report.app_route_path));
         assert!(rendered.contains("route_id=surface:contract.app"));
@@ -8659,7 +8892,55 @@ mod tests {
             report.app_route_surface_id
         )));
 
-        let app_surface = request_plugin_surface(&mut client, &report.package_name, "contract.app");
+        app.handle_dispatch(click_dispatch(
+            &hit_map,
+            &format!("tui-package-{fixture_index}-show"),
+        ));
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::ShowPackage(report.package_name.clone()))
+        );
+        assert_eq!(app.packages.len(), 1);
+        assert_eq!(app.packages[0].surfaces, listed_fixture.surfaces);
+        let (show_lines, show_hit_map) = renderer::render_to_lines(&app.surface(), 500, 240);
+        let show_rendered = show_lines.join("\n");
+        assert!(show_rendered.contains(&format!(
+            "id=contract.settings kind={} title=Contract Settings supports={}",
+            report.settings_surface_kind,
+            report.settings_surface_supports.join(",")
+        )));
+
+        app.handle_dispatch(click_dispatch(&show_hit_map, "tui-refresh"));
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::ListPackages)
+        );
+        assert_eq!(app.packages, listed_packages);
+
+        let navigation_index = app
+            .package_navigation
+            .iter()
+            .position(|entry| {
+                entry.package_name == report.package_name
+                    && entry.target.surface_id.as_deref() == Some("contract.app")
+            })
+            .expect("Hub-projected contract app navigation remains visible after refresh");
+        let (_lines, navigation_hit_map) = renderer::render_to_lines(&app.surface(), 500, 240);
+        app.handle_dispatch(click_dispatch(
+            &navigation_hit_map,
+            &format!("tui-package-navigation-{navigation_index}-open"),
+        ));
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceRender {
+                    package_name: report.package_name.clone(),
+                    surface_id: "contract.app".to_string(),
+                })
+        );
+        let app_surface = app
+            .plugin_surface
+            .clone()
+            .expect("real navigation Open applies the delivered plugin surface");
         let app_rendered = assert_rendered_plugin_surface_contains(
             &app_surface,
             &report.client_render_check.app_surface_node_id,
@@ -8768,28 +9049,56 @@ mod tests {
             open_action.payload,
             Some(report.open_action_payload.clone())
         );
-        let open_request = UiActionRequest {
-            request_id: UiActionRequestId("contract-action-open-tui".to_string()),
-            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
-            action_id: open_action.id,
-            node_id: open_node.id.clone(),
-            kind: UiActionKind::Submit,
-            values: None,
-            payload: open_action.payload,
-        };
         let mut open_app = TuiApp::new(None);
         open_app.apply_response(plugin_surface_response(app_surface.clone()));
         open_app.client =
             Some(HubConnection::connect(hub.endpoint()).expect("connect open app to live hub"));
         open_app.observed_requests.clear();
-        open_app.handle_dispatch(InputDispatch::Action(open_request.clone()));
+        let (_lines, open_hit_map) = renderer::render_to_lines_with_presentation_state(
+            &open_app.surface(),
+            240,
+            120,
+            &RenderState::default(),
+            &open_app.plugin_presentation,
+        );
+        let open_dispatch = click_dispatch_for_surface(
+            &open_hit_map,
+            &report.open_action_node_id,
+            Some(&app_surface.surface_id),
+        );
+        let open_request = match &open_dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("rendered plugin Open must dispatch an action, got {other:?}"),
+        };
+        assert_eq!(open_request.surface_id.0, app_surface.surface_id);
+        assert_eq!(open_request.action_id.0, report.open_action_id);
+        assert_eq!(open_request.node_id, open_node.id);
+        assert_eq!(open_request.kind, UiActionKind::Submit);
+        assert!(
+            open_request
+                .values
+                .as_ref()
+                .is_some_and(|values| values.0.is_empty())
+        );
+        assert_eq!(
+            open_request.payload,
+            Some(report.open_action_payload.clone())
+        );
+        open_app.handle_dispatch(open_dispatch);
         assert!(
             open_app
                 .observed_requests
                 .contains(&ObservedRequest::PluginSurfaceAction {
                     package_name: report.package_name.clone(),
-                    request: open_request,
+                    request: open_request.clone(),
                 })
+        );
+        assert_eq!(
+            open_app
+                .plugin_action_result
+                .as_ref()
+                .map(|result| &result.request_id),
+            Some(&open_request.request_id)
         );
         for (key, value) in &report.open_set_values {
             assert_eq!(
@@ -9004,6 +9313,7 @@ mod tests {
             session_uuid: session_id.to_string(),
             registry_state: "active".to_string(),
             lifecycle: lifecycle.map(str::to_string),
+            lifecycle_class: "current".to_string(),
             rows: 24,
             cols: 80,
             updated_at: 1,
@@ -9064,6 +9374,7 @@ mod tests {
             session_count: 0,
             recovered_sessions: Vec::new(),
             stale_sessions: Vec::new(),
+            lifecycle_counters: botster_hub_client::DaemonLifecycleCounters::default(),
             diagnostics: Vec::new(),
         });
         response
@@ -9717,6 +10028,34 @@ mod tests {
         }
     }
 
+    fn contract_package_surfaces() -> Vec<PackageSurfaceDescriptor> {
+        vec![
+            PackageSurfaceDescriptor {
+                id: "contract.app".to_string(),
+                kind: PackageSurfaceKind::App,
+                title: "Contract App".to_string(),
+                description: Some("Contract application surface".to_string()),
+                icon: None,
+                order: Some(1),
+                category: Some("contracts".to_string()),
+                supports: vec![
+                    PackageSurfaceOperation::Render,
+                    PackageSurfaceOperation::Action,
+                ],
+            },
+            PackageSurfaceDescriptor {
+                id: "contract.settings".to_string(),
+                kind: PackageSurfaceKind::Settings,
+                title: "Contract Settings".to_string(),
+                description: None,
+                icon: None,
+                order: None,
+                category: None,
+                supports: vec![PackageSurfaceOperation::Render],
+            },
+        ]
+    }
+
     fn package_with_configuration() -> DaemonPackage {
         let mut package = package(
             "configuration.plugin",
@@ -10056,6 +10395,7 @@ mod tests {
             events: Vec::new(),
             cleanup: None,
             coordination: None,
+            plugin_worker_counters: None,
             error: None,
             diagnostics: Vec::new(),
         }
