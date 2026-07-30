@@ -5182,6 +5182,9 @@ mod tests {
         assert!(rendered.contains(
             "surface: package=botster.plugin-contract-matrix id=contract.settings kind=settings title=Contract Settings supports=render"
         ));
+        assert!(rendered.contains(
+            "surface: package=botster.plugin-contract-matrix id=contract.diagnostics kind=diagnostics title=Contract Diagnostics supports=none"
+        ));
 
         app.handle_dispatch(click_dispatch(&hit_map, "tui-package-0-show"));
 
@@ -5225,10 +5228,10 @@ mod tests {
 
         let mut error = base_response(DaemonResponseKind::Packages);
         error.error = Some(botster_hub_client::DaemonOperatorError {
-            code: "package_not_found".to_string(),
+            code: "package_policy_error".to_string(),
             request_id: "show-missing".to_string(),
-            operation: "show_package".to_string(),
-            message: "package missing is not installed".to_string(),
+            operation: "show".to_string(),
+            message: "package action failed: PackageNotInstalled".to_string(),
             diagnostics: Vec::new(),
         });
         app.apply_response(error);
@@ -5241,13 +5244,13 @@ mod tests {
         assert!(
             app.error
                 .as_deref()
-                .is_some_and(|error| error.contains("package_not_found"))
+                .is_some_and(|error| error.contains("package_policy_error"))
         );
         let rendered_error = renderer::render_to_lines(&app.surface(), 320, 120)
             .0
             .join("\n");
-        assert!(rendered_error.contains("package_not_found"));
-        assert!(rendered_error.contains("show_package"));
+        assert!(rendered_error.contains("package_policy_error"));
+        assert!(rendered_error.contains("operation=show"));
 
         app.apply_response(packages_response(full_list.clone()));
         assert_eq!(app.packages, full_list);
@@ -8357,6 +8360,28 @@ mod tests {
 
         assert_live_attach_history_readback(&hub);
 
+        let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let data_dir = hub.data_dir().to_string_lossy().to_string();
+        let package_root = package_root.to_string_lossy().to_string();
+        let package_install_output = std::process::Command::new(&hub_bin)
+            .args([
+                "packages",
+                "install",
+                "--data-dir",
+                data_dir.as_str(),
+                "--path",
+                package_root.as_str(),
+            ])
+            .output()
+            .expect("run packages install for botster-tui checkout");
+        assert!(
+            package_install_output.status.success(),
+            "packages install failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&package_install_output.stdout),
+            String::from_utf8_lossy(&package_install_output.stderr)
+        );
+        println!("package-install: ok");
+
         let contract_matrix_fixture = std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
             .map(PathBuf::from)
             .expect(
@@ -8369,27 +8394,6 @@ mod tests {
         .expect("plugin contract matrix conformance passes");
         assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
 
-        let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let data_dir = hub.data_dir().to_string_lossy().to_string();
-        let package_root = package_root.to_string_lossy().to_string();
-        let package_open_output = std::process::Command::new(&hub_bin)
-            .args([
-                "packages",
-                "install",
-                "--data-dir",
-                data_dir.as_str(),
-                "--path",
-                package_root.as_str(),
-            ])
-            .output()
-            .expect("run packages install for botster-tui checkout");
-        assert!(
-            package_open_output.status.success(),
-            "packages install failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&package_open_output.stdout),
-            String::from_utf8_lossy(&package_open_output.stderr)
-        );
-        println!("package-install: ok");
         let package_enable_output = std::process::Command::new(&hub_bin)
             .args([
                 "packages",
@@ -8848,6 +8852,11 @@ mod tests {
             .request(&DaemonRequest::ListPackageNavigation)
             .expect("list package navigation after contract matrix conformance");
         let listed_packages = list_packages.packages.clone();
+        assert!(
+            listed_packages.len() > 1,
+            "live Show/Refresh proof requires multiple packages, got {}",
+            listed_packages.len()
+        );
         let listed_fixture = listed_packages
             .iter()
             .find(|package| package.package_name == report.package_name)
@@ -8941,6 +8950,27 @@ mod tests {
             .plugin_surface
             .clone()
             .expect("real navigation Open applies the delivered plugin surface");
+        let packages_before_missing_show = app.packages.clone();
+        let navigation_before_missing_show = app.package_navigation.clone();
+        let owner_before_missing_show = app.plugin_surface.clone();
+        app.request_and_apply(DaemonRequest::ShowPackage {
+            package_name: "missing-package".to_string(),
+        });
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::ShowPackage("missing-package".to_string()))
+        );
+        assert_eq!(app.packages, packages_before_missing_show);
+        assert_eq!(app.package_navigation, navigation_before_missing_show);
+        assert_eq!(app.plugin_surface, owner_before_missing_show);
+        assert!(app.error.as_deref().is_some_and(
+            |error| error.contains("package_policy_error") && error.contains("operation=show")
+        ));
+        let missing_show_rendered = renderer::render_to_lines(&app.surface(), 500, 240)
+            .0
+            .join("\n");
+        assert!(missing_show_rendered.contains("package_policy_error"));
+        assert!(missing_show_rendered.contains("operation=show"));
         let app_rendered = assert_rendered_plugin_surface_contains(
             &app_surface,
             &report.client_render_check.app_surface_node_id,
@@ -10052,6 +10082,16 @@ mod tests {
                 order: None,
                 category: None,
                 supports: vec![PackageSurfaceOperation::Render],
+            },
+            PackageSurfaceDescriptor {
+                id: "contract.diagnostics".to_string(),
+                kind: PackageSurfaceKind::Diagnostics,
+                title: "Contract Diagnostics".to_string(),
+                description: None,
+                icon: None,
+                order: None,
+                category: None,
+                supports: Vec::new(),
             },
         ]
     }
