@@ -321,6 +321,24 @@ impl SessionEntityState {
                 .snapshot_seq
                 .is_none_or(|current| snapshot_seq > current)
     }
+
+    fn binding_rows(&self) -> Result<BTreeMap<String, Value>, String> {
+        self.entities
+            .iter()
+            .map(|(session_uuid, entity)| {
+                let mut value = serde_json::to_value(entity).map_err(|error| {
+                    format!("session entity {session_uuid} failed binding serialization: {error}")
+                })?;
+                let row = value.as_object_mut().ok_or_else(|| {
+                    format!("session entity {session_uuid} did not serialize as an object")
+                })?;
+                for field in ["lifecycle", "exit_code", "failure_reason"] {
+                    row.entry(field.to_string()).or_insert(Value::Null);
+                }
+                Ok((session_uuid.clone(), value))
+            })
+            .collect()
+    }
 }
 
 enum SessionSubscriptionMessage {
@@ -758,6 +776,10 @@ impl TuiApp {
             Ok(transition) => {
                 if let Some(replacement) = transition.replacement {
                     surface.body = replacement;
+                    // The snapshot validates the Hub-delivered tree at ingestion. An accepted
+                    // action replacement is app-owned active state and must not leave a second,
+                    // stale structural tree that looks current.
+                    surface.ui_tree_snapshot = None;
                 }
                 self.pending_plugin_request = None;
                 self.action_feedback = Some(plugin_action_result_text(&result));
@@ -1644,16 +1666,23 @@ impl TuiApp {
         if matches!(response.kind, DaemonResponseKind::PluginSurface)
             && let Some(surface) = response.plugin_surface
         {
-            let owner_changed = self.plugin_surface.as_ref().is_none_or(|current| {
-                current.package_name != surface.package_name
-                    || current.surface_id != surface.surface_id
-            });
-            if owner_changed {
-                self.plugin_presentation = renderer::PresentationState::default();
-                self.plugin_action_result = None;
-                self.pending_plugin_request = None;
+            match normalize_plugin_surface(surface) {
+                Ok(surface) => {
+                    let owner_changed = self.plugin_surface.as_ref().is_none_or(|current| {
+                        current.package_name != surface.package_name
+                            || current.surface_id != surface.surface_id
+                    });
+                    if owner_changed {
+                        self.plugin_presentation = renderer::PresentationState::default();
+                        self.plugin_action_result = None;
+                        self.pending_plugin_request = None;
+                    }
+                    self.plugin_surface = Some(surface);
+                }
+                Err(error) => {
+                    self.error = Some(format!("plugin surface render: {error}"));
+                }
             }
-            self.plugin_surface = Some(surface);
         }
         if matches!(response.kind, DaemonResponseKind::PluginActionResult)
             && let Some(result) = response.plugin_action_result
@@ -2083,6 +2112,7 @@ impl TuiApp {
         root.children.push(child(plugin_surface_render_root(
             surface,
             self.plugin_action_result.as_ref(),
+            &self.session_entities,
         )));
         root
     }
@@ -3909,22 +3939,297 @@ fn navigation_unsupported_text(entry: &DaemonPackageNavigationEntry) -> String {
 }
 
 fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, String> {
-    let node = surface.body.clone();
-    node.validate().map_err(|error| {
-        format!(
-            "plugin surface {}:{} failed UiNode validate: {error}",
-            surface.package_name, surface.surface_id
-        )
-    })?;
-    renderer::tui_capabilities()
-        .validate_node(&node)
-        .map_err(|error| {
+    // Binding sentinels intentionally do not satisfy the final rendered prop
+    // schema. Static delivered trees can be validated immediately; bound trees
+    // are validated after materialization in plugin_surface_render_root.
+    if !node_requires_binding_materialization(&surface.body) {
+        surface.body.validate().map_err(|error| {
             format!(
-                "plugin surface {}:{} unsupported TUI primitive: {error}",
+                "plugin surface {}:{} failed UiNode validate: {error}",
                 surface.package_name, surface.surface_id
             )
         })?;
+        renderer::tui_capabilities()
+            .validate_node(&surface.body)
+            .map_err(|error| {
+                format!(
+                    "plugin surface {}:{} unsupported TUI primitive: {error}",
+                    surface.package_name, surface.surface_id
+                )
+            })?;
+    }
+    Ok(surface.body.clone())
+}
+
+fn normalize_plugin_surface(surface: DaemonPluginSurface) -> Result<DaemonPluginSurface, String> {
+    let snapshot = surface.ui_tree_snapshot.as_ref().ok_or_else(|| {
+        format!(
+            "plugin surface {}:{} omitted ui_tree_snapshot",
+            surface.package_name, surface.surface_id
+        )
+    })?;
+    if snapshot.package_name != surface.package_name
+        || snapshot.surface_id != surface.surface_id
+        || snapshot.body != surface.body
+    {
+        return Err(format!(
+            "plugin surface {}:{} ui_tree_snapshot identity/body mismatch",
+            surface.package_name, surface.surface_id
+        ));
+    }
+    Ok(surface)
+}
+
+fn materialize_plugin_surface(
+    root: &UiNode,
+    session_entities: &SessionEntityState,
+) -> Result<UiNode, String> {
+    if !node_requires_binding_materialization(root) {
+        return Ok(root.clone());
+    }
+    let rows = session_entities.binding_rows()?;
+    materialize_binding_node(root, &rows, None)
+}
+
+fn node_requires_binding_materialization(node: &UiNode) -> bool {
+    node.props.values().any(value_contains_binding)
+        || node
+            .children
+            .iter()
+            .chain(node.slots.values().flatten())
+            .any(child_requires_binding_materialization)
+}
+
+fn child_requires_binding_materialization(child: &UiChild) -> bool {
+    match child {
+        UiChild::Node(node)
+        | UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+            node_requires_binding_materialization(node)
+        }
+        UiChild::BindList(_) | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { .. }) => {
+            true
+        }
+    }
+}
+
+fn value_contains_binding(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => {
+            (values.len() == 1 && values.get("$bind").and_then(Value::as_str).is_some())
+                || values.values().any(value_contains_binding)
+        }
+        Value::Array(values) => values.iter().any(value_contains_binding),
+        _ => false,
+    }
+}
+
+fn materialize_binding_node(
+    source: &UiNode,
+    session_rows: &BTreeMap<String, Value>,
+    item: Option<&Value>,
+) -> Result<UiNode, String> {
+    let mut node = source.clone();
+    for value in node.props.values_mut() {
+        *value = materialize_binding_value(value, item)?;
+    }
+    node.children = materialize_binding_children(&source.children, session_rows, item)?;
+    node.slots = source
+        .slots
+        .iter()
+        .map(|(name, children)| {
+            materialize_binding_children(children, session_rows, item)
+                .map(|children| (name.clone(), children))
+        })
+        .collect::<Result<_, _>>()?;
     Ok(node)
+}
+
+fn materialize_binding_children(
+    children: &[UiChild],
+    session_rows: &BTreeMap<String, Value>,
+    item: Option<&Value>,
+) -> Result<Vec<UiChild>, String> {
+    let mut materialized = Vec::new();
+    for child in children {
+        match child {
+            UiChild::Node(node) => materialized.push(UiChild::Node(Box::new(
+                materialize_binding_node(node, session_rows, item)?,
+            ))),
+            UiChild::Conditional(UiConditional::When { condition, node }) => {
+                materialized.push(UiChild::Conditional(UiConditional::When {
+                    condition: condition.clone(),
+                    node: Box::new(materialize_binding_node(node, session_rows, item)?),
+                }));
+            }
+            UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
+                materialized.push(UiChild::Conditional(UiConditional::Hidden {
+                    condition: condition.clone(),
+                    node: Box::new(materialize_binding_node(node, session_rows, item)?),
+                }));
+            }
+            UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { predicate, node }) => {
+                materialized.push(UiChild::BindIf(
+                    botster_ui_contract::UiBindIf::PresentationIf {
+                        predicate: predicate.clone(),
+                        node: Box::new(materialize_binding_node(node, session_rows, item)?),
+                    },
+                ));
+            }
+            UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { path, node }) => {
+                let value = resolve_item_binding(path, item)?;
+                if binding_truthy(value) {
+                    materialized.push(UiChild::Node(Box::new(materialize_binding_node(
+                        node,
+                        session_rows,
+                        item,
+                    )?)));
+                }
+            }
+            UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+                source,
+                r#where,
+                item_template,
+                empty_template,
+            }) => {
+                if source != "/session" {
+                    return Err(format!("unsupported binding source {source:?}"));
+                }
+                for field in r#where.keys() {
+                    if !SESSION_BINDING_FIELDS.contains(&field.as_str()) {
+                        return Err(format!(
+                            "unsupported /session where field {field:?}; the entity was not treated as unavailable"
+                        ));
+                    }
+                }
+                let matching = session_rows
+                    .values()
+                    .filter(|row| {
+                        r#where
+                            .iter()
+                            .all(|(field, expected)| row.get(field) == Some(expected))
+                    })
+                    .collect::<Vec<_>>();
+                if matching.is_empty() {
+                    if let Some(empty_template) = empty_template {
+                        materialized.push(UiChild::Node(Box::new(materialize_binding_node(
+                            empty_template,
+                            session_rows,
+                            None,
+                        )?)));
+                    }
+                } else {
+                    if matching.len() > 1 && node_tree_has_id(item_template) {
+                        return Err(
+                            "multi-row /session binding requires canonical row-bound node ids; expansion was rejected to prevent ambiguous focus and action dispatch"
+                                .to_string(),
+                        );
+                    }
+                    for row in matching {
+                        materialized.push(UiChild::Node(Box::new(materialize_binding_node(
+                            item_template,
+                            session_rows,
+                            Some(row),
+                        )?)));
+                    }
+                }
+            }
+        }
+    }
+    Ok(materialized)
+}
+
+const SESSION_BINDING_FIELDS: &[&str] = &[
+    "session_uuid",
+    "registry_state",
+    "lifecycle",
+    "lifecycle_class",
+    "rows",
+    "cols",
+    "updated_at",
+    "exit_code",
+    "failure_reason",
+];
+
+fn node_tree_has_id(node: &UiNode) -> bool {
+    node.id.is_some()
+        || node
+            .children
+            .iter()
+            .chain(node.slots.values().flatten())
+            .any(child_tree_has_id)
+}
+
+fn child_tree_has_id(child: &UiChild) -> bool {
+    match child {
+        UiChild::Node(node)
+        | UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+            node_tree_has_id(node)
+        }
+        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+            item_template,
+            empty_template,
+            ..
+        }) => {
+            node_tree_has_id(item_template)
+                || empty_template.as_deref().is_some_and(node_tree_has_id)
+        }
+    }
+}
+
+fn materialize_binding_value(value: &Value, item: Option<&Value>) -> Result<Value, String> {
+    match value {
+        Value::Object(values)
+            if values.len() == 1 && values.get("$bind").and_then(Value::as_str).is_some() =>
+        {
+            let path = values
+                .get("$bind")
+                .and_then(Value::as_str)
+                .expect("guarded binding path");
+            Ok(resolve_item_binding(path, item)?.clone())
+        }
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                materialize_binding_value(value, item).map(|value| (key.clone(), value))
+            })
+            .collect::<Result<serde_json::Map<_, _>, _>>()
+            .map(Value::Object),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| materialize_binding_value(value, item))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn resolve_item_binding<'a>(path: &str, item: Option<&'a Value>) -> Result<&'a Value, String> {
+    let relative = path.strip_prefix("@/").ok_or_else(|| {
+        if path.starts_with('/') {
+            format!("unsupported absolute binding path {path:?}")
+        } else {
+            format!("unsupported binding path {path:?}")
+        }
+    })?;
+    let item = item.ok_or_else(|| format!("item-relative binding {path:?} has no current row"))?;
+    item.pointer(&format!("/{relative}"))
+        .ok_or_else(|| format!("binding path {path:?} is missing from the current session row"))
+}
+
+fn binding_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
 }
 
 fn iframe_unsupported_diagnostic(surface: &DaemonPluginSurface) -> Option<String> {
@@ -3999,6 +4304,7 @@ fn plugin_action_result_text(result: &UiActionResult) -> String {
 fn plugin_surface_render_root(
     surface: &DaemonPluginSurface,
     result: Option<&UiActionResult>,
+    session_entities: &SessionEntityState,
 ) -> UiNode {
     if let Some(diagnostic) = iframe_unsupported_diagnostic(surface) {
         return node(
@@ -4007,7 +4313,7 @@ fn plugin_surface_render_root(
             json!({ "text": diagnostic }),
         );
     }
-    let mut root = match plugin_surface_body_node(surface) {
+    let root = match plugin_surface_body_node(surface) {
         Ok(root) => root,
         Err(error) => {
             return node(
@@ -4017,8 +4323,42 @@ fn plugin_surface_render_root(
             );
         }
     };
+    let mut root = match materialize_plugin_surface(&root, session_entities) {
+        Ok(root) => root,
+        Err(error) => {
+            return node(
+                UiNodeKind::Text,
+                "tui-plugin-surface-binding-invalid",
+                json!({ "text": format!("plugin surface binding: {error}") }),
+            );
+        }
+    };
     if let Some(result) = result {
         apply_plugin_result_errors(&mut root, result);
+    }
+    if let Err(error) = root.validate() {
+        return node(
+            UiNodeKind::Text,
+            "tui-plugin-surface-materialized-invalid",
+            json!({
+                "text": format!(
+                    "plugin surface render: plugin surface {}:{} failed UiNode validate: {error}",
+                    surface.package_name, surface.surface_id
+                )
+            }),
+        );
+    }
+    if let Err(error) = renderer::tui_capabilities().validate_node(&root) {
+        return node(
+            UiNodeKind::Text,
+            "tui-plugin-surface-materialized-unsupported",
+            json!({
+                "text": format!(
+                    "plugin surface render: plugin surface {}:{} unsupported TUI primitive: {error}",
+                    surface.package_name, surface.surface_id
+                )
+            }),
+        );
     }
     root
 }
@@ -4930,6 +5270,597 @@ mod tests {
         assert!(state.has_snapshot);
     }
 
+    fn canonical_surface(
+        package_name: &str,
+        surface_id: &str,
+        body: UiNode,
+    ) -> DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
+            package_name: package_name.to_string(),
+            surface_id: surface_id.to_string(),
+            body,
+            ui_tree_snapshot: None,
+        })
+    }
+
+    fn session_binding_values(root: &UiNode, references: &[String]) -> BTreeMap<String, String> {
+        references
+            .iter()
+            .enumerate()
+            .map(|(index, session_uuid)| {
+                let lifecycle_id = format!("contract-session-{}-lifecycle", index + 1);
+                let unavailable_id = format!("contract-session-{}-unavailable", index + 1);
+                let value = if let Some(node) = find_ui_node_by_id(root, &lifecycle_id) {
+                    node.props
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .expect("materialized lifecycle text")
+                        .to_string()
+                } else {
+                    assert!(find_ui_node_by_id(root, &unavailable_id).is_some());
+                    "unavailable".to_string()
+                };
+                (session_uuid.clone(), value)
+            })
+            .collect()
+    }
+
+    fn assert_session_binding_frame(
+        app: &TuiApp,
+        expected: &BTreeMap<String, String>,
+        references: &[String],
+    ) {
+        let root = materialize_plugin_surface(
+            &app.plugin_surface.as_ref().expect("active surface").body,
+            &app.session_entities,
+        )
+        .expect("canonical session bindings materialize");
+        assert_eq!(session_binding_values(&root, references), *expected);
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 60);
+        let rendered = lines.join("\n");
+        for fallback in ["bind /", "bind @/", "bound list: waiting for entities"] {
+            assert!(!rendered.contains(fallback), "{rendered}");
+        }
+        for (index, session_uuid) in references.iter().enumerate() {
+            let value = expected
+                .get(session_uuid)
+                .expect("published expected value");
+            let (suffix, text) = if value == "unavailable" {
+                ("unavailable", "Session unavailable")
+            } else {
+                ("lifecycle", value.as_str())
+            };
+            assert!(rendered.contains(text), "{rendered}");
+            let node_id = format!("contract-session-{}-{suffix}", index + 1);
+            assert!(
+                hit_map
+                    .regions()
+                    .iter()
+                    .any(|region| region.node_id == node_id),
+                "{node_id} should be present in the production frame hit map"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_session_bindings_follow_published_oracle_through_frames_and_reconnect() {
+        let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
+        assert_eq!(scenario.conformance_fixture_revision, 24);
+        let body =
+            serde_json::from_value(scenario.surface.clone()).expect("published surface is typed");
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.sessions",
+            body,
+        )));
+
+        let generation_one = match &scenario.initial_snapshot {
+            DaemonEntityFrame::Snapshot {
+                subscription_id, ..
+            } => subscription_id.clone(),
+            _ => panic!("published initial stage must be a snapshot"),
+        };
+        app.session_entities
+            .begin_generation(generation_one.clone());
+        assert!(
+            app.session_entities
+                .apply(scenario.initial_snapshot.clone())
+                .expect("initial snapshot applies")
+        );
+        assert_session_binding_frame(&app, &scenario.expected.initial, &scenario.references);
+
+        let missing_uuid = scenario
+            .references
+            .last()
+            .expect("missing reference")
+            .clone();
+        assert!(
+            app.session_entities
+                .apply(DaemonEntityFrame::Upsert {
+                    subscription_id: generation_one.clone(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 2,
+                    id: missing_uuid.clone(),
+                    entity: DaemonSessionEntity {
+                        session_uuid: missing_uuid.clone(),
+                        registry_state: "running".to_string(),
+                        lifecycle: Some("running".to_string()),
+                        lifecycle_class: "current".to_string(),
+                        rows: 24,
+                        cols: 80,
+                        updated_at: 2,
+                        exit_code: None,
+                        failure_reason: None,
+                    },
+                })
+                .expect("authoritative upsert applies")
+        );
+        let root = materialize_plugin_surface(
+            &app.plugin_surface.as_ref().expect("active surface").body,
+            &app.session_entities,
+        )
+        .expect("upserted bindings materialize");
+        assert_eq!(
+            session_binding_values(&root, &scenario.references)
+                .get(&missing_uuid)
+                .map(String::as_str),
+            Some("current")
+        );
+
+        app.session_entities.begin_generation(generation_one);
+        app.session_entities
+            .apply(scenario.initial_snapshot.clone())
+            .expect("initial snapshot reapplies");
+        for (frame, expected) in scenario.transition_frames.iter().zip([
+            &scenario.expected.after_ended_patch,
+            &scenario.expected.after_indeterminate_patch,
+            &scenario.expected.after_remove,
+        ]) {
+            assert!(
+                app.session_entities
+                    .apply(frame.clone())
+                    .expect("transition frame applies")
+            );
+            assert_session_binding_frame(&app, expected, &scenario.references);
+        }
+
+        let generation_two = match &scenario.reconnect_snapshot {
+            DaemonEntityFrame::Snapshot {
+                subscription_id, ..
+            } => subscription_id.clone(),
+            _ => panic!("published reconnect stage must be a snapshot"),
+        };
+        app.session_entities.begin_generation(generation_two);
+        assert!(
+            !app.session_entities
+                .apply(scenario.transition_frames[0].clone())
+                .expect("stale prior-generation delta is ignored")
+        );
+        assert!(
+            app.session_entities
+                .apply(scenario.reconnect_snapshot.clone())
+                .expect("fresh reconnect snapshot applies")
+        );
+        assert_session_binding_frame(
+            &app,
+            &scenario.expected.after_reconnect,
+            &scenario.references,
+        );
+    }
+
+    #[test]
+    fn bound_action_materializes_payload_and_dispatches_from_real_hit_region() {
+        let body = ui_node(json!({
+            "type": "panel",
+            "id": "bound-action-panel",
+            "props": { "title": "Bound action" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": "session-action" },
+                "item_template": {
+                    "type": "panel",
+                    "id": "bound-session-panel",
+                    "props": { "title": "Bound session" },
+                    "slots": {
+                        "body": [{
+                            "$kind": "bind_if",
+                            "path": "@/lifecycle_class",
+                            "node": {
+                                "type": "button",
+                                "id": "bound-session-action",
+                                "props": {
+                                    "label": { "$bind": "@/lifecycle_class" },
+                                    "action": {
+                                        "id": "bound.open",
+                                        "payload": {
+                                            "session_uuid": { "$bind": "@/session_uuid" },
+                                            "lifecycle_class": { "$bind": "@/lifecycle_class" }
+                                        }
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                },
+                "empty_template": {
+                    "type": "text",
+                    "id": "bound-session-unavailable",
+                    "props": { "text": "Session unavailable" }
+                }
+            }]
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.bound-action",
+            body,
+        )));
+        app.session_entities
+            .begin_generation("bound-action-generation".to_string());
+        app.session_entities
+            .apply(DaemonEntityFrame::Snapshot {
+                subscription_id: "bound-action-generation".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                items: vec![DaemonSessionEntity {
+                    session_uuid: "session-action".to_string(),
+                    registry_state: "running".to_string(),
+                    lifecycle: Some("running".to_string()),
+                    lifecycle_class: "current".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    updated_at: 1,
+                    exit_code: None,
+                    failure_reason: None,
+                }],
+                resync_reason: None,
+            })
+            .expect("snapshot applies");
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("current"), "{rendered}");
+        assert!(!rendered.contains("Session unavailable"), "{rendered}");
+        let dispatch = click_dispatch_for_surface(
+            &hit_map,
+            "bound-session-action",
+            Some("contract.bound-action"),
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("materialized button should dispatch an action");
+        };
+        assert_eq!(
+            request.payload,
+            Some(json!({
+                "session_uuid": "session-action",
+                "lifecycle_class": "current"
+            }))
+        );
+        let surface_fixture = app.plugin_surface.clone().expect("active bound surface");
+        app.handle_dispatch(InputDispatch::Action(request.clone()));
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: "botster.plugin-contract-matrix".to_string(),
+                    request,
+                })
+        );
+        app.apply_response(plugin_surface_response(surface_fixture));
+        app.session_entities
+            .begin_generation("bound-action-generation".to_string());
+        app.session_entities
+            .apply(DaemonEntityFrame::Snapshot {
+                subscription_id: "bound-action-generation".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                items: vec![DaemonSessionEntity {
+                    session_uuid: "session-action".to_string(),
+                    registry_state: "running".to_string(),
+                    lifecycle: Some("running".to_string()),
+                    lifecycle_class: "current".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    updated_at: 1,
+                    exit_code: None,
+                    failure_reason: None,
+                }],
+                resync_reason: None,
+            })
+            .expect("focus-removal baseline applies");
+
+        let action_region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "bound-session-action")
+            .expect("bound action region");
+        let mut router = InputRouter::new(renderer::action_request_context_for(
+            "contract.bound-action",
+        ));
+        let _ = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                action_region.rect.x,
+                action_region.rect.y,
+            ),
+            &hit_map,
+        );
+        assert_eq!(router.focused_node_id(), Some("bound-session-action"));
+        assert!(
+            app.session_entities
+                .apply(DaemonEntityFrame::Remove {
+                    subscription_id: "bound-action-generation".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 2,
+                    id: "session-action".to_string(),
+                })
+                .expect("remove applies")
+        );
+        let (removed_lines, removed_hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
+        let removed = removed_lines.join("\n");
+        assert!(removed.contains("Session unavailable"), "{removed}");
+        assert!(
+            !removed_hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "bound-session-action")
+        );
+        router.reconcile(&removed_hit_map);
+        assert_ne!(router.focused_node_id(), Some("bound-session-action"));
+    }
+
+    #[test]
+    fn optional_session_fields_are_null_and_bind_if_preserves_the_surface() {
+        let body = ui_node(json!({
+            "type": "panel",
+            "id": "optional-field-panel",
+            "props": { "title": "Optional field" },
+            "children": [
+                {
+                    "type": "text",
+                    "id": "optional-field-surrounding-content",
+                    "props": { "text": "Surrounding content remains" }
+                },
+                {
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "where": { "session_uuid": "session-indeterminate" },
+                    "item_template": {
+                        "type": "panel",
+                        "id": "optional-field-row",
+                        "props": { "title": "Indeterminate session" },
+                        "children": [{
+                            "$kind": "bind_if",
+                            "path": "@/lifecycle",
+                            "node": {
+                                "type": "text",
+                                "id": "optional-field-lifecycle",
+                                "props": { "text": { "$bind": "@/lifecycle" } }
+                            }
+                        }]
+                    }
+                }
+            ]
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.optional-field",
+            body,
+        )));
+        app.session_entities
+            .begin_generation("optional-field-generation".to_string());
+        app.session_entities
+            .apply(snapshot_frame(
+                "optional-field-generation",
+                1,
+                vec![session_entity("session-indeterminate", None)],
+            ))
+            .expect("snapshot applies");
+
+        let rows = app
+            .session_entities
+            .binding_rows()
+            .expect("binding rows serialize");
+        let row = rows
+            .get("session-indeterminate")
+            .expect("session binding row");
+        for field in ["lifecycle", "exit_code", "failure_reason"] {
+            assert_eq!(row.get(field), Some(&Value::Null), "{field}");
+        }
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Surrounding content remains"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Indeterminate session"), "{rendered}");
+        assert!(!rendered.contains("plugin surface binding:"), "{rendered}");
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "optional-field-lifecycle")
+        );
+    }
+
+    #[test]
+    fn unsafe_multi_row_identity_and_unknown_where_fields_fail_visibly() {
+        let multi_row = ui_node(json!({
+            "type": "panel",
+            "id": "multi-row-panel",
+            "props": { "title": "Multi row" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "registry_state": "active" },
+                "item_template": {
+                    "type": "button",
+                    "id": "multi-row-action",
+                    "props": {
+                        "label": { "$bind": "@/session_uuid" },
+                        "action": {
+                            "id": "contract.open",
+                            "payload": {
+                                "session_uuid": { "$bind": "@/session_uuid" }
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.multi-row",
+            multi_row,
+        )));
+        app.session_entities
+            .begin_generation("multi-row-generation".to_string());
+        app.session_entities
+            .apply(snapshot_frame(
+                "multi-row-generation",
+                1,
+                vec![
+                    session_entity("session-alpha", Some("running")),
+                    session_entity("session-beta", Some("running")),
+                ],
+            ))
+            .expect("snapshot applies");
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("requires canonical row-bound node ids"),
+            "{rendered}"
+        );
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "multi-row-action"),
+            "ambiguous actions must not reach input routing"
+        );
+
+        let unknown_where = ui_node(json!({
+            "type": "panel",
+            "id": "unknown-where-panel",
+            "props": { "title": "Unknown where" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_udid": "session-alpha" },
+                "item_template": {
+                    "type": "text",
+                    "id": "unknown-where-row",
+                    "props": { "text": "matched" }
+                },
+                "empty_template": {
+                    "type": "text",
+                    "id": "unknown-where-empty",
+                    "props": { "text": "Session unavailable" }
+                }
+            }]
+        }));
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.unknown-where",
+            unknown_where,
+        )));
+        let rendered = renderer::render_to_lines(&app.surface(), 120, 40)
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("unsupported /session where field"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Session unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn canonical_snapshot_and_absolute_binding_fail_visibly() {
+        let body = ui_node(json!({
+            "type": "text",
+            "id": "snapshot-body",
+            "props": { "text": "body" }
+        }));
+        let mut missing_snapshot = TuiApp::new(None);
+        missing_snapshot.apply_response(plugin_surface_response(DaemonPluginSurface {
+            package_name: "botster.plugin-contract-matrix".to_string(),
+            surface_id: "contract.missing-snapshot".to_string(),
+            body,
+            ui_tree_snapshot: None,
+        }));
+        assert!(
+            missing_snapshot
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("omitted ui_tree_snapshot"))
+        );
+        assert!(missing_snapshot.plugin_surface.is_none());
+
+        let invalid_binding = ui_node(json!({
+            "type": "panel",
+            "id": "invalid-binding-panel",
+            "props": { "title": "Invalid binding" },
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": "session-invalid" },
+                "item_template": {
+                    "type": "text",
+                    "id": "invalid-bound-value",
+                    "props": {
+                        "text": { "$bind": "/session/session-invalid/lifecycle_class" }
+                    }
+                }
+            }]
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.invalid-binding",
+            invalid_binding,
+        )));
+        app.session_entities
+            .begin_generation("invalid-binding-generation".to_string());
+        app.session_entities
+            .apply(DaemonEntityFrame::Snapshot {
+                subscription_id: "invalid-binding-generation".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                items: vec![DaemonSessionEntity {
+                    session_uuid: "session-invalid".to_string(),
+                    registry_state: "running".to_string(),
+                    lifecycle: Some("running".to_string()),
+                    lifecycle_class: "current".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    updated_at: 1,
+                    exit_code: None,
+                    failure_reason: None,
+                }],
+                resync_reason: None,
+            })
+            .expect("snapshot applies");
+        let rendered = renderer::render_to_lines(&app.surface(), 120, 40)
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("unsupported absolute binding path"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Session unavailable"), "{rendered}");
+    }
+
     #[test]
     fn session_reducer_requires_snapshot_and_strictly_advancing_active_generation() {
         let mut state = SessionEntityState::default();
@@ -5633,6 +6564,10 @@ mod tests {
         assert_eq!(
             surface.body.id,
             Some(UiNodeId("contract-action-replacement".to_string()))
+        );
+        assert!(
+            surface.ui_tree_snapshot.is_none(),
+            "an app-owned replacement must clear the stale delivered snapshot"
         );
         assert!(
             app.plugin_presentation
@@ -8842,6 +9777,137 @@ mod tests {
         );
 
         let mut client = HubConnection::connect(hub.endpoint()).expect("connect to live hub");
+        let mut binding_app = TuiApp::new(Some(hub.endpoint().clone()));
+        binding_app.workspace_test_mode = true;
+        let snapshot_deadline = Instant::now() + Duration::from_secs(7);
+        while !binding_app.session_entities.has_snapshot && Instant::now() < snapshot_deadline {
+            binding_app.poll_hub();
+            thread::yield_now();
+        }
+        assert!(
+            binding_app.session_entities.has_snapshot,
+            "live TuiApp must hydrate its app-owned session store"
+        );
+        let live_session_uuid = format!("tui-binding-{}", short_suffix());
+        let missing_session_uuid = format!("tui-binding-missing-{}", short_suffix());
+        client
+            .request(&DaemonRequest::Spawn {
+                session_id: live_session_uuid.clone(),
+                command: "while IFS= read -r line; do :; done".to_string(),
+            })
+            .expect("spawn session after the TUI subscription baseline");
+        wait_for_authoritative_session(&mut binding_app, &live_session_uuid)
+            .expect("live spawn upsert reaches the TUI-owned store");
+        binding_app.observed_requests.clear();
+        binding_app.request_and_apply(DaemonRequest::PluginSurfaceRender {
+            package_name: report.package_name.clone(),
+            surface_id: report.session_surface_id.clone(),
+            payload: json!({
+                "session_uuids": [&live_session_uuid, &missing_session_uuid]
+            }),
+        });
+        assert!(
+            binding_app
+                .observed_requests
+                .contains(&ObservedRequest::PluginSurfaceRender {
+                    package_name: report.package_name.clone(),
+                    surface_id: report.session_surface_id.clone(),
+                })
+        );
+        let lifecycle_class = binding_app
+            .session_entities
+            .entities
+            .get(&live_session_uuid)
+            .expect("live row is held by the app-owned store")
+            .lifecycle_class
+            .clone();
+        let rendered = renderer::render_to_lines(&binding_app.surface(), 180, 60)
+            .0
+            .join("\n");
+        assert!(rendered.contains(&lifecycle_class), "{rendered}");
+        assert!(rendered.contains("Session unavailable"), "{rendered}");
+        for fallback in ["bind /", "bind @/", "bound list: waiting for entities"] {
+            assert!(!rendered.contains(fallback), "{rendered}");
+        }
+
+        let prior_generation = binding_app
+            .session_entities
+            .subscription_id
+            .clone()
+            .expect("initial binding generation");
+        let render_requests_before_reconnect = binding_app
+            .observed_requests
+            .iter()
+            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
+            .count();
+        binding_app.force_reconnect();
+        assert_ne!(
+            binding_app.session_entities.subscription_id.as_deref(),
+            Some(prior_generation.as_str())
+        );
+        assert_eq!(
+            binding_app
+                .observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
+                .count(),
+            render_requests_before_reconnect,
+            "reconnect must not refresh the plugin surface"
+        );
+        wait_for_authoritative_session(&mut binding_app, &live_session_uuid)
+            .expect("fresh app-owned generation restores the bound row");
+        binding_app.request_and_apply(DaemonRequest::PluginSurfaceRender {
+            package_name: report.package_name.clone(),
+            surface_id: report.session_surface_id.clone(),
+            payload: json!({
+                "session_uuids": [&live_session_uuid, &missing_session_uuid]
+            }),
+        });
+        let rebound = renderer::render_to_lines(&binding_app.surface(), 180, 60)
+            .0
+            .join("\n");
+        assert!(rebound.contains(&lifecycle_class), "{rebound}");
+
+        client
+            .request(&DaemonRequest::ShutdownSession {
+                session_id: live_session_uuid.clone(),
+            })
+            .expect("shutdown live bound session");
+        let ended_deadline = Instant::now() + Duration::from_secs(7);
+        while binding_app
+            .session_entities
+            .entities
+            .get(&live_session_uuid)
+            .is_none_or(|entity| entity.lifecycle_class != "ended")
+            && Instant::now() < ended_deadline
+        {
+            binding_app.poll_hub();
+            thread::yield_now();
+        }
+        let ended = renderer::render_to_lines(&binding_app.surface(), 180, 60)
+            .0
+            .join("\n");
+        assert!(ended.contains("ended"), "{ended}");
+        client
+            .request(&DaemonRequest::RemoveSession {
+                session_id: live_session_uuid.clone(),
+            })
+            .expect("remove live bound session");
+        let removed_deadline = Instant::now() + Duration::from_secs(7);
+        while binding_app
+            .session_entities
+            .entities
+            .contains_key(&live_session_uuid)
+            && Instant::now() < removed_deadline
+        {
+            binding_app.poll_hub();
+            thread::yield_now();
+        }
+        let removed = renderer::render_to_lines(&binding_app.surface(), 180, 60)
+            .0
+            .join("\n");
+        assert!(removed.contains("Session unavailable"), "{removed}");
+
         let list_packages = client
             .request(&DaemonRequest::ListPackages)
             .expect("list packages after contract matrix conformance");
@@ -9486,8 +10552,17 @@ mod tests {
         }
     }
 
+    fn canonical_plugin_surface_fixture(mut surface: DaemonPluginSurface) -> DaemonPluginSurface {
+        surface.ui_tree_snapshot = Some(botster_hub_client::DaemonUiTreeSnapshot {
+            package_name: surface.package_name.clone(),
+            surface_id: surface.surface_id.clone(),
+            body: surface.body.clone(),
+        });
+        surface
+    }
+
     fn presentation_plugin_surface() -> DaemonPluginSurface {
-        DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.presentation".to_string(),
             body: ui_node(json!({
@@ -9562,11 +10637,11 @@ mod tests {
                 ]
             })),
             ui_tree_snapshot: None,
-        }
+        })
     }
 
     fn field_error_kinds_plugin_surface() -> DaemonPluginSurface {
-        DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.field-errors".to_string(),
             body: ui_node(json!({
@@ -9649,11 +10724,11 @@ mod tests {
                 }
             })),
             ui_tree_snapshot: None,
-        }
+        })
     }
 
     fn contract_app_plugin_surface() -> DaemonPluginSurface {
-        DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.app".to_string(),
             body: ui_node(json!({
@@ -9683,11 +10758,11 @@ mod tests {
                 ]
             })),
             ui_tree_snapshot: None,
-        }
+        })
     }
 
     fn composite_application_primitives_plugin_surface() -> DaemonPluginSurface {
-        DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.composite".to_string(),
             body: ui_node(json!({
@@ -9913,11 +10988,11 @@ mod tests {
                 }
             })),
             ui_tree_snapshot: None,
-        }
+        })
     }
 
     fn invalid_table_plugin_surface() -> DaemonPluginSurface {
-        DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.invalid".to_string(),
             body: ui_node(json!({
@@ -9925,11 +11000,11 @@ mod tests {
                 "id": "contract-invalid-table"
             })),
             ui_tree_snapshot: None,
-        }
+        })
     }
 
     fn iframe_plugin_surface() -> DaemonPluginSurface {
-        DaemonPluginSurface {
+        canonical_plugin_surface_fixture(DaemonPluginSurface {
             package_name: "botster.plugin-contract-matrix".to_string(),
             surface_id: "contract.iframe".to_string(),
             body: ui_node(json!({
@@ -9951,7 +11026,7 @@ mod tests {
                 ]
             })),
             ui_tree_snapshot: None,
-        }
+        })
     }
 
     fn plugin_contract_app_navigation() -> DaemonPackageNavigationEntry {

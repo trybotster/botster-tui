@@ -214,10 +214,23 @@ Unknown or colliding plugin action IDs never enter the built-in
 `botster.tui.*` switch, and no plugin action dispatches without a matching
 active owner.
 
+Plugin surfaces use the identity-matched `ui_tree_snapshot.body` renderer
+entrypoint and project canonical `/session` `bind_list`, item-relative
+`$bind`, and `bind_if` values from the TUI's existing authoritative session
+subscription. Snapshot, upsert, patch, remove, and reconnect baselines affect
+the next frame and hit map directly; the client does not poll or refresh the
+surface, derive lifecycle classes, or keep a second session store. Missing
+references select the authored empty template, while malformed or unsupported
+bindings render a diagnostic instead of masquerading as unavailable. A
+multi-row expansion whose item template carries authored node IDs is also
+rejected visibly until the Hub-owned UI contract can supply distinct
+row-bound IDs; this prevents ambiguous keyboard focus and action dispatch
+instead of inventing client-local identity semantics.
+
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
-package list, package detail, navigation, app, empty, and settings surfaces
-through `botster-hub-client`. It renders the same typed package descriptors
+package list, package detail, navigation, app, empty, settings, and
+session-binding surfaces through `botster-hub-client`. It renders the same typed package descriptors
 after List and Show, activates Show and resolved navigation Open through the
 production frame hit map and Crossterm input router, and restores the complete
 package list through Refresh. Those delivered
@@ -334,7 +347,6 @@ Included now:
 Not included yet:
 
 - Pairing, remote auth, or hub provisioning inside this crate.
-- Entity-store hydration for bound plugin lists.
 - Plugin execution, Project Pipelines policy, browser surfaces, or hub/core
   runtime policy.
 
