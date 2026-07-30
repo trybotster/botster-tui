@@ -475,6 +475,11 @@ and they are not pulled into this repository's implementation scope.
 - **Stale hit regions/focus:** entity removal changes the concrete tree.
   Re-render, rebuild the hit map in the same draw, and run the existing router
   reconciliation before accepting input.
+- **Repeated node identity in multi-row expansion:** the pinned contract cannot
+  bind `UiNode.id`, so expanding an ID-bearing template more than once would
+  make keyboard focus and action dispatch ambiguous. Reject that expansion
+  visibly and route canonical row-bound identity to Hub/UI-contract ticket
+  `ticket_1785436979_640117`; do not invent client-local ID rewriting.
 - **Dual structural read paths:** reading the outer
   `plugin_surface.body` when the documented snapshot entrypoint is absent
   would let the client accept two structural sources. Verify the pinned
@@ -510,6 +515,11 @@ Unknowns for implementation to validate early:
   and have no worked canonical lookup semantics at the pinned revision. They
   are excluded rather than guessed; encountering one is a stop-and-route
   event.
+- Review proved that the pinned `UiNode.id` cannot express the row-relative
+  identity needed by a `bind_list` matching multiple rows. This is now a
+  registered blocking Hub/UI-contract child run
+  (`run_1785436979_236604`); the TUI fails ID-bearing multi-row expansion
+  visibly until that producer-owned contract is available.
 
 None of these unknowns authorize a compatibility fallback, a local contract
 copy, or a cross-repository edit.
