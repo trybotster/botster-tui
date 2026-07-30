@@ -13,6 +13,7 @@
   [[botster-runtime-verifier-playbook]], and
   [[project-pipelines-playbook]].
 - Atomic notes loaded: [[botster package surface semantics live in ui contract while hub owns admission]],
+  [[botster-architecture]], [[cli-patterns]],
   [[package navigation entries declare discoverability not host placement]],
   [[plugin surface requests require a declared id and operation]],
   [[botster hub client crate is the external client boundary]],
@@ -62,6 +63,14 @@ The required `botster-tui-kit` repin merged as
 `c66f1ae60235d7d0ce0993f4e9ed89068a12b7d2` (PR 25). Its workspace pins
 `botster-ui-contract` to the same Hub merge commit `b403bb72...`.
 
+`botster-hub-test-support` at `b403bb72...` declares its `botster-core`
+dependency with `branch = "main"`, but the tested pairing is not whatever Core
+main resolves to later. Hub's lockfile at that merge resolves the branch source
+to `e36435f2cb583c344d6f6ba2d62c39da324c7a64`. The current TUI lock already
+contains that exact transitive source alongside its deliberate direct
+`botster-core`/`botster-core-test-support` revision
+`16bf08f29ec723c70c290cf995745ccbf79d4f05`; the repin must preserve both.
+
 The current TUI instead pins `botster-hub-client`,
 `botster-hub-test-support`, and its direct `botster-ui-contract` dependency to
 Hub revision `3d3623f...`, and pins `botster-tui-kit` to `22df686...`.
@@ -76,7 +85,13 @@ only `surfaces=<count>` and there is no TUI `ShowPackage` action.
    `botster-hub-client`, direct `botster-ui-contract`, and
    `botster-hub-test-support`. Repin `botster-tui-kit` to its merged
    `c66f1ae60235d7d0ce0993f4e9ed89068a12b7d2` revision, whose own contract pin
-   is the same Hub commit. Regenerate `Cargo.lock` narrowly.
+   is the same Hub commit. After editing the manifest, update only
+   `botster-hub-client`, `botster-ui-contract`, `botster-hub-test-support`, and
+   `botster-tui-kit` with package-targeted `cargo update -p ... --precise ...`
+   operations. Source-qualify and restore the floating
+   `botster-core?branch=main` package to `e36435f2...` if Cargo attempts to
+   advance it. The reviewer-visible lock diff must contain no unrelated source
+   line movement, and the direct `16bf08f2...` Core pins must remain unchanged.
 2. Update the TUI compatibility floor to conformance fixture revision 24 and
    make only the mechanical fixture-literal additions required by the fresh
    public Hub-client DTOs (`lifecycle_class`, lifecycle counters, optional
@@ -132,10 +147,11 @@ proof, or the documentation made stale by those changes.
   System-details redesign.
 - No canonical session binding/entity-store work owned by open ticket
   `ticket_1785298229_854008`.
-- No browser parity implementation. This run does not modify the shared
-  contract; generated TypeScript and browser/package parity remain evidence
-  owned by the merged Hub dependency. The TUI supplies the required downstream
-  consumer proof.
+- No browser parity implementation. This run does not author the shared
+  contract. Closed Web consumer ticket `ticket_1785295078_550933`, target
+  `tgt_40abcf71ccf049f4ac0c99953a799869`, cold-switched `botster-web` to these
+  same Hub-owned package surface/navigation types and supplies the browser half
+  of the charter's parity gate. This run supplies the TUI half.
 
 ## Ownership boundaries and cross-repository dependencies
 
@@ -180,10 +196,13 @@ do not substitute a later Hub commit or reimplement the dependency.
   `Terminal<TestBackend>::draw` production renderer. Tests must pair them with
   hit-map and `InputRouter::dispatch_event` evidence; semantic tree inspection
   alone is insufficient.
-- Assumption: a Show response may replace the visible package vector with the
-  one authoritative package returned by Hub; the existing Refresh action
-  restores the full list. Avoid a new detail-cache abstraction unless the
-  actual response behavior makes this unusable.
+- Assumption: Hub's Show response contains one authoritative package and may
+  temporarily replace the visible package vector, while package navigation and
+  active plugin owner state remain independently intact. The production
+  Refresh/ListPackages path must restore the full package list. If recovery,
+  navigation, owner identity, or typed-error preservation cannot hold under
+  vector replacement, use narrow package-detail state and record why; do not
+  introduce a general cache abstraction.
 - Unknown until compilation: which unrelated additive public DTO fields
   between revisions require fixture literal updates. Keep those changes
   mechanical and do not expose unrelated new UI.
@@ -244,6 +263,11 @@ implementation report.
 - A broad dependency bump can introduce unrelated lifecycle/UI work.
   Mitigation: use the exact two merge commits and restrict fresh DTO changes to
   compilation/test literals unless ticket behavior requires them.
+- `botster-hub-test-support` can float its branch-tracked Core dependency to an
+  untested revision during lock regeneration. Mitigation: preserve
+  `botster-core?branch=main#e36435f2...`, preserve the direct
+  `botster-core?rev=16bf08f2...` source, and reject unrelated lock source-line
+  changes.
 
 ## Acceptance checks and tests
 
@@ -262,6 +286,12 @@ implementation report.
 - The direct Hub dependencies resolve to `b403bb72...`; the kit resolves to
   `c66f1ae...`, and inspection of that kit artifact confirms its contract
   dependency resolves to `b403bb72...`.
+- The lockfile's transitive `botster-core?branch=main` source remains exactly
+  `e36435f2cb583c344d6f6ba2d62c39da324c7a64`, matching Hub
+  `b403bb72...`'s committed lockfile. The direct `botster-core` and
+  `botster-core-test-support` sources remain exactly
+  `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The implementation report records
+  both resolutions as deliberate provenance.
 
 ### Repository gates
 
@@ -284,6 +314,14 @@ Strict Clippy means the repository command exactly:
 - A real rendered package Show control produces
   `DaemonRequest::ShowPackage` only after production key or mouse routing and
   renders the Hub response.
+- After that real Show activation, a rendered Refresh control (or the same
+  production ListPackages refresh path) restores the complete fixture package
+  list. Show followed by navigation Open still emits `PluginSurfaceRender`
+  with the Hub-projected package/surface identity, and an already-active plugin
+  surface retains its package/surface owner across Show.
+- `ShowPackage` for an uninstalled package renders the sanitized typed Hub
+  error without clearing/corrupting the visible package list, navigation state,
+  or active plugin owner.
 - A real rendered navigation Open control produces
   `PluginSurfaceRender` with the Hub-projected package/surface identity.
 - A delivered arbitrary plugin button or form produces
@@ -291,8 +329,9 @@ Strict Clippy means the repository command exactly:
   identity through the real input router; typed success and failure results
   preserve the existing replacement, presentation, feedback, and error rules.
 - Negative controls prove no plugin action without an active matching owner,
-  blocked/unsupported navigation does not open, and no built-in action id
-  branch handles arbitrary plugin actions.
+  blocked/unsupported navigation does not open, an uninstalled Show preserves
+  client state, and no built-in action id branch handles arbitrary plugin
+  actions.
 
 ### Downstream live-Hub proof
 
