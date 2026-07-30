@@ -116,7 +116,18 @@ Therefore:
 - this run does not reverse dependencies or wait on Workspaces;
 - it does not add Workspaces-specific policy or a local Workspaces fixture;
 - its acceptance evidence must be sufficient for the downstream Workspaces
-  ticket to consume without another TUI implementation change.
+  ticket to consume the revision-24 exact-UUID producer shape without another
+  TUI implementation change.
+
+Review later proved that the pinned contract cannot express distinct
+row-relative `UiNode.id` values for a `bind_list` matching multiple rows.
+Question `question_1785437646_635577` approved a non-blocking follow-on chain
+for that newly discovered contract gap: this run may complete against
+revision 24 with unsafe ID-bearing multi-row expansion rejected visibly; Hub
+ticket `ticket_1785436979_640117` publishes the canonical row-identity
+contract; TUI follow-up `ticket_1785438029_926883` then owns the repin,
+removing the rejection, and real per-row keyboard/hit-region proof before
+Workspaces consumes it.
 
 ## Scope
 
@@ -367,11 +378,13 @@ TUI-authored copy.
   plausible-looking fallback output.
 - Assert the materialized node ids appear in the production `HitMap` and the
   unmatched item-template ids do not.
-- Include a typed bound actionable-row/control test that resolves its visible
-  value and action payload, then dispatches real mouse and keyboard input
-  through `InputRouter` and proves the emitted canonical
-  `UiActionRequest` uses the materialized hit region. This is complementary to,
-  not a replacement for, the published Hub fixture.
+- Include a typed single-match bound actionable-row/control test that resolves
+  its visible value and action payload, proves canonical `UiActionRequest`
+  dispatch from the materialized hit region, exercises real mouse focus, and
+  proves entity removal clears focus and the actionable region. Real
+  multi-row keyboard activation and per-row hit-region proof are owned by
+  follow-up `ticket_1785438029_926883` after the canonical row-identity repin.
+  This is complementary to, not a replacement for, the published Hub fixture.
 - Reconcile focus after entity-driven region changes and prove a removed row
   cannot retain a stale clickable region.
 
@@ -440,13 +453,18 @@ failure text, and a clean-main comparison.
 
 ### Downstream proof
 
-This ticket's generic proof is complete only when it leaves no TUI
-implementation gap for downstream consumers. The actual owner-authored
-Workspaces detail surface is nevertheless an explicit deferred acceptance
-check:
+This ticket's revision-24 exact-UUID producer proof must leave no additional
+TUI implementation gap for that shipped shape. Generic ID-bearing multi-row
+support follows the explicit chain approved in
+`question_1785437646_635577`. The actual owner-authored Workspaces detail
+surface is an explicit deferred acceptance check:
 
-- `ticket_1785296184_677408` must render its owner-authored workspace detail
-  through this merged TUI capability with no Workspaces-specific client code.
+- `ticket_1785438029_926883` must consume the Hub row-identity contract, repin
+  the TUI, lift the fail-safe rejection, and prove real per-row keyboard and
+  hit-region dispatch.
+- `ticket_1785296184_677408` depends on that TUI follow-up and must render its
+  owner-authored workspace detail through the merged generic capability with
+  no Workspaces-specific client code.
 - `ticket_1785192726_335558` must repeat the clean-stack keyboard click-through
   using merged artifacts and the production package runtime.
 
@@ -516,10 +534,11 @@ Unknowns for implementation to validate early:
   are excluded rather than guessed; encountering one is a stop-and-route
   event.
 - Review proved that the pinned `UiNode.id` cannot express the row-relative
-  identity needed by a `bind_list` matching multiple rows. This is now a
-  registered blocking Hub/UI-contract child run
-  (`run_1785436979_236604`); the TUI fails ID-bearing multi-row expansion
-  visibly until that producer-owned contract is available.
+  identity needed by a `bind_list` matching multiple rows. Per the
+  human-approved non-blocking chain, Hub run `run_1785436979_236604` feeds TUI
+  follow-up `ticket_1785438029_926883`, which owns the repin and real per-row
+  keyboard/hit-region proof. This run fails ID-bearing multi-row expansion
+  visibly but does not wait on that chain.
 
 None of these unknowns authorize a compatibility fallback, a local contract
 copy, or a cross-repository edit.
