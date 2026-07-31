@@ -101,11 +101,11 @@ by the parent campaign.
    kit. Require an item-relative path, a string result, and a nonblank literal.
    Do not stringify, prefix, suffix, index, hash, or otherwise rewrite it.
 4. Replace the pre-contract `node_tree_has_id` blanket rejection and its
-   diagnostic. Materialize the complete surface, then collect every realized
-   literal id across that surface and fail visibly on the first duplicate.
-   This permits canonical distinct row ids while retaining a diagnostic for
-   repeated literal roots, descendants, and a bound row id that collides with
-   a static sibling outside its `BindList`.
+   diagnostic. Materialize the complete surface, then reject realized literal
+   ids that can coexist in one render. This permits canonical distinct row ids
+   and ID reuse across mutually exclusive responsive alternatives while
+   retaining a diagnostic for repeated literal roots, descendants, and a bound
+   row id that collides with a static sibling outside its `BindList`.
 5. Use the Hub revision-25 `row_expected` stages and
    `materialize_session_plugin_rows` results as exact oracles. Prove the TUI's
    concrete rows carry the same ids and action payloads in producer order.
@@ -188,7 +188,8 @@ Keep feature logic beside the existing binding projection in
 3. Preserve producer snapshot/upsert order in the existing session entity
    projection and materialize matching rows in that order. After the complete
    surface is concrete, walk the whole materialized tree once and reject
-   duplicate realized literals before validation or rendering. Keep
+   duplicate realized literals within each possible render before validation
+   or rendering. Keep
    empty-template, unsupported-source, unknown-field, missing-value, and
    absolute-path errors visible.
 4. Adapt all compiler-exposed TUI-owned authored-id construction/read sites.
@@ -237,8 +238,9 @@ Resolved assumptions:
 Implementation must validate early:
 
 - The duplicate pass is deliberately surface-wide, not scoped to one expanded
-  list. Implementation still must choose concise first-collision wording
-  inside the existing binding diagnostic category.
+  list, but render-scoped within that surface: mutually exclusive responsive
+  alternatives may reuse an id. Keep concise first-collision wording inside
+  the existing binding diagnostic category.
 - The public tarball path is resolved:
   `package/fixtures/plugin-contract-matrix`, containing the two files required
   by `script/test-live-hub` plus its README.
@@ -264,10 +266,11 @@ appears, ask the human through Project Pipelines.
 - **Stale focus after removal:** rebuilding the frame without router
   reconciliation can retain an absent id. Remove the focused row, redraw,
   reconcile, and prove focus moves to a surviving canonical region.
-- **Ambiguous identities anywhere in the surface:** deleting the old blanket
-  guard with only per-list detection would miss a bound row id colliding with
-  a static sibling. Reject duplicate realized literals across the complete
-  materialized surface before rendering.
+- **Ambiguous identities within one render:** deleting the old blanket guard
+  with only per-list detection would miss a bound row id colliding with a
+  static sibling. Reject duplicate realized literals that can coexist across
+  the complete materialized surface, without rejecting mutually exclusive
+  responsive alternatives.
 - **Silent DTO drift:** a defaulted or partially populated reference row would
   omit a future optional field under `skip_serializing_if`. Use an exhaustive
   struct literal with every option `Some`, and drive both filtering and null
@@ -316,8 +319,10 @@ appears, ask the human through Project Pipelines.
 - Two distinct rows materialize two distinct literal root ids and row-specific
   payloads in producer order.
 - A multi-row literal root, repeated descendant, or bound row id equal to a
-  static id elsewhere in the same surface realizes a duplicate and returns the
+  static id elsewhere in the same render realizes a duplicate and returns the
   visible ambiguous-tree diagnostic; no colliding hit region is published.
+- Mutually exclusive responsive alternatives may reuse the same literal id;
+  each rendered width publishes only one corresponding hit region.
 - Unknown `where` fields still fail the whole surface visibly rather than
   selecting `empty_template`.
 - The exhaustive serialized reference literal exposes every current
