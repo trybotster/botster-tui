@@ -6213,42 +6213,74 @@ mod tests {
         materialize_plugin_surface(&complementary, &SessionEntityState::default())
             .expect("When and Hidden with the same condition cannot coexist");
 
-        let mut overlapping = node(
-            UiNodeKind::Panel,
-            "overlapping-panel",
-            json!({ "title": "Overlapping conditions" }),
+        let assert_collision =
+            |app: &mut TuiApp, surface_id: &str, node_id: &str, children: Vec<UiChild>| {
+                let mut overlapping = node(
+                    UiNodeKind::Panel,
+                    &format!("{node_id}-panel"),
+                    json!({ "title": "Overlapping conditions" }),
+                );
+                overlapping.children = children;
+                let diagnostic = format!("duplicate materialized node id {node_id:?}");
+                assert_eq!(
+                    materialize_plugin_surface(&overlapping, &SessionEntityState::default())
+                        .unwrap_err(),
+                    diagnostic
+                );
+                app.apply_response(plugin_surface_response(canonical_surface(
+                    "botster.plugin-contract-matrix",
+                    surface_id,
+                    overlapping,
+                )));
+                let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 40);
+                let rendered = lines.join("\n");
+                assert!(rendered.contains(&diagnostic), "{rendered}");
+                assert!(
+                    !hit_map
+                        .regions()
+                        .iter()
+                        .any(|region| region.node_id == node_id),
+                    "overlapping conditionals must fail before ambiguous regions reach routing"
+                );
+            };
+        assert_collision(
+            &mut app,
+            "contract.overlapping-hidden",
+            "overlapping-hidden-action",
+            vec![
+                responsive_child(UiWidthClass::Expanded, action("overlapping-hidden-action")),
+                UiChild::Conditional(UiConditional::Hidden {
+                    condition: UiCondition {
+                        width: Some(UiWidthClass::Compact),
+                        ..UiCondition::default()
+                    },
+                    node: Box::new(action("overlapping-hidden-action")),
+                }),
+            ],
         );
-        overlapping.children = vec![
-            responsive_child(UiWidthClass::Expanded, action("overlapping-action")),
-            UiChild::Conditional(UiConditional::Hidden {
-                condition: UiCondition {
-                    width: Some(UiWidthClass::Compact),
-                    ..UiCondition::default()
-                },
-                node: Box::new(action("overlapping-action")),
-            }),
-        ];
-        assert_eq!(
-            materialize_plugin_surface(&overlapping, &SessionEntityState::default()).unwrap_err(),
-            "duplicate materialized node id \"overlapping-action\""
+        assert_collision(
+            &mut app,
+            "contract.identical-when",
+            "identical-when-action",
+            vec![
+                responsive_child(UiWidthClass::Expanded, action("identical-when-action")),
+                responsive_child(UiWidthClass::Expanded, action("identical-when-action")),
+            ],
         );
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.overlapping",
-            overlapping,
-        )));
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 40);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.contains("duplicate materialized node id \"overlapping-action\""),
-            "{rendered}"
-        );
-        assert!(
-            !hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "overlapping-action"),
-            "overlapping conditionals must fail before ambiguous regions reach routing"
+        assert_collision(
+            &mut app,
+            "contract.cross-axis-when",
+            "cross-axis-when-action",
+            vec![
+                responsive_child(UiWidthClass::Expanded, action("cross-axis-when-action")),
+                UiChild::Conditional(UiConditional::When {
+                    condition: UiCondition {
+                        height: Some(botster_ui_contract::UiHeightClass::Tall),
+                        ..UiCondition::default()
+                    },
+                    node: Box::new(action("cross-axis-when-action")),
+                }),
+            ],
         );
     }
 
