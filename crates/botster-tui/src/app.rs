@@ -4202,42 +4202,60 @@ fn reject_duplicate_realized_node_ids(root: &UiNode) -> Result<(), String> {
     collect_realized_node_ids(root).map(|_| ())
 }
 
+enum RealizedChildCondition {
+    When(UiCondition),
+    Hidden(UiCondition),
+}
+
 fn collect_realized_node_ids(node: &UiNode) -> Result<std::collections::BTreeSet<String>, String> {
-    let mut simultaneous = std::collections::BTreeSet::new();
+    let mut realized = std::collections::BTreeSet::new();
     if let Some(UiAuthoredNodeId::Literal(id)) = &node.id {
-        simultaneous.insert(id.0.clone());
+        realized.insert(id.0.clone());
     }
 
-    let mut alternatives = Vec::new();
+    let mut children = Vec::new();
     for child in node.children.iter().chain(node.slots.values().flatten()) {
-        let (ids, alternative) = collect_realized_child_ids(child)?;
-        if alternative {
-            alternatives.push(ids);
-        } else {
-            merge_realized_node_ids(&mut simultaneous, &ids)?;
+        let (ids, condition) = collect_realized_child_ids(child)?;
+        reject_realized_node_id_overlap(&realized, &ids)?;
+        children.push((ids, condition));
+    }
+    for (index, (left_ids, left_condition)) in children.iter().enumerate() {
+        for (right_ids, right_condition) in children.iter().skip(index + 1) {
+            if !realized_children_are_exclusive(left_condition, right_condition) {
+                reject_realized_node_id_overlap(left_ids, right_ids)?;
+            }
         }
     }
-    for ids in &alternatives {
-        reject_realized_node_id_overlap(&simultaneous, ids)?;
+    for (ids, _) in children {
+        realized.extend(ids);
     }
-    for ids in alternatives {
-        simultaneous.extend(ids);
-    }
-    Ok(simultaneous)
+    Ok(realized)
 }
 
 fn collect_realized_child_ids(
     child: &UiChild,
-) -> Result<(std::collections::BTreeSet<String>, bool), String> {
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        Option<RealizedChildCondition>,
+    ),
+    String,
+> {
     match child {
         UiChild::Node(node)
         | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. }) => {
-            collect_realized_node_ids(node).map(|ids| (ids, false))
+            collect_realized_node_ids(node).map(|ids| (ids, None))
         }
-        UiChild::Conditional(UiConditional::When { node, .. })
-        | UiChild::Conditional(UiConditional::Hidden { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
-            collect_realized_node_ids(node).map(|ids| (ids, true))
+        UiChild::Conditional(UiConditional::When { condition, node }) => {
+            collect_realized_node_ids(node)
+                .map(|ids| (ids, Some(RealizedChildCondition::When(condition.clone()))))
+        }
+        UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
+            collect_realized_node_ids(node)
+                .map(|ids| (ids, Some(RealizedChildCondition::Hidden(condition.clone()))))
+        }
+        UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+            collect_realized_node_ids(node).map(|ids| (ids, None))
         }
         UiChild::BindList(botster_ui_contract::UiBindList::BindList {
             item_template,
@@ -4248,18 +4266,47 @@ fn collect_realized_child_ids(
             if let Some(empty_template) = empty_template {
                 ids.extend(collect_realized_node_ids(empty_template)?);
             }
-            Ok((ids, false))
+            Ok((ids, None))
         }
     }
 }
 
-fn merge_realized_node_ids(
-    target: &mut std::collections::BTreeSet<String>,
-    incoming: &std::collections::BTreeSet<String>,
-) -> Result<(), String> {
-    reject_realized_node_id_overlap(target, incoming)?;
-    target.extend(incoming.iter().cloned());
-    Ok(())
+fn realized_children_are_exclusive(
+    left: &Option<RealizedChildCondition>,
+    right: &Option<RealizedChildCondition>,
+) -> bool {
+    match (left, right) {
+        (Some(RealizedChildCondition::When(left)), Some(RealizedChildCondition::When(right))) => {
+            conditions_are_distinct_on_one_axis(left, right)
+        }
+        (Some(RealizedChildCondition::When(left)), Some(RealizedChildCondition::Hidden(right)))
+        | (Some(RealizedChildCondition::Hidden(left)), Some(RealizedChildCondition::When(right))) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
+fn conditions_are_distinct_on_one_axis(left: &UiCondition, right: &UiCondition) -> bool {
+    condition_axis_count(left) == 1
+        && condition_axis_count(right) == 1
+        && ((left.width.is_some() && right.width.is_some() && left.width != right.width)
+            || (left.height.is_some() && right.height.is_some() && left.height != right.height)
+            || (left.pointer.is_some() && right.pointer.is_some() && left.pointer != right.pointer)
+            || (left.orientation.is_some()
+                && right.orientation.is_some()
+                && left.orientation != right.orientation)
+            || (left.keyboard_occluded.is_some()
+                && right.keyboard_occluded.is_some()
+                && left.keyboard_occluded != right.keyboard_occluded))
+}
+
+fn condition_axis_count(condition: &UiCondition) -> usize {
+    usize::from(condition.width.is_some())
+        + usize::from(condition.height.is_some())
+        + usize::from(condition.pointer.is_some())
+        + usize::from(condition.orientation.is_some())
+        + usize::from(condition.keyboard_occluded.is_some())
 }
 
 fn reject_realized_node_id_overlap(
@@ -6105,10 +6152,10 @@ mod tests {
 
     #[test]
     fn duplicate_ids_in_responsive_alternatives_are_render_scoped() {
-        let action = || {
+        let action = |id: &str| {
             node(
                 UiNodeKind::Button,
-                "responsive-action",
+                id,
                 json!({
                     "label": "Responsive action",
                     "action": { "id": "contract.responsive" }
@@ -6121,8 +6168,8 @@ mod tests {
             json!({ "title": "Responsive alternatives" }),
         );
         body.children = vec![
-            responsive_child(UiWidthClass::Expanded, action()),
-            responsive_child(UiWidthClass::Compact, action()),
+            responsive_child(UiWidthClass::Expanded, action("responsive-action")),
+            responsive_child(UiWidthClass::Compact, action("responsive-action")),
         ];
         materialize_plugin_surface(&body, &SessionEntityState::default())
             .expect("mutually exclusive render alternatives may reuse one node id");
@@ -6147,6 +6194,62 @@ mod tests {
                 1
             );
         }
+
+        let mut complementary = node(
+            UiNodeKind::Panel,
+            "complementary-panel",
+            json!({ "title": "Complementary conditions" }),
+        );
+        complementary.children = vec![
+            responsive_child(UiWidthClass::Expanded, action("complementary-action")),
+            UiChild::Conditional(UiConditional::Hidden {
+                condition: UiCondition {
+                    width: Some(UiWidthClass::Expanded),
+                    ..UiCondition::default()
+                },
+                node: Box::new(action("complementary-action")),
+            }),
+        ];
+        materialize_plugin_surface(&complementary, &SessionEntityState::default())
+            .expect("When and Hidden with the same condition cannot coexist");
+
+        let mut overlapping = node(
+            UiNodeKind::Panel,
+            "overlapping-panel",
+            json!({ "title": "Overlapping conditions" }),
+        );
+        overlapping.children = vec![
+            responsive_child(UiWidthClass::Expanded, action("overlapping-action")),
+            UiChild::Conditional(UiConditional::Hidden {
+                condition: UiCondition {
+                    width: Some(UiWidthClass::Compact),
+                    ..UiCondition::default()
+                },
+                node: Box::new(action("overlapping-action")),
+            }),
+        ];
+        assert_eq!(
+            materialize_plugin_surface(&overlapping, &SessionEntityState::default()).unwrap_err(),
+            "duplicate materialized node id \"overlapping-action\""
+        );
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.overlapping",
+            overlapping,
+        )));
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 40);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("duplicate materialized node id \"overlapping-action\""),
+            "{rendered}"
+        );
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "overlapping-action"),
+            "overlapping conditionals must fail before ambiguous regions reach routing"
+        );
     }
 
     #[test]
