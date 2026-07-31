@@ -224,8 +224,9 @@ references select the authored empty template, while malformed or unsupported
 bindings render a diagnostic instead of masquerading as unavailable. The TUI
 resolves producer-authored item-relative row IDs while each `bind_list` row is
 in context, then gives the renderer distinct literal IDs. Duplicate realized
-IDs anywhere on the materialized surface still fail visibly before focus or
-action routing, including collisions between a bound row and a static sibling.
+IDs that can coexist in one materialized render fail visibly before focus or
+action routing, including collisions between a bound row and a static sibling;
+mutually exclusive responsive alternatives may reuse an ID.
 
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
@@ -316,8 +317,9 @@ name a Hub contract-matrix fixture directory containing `botster-package.json`
 and `plugin.lua`; the parent acceptance run uses the extracted
 `package/fixtures/plugin-contract-matrix` directory from public
 `@trybotster/hub-test-support@0.1.18`. The wrapper fails before building when
-the fixture is missing or invalid. Normal unit tests skip the isolated runtime when the binary variables
-are absent; the wrapper sets `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
+the fixture is missing or invalid. Normal unit tests skip the isolated runtime
+when the binary variables are absent; the wrapper sets
+`BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
 binaries or plugin-surface proof cannot silently pass. The live-Hub test also
 asserts non-default compatibility descriptor values from the isolated daemon
 and exercises a compatibility mismatch through
