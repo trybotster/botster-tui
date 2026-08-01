@@ -210,6 +210,7 @@ dependencies = [
  "botster-ui-contract",
  "crossterm",
  "ratatui",
+ "serde",
  "serde_json",
 ]
 
