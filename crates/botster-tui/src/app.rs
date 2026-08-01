@@ -11188,6 +11188,12 @@ mod tests {
             assert!(app.session_entities.has_snapshot);
             ledger.record(WorkspacesStage::FreshReconnectSubscription);
             ledger.record(WorkspacesStage::FreshReconnectSnapshot);
+            wait_for_session_entity_expectation(
+                &mut app,
+                &session_ids[1],
+                SessionEntityExpectation::Lifecycle("ended"),
+                "reconnect must rehydrate the exact controlled session in its authoritative ended state",
+            );
 
             let stale_seq = app.session_entities.snapshot_seq.unwrap_or_default() + 1;
             assert!(
