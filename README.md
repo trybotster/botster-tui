@@ -27,10 +27,10 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`c66f1ae60235d7d0ce0993f4e9ed89068a12b7d2` and the kit, Hub client, and this
+`3bf8ae81d3e716b196fae8e4a7560dd5fc5c2e69` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
-`b403bb72c1065f633ae59fd876b13024e2ab54a7`. Runnable-entrypoint connection
+`fab44c5de7b28a8756268608662d2b870efb001a`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
@@ -100,7 +100,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`b403bb72c1065f633ae59fd876b13024e2ab54a7`. The protocol source is
+`fab44c5de7b28a8756268608662d2b870efb001a`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -200,7 +200,7 @@ terminal readback, package navigation, resize, and plugin surface render/action.
 A running but incompatible hub is reported as a compatibility mismatch instead
 of being collapsed into the generic unavailable/reconnecting state.
 The cold compatibility floor is daemon protocol version 4 and conformance
-fixture revision 24. Protocol versions 2–3 and fixture revisions 16–23 fail
+fixture revision 25. Protocol versions 2–3 and fixture revisions 16–24 fail
 through the structured compatibility diagnostic; there is no fallback path.
 
 When the Hub delivers a plugin surface, the TUI keeps a stable client-owned
@@ -221,11 +221,12 @@ subscription. Snapshot, upsert, patch, remove, and reconnect baselines affect
 the next frame and hit map directly; the client does not poll or refresh the
 surface, derive lifecycle classes, or keep a second session store. Missing
 references select the authored empty template, while malformed or unsupported
-bindings render a diagnostic instead of masquerading as unavailable. A
-multi-row expansion whose item template carries authored node IDs is also
-rejected visibly until the Hub-owned UI contract can supply distinct
-row-bound IDs; this prevents ambiguous keyboard focus and action dispatch
-instead of inventing client-local identity semantics.
+bindings render a diagnostic instead of masquerading as unavailable. The TUI
+resolves producer-authored item-relative row IDs while each `bind_list` row is
+in context, then gives the renderer distinct literal IDs. Duplicate realized
+IDs that can coexist in one materialized render fail visibly before focus or
+action routing, including collisions between a bound row and a static sibling;
+mutually exclusive responsive alternatives may reuse an ID.
 
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
@@ -288,7 +289,7 @@ There is also an automated isolated-Hub test using
 `botster-hub` and `botster-session-worker` binaries, or resolves those command
 names from `PATH`; it does not discover or build a sibling Hub checkout. It
 starts an isolated daemon, runs the TUI live-runtime path, runs the
-revision-24 session lifecycle/presentation conformance runner and plugin
+revision-25 session lifecycle/presentation conformance runner and plugin
 contract matrix conformance harness, renders the delivered fixture
 surfaces through the TUI renderer, and tears the daemon down. The renderer
 coverage includes the composite application primitive fixture for `metric_grid`,
@@ -313,9 +314,12 @@ command on `PATH` and fails with a setup diagnostic if it is unavailable.
 `CARGO_TARGET_DIR` is optional; omitting it creates and cleans up a fresh
 temporary target. `BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` is required and must
 name a Hub contract-matrix fixture directory containing `botster-package.json`
-and `plugin.lua`; the wrapper fails before building when it is missing or
-invalid. Normal unit tests skip the isolated runtime when the binary variables
-are absent; the wrapper sets `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
+and `plugin.lua`; the parent acceptance run uses the extracted
+`package/fixtures/plugin-contract-matrix` directory from public
+`@trybotster/hub-test-support@0.1.18`. The wrapper fails before building when
+the fixture is missing or invalid. Normal unit tests skip the isolated runtime
+when the binary variables are absent; the wrapper sets
+`BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
 binaries or plugin-surface proof cannot silently pass. The live-Hub test also
 asserts non-default compatibility descriptor values from the isolated daemon
 and exercises a compatibility mismatch through
