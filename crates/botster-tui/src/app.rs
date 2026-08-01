@@ -25,8 +25,8 @@ use botster_hub_client::{
 };
 use botster_ui_contract::{
     PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest,
-    UiActionResult, UiChild, UiCondition, UiConditional, UiFormValues, UiNode, UiNodeId,
-    UiNodeKind, UiWidthClass,
+    UiActionResult, UiAuthoredNodeId, UiChild, UiCondition, UiConditional, UiFormValues, UiNode,
+    UiNodeId, UiNodeKind, UiWidthClass,
 };
 use crossterm::{
     cursor::Show,
@@ -51,7 +51,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 24;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 25;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -215,6 +215,7 @@ struct SessionEntityState {
     subscription_id: Option<String>,
     has_snapshot: bool,
     snapshot_seq: Option<u64>,
+    entity_order: Vec<String>,
     entities: BTreeMap<String, DaemonSessionEntity>,
 }
 
@@ -223,6 +224,7 @@ impl SessionEntityState {
         self.subscription_id = Some(subscription_id);
         self.has_snapshot = false;
         self.snapshot_seq = None;
+        self.entity_order.clear();
         self.entities.clear();
     }
 
@@ -238,6 +240,10 @@ impl SessionEntityState {
                 if !self.matches(&subscription_id, &entity_type) {
                     return Ok(false);
                 }
+                self.entity_order = items
+                    .iter()
+                    .map(|entity| entity.session_uuid.clone())
+                    .collect();
                 self.entities = items
                     .into_iter()
                     .map(|entity| (entity.session_uuid.clone(), entity))
@@ -261,6 +267,9 @@ impl SessionEntityState {
                         "session entity id mismatch: frame={id} entity={}",
                         entity.session_uuid
                     ));
+                }
+                if !self.entities.contains_key(&id) {
+                    self.entity_order.push(id.clone());
                 }
                 self.entities.insert(id, entity);
                 self.snapshot_seq = Some(snapshot_seq);
@@ -304,6 +313,7 @@ impl SessionEntityState {
                     return Ok(false);
                 }
                 self.entities.remove(&id);
+                self.entity_order.retain(|entity_id| entity_id != &id);
                 self.snapshot_seq = Some(snapshot_seq);
                 Ok(true)
             }
@@ -322,9 +332,15 @@ impl SessionEntityState {
                 .is_none_or(|current| snapshot_seq > current)
     }
 
-    fn binding_rows(&self) -> Result<BTreeMap<String, Value>, String> {
-        self.entities
+    fn binding_rows(&self) -> Result<Vec<Value>, String> {
+        let reference = session_binding_reference_row();
+        self.entity_order
             .iter()
+            .filter_map(|session_uuid| {
+                self.entities
+                    .get(session_uuid)
+                    .map(|entity| (session_uuid, entity))
+            })
             .map(|(session_uuid, entity)| {
                 let mut value = serde_json::to_value(entity).map_err(|error| {
                     format!("session entity {session_uuid} failed binding serialization: {error}")
@@ -332,13 +348,31 @@ impl SessionEntityState {
                 let row = value.as_object_mut().ok_or_else(|| {
                     format!("session entity {session_uuid} did not serialize as an object")
                 })?;
-                for field in ["lifecycle", "exit_code", "failure_reason"] {
-                    row.entry(field.to_string()).or_insert(Value::Null);
+                for field in reference.keys() {
+                    row.entry(field.clone()).or_insert(Value::Null);
                 }
-                Ok((session_uuid.clone(), value))
+                Ok(value)
             })
             .collect()
     }
+}
+
+fn session_binding_reference_row() -> serde_json::Map<String, Value> {
+    serde_json::to_value(DaemonSessionEntity {
+        session_uuid: "reference-session".to_string(),
+        registry_state: "running".to_string(),
+        lifecycle: Some("running".to_string()),
+        lifecycle_class: "current".to_string(),
+        rows: 24,
+        cols: 80,
+        updated_at: 1,
+        exit_code: Some(0),
+        failure_reason: Some("reference failure".to_string()),
+    })
+    .expect("exhaustive session binding reference row must serialize")
+    .as_object()
+    .expect("session binding reference row must serialize as an object")
+    .clone()
 }
 
 enum SessionSubscriptionMessage {
@@ -1194,8 +1228,9 @@ impl TuiApp {
             .retain(|session_id, _| !self.session_entities.entities.contains_key(session_id));
         self.sessions = self
             .session_entities
-            .entities
-            .values()
+            .entity_order
+            .iter()
+            .filter_map(|session_id| self.session_entities.entities.get(session_id))
             .map(SessionRow::from_entity)
             .chain(self.pending_sessions.values().cloned())
             .collect();
@@ -2567,7 +2602,7 @@ impl TuiApp {
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut node)| {
-                        node.id = Some(UiNodeId(format!("tui-install-plan-{index}")));
+                        node.id = Some(UiNodeId(format!("tui-install-plan-{index}")).into());
                         child(node)
                     }),
             );
@@ -2578,7 +2613,7 @@ impl TuiApp {
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut node)| {
-                        node.id = Some(UiNodeId(format!("tui-update-status-{index}")));
+                        node.id = Some(UiNodeId(format!("tui-update-status-{index}")).into());
                         child(node)
                     }),
             );
@@ -3380,7 +3415,7 @@ fn wait_for_app_output(app: &mut TuiApp, needle: &str) -> DaemonTransportResult<
 fn node(kind: UiNodeKind, id: &str, props: Value) -> UiNode {
     UiNode {
         kind,
-        id: Some(UiNodeId(id.to_string())),
+        id: Some(UiNodeId(id.to_string()).into()),
         props: props.as_object().cloned().unwrap_or_default(),
         children: Vec::new(),
         slots: BTreeMap::new(),
@@ -3984,15 +4019,19 @@ fn materialize_plugin_surface(
     root: &UiNode,
     session_entities: &SessionEntityState,
 ) -> Result<UiNode, String> {
-    if !node_requires_binding_materialization(root) {
-        return Ok(root.clone());
-    }
-    let rows = session_entities.binding_rows()?;
-    materialize_binding_node(root, &rows, None)
+    let materialized = if node_requires_binding_materialization(root) {
+        let rows = session_entities.binding_rows()?;
+        materialize_binding_node(root, &rows, None, false)?
+    } else {
+        root.clone()
+    };
+    reject_duplicate_realized_node_ids(&materialized)?;
+    Ok(materialized)
 }
 
 fn node_requires_binding_materialization(node: &UiNode) -> bool {
-    node.props.values().any(value_contains_binding)
+    matches!(node.id, Some(UiAuthoredNodeId::Bind(_)))
+        || node.props.values().any(value_contains_binding)
         || node
             .children
             .iter()
@@ -4027,10 +4066,31 @@ fn value_contains_binding(value: &Value) -> bool {
 
 fn materialize_binding_node(
     source: &UiNode,
-    session_rows: &BTreeMap<String, Value>,
+    session_rows: &[Value],
     item: Option<&Value>,
+    bound_id_allowed: bool,
 ) -> Result<UiNode, String> {
     let mut node = source.clone();
+    node.id = match source.id.as_ref() {
+        None => None,
+        Some(UiAuthoredNodeId::Literal(id)) => Some(UiAuthoredNodeId::Literal(id.clone())),
+        Some(UiAuthoredNodeId::Bind(binding)) => {
+            if !bound_id_allowed {
+                return Err(
+                    "bound node id is only supported on a direct BindList item template root"
+                        .to_string(),
+                );
+            }
+            let value = resolve_item_binding(&binding.path, item)?;
+            let id = value
+                .as_str()
+                .ok_or_else(|| "bound node id did not resolve to a string".to_string())?;
+            if id.trim().is_empty() {
+                return Err("bound node id resolved to a blank string".to_string());
+            }
+            Some(UiAuthoredNodeId::Literal(UiNodeId(id.to_string())))
+        }
+    };
     for value in node.props.values_mut() {
         *value = materialize_binding_value(value, item)?;
     }
@@ -4048,32 +4108,32 @@ fn materialize_binding_node(
 
 fn materialize_binding_children(
     children: &[UiChild],
-    session_rows: &BTreeMap<String, Value>,
+    session_rows: &[Value],
     item: Option<&Value>,
 ) -> Result<Vec<UiChild>, String> {
     let mut materialized = Vec::new();
     for child in children {
         match child {
             UiChild::Node(node) => materialized.push(UiChild::Node(Box::new(
-                materialize_binding_node(node, session_rows, item)?,
+                materialize_binding_node(node, session_rows, item, false)?,
             ))),
             UiChild::Conditional(UiConditional::When { condition, node }) => {
                 materialized.push(UiChild::Conditional(UiConditional::When {
                     condition: condition.clone(),
-                    node: Box::new(materialize_binding_node(node, session_rows, item)?),
+                    node: Box::new(materialize_binding_node(node, session_rows, item, false)?),
                 }));
             }
             UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
                 materialized.push(UiChild::Conditional(UiConditional::Hidden {
                     condition: condition.clone(),
-                    node: Box::new(materialize_binding_node(node, session_rows, item)?),
+                    node: Box::new(materialize_binding_node(node, session_rows, item, false)?),
                 }));
             }
             UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { predicate, node }) => {
                 materialized.push(UiChild::BindIf(
                     botster_ui_contract::UiBindIf::PresentationIf {
                         predicate: predicate.clone(),
-                        node: Box::new(materialize_binding_node(node, session_rows, item)?),
+                        node: Box::new(materialize_binding_node(node, session_rows, item, false)?),
                     },
                 ));
             }
@@ -4084,6 +4144,7 @@ fn materialize_binding_children(
                         node,
                         session_rows,
                         item,
+                        false,
                     )?)));
                 }
             }
@@ -4096,15 +4157,16 @@ fn materialize_binding_children(
                 if source != "/session" {
                     return Err(format!("unsupported binding source {source:?}"));
                 }
+                let reference = session_binding_reference_row();
                 for field in r#where.keys() {
-                    if !SESSION_BINDING_FIELDS.contains(&field.as_str()) {
+                    if !reference.contains_key(field) {
                         return Err(format!(
                             "unsupported /session where field {field:?}; the entity was not treated as unavailable"
                         ));
                     }
                 }
                 let matching = session_rows
-                    .values()
+                    .iter()
                     .filter(|row| {
                         r#where
                             .iter()
@@ -4117,20 +4179,16 @@ fn materialize_binding_children(
                             empty_template,
                             session_rows,
                             None,
+                            false,
                         )?)));
                     }
                 } else {
-                    if matching.len() > 1 && node_tree_has_id(item_template) {
-                        return Err(
-                            "multi-row /session binding requires canonical row-bound node ids; expansion was rejected to prevent ambiguous focus and action dispatch"
-                                .to_string(),
-                        );
-                    }
                     for row in matching {
                         materialized.push(UiChild::Node(Box::new(materialize_binding_node(
                             item_template,
                             session_rows,
                             Some(row),
+                            true,
                         )?)));
                     }
                 }
@@ -4140,45 +4198,125 @@ fn materialize_binding_children(
     Ok(materialized)
 }
 
-const SESSION_BINDING_FIELDS: &[&str] = &[
-    "session_uuid",
-    "registry_state",
-    "lifecycle",
-    "lifecycle_class",
-    "rows",
-    "cols",
-    "updated_at",
-    "exit_code",
-    "failure_reason",
-];
-
-fn node_tree_has_id(node: &UiNode) -> bool {
-    node.id.is_some()
-        || node
-            .children
-            .iter()
-            .chain(node.slots.values().flatten())
-            .any(child_tree_has_id)
+fn reject_duplicate_realized_node_ids(root: &UiNode) -> Result<(), String> {
+    collect_realized_node_ids(root).map(|_| ())
 }
 
-fn child_tree_has_id(child: &UiChild) -> bool {
+enum RealizedChildCondition {
+    When(UiCondition),
+    Hidden(UiCondition),
+}
+
+fn collect_realized_node_ids(node: &UiNode) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut realized = std::collections::BTreeSet::new();
+    if let Some(UiAuthoredNodeId::Literal(id)) = &node.id {
+        realized.insert(id.0.clone());
+    }
+
+    let mut children = Vec::new();
+    for child in node.children.iter().chain(node.slots.values().flatten()) {
+        let (ids, condition) = collect_realized_child_ids(child)?;
+        reject_realized_node_id_overlap(&realized, &ids)?;
+        children.push((ids, condition));
+    }
+    for (index, (left_ids, left_condition)) in children.iter().enumerate() {
+        for (right_ids, right_condition) in children.iter().skip(index + 1) {
+            if !realized_children_are_exclusive(left_condition, right_condition) {
+                reject_realized_node_id_overlap(left_ids, right_ids)?;
+            }
+        }
+    }
+    for (ids, _) in children {
+        realized.extend(ids);
+    }
+    Ok(realized)
+}
+
+fn collect_realized_child_ids(
+    child: &UiChild,
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        Option<RealizedChildCondition>,
+    ),
+    String,
+> {
     match child {
         UiChild::Node(node)
-        | UiChild::Conditional(UiConditional::When { node, .. })
-        | UiChild::Conditional(UiConditional::Hidden { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
-            node_tree_has_id(node)
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. }) => {
+            collect_realized_node_ids(node).map(|ids| (ids, None))
+        }
+        UiChild::Conditional(UiConditional::When { condition, node }) => {
+            collect_realized_node_ids(node)
+                .map(|ids| (ids, Some(RealizedChildCondition::When(condition.clone()))))
+        }
+        UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
+            collect_realized_node_ids(node)
+                .map(|ids| (ids, Some(RealizedChildCondition::Hidden(condition.clone()))))
+        }
+        UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+            collect_realized_node_ids(node).map(|ids| (ids, None))
         }
         UiChild::BindList(botster_ui_contract::UiBindList::BindList {
             item_template,
             empty_template,
             ..
         }) => {
-            node_tree_has_id(item_template)
-                || empty_template.as_deref().is_some_and(node_tree_has_id)
+            let mut ids = collect_realized_node_ids(item_template)?;
+            if let Some(empty_template) = empty_template {
+                ids.extend(collect_realized_node_ids(empty_template)?);
+            }
+            Ok((ids, None))
         }
     }
+}
+
+fn realized_children_are_exclusive(
+    left: &Option<RealizedChildCondition>,
+    right: &Option<RealizedChildCondition>,
+) -> bool {
+    match (left, right) {
+        (Some(RealizedChildCondition::When(left)), Some(RealizedChildCondition::When(right))) => {
+            conditions_are_distinct_on_one_axis(left, right)
+        }
+        (Some(RealizedChildCondition::When(left)), Some(RealizedChildCondition::Hidden(right)))
+        | (Some(RealizedChildCondition::Hidden(left)), Some(RealizedChildCondition::When(right))) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
+fn conditions_are_distinct_on_one_axis(left: &UiCondition, right: &UiCondition) -> bool {
+    condition_axis_count(left) == 1
+        && condition_axis_count(right) == 1
+        && ((left.width.is_some() && right.width.is_some() && left.width != right.width)
+            || (left.height.is_some() && right.height.is_some() && left.height != right.height)
+            || (left.pointer.is_some() && right.pointer.is_some() && left.pointer != right.pointer)
+            || (left.orientation.is_some()
+                && right.orientation.is_some()
+                && left.orientation != right.orientation)
+            || (left.keyboard_occluded.is_some()
+                && right.keyboard_occluded.is_some()
+                && left.keyboard_occluded != right.keyboard_occluded))
+}
+
+fn condition_axis_count(condition: &UiCondition) -> usize {
+    usize::from(condition.width.is_some())
+        + usize::from(condition.height.is_some())
+        + usize::from(condition.pointer.is_some())
+        + usize::from(condition.orientation.is_some())
+        + usize::from(condition.keyboard_occluded.is_some())
+}
+
+fn reject_realized_node_id_overlap(
+    left: &std::collections::BTreeSet<String>,
+    right: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    if let Some(id) = left.intersection(right).next() {
+        return Err(format!("duplicate materialized node id {id:?}"));
+    }
+    Ok(())
 }
 
 fn materialize_binding_value(value: &Value, item: Option<&Value>) -> Result<Value, String> {
@@ -4367,6 +4505,7 @@ fn apply_plugin_result_errors(root_node: &mut UiNode, result: &UiActionResult) {
     let field_error = root_node
         .id
         .as_ref()
+        .and_then(UiAuthoredNodeId::as_literal)
         .and_then(|id| result.field_errors.get(&id.0))
         .or_else(|| {
             root_node
@@ -4384,6 +4523,7 @@ fn apply_plugin_result_errors(root_node: &mut UiNode, result: &UiActionResult) {
         let form_id = root_node
             .id
             .as_ref()
+            .and_then(UiAuthoredNodeId::as_literal)
             .map_or("plugin-form", |id| id.0.as_str());
         root_node.children.insert(
             0,
@@ -4739,7 +4879,12 @@ mod tests {
     }
 
     fn find_ui_node_by_id<'a>(root: &'a UiNode, node_id: &str) -> Option<&'a UiNode> {
-        if root.id.as_ref().is_some_and(|id| id.0 == node_id) {
+        if root
+            .id
+            .as_ref()
+            .and_then(UiAuthoredNodeId::as_literal)
+            .is_some_and(|id| id.0 == node_id)
+        {
             return Some(root);
         }
         root.children
@@ -5181,7 +5326,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_4_revision_24_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_4_revision_25_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
@@ -5189,7 +5334,7 @@ mod tests {
             MINIMUM_CONFORMANCE_FIXTURE_REVISION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 4);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 24);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 25);
         assert!(
             requirement
                 .required_features
@@ -5203,13 +5348,13 @@ mod tests {
                 .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
         );
 
-        for revision in 16..24 {
+        for revision in 16..25 {
             let mut older_hub = DaemonCompatibility::current();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-presentation fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 24"));
+            assert!(error.diagnostic.contains("requires at least 25"));
         }
         for protocol_version in 2..4 {
             let mut older_hub = DaemonCompatibility::current();
@@ -5224,7 +5369,11 @@ mod tests {
             assert!(error.diagnostic.contains("requires at least 4"));
         }
         botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 4 fixture revision 24 hub should connect");
+            .expect("protocol 4 fixture revision 25 hub should connect");
+        let mut future_hub = DaemonCompatibility::current();
+        future_hub.conformance_fixture_revision = 26;
+        botster_hub_client::ensure_compatible(&requirement, &future_hub)
+            .expect("runtime compatibility must preserve minimum semantics for revision 26");
     }
 
     #[test]
@@ -5309,6 +5458,7 @@ mod tests {
         app: &TuiApp,
         expected: &BTreeMap<String, String>,
         references: &[String],
+        expected_rows: &[botster_hub_test_support::SessionPluginMaterializedRow],
     ) {
         let root = materialize_plugin_surface(
             &app.plugin_surface.as_ref().expect("active surface").body,
@@ -5316,6 +5466,9 @@ mod tests {
         )
         .expect("canonical session bindings materialize");
         assert_eq!(session_binding_values(&root, references), *expected);
+        let mut actual_rows = Vec::new();
+        collect_session_action_rows(&root, &mut actual_rows);
+        assert_eq!(actual_rows, expected_rows);
 
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 60);
         let rendered = lines.join("\n");
@@ -5343,10 +5496,173 @@ mod tests {
         }
     }
 
+    fn collect_session_action_rows(
+        node: &UiNode,
+        rows: &mut Vec<botster_hub_test_support::SessionPluginMaterializedRow>,
+    ) {
+        if let Some(id) = node.id.as_ref().and_then(UiAuthoredNodeId::as_literal)
+            && node
+                .props
+                .get("action")
+                .and_then(|action| action.get("id"))
+                .and_then(Value::as_str)
+                == Some("contract.action")
+        {
+            rows.push(botster_hub_test_support::SessionPluginMaterializedRow {
+                node_id: id.0.clone(),
+                action_payload: node_action(node)
+                    .payload
+                    .expect("canonical row action has a payload"),
+            });
+        }
+        for child in node
+            .children
+            .iter()
+            .chain(node.slots.values().flatten())
+            .filter_map(static_child_node)
+        {
+            collect_session_action_rows(child, rows);
+        }
+    }
+
+    fn assert_multi_row_keyboard_and_mouse_dispatch(
+        app: &mut TuiApp,
+        expected_rows: &[botster_hub_test_support::SessionPluginMaterializedRow],
+    ) {
+        assert!(
+            expected_rows.len() >= 2,
+            "published oracle must remain multi-row"
+        );
+        let target = &expected_rows[1];
+        let mut router =
+            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
+        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            180,
+            60,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        router.reconcile(&hit_map);
+        let region_rects = expected_rows
+            .iter()
+            .map(|row| {
+                hit_map
+                    .regions()
+                    .iter()
+                    .find(|region| region.node_id == row.node_id)
+                    .map(|region| {
+                        (
+                            region.rect.x,
+                            region.rect.y,
+                            region.rect.width,
+                            region.rect.height,
+                        )
+                    })
+                    .expect("each producer row has a distinct production hit region")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(region_rects.len(), expected_rows.len());
+
+        let mut focused = std::collections::BTreeSet::new();
+        for _ in 0..=(2 * hit_map.regions().len() + 1) {
+            if let InputDispatch::Focus { node_id } = router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &hit_map,
+            ) {
+                focused.insert(node_id);
+            }
+            if expected_rows
+                .iter()
+                .all(|row| focused.contains(&row.node_id))
+            {
+                break;
+            }
+        }
+        for row in expected_rows {
+            assert!(
+                focused.contains(&row.node_id),
+                "Tab traversal did not reach {}",
+                row.node_id
+            );
+        }
+        for _ in 0..=hit_map.regions().len() {
+            if router.focused_node_id() == Some(target.node_id.as_str()) {
+                break;
+            }
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &hit_map,
+            );
+        }
+        assert_eq!(router.focused_node_id(), Some(target.node_id.as_str()));
+
+        let mut keyboard_request = None;
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let dispatch = router.dispatch_event(
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                &hit_map,
+            );
+            let InputDispatch::Action(request) = &dispatch else {
+                panic!("focused row must dispatch for {code:?}, got {dispatch:?}");
+            };
+            assert_eq!(request.node_id, Some(UiNodeId(target.node_id.clone())));
+            assert_eq!(request.payload.as_ref(), Some(&target.action_payload));
+            keyboard_request.get_or_insert_with(|| request.clone());
+        }
+
+        let mut mouse_router =
+            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
+        let (_lines, mouse_hits) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            180,
+            60,
+            &mouse_router.render_state(),
+            &app.plugin_presentation,
+        );
+        let region = mouse_hits
+            .regions()
+            .iter()
+            .find(|region| region.node_id == target.node_id)
+            .expect("target row remains in the production hit map");
+        let down = mouse_router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                region.rect.x,
+                region.rect.y,
+            ),
+            &mouse_hits,
+        );
+        assert!(matches!(down, InputDispatch::Focus { .. }));
+        let up = mouse_router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                region.rect.x,
+                region.rect.y,
+            ),
+            &mouse_hits,
+        );
+        let InputDispatch::Action(request) = &up else {
+            panic!("target row mouse release must dispatch, got {up:?}");
+        };
+        assert_eq!(request.node_id, Some(UiNodeId(target.node_id.clone())));
+        assert_eq!(request.payload.as_ref(), Some(&target.action_payload));
+        app.observed_requests.clear();
+        app.handle_dispatch(InputDispatch::Action(
+            keyboard_request.expect("Enter produced a typed request"),
+        ));
+        assert!(app.observed_requests.iter().any(|observed| matches!(
+            observed,
+            ObservedRequest::PluginSurfaceAction { request, .. }
+                if request.node_id == Some(UiNodeId(target.node_id.clone()))
+                    && request.payload.as_ref() == Some(&target.action_payload)
+        )));
+    }
+
     #[test]
     fn canonical_session_bindings_follow_published_oracle_through_frames_and_reconnect() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
-        assert_eq!(scenario.conformance_fixture_revision, 24);
+        assert_eq!(scenario.conformance_fixture_revision, 25);
         let body =
             serde_json::from_value(scenario.surface.clone()).expect("published surface is typed");
         let mut app = TuiApp::new(None);
@@ -5370,7 +5686,39 @@ mod tests {
                 .apply(scenario.initial_snapshot.clone())
                 .expect("initial snapshot applies")
         );
-        assert_session_binding_frame(&app, &scenario.expected.initial, &scenario.references);
+        let initial_frames = vec![scenario.initial_snapshot.clone()];
+        let initial_rows = botster_hub_test_support::materialize_session_plugin_rows(
+            &scenario.surface,
+            &initial_frames,
+        )
+        .expect("producer initial rows materialize");
+        assert_eq!(
+            initial_rows
+                .iter()
+                .map(|row| row.node_id.clone())
+                .collect::<Vec<_>>(),
+            scenario.row_expected.initial
+        );
+        assert_session_binding_frame(
+            &app,
+            &scenario.expected.initial,
+            &scenario.references,
+            &initial_rows,
+        );
+        assert_multi_row_keyboard_and_mouse_dispatch(&mut app, &initial_rows);
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.sessions",
+            serde_json::from_value(scenario.surface.clone())
+                .expect("published surface remains typed"),
+        )));
+        app.session_entities
+            .begin_generation(generation_one.clone());
+        assert!(
+            app.session_entities
+                .apply(scenario.initial_snapshot.clone())
+                .expect("initial snapshot reapplies after action seam proof")
+        );
 
         let missing_uuid = scenario
             .references
@@ -5414,17 +5762,114 @@ mod tests {
         app.session_entities
             .apply(scenario.initial_snapshot.clone())
             .expect("initial snapshot reapplies");
-        for (frame, expected) in scenario.transition_frames.iter().zip([
-            &scenario.expected.after_ended_patch,
-            &scenario.expected.after_indeterminate_patch,
-            &scenario.expected.after_remove,
-        ]) {
+        let removed_row = initial_rows.first().expect("initial row removed by patch");
+        let mut removal_router =
+            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
+        let (_lines, initial_removal_hits) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            180,
+            60,
+            &removal_router.render_state(),
+            &app.plugin_presentation,
+        );
+        removal_router.reconcile(&initial_removal_hits);
+        for _ in 0..=initial_removal_hits.regions().len() {
+            if removal_router.focused_node_id() == Some(removed_row.node_id.as_str()) {
+                break;
+            }
+            removal_router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &initial_removal_hits,
+            );
+        }
+        assert_eq!(
+            removal_router.focused_node_id(),
+            Some(removed_row.node_id.as_str())
+        );
+        let transition_expectations = [
+            (
+                &scenario.expected.after_ended_patch,
+                &scenario.row_expected.after_ended_patch,
+            ),
+            (
+                &scenario.expected.after_indeterminate_patch,
+                &scenario.row_expected.after_indeterminate_patch,
+            ),
+            (
+                &scenario.expected.after_remove,
+                &scenario.row_expected.after_remove,
+            ),
+        ];
+        let mut stage_frames = vec![scenario.initial_snapshot.clone()];
+        for (stage, (frame, (expected, row_expected))) in scenario
+            .transition_frames
+            .iter()
+            .zip(transition_expectations)
+            .enumerate()
+        {
             assert!(
                 app.session_entities
                     .apply(frame.clone())
                     .expect("transition frame applies")
             );
-            assert_session_binding_frame(&app, expected, &scenario.references);
+            stage_frames.push(frame.clone());
+            let expected_rows = botster_hub_test_support::materialize_session_plugin_rows(
+                &scenario.surface,
+                &stage_frames,
+            )
+            .expect("producer transition rows materialize");
+            assert_eq!(
+                expected_rows
+                    .iter()
+                    .map(|row| row.node_id.clone())
+                    .collect::<Vec<_>>(),
+                *row_expected
+            );
+            assert_session_binding_frame(&app, expected, &scenario.references, &expected_rows);
+            if stage == 0 {
+                let surviving_row = expected_rows
+                    .first()
+                    .expect("ended patch preserves one canonical row");
+                let (_lines, removed_hits) = renderer::render_to_lines_with_presentation_state(
+                    &app.surface(),
+                    180,
+                    60,
+                    &removal_router.render_state(),
+                    &app.plugin_presentation,
+                );
+                assert!(
+                    !removed_hits
+                        .regions()
+                        .iter()
+                        .any(|region| region.node_id == removed_row.node_id)
+                );
+                removal_router.reconcile(&removed_hits);
+                assert_ne!(
+                    removal_router.focused_node_id(),
+                    Some(removed_row.node_id.as_str())
+                );
+                for _ in 0..=removed_hits.regions().len() {
+                    if removal_router.focused_node_id() == Some(surviving_row.node_id.as_str()) {
+                        break;
+                    }
+                    removal_router.dispatch_event(
+                        Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                        &removed_hits,
+                    );
+                }
+                let dispatch = removal_router.dispatch_event(
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    &removed_hits,
+                );
+                let InputDispatch::Action(request) = dispatch else {
+                    panic!("surviving row must dispatch after reconcile")
+                };
+                assert_eq!(
+                    request.node_id,
+                    Some(UiNodeId(surviving_row.node_id.clone()))
+                );
+                assert_eq!(request.payload, Some(surviving_row.action_payload.clone()));
+            }
         }
 
         let generation_two = match &scenario.reconnect_snapshot {
@@ -5444,10 +5889,24 @@ mod tests {
                 .apply(scenario.reconnect_snapshot.clone())
                 .expect("fresh reconnect snapshot applies")
         );
+        let reconnect_frames = vec![scenario.reconnect_snapshot.clone()];
+        let reconnect_rows = botster_hub_test_support::materialize_session_plugin_rows(
+            &scenario.surface,
+            &reconnect_frames,
+        )
+        .expect("producer reconnect rows materialize");
+        assert_eq!(
+            reconnect_rows
+                .iter()
+                .map(|row| row.node_id.clone())
+                .collect::<Vec<_>>(),
+            scenario.row_expected.after_reconnect
+        );
         assert_session_binding_frame(
             &app,
             &scenario.expected.after_reconnect,
             &scenario.references,
+            &reconnect_rows,
         );
     }
 
@@ -5668,7 +6127,8 @@ mod tests {
             .binding_rows()
             .expect("binding rows serialize");
         let row = rows
-            .get("session-indeterminate")
+            .iter()
+            .find(|row| row.get("session_uuid") == Some(&json!("session-indeterminate")))
             .expect("session binding row");
         for field in ["lifecycle", "exit_code", "failure_reason"] {
             assert_eq!(row.get(field), Some(&Value::Null), "{field}");
@@ -5691,7 +6151,141 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_multi_row_identity_and_unknown_where_fields_fail_visibly() {
+    fn duplicate_ids_in_responsive_alternatives_are_render_scoped() {
+        let action = |id: &str| {
+            node(
+                UiNodeKind::Button,
+                id,
+                json!({
+                    "label": "Responsive action",
+                    "action": { "id": "contract.responsive" }
+                }),
+            )
+        };
+        let mut body = node(
+            UiNodeKind::Panel,
+            "responsive-panel",
+            json!({ "title": "Responsive alternatives" }),
+        );
+        body.children = vec![
+            responsive_child(UiWidthClass::Expanded, action("responsive-action")),
+            responsive_child(UiWidthClass::Compact, action("responsive-action")),
+        ];
+        materialize_plugin_surface(&body, &SessionEntityState::default())
+            .expect("mutually exclusive render alternatives may reuse one node id");
+
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.responsive",
+            body,
+        )));
+        for width in [40, 180] {
+            let (lines, hit_map) = renderer::render_to_lines(&app.surface(), width, 40);
+            let rendered = lines.join("\n");
+            assert!(!rendered.contains("plugin surface binding:"), "{rendered}");
+            assert_eq!(
+                hit_map
+                    .regions()
+                    .iter()
+                    .filter(|region| region.node_id == "responsive-action")
+                    .count(),
+                1
+            );
+        }
+
+        let mut complementary = node(
+            UiNodeKind::Panel,
+            "complementary-panel",
+            json!({ "title": "Complementary conditions" }),
+        );
+        complementary.children = vec![
+            responsive_child(UiWidthClass::Expanded, action("complementary-action")),
+            UiChild::Conditional(UiConditional::Hidden {
+                condition: UiCondition {
+                    width: Some(UiWidthClass::Expanded),
+                    ..UiCondition::default()
+                },
+                node: Box::new(action("complementary-action")),
+            }),
+        ];
+        materialize_plugin_surface(&complementary, &SessionEntityState::default())
+            .expect("When and Hidden with the same condition cannot coexist");
+
+        let assert_collision =
+            |app: &mut TuiApp, surface_id: &str, node_id: &str, children: Vec<UiChild>| {
+                let mut overlapping = node(
+                    UiNodeKind::Panel,
+                    &format!("{node_id}-panel"),
+                    json!({ "title": "Overlapping conditions" }),
+                );
+                overlapping.children = children;
+                let diagnostic = format!("duplicate materialized node id {node_id:?}");
+                assert_eq!(
+                    materialize_plugin_surface(&overlapping, &SessionEntityState::default())
+                        .unwrap_err(),
+                    diagnostic
+                );
+                app.apply_response(plugin_surface_response(canonical_surface(
+                    "botster.plugin-contract-matrix",
+                    surface_id,
+                    overlapping,
+                )));
+                let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 40);
+                let rendered = lines.join("\n");
+                assert!(rendered.contains(&diagnostic), "{rendered}");
+                assert!(
+                    !hit_map
+                        .regions()
+                        .iter()
+                        .any(|region| region.node_id == node_id),
+                    "overlapping conditionals must fail before ambiguous regions reach routing"
+                );
+            };
+        assert_collision(
+            &mut app,
+            "contract.overlapping-hidden",
+            "overlapping-hidden-action",
+            vec![
+                responsive_child(UiWidthClass::Expanded, action("overlapping-hidden-action")),
+                UiChild::Conditional(UiConditional::Hidden {
+                    condition: UiCondition {
+                        width: Some(UiWidthClass::Compact),
+                        ..UiCondition::default()
+                    },
+                    node: Box::new(action("overlapping-hidden-action")),
+                }),
+            ],
+        );
+        assert_collision(
+            &mut app,
+            "contract.identical-when",
+            "identical-when-action",
+            vec![
+                responsive_child(UiWidthClass::Expanded, action("identical-when-action")),
+                responsive_child(UiWidthClass::Expanded, action("identical-when-action")),
+            ],
+        );
+        assert_collision(
+            &mut app,
+            "contract.cross-axis-when",
+            "cross-axis-when-action",
+            vec![
+                responsive_child(UiWidthClass::Expanded, action("cross-axis-when-action")),
+                UiChild::Conditional(UiConditional::When {
+                    condition: UiCondition {
+                        height: Some(botster_ui_contract::UiHeightClass::Tall),
+                        ..UiCondition::default()
+                    },
+                    node: Box::new(action("cross-axis-when-action")),
+                }),
+            ],
+        );
+    }
+
+    #[test]
+    fn duplicate_multi_row_identity_and_unknown_where_fields_fail_visibly() {
         let multi_row = ui_node(json!({
             "type": "panel",
             "id": "multi-row-panel",
@@ -5738,7 +6332,7 @@ mod tests {
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("requires canonical row-bound node ids"),
+            rendered.contains("duplicate materialized node id \"multi-row-action\""),
             "{rendered}"
         );
         assert!(
@@ -5747,6 +6341,53 @@ mod tests {
                 .iter()
                 .any(|region| region.node_id == "multi-row-action"),
             "ambiguous actions must not reach input routing"
+        );
+
+        let static_sibling_collision = ui_node(json!({
+            "type": "panel",
+            "id": "static-sibling-panel",
+            "props": { "title": "Static sibling collision" },
+            "children": [
+                {
+                    "type": "button",
+                    "id": "session-alpha",
+                    "props": {
+                        "label": "Static sibling",
+                        "action": { "id": "contract.static" }
+                    }
+                },
+                {
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "where": { "session_uuid": "session-alpha" },
+                    "item_template": {
+                        "type": "button",
+                        "id": { "$bind": "@/session_uuid" },
+                        "props": {
+                            "label": "Bound row",
+                            "action": { "id": "contract.bound" }
+                        }
+                    }
+                }
+            ]
+        }));
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.static-sibling-collision",
+            static_sibling_collision,
+        )));
+        let (lines, collision_hits) = renderer::render_to_lines(&app.surface(), 120, 40);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("duplicate materialized node id \"session-alpha\""),
+            "{rendered}"
+        );
+        assert!(
+            !collision_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "session-alpha"),
+            "a row-vs-static collision must fail before either action reaches routing"
         );
 
         let unknown_where = ui_node(json!({
@@ -5862,6 +6503,83 @@ mod tests {
     }
 
     #[test]
+    fn invalid_bound_row_ids_fail_before_renderer_state() {
+        let mut state = SessionEntityState::default();
+        state.begin_generation("invalid-bound-id-generation".to_string());
+        state
+            .apply(snapshot_frame(
+                "invalid-bound-id-generation",
+                1,
+                vec![session_entity("session-alpha", Some("running"))],
+            ))
+            .expect("snapshot applies");
+
+        for (path, expected) in [
+            ("@/rows", "bound node id did not resolve to a string"),
+            (
+                "@/does_not_exist",
+                "binding path \"@/does_not_exist\" is missing from the current session row",
+            ),
+            (
+                "/session/session-alpha",
+                "unsupported absolute binding path",
+            ),
+        ] {
+            let root = ui_node(json!({
+                "type": "panel",
+                "id": "invalid-bound-id-panel",
+                "children": [{
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "where": { "session_uuid": "session-alpha" },
+                    "item_template": {
+                        "type": "button",
+                        "id": { "$bind": path },
+                        "props": {
+                            "label": "Invalid bound id",
+                            "action": { "id": "contract.invalid" }
+                        }
+                    }
+                }]
+            }));
+            let error = materialize_plugin_surface(&root, &state)
+                .expect_err("invalid bound identity must not materialize");
+            assert!(error.contains(expected), "{path}: {error}");
+        }
+
+        let mut blank_state = SessionEntityState::default();
+        blank_state.begin_generation("blank-bound-id-generation".to_string());
+        blank_state
+            .apply(snapshot_frame(
+                "blank-bound-id-generation",
+                1,
+                vec![session_entity(" ", Some("running"))],
+            ))
+            .expect("blank-id snapshot applies");
+        let blank = ui_node(json!({
+            "type": "panel",
+            "id": "blank-bound-id-panel",
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "registry_state": "active" },
+                "item_template": {
+                    "type": "button",
+                    "id": { "$bind": "@/session_uuid" },
+                    "props": {
+                        "label": "Blank bound id",
+                        "action": { "id": "contract.blank" }
+                    }
+                }
+            }]
+        }));
+        assert_eq!(
+            materialize_plugin_surface(&blank, &blank_state).unwrap_err(),
+            "bound node id resolved to a blank string"
+        );
+    }
+
+    #[test]
     fn session_reducer_requires_snapshot_and_strictly_advancing_active_generation() {
         let mut state = SessionEntityState::default();
         state.begin_generation("generation-2".to_string());
@@ -5887,6 +6605,31 @@ mod tests {
             !state
                 .apply(snapshot_frame("generation-1", 99, Vec::new()))
                 .expect("prior generation ignored")
+        );
+    }
+
+    #[test]
+    fn session_navigator_preserves_authoritative_snapshot_order() {
+        let mut app = TuiApp::new(None);
+        app.session_entities
+            .begin_generation("ordered-generation".to_string());
+        app.session_entities
+            .apply(snapshot_frame(
+                "ordered-generation",
+                1,
+                vec![
+                    session_entity("session-zeta", Some("running")),
+                    session_entity("session-alpha", Some("running")),
+                ],
+            ))
+            .expect("out-of-lexicographic-order snapshot applies");
+        app.rebuild_session_rows();
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-zeta", "session-alpha"]
         );
     }
 
@@ -6445,7 +7188,7 @@ mod tests {
         assert!(app.plugin_action_result.is_none());
         assert!(app.observed_requests.is_empty());
         assert!(app.system_details_visible);
-        assert!(app.surface().id == Some(UiNodeId("workspace-root".to_string())));
+        assert!(app.surface().id == Some(UiNodeId("workspace-root".to_string()).into()));
     }
 
     #[test]
@@ -6563,7 +7306,7 @@ mod tests {
         let surface = app.plugin_surface.as_ref().expect("owner retained");
         assert_eq!(
             surface.body.id,
-            Some(UiNodeId("contract-action-replacement".to_string()))
+            Some(UiNodeId("contract-action-replacement".to_string()).into())
         );
         assert!(
             surface.ui_tree_snapshot.is_none(),
@@ -10075,6 +10818,7 @@ mod tests {
         let submit_node_id = submit_node
             .id
             .as_ref()
+            .and_then(UiAuthoredNodeId::as_literal)
             .expect("action-bearing form has an id")
             .clone();
         let success_request = UiActionRequest {
@@ -10120,6 +10864,7 @@ mod tests {
                 .body
                 .id
                 .as_ref()
+                .and_then(UiAuthoredNodeId::as_literal)
                 .map(|id| id.0.as_str()),
             Some(report.action_success_replacement_node_id.as_str())
         );
@@ -10168,7 +10913,14 @@ mod tests {
         };
         assert_eq!(open_request.surface_id.0, app_surface.surface_id);
         assert_eq!(open_request.action_id.0, report.open_action_id);
-        assert_eq!(open_request.node_id, open_node.id);
+        assert_eq!(
+            open_request.node_id,
+            open_node
+                .id
+                .as_ref()
+                .and_then(UiAuthoredNodeId::as_literal)
+                .cloned()
+        );
         assert_eq!(open_request.kind, UiActionKind::Submit);
         assert!(
             open_request
