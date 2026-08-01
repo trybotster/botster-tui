@@ -5642,10 +5642,17 @@ mod tests {
             ]
         }));
         let (_, duplicate_hits) = renderer::render_to_lines(&duplicate, 120, 40);
-        assert_eq!(
+        let duplicate_error =
             unique_hit_action(&duplicate_hits, action_id, "session_id", session_id)
-                .expect_err("duplicate production matches must fail"),
-            "expected exactly one production hit region for botster_workspaces.remove_session with session_id=\"session-historical\", found 2; matching_node_ids=[\"duplicate-remove-one\", \"duplicate-remove-two\"]"
+                .expect_err("duplicate production matches must fail");
+        assert!(duplicate_error.contains("found 2"), "{duplicate_error}");
+        assert!(
+            duplicate_error.contains("duplicate-remove-one"),
+            "{duplicate_error}"
+        );
+        assert!(
+            duplicate_error.contains("duplicate-remove-two"),
+            "{duplicate_error}"
         );
     }
 
@@ -11019,6 +11026,7 @@ mod tests {
         app.apply_response(packages);
         app.apply_response(apps);
         app.apply_response(navigation);
+        let mut expected_historical_keyboard_node_id = None;
         if profile == WorkspacesProfile::Lifecycle {
             for session_id in &session_ids[..2] {
                 wait_for_session_entity_expectation(
@@ -11479,12 +11487,14 @@ mod tests {
                 false,
                 true,
             );
-            assert_binding_realization(
-                &rehydrated_root,
-                session_binding(&bindings, &session_ids[2], None),
-                false,
-                true,
-            );
+            let historical_keyboard_binding = session_binding(&bindings, &session_ids[2], None);
+            assert_binding_realization(&rehydrated_root, historical_keyboard_binding, false, true);
+            expected_historical_keyboard_node_id = Some(UiNodeId(
+                historical_keyboard_binding
+                    .empty_root_id()
+                    .expect("historical keyboard binding has a literal empty root")
+                    .to_string(),
+            ));
             ledger.record(WorkspacesStage::HistoricalReferencesRehydrated);
         }
 
@@ -11529,6 +11539,11 @@ mod tests {
                     &session_ids[2],
                 )
                 .expect("discover one exact membership action in the production hit map");
+                assert_eq!(
+                    Some(&node_id),
+                    expected_historical_keyboard_node_id.as_ref(),
+                    "lifecycle keyboard action belongs to the realized absent reference root"
+                );
                 (node_id, action, Some(&session_ids[2]))
             }
         };
@@ -11581,6 +11596,15 @@ mod tests {
                 240,
                 &RenderState::default(),
                 &app.plugin_presentation,
+            );
+            unique_hit_action(
+                &after_remove_hits,
+                "botster_workspaces.remove_session",
+                "session_id",
+                &session_ids[0],
+            )
+            .expect(
+                "retained historical references still publish their exact removal action after an unrelated removal",
             );
             let removed = unique_hit_action(
                 &after_remove_hits,

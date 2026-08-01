@@ -107,7 +107,9 @@ Make one surgical oracle correction in `crates/botster-tui/src/app.rs`:
    `list_item.actions` action onto the list-item region; the nested materialized
    button id is not itself the dispatch region id. Keep the exact semantic
    action id, exact `session_ids[2]` payload, and literal node identity
-   assertions.
+   assertions. Explicitly assert that the Lifecycle region identity equals the
+   realized absent binding root for `session_ids[2]`; uniqueness alone does not
+   prove the action stayed in the historical branch.
 4. Render `app.surface()` through the existing production presentation-aware
    frame path, locate that exact action and its owning node in the resulting hit map,
    focus it through the existing mouse-down path, press real Enter through
@@ -122,6 +124,12 @@ Make one surgical oracle correction in `crates/botster-tui/src/app.rs`:
    earlier Workspaces ledger stage. No README contract change is expected
    because the documented contract already says actions come from the
    production frame and hit map using exact delivered/materialized identity.
+7. After the accepted removal, rerender the production frame and assert the
+   exact action/payload for `session_ids[2]` is absent from its hit map. Prove
+   that absence is non-vacuous by resolving another retained historical
+   reference action from the same hit map. Do not use whole-screen UUID text:
+   the accepted-action feedback intentionally renders a request id derived from
+   the removed node id.
 
 The exact-one hit-region collector is the only new helper justified by this ticket. Both
 the focused regression and lifecycle live oracle must use it. Keep it test-only
@@ -251,6 +259,13 @@ Inspected and expected unchanged:
   `app.surface()` with the existing presentation state and dispatch through
   `InputRouter`; do not synthesize a region or call `handle_plugin_action`
   directly.
+- **Post-removal absence passes because the surface vanished.** Resolve a
+  retained historical removal action from the same rerendered hit map before
+  asserting the removed action/payload has zero matches.
+- **Rendered text falsely reports a removed membership.** The accepted action
+  feedback renders `request_id=req-<node_id>-<suffix>`, so the removed UUID
+  deliberately remains in shell text. Assert action/payload absence from the
+  production hit map instead of scanning all rendered text.
 - **Earlier lifecycle regressions are hidden by focusing only on the failure.**
   Require the full lifecycle ledger and its current -> ended -> removal ->
   reconnect -> exact ended rehydration -> historical-reference sequence to
@@ -284,7 +299,10 @@ Cargo runs:
    wins over an earlier authored current template carrying the same
    action/payload; the exact-one collector rejects zero and duplicate production
    hit-region matches; and Enter dispatch yields the exact absent realized
-   node/action/payload through the real hit map.
+   node/action/payload through the real hit map. The live Lifecycle oracle also
+   asserts the selected node equals `session_ids[2]`'s realized absent binding
+   root, then rerenders after acceptance, resolves a retained historical action
+   as a same-frame positive control, and rejects the removed action/payload.
 5. `git diff --check` and a focused source scan confirming no new sleeps,
    retries, `ListSessions`, refresh fallback, Workspaces node-id/group literal,
    direct handler bypass, or dependency change; also confirm the plumbing arm
