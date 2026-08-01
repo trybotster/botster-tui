@@ -61,23 +61,27 @@ profile="${2:-}"
 case "$mode" in
   contract-matrix)
     if [ "$#" -gt 1 ]; then
-      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle>" >&2
+      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver>" >&2
       exit 1
     fi
     contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
     test_filter="app::tests::headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available"
     ;;
   workspaces)
-    if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ]; }; then
-      echo "usage: script/test-live-hub workspaces <plumbing|lifecycle>" >&2
+    if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ] && [ "$profile" != "installed-driver" ]; }; then
+      echo "usage: script/test-live-hub workspaces <plumbing|lifecycle|installed-driver>" >&2
       exit 1
     fi
     workspaces_package="$(resolve_workspaces_package)"
-    test_filter="app::tests::workspaces_live_acceptance_runs_against_real_package"
+    if [ "$profile" = "installed-driver" ]; then
+      test_filter="app::tests::installed_workspaces_spawn_driver_runs_through_apps_open"
+    else
+      test_filter="app::tests::workspaces_live_acceptance_runs_against_real_package"
+    fi
     ;;
   *)
     echo "unknown live-Hub mode: $mode" >&2
-    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle>" >&2
+    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver>" >&2
     exit 1
     ;;
 esac
@@ -92,7 +96,7 @@ else
 fi
 
 cargo build -p botster-tui --target-dir "$target_dir" --locked
-if [ "$mode" = "contract-matrix" ]; then
+if [ "$mode" = "contract-matrix" ] || [ "$profile" = "installed-driver" ]; then
   mkdir -p target/debug
   cp "$target_dir/debug/botster-tui" target/debug/botster-tui
 fi
@@ -124,6 +128,13 @@ if [ "$mode" = "workspaces" ]; then
   case "$profile" in
     plumbing) profile_label="Plumbing" ;;
     lifecycle) profile_label="Lifecycle" ;;
+    installed-driver)
+      if ! grep -F "installed-workspaces-driver: complete cases=3" "$test_output" >/dev/null; then
+        echo "Workspaces installed-driver acceptance did not complete" >&2
+        exit 1
+      fi
+      exit 0
+      ;;
   esac
   if ! grep -F "workspaces-acceptance: profile=$profile_label ledger=complete" "$test_output" >/dev/null; then
     echo "Workspaces $profile acceptance ledger did not complete" >&2

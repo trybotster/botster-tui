@@ -1,3 +1,4 @@
+mod acceptance;
 mod app;
 mod renderer;
 
