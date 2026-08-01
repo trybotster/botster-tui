@@ -5216,6 +5216,44 @@ mod tests {
             })
     }
 
+    fn unique_hit_action(
+        hit_map: &HitMap,
+        action_id: &str,
+        payload_key: &str,
+        payload_value: &str,
+    ) -> Result<(UiNodeId, botster_ui_contract::UiAction), String> {
+        let matches = hit_map
+            .regions()
+            .iter()
+            .filter(|region| {
+                region.action.as_ref().is_some_and(|action| {
+                    action.id.0 == action_id
+                        && action.payload.as_ref().is_some_and(|payload| {
+                            payload.get(payload_key).and_then(Value::as_str) == Some(payload_value)
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return Ok((
+                UiNodeId(matches[0].node_id.clone()),
+                matches[0]
+                    .action
+                    .clone()
+                    .expect("matching hit region has action metadata"),
+            ));
+        }
+        let matching_node_ids = matches
+            .iter()
+            .take(8)
+            .map(|region| region.node_id.clone())
+            .collect::<Vec<_>>();
+        Err(format!(
+            "expected exactly one production hit region for {action_id} with {payload_key}={payload_value:?}, found {}; matching_node_ids={matching_node_ids:?}",
+            matches.len()
+        ))
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     struct SessionBindingDescriptor {
         filters: std::collections::BTreeMap<String, Value>,
@@ -5447,6 +5485,174 @@ mod tests {
         assert_realized_roots_follow_reference_order(
             &materialized,
             ["first-root".to_string(), "second-root".to_string()],
+        );
+    }
+
+    #[test]
+    fn materialized_action_oracle_dispatches_the_unique_absent_branch() {
+        let session_id = "session-historical";
+        let action_id = "botster_workspaces.remove_session";
+        let body = ui_node(json!({
+            "type": "panel",
+            "id": "materialized-action-panel",
+            "props": { "title": "Materialized action" },
+            "children": [
+                {
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "where": {
+                        "session_uuid": session_id,
+                        "lifecycle_class": "current"
+                    },
+                    "item_template": {
+                        "type": "button",
+                        "id": "authored-current-remove",
+                        "props": {
+                            "label": "Remove current",
+                            "action": {
+                                "id": action_id,
+                                "payload": { "session_id": session_id }
+                            }
+                        }
+                    }
+                },
+                {
+                    "$kind": "bind_list",
+                    "source": "/session",
+                    "where": { "session_uuid": session_id },
+                    "item_template": {
+                        "type": "text",
+                        "id": "presence-detector",
+                        "props": { "text": "" }
+                    },
+                    "empty_template": {
+                        "type": "button",
+                        "id": "realized-absent-remove",
+                        "props": {
+                            "label": "Remove historical reference",
+                            "action": {
+                                "id": action_id,
+                                "payload": { "session_id": session_id }
+                            }
+                        }
+                    }
+                }
+            ]
+        }));
+        assert_eq!(
+            find_action_node(&body, action_id, "session_id", session_id)
+                .and_then(|node| node.id.as_ref())
+                .and_then(UiAuthoredNodeId::as_literal)
+                .map(|id| id.0.as_str()),
+            Some("authored-current-remove"),
+            "authored first-match traversal deliberately disagrees with the realized branch"
+        );
+
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.materialized-action",
+            body,
+        )));
+        let materialized = materialized_plugin_root(&app);
+        assert!(find_ui_node_by_id(&materialized, "realized-absent-remove").is_some());
+        let mut router = InputRouter::new(renderer::action_request_context_for(
+            "contract.materialized-action",
+        ));
+        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            120,
+            40,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        let (action_node_id, action) =
+            unique_hit_action(&hit_map, action_id, "session_id", session_id)
+                .expect("absent materialization has one exact production action region");
+        assert_eq!(action_node_id.0, "realized-absent-remove");
+        router.reconcile(&hit_map);
+        let region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == action_node_id.0)
+            .expect("realized absent action is in the production hit map");
+        assert!(matches!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    region.rect.x,
+                    region.rect.y,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Focus { .. }
+        ));
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = &dispatch else {
+            panic!("focused realized action must dispatch, got {dispatch:?}");
+        };
+        assert_eq!(request.node_id, Some(action_node_id));
+        assert_eq!(request.action_id, action.id);
+        assert_eq!(request.payload, action.payload);
+        let request = request.clone();
+        app.handle_dispatch(dispatch);
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: "botster.plugin-contract-matrix".to_string(),
+                    request,
+                })
+        );
+
+        let missing = unique_hit_action(&hit_map, action_id, "session_id", "missing-session")
+            .expect_err("zero production matches must fail");
+        assert!(missing.contains("found 0"), "{missing}");
+
+        let duplicate = ui_node(json!({
+            "type": "stack",
+            "id": "duplicate-actions",
+            "props": {},
+            "children": [
+                {
+                    "type": "button",
+                    "id": "duplicate-remove-one",
+                    "props": {
+                        "label": "Remove one",
+                        "action": {
+                            "id": action_id,
+                            "payload": { "session_id": session_id }
+                        }
+                    }
+                },
+                {
+                    "type": "button",
+                    "id": "duplicate-remove-two",
+                    "props": {
+                        "label": "Remove two",
+                        "action": {
+                            "id": action_id,
+                            "payload": { "session_id": session_id }
+                        }
+                    }
+                }
+            ]
+        }));
+        let (_, duplicate_hits) = renderer::render_to_lines(&duplicate, 120, 40);
+        let duplicate_error =
+            unique_hit_action(&duplicate_hits, action_id, "session_id", session_id)
+                .expect_err("duplicate production matches must fail");
+        assert!(duplicate_error.contains("found 2"), "{duplicate_error}");
+        assert!(
+            duplicate_error.contains("duplicate-remove-one"),
+            "{duplicate_error}"
+        );
+        assert!(
+            duplicate_error.contains("duplicate-remove-two"),
+            "{duplicate_error}"
         );
     }
 
@@ -10820,6 +11026,7 @@ mod tests {
         app.apply_response(packages);
         app.apply_response(apps);
         app.apply_response(navigation);
+        let mut expected_historical_keyboard_node_id = None;
         if profile == WorkspacesProfile::Lifecycle {
             for session_id in &session_ids[..2] {
                 wait_for_session_entity_expectation(
@@ -11280,12 +11487,14 @@ mod tests {
                 false,
                 true,
             );
-            assert_binding_realization(
-                &rehydrated_root,
-                session_binding(&bindings, &session_ids[2], None),
-                false,
-                true,
-            );
+            let historical_keyboard_binding = session_binding(&bindings, &session_ids[2], None);
+            assert_binding_realization(&rehydrated_root, historical_keyboard_binding, false, true);
+            expected_historical_keyboard_node_id = Some(UiNodeId(
+                historical_keyboard_binding
+                    .empty_root_id()
+                    .expect("historical keyboard binding has a literal empty root")
+                    .to_string(),
+            ));
             ledger.record(WorkspacesStage::HistoricalReferencesRehydrated);
         }
 
@@ -11293,35 +11502,6 @@ mod tests {
             .plugin_surface
             .clone()
             .expect("Workspaces retains its owner surface after row selection");
-        let (keyboard_node, keyboard_expectation) = match profile {
-            WorkspacesProfile::Plumbing => (
-                find_action_node(
-                    &active_surface.body,
-                    "botster_workspaces.open",
-                    "dialog",
-                    &format!("rename:{workspace_id}"),
-                )
-                .expect("discover an owner-authored detail action from the delivered tree"),
-                None,
-            ),
-            WorkspacesProfile::Lifecycle => (
-                find_action_node(
-                    &active_surface.body,
-                    "botster_workspaces.remove_session",
-                    "session_id",
-                    &session_ids[2],
-                )
-                .expect("discover the owner-authored membership action from the delivered tree"),
-                Some(&session_ids[2]),
-            ),
-        };
-        let keyboard_node_id = keyboard_node
-            .id
-            .as_ref()
-            .and_then(UiAuthoredNodeId::as_literal)
-            .expect("owner-authored keyboard action has literal identity")
-            .clone();
-        let keyboard_action = node_action(keyboard_node);
         let mut router =
             InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE_ID));
         let (_lines, keyboard_hits) = renderer::render_to_lines_with_presentation_state(
@@ -11331,6 +11511,42 @@ mod tests {
             &router.render_state(),
             &app.plugin_presentation,
         );
+        let (keyboard_node_id, keyboard_action, keyboard_expectation) = match profile {
+            WorkspacesProfile::Plumbing => {
+                let keyboard_node = find_action_node(
+                    &active_surface.body,
+                    "botster_workspaces.open",
+                    "dialog",
+                    &format!("rename:{workspace_id}"),
+                )
+                .expect("discover an owner-authored detail action from the delivered tree");
+                (
+                    keyboard_node
+                        .id
+                        .as_ref()
+                        .and_then(UiAuthoredNodeId::as_literal)
+                        .expect("owner-authored keyboard action has literal identity")
+                        .clone(),
+                    node_action(keyboard_node),
+                    None,
+                )
+            }
+            WorkspacesProfile::Lifecycle => {
+                let (node_id, action) = unique_hit_action(
+                    &keyboard_hits,
+                    "botster_workspaces.remove_session",
+                    "session_id",
+                    &session_ids[2],
+                )
+                .expect("discover one exact membership action in the production hit map");
+                assert_eq!(
+                    Some(&node_id),
+                    expected_historical_keyboard_node_id.as_ref(),
+                    "lifecycle keyboard action belongs to the realized absent reference root"
+                );
+                (node_id, action, Some(&session_ids[2]))
+            }
+        };
         router.reconcile(&keyboard_hits);
         let keyboard_region = keyboard_hits
             .regions()
@@ -11374,19 +11590,30 @@ mod tests {
             Some(botster_ui_contract::UiActionResultState::Accepted)
         );
         if let Some(removed_membership_id) = keyboard_expectation {
-            let after_remove = renderer::render_to_lines_with_presentation_state(
+            let (_lines, after_remove_hits) = renderer::render_to_lines_with_presentation_state(
                 &app.surface(),
                 500,
                 240,
                 &RenderState::default(),
                 &app.plugin_presentation,
-            )
-            .0
-            .join("\n");
-            assert!(
-                !after_remove.contains(removed_membership_id),
-                "{after_remove}"
             );
+            unique_hit_action(
+                &after_remove_hits,
+                "botster_workspaces.remove_session",
+                "session_id",
+                &session_ids[0],
+            )
+            .expect(
+                "retained historical references still publish their exact removal action after an unrelated removal",
+            );
+            let removed = unique_hit_action(
+                &after_remove_hits,
+                "botster_workspaces.remove_session",
+                "session_id",
+                removed_membership_id,
+            )
+            .expect_err("accepted removal eliminates the exact membership action");
+            assert!(removed.contains("found 0"), "{removed}");
         }
         ledger.record(WorkspacesStage::KeyboardDispatch);
 
