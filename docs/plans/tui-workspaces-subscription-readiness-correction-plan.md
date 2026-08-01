@@ -120,10 +120,13 @@ orchestration and its documentation:
 3. Preserve the existing Workspaces current rendering, exact ended-row wait,
    exact removal wait, and their current -> ended -> removal program order.
    Route only those bounded entity-state waits through the shared last-state
-   diagnostic where necessary. Do not add store-wide sequence comparisons:
-   `snapshot_seq` is diagnostic metadata for one active generation, not a
-   per-row lifecycle clock, and the existing sequential mutations plus exact
-   row predicates are the deterministic ordering barriers.
+   diagnostic where necessary. After the fresh reconnect generation and
+   authoritative snapshot barrier, require the surviving controlled UUID to be
+   present in exact `ended` state before historical rehydration assertions.
+   Do not add store-wide sequence comparisons: `snapshot_seq` is diagnostic
+   metadata for one active generation, not a per-row lifecycle clock, and the
+   existing sequential mutations plus exact row predicates are the
+   deterministic ordering barriers.
 4. Preserve the existing generic contract-matrix fixture chain: it already
    constructs `TuiApp` before spawning its generated unique UUID, waits for the
    exact authoritative row, then drives exact ended and removal predicates.
@@ -145,7 +148,7 @@ Already correct; do not rewrite:
   predicate/assertion;
 - the Workspaces current/ended/absent materialization, fixed 16-reference
   seeding, binding ceiling, realized-root ordering, membership removal,
-  reconnect, input, and ledger assertions;
+  reconnect generation/stale-frame mechanics, input, and ledger assertions;
 - the generic contract-matrix fixture's existing subscribe-before-spawn,
   exact-row, ended, removal, delivered-surface, reconnect, and action chain;
 - production `wait_for_authoritative_session` and its unrelated call sites.
@@ -343,8 +346,9 @@ if it fails. Green evidence must prove, in order:
 4. after the controlled shutdown, one exact row observed and rendered ended;
 5. after the controlled removal, the other exact row absent while its
    Workspaces reference remains legible;
-6. existing membership-removal, reconnect/new-generation snapshot, surface
-   reopen, historical rehydration, input routing, and completion-ledger checks;
+6. existing membership-removal, reconnect/new-generation snapshot followed by
+   exact surviving-ended-row rehydration, surface reopen, historical
+   rehydration, input routing, and completion-ledger checks;
 7. no list or surface refresh used to reconcile lifecycle.
 
 This downstream run is the required user/runtime path for this harness ticket;
