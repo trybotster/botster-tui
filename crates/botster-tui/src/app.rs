@@ -4831,6 +4831,7 @@ mod tests {
     use botster_ui_contract::{
         UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
     };
+    use std::path::Path;
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
@@ -4938,9 +4939,453 @@ mod tests {
         None
     }
 
+    const WORKSPACES_PACKAGE_NAME: &str = "botster-workspaces";
+    const WORKSPACES_SURFACE_ID: &str = "workspaces";
+    const WORKSPACES_DOWNSTREAM_TICKET: &str = "ticket_1785296184_677408";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WorkspacesProfile {
+        Plumbing,
+        Lifecycle,
+    }
+
+    impl WorkspacesProfile {
+        fn parse(value: &str) -> Result<Self, String> {
+            match value {
+                "plumbing" => Ok(Self::Plumbing),
+                "lifecycle" => Ok(Self::Lifecycle),
+                _ => Err(format!(
+                    "BOTSTER_TUI_WORKSPACES_PROFILE must be plumbing or lifecycle, got {value:?}"
+                )),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum WorkspacesStage {
+        ProfileSelected,
+        PackageValidated,
+        PackageInstalled,
+        PackageEnabledAndReloaded,
+        NavigationOpened,
+        OwnerIndexRendered,
+        OwnerDetailRendered,
+        OwnerRowSelected,
+        LiteralActionIdentityObserved,
+        MouseDispatch,
+        KeyboardDispatch,
+        AcceptedOwnerAction,
+        CanonicalItemRootIdentityObserved,
+        CurrentRendered,
+        EndedRendered,
+        AbsentRendered,
+        TransitionWithoutListOrSurfaceRefresh,
+        FreshReconnectSubscription,
+        FreshReconnectSnapshot,
+        SurfaceReopened,
+        HistoricalReferencesRehydrated,
+        StaleGenerationRejected,
+        AbsenceTemplateInert,
+        SixteenReferenceScale,
+        CleanShutdown,
+    }
+
+    impl WorkspacesStage {
+        fn plumbing() -> &'static [Self] {
+            &[
+                Self::ProfileSelected,
+                Self::PackageValidated,
+                Self::PackageInstalled,
+                Self::PackageEnabledAndReloaded,
+                Self::NavigationOpened,
+                Self::OwnerIndexRendered,
+                Self::OwnerDetailRendered,
+                Self::OwnerRowSelected,
+                Self::LiteralActionIdentityObserved,
+                Self::MouseDispatch,
+                Self::KeyboardDispatch,
+                Self::AcceptedOwnerAction,
+                Self::CleanShutdown,
+            ]
+        }
+
+        fn lifecycle() -> Vec<Self> {
+            let mut stages = Self::plumbing().to_vec();
+            stages.splice(
+                stages.len() - 1..stages.len() - 1,
+                [
+                    Self::CanonicalItemRootIdentityObserved,
+                    Self::CurrentRendered,
+                    Self::EndedRendered,
+                    Self::AbsentRendered,
+                    Self::TransitionWithoutListOrSurfaceRefresh,
+                    Self::FreshReconnectSubscription,
+                    Self::FreshReconnectSnapshot,
+                    Self::SurfaceReopened,
+                    Self::HistoricalReferencesRehydrated,
+                    Self::StaleGenerationRejected,
+                    Self::AbsenceTemplateInert,
+                    Self::SixteenReferenceScale,
+                ],
+            );
+            stages
+        }
+    }
+
+    #[derive(Debug)]
+    struct WorkspacesLedger {
+        profile: WorkspacesProfile,
+        completed: std::collections::BTreeSet<WorkspacesStage>,
+    }
+
+    impl WorkspacesLedger {
+        fn new(profile: WorkspacesProfile) -> Self {
+            let mut ledger = Self {
+                profile,
+                completed: std::collections::BTreeSet::new(),
+            };
+            ledger.record(WorkspacesStage::ProfileSelected);
+            ledger
+        }
+
+        fn record(&mut self, stage: WorkspacesStage) {
+            self.completed.insert(stage);
+            println!(
+                "workspaces-acceptance: profile={:?} stage={stage:?}",
+                self.profile
+            );
+        }
+
+        fn missing(&self) -> Vec<WorkspacesStage> {
+            let required = match self.profile {
+                WorkspacesProfile::Plumbing => WorkspacesStage::plumbing().to_vec(),
+                WorkspacesProfile::Lifecycle => WorkspacesStage::lifecycle(),
+            };
+            required
+                .into_iter()
+                .filter(|stage| !self.completed.contains(stage))
+                .collect()
+        }
+
+        fn assert_complete(&self) -> Result<(), String> {
+            let missing = self.missing();
+            if missing.is_empty() {
+                println!(
+                    "workspaces-acceptance: profile={:?} ledger=complete stages={:?}",
+                    self.profile, self.completed
+                );
+                Ok(())
+            } else {
+                Err(format!(
+                    "Workspaces {:?} acceptance ledger incomplete: missing {missing:?}",
+                    self.profile
+                ))
+            }
+        }
+    }
+
+    fn validate_workspaces_package(path: &Path) -> Result<PathBuf, String> {
+        if !path.is_dir() {
+            return Err(format!(
+                "BOTSTER_WORKSPACES_PACKAGE_PATH is not a directory: {}",
+                path.display()
+            ));
+        }
+        let manifest_path = path.join("botster-package.json");
+        let plugin_path = path.join("plugin.lua");
+        if !manifest_path.is_file() || !plugin_path.is_file() {
+            return Err(format!(
+                "BOTSTER_WORKSPACES_PACKAGE_PATH must contain botster-package.json and plugin.lua: {}",
+                path.display()
+            ));
+        }
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path)
+                .map_err(|error| format!("read {}: {error}", manifest_path.display()))?,
+        )
+        .map_err(|error| format!("parse {}: {error}", manifest_path.display()))?;
+        if manifest.get("name").and_then(Value::as_str) != Some(WORKSPACES_PACKAGE_NAME) {
+            return Err(format!(
+                "BOTSTER_WORKSPACES_PACKAGE_PATH manifest name must be {WORKSPACES_PACKAGE_NAME}: {}",
+                manifest_path.display()
+            ));
+        }
+        std::fs::canonicalize(path)
+            .map_err(|error| format!("canonicalize {}: {error}", path.display()))
+    }
+
+    fn find_action_node<'a>(
+        root: &'a UiNode,
+        action_id: &str,
+        payload_key: &str,
+        payload_value: &str,
+    ) -> Option<&'a UiNode> {
+        let matches = root
+            .props
+            .get("action")
+            .and_then(|value| {
+                serde_json::from_value::<botster_ui_contract::UiAction>(value.clone()).ok()
+            })
+            .is_some_and(|action| {
+                action.id.0 == action_id
+                    && action.payload.as_ref().is_some_and(|payload| {
+                        payload.get(payload_key).and_then(Value::as_str) == Some(payload_value)
+                    })
+            });
+        if matches {
+            return Some(root);
+        }
+        root.children
+            .iter()
+            .chain(root.slots.values().flatten())
+            .find_map(|child| match child {
+                UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+                    item_template,
+                    empty_template,
+                    ..
+                }) => find_action_node(item_template, action_id, payload_key, payload_value)
+                    .or_else(|| {
+                        empty_template.as_deref().and_then(|node| {
+                            find_action_node(node, action_id, payload_key, payload_value)
+                        })
+                    }),
+                _ => static_child_node(child)
+                    .and_then(|node| find_action_node(node, action_id, payload_key, payload_value)),
+            })
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct SessionBindingDescriptor {
+        filters: std::collections::BTreeMap<String, Value>,
+        item_template: UiNode,
+        empty_template: Option<UiNode>,
+    }
+
+    impl SessionBindingDescriptor {
+        fn session_uuid(&self) -> Option<&str> {
+            self.filters.get("session_uuid").and_then(Value::as_str)
+        }
+
+        fn lifecycle_class(&self) -> Option<&str> {
+            self.filters.get("lifecycle_class").and_then(Value::as_str)
+        }
+
+        fn item_root_id(&self) -> Option<&str> {
+            self.item_template
+                .id
+                .as_ref()
+                .and_then(UiAuthoredNodeId::as_literal)
+                .map(|id| id.0.as_str())
+        }
+
+        fn empty_root_id(&self) -> Option<&str> {
+            self.empty_template
+                .as_ref()
+                .and_then(|node| node.id.as_ref())
+                .and_then(UiAuthoredNodeId::as_literal)
+                .map(|id| id.0.as_str())
+        }
+    }
+
+    fn collect_session_bindings(root: &UiNode) -> Vec<SessionBindingDescriptor> {
+        fn visit_child(child: &UiChild, descriptors: &mut Vec<SessionBindingDescriptor>) {
+            match child {
+                UiChild::Node(node)
+                | UiChild::Conditional(UiConditional::When { node, .. })
+                | UiChild::Conditional(UiConditional::Hidden { node, .. })
+                | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
+                | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
+                    visit_node(node, descriptors)
+                }
+                UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+                    source,
+                    r#where,
+                    item_template,
+                    empty_template,
+                }) => {
+                    if source == "/session" {
+                        descriptors.push(SessionBindingDescriptor {
+                            filters: r#where.clone(),
+                            item_template: item_template.as_ref().clone(),
+                            empty_template: empty_template.as_deref().cloned(),
+                        });
+                    }
+                    visit_node(item_template, descriptors);
+                    if let Some(empty_template) = empty_template {
+                        visit_node(empty_template, descriptors);
+                    }
+                }
+            }
+        }
+
+        fn visit_node(node: &UiNode, descriptors: &mut Vec<SessionBindingDescriptor>) {
+            for child in node.children.iter().chain(node.slots.values().flatten()) {
+                visit_child(child, descriptors);
+            }
+        }
+
+        let mut descriptors = Vec::new();
+        visit_node(root, &mut descriptors);
+        descriptors
+    }
+
+    fn session_binding<'a>(
+        bindings: &'a [SessionBindingDescriptor],
+        session_uuid: &str,
+        lifecycle_class: Option<&str>,
+    ) -> &'a SessionBindingDescriptor {
+        bindings
+            .iter()
+            .find(|binding| {
+                binding.session_uuid() == Some(session_uuid)
+                    && binding.lifecycle_class() == lifecycle_class
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "owner surface must provide /session binding for session_uuid={session_uuid} lifecycle_class={lifecycle_class:?}; required by {WORKSPACES_DOWNSTREAM_TICKET}"
+                )
+            })
+    }
+
+    fn assert_binding_realization(
+        materialized: &UiNode,
+        binding: &SessionBindingDescriptor,
+        expect_item: bool,
+        expect_empty: bool,
+    ) {
+        let item_id = binding
+            .item_root_id()
+            .expect("Workspaces keeps per-reference item root identity literal");
+        assert_eq!(
+            find_ui_node_by_id(materialized, item_id).is_some(),
+            expect_item
+        );
+        match binding.empty_root_id() {
+            Some(empty_id) => {
+                assert_eq!(
+                    find_ui_node_by_id(materialized, empty_id).is_some(),
+                    expect_empty
+                )
+            }
+            None => assert!(!expect_empty, "expected empty template is absent"),
+        }
+    }
+
+    fn materialized_plugin_root(app: &TuiApp) -> UiNode {
+        materialize_plugin_surface(
+            &app.plugin_surface
+                .as_ref()
+                .expect("active plugin surface")
+                .body,
+            &app.session_entities,
+        )
+        .expect("owner-authored Workspaces bindings materialize through TuiApp")
+    }
+
+    fn assert_realized_roots_follow_reference_order(
+        materialized: &UiNode,
+        roots: impl IntoIterator<Item = String>,
+    ) {
+        fn collect_realized_node_order(node: &UiNode, order: &mut Vec<String>) {
+            if let Some(id) = node.id.as_ref().and_then(UiAuthoredNodeId::as_literal) {
+                order.push(id.0.clone());
+            }
+            for child in node
+                .children
+                .iter()
+                .chain(node.slots.values().flatten())
+                .filter_map(static_child_node)
+            {
+                collect_realized_node_order(child, order);
+            }
+        }
+
+        let roots = roots.into_iter().collect::<Vec<_>>();
+        let mut realized_order = Vec::new();
+        collect_realized_node_order(materialized, &mut realized_order);
+        let positions = roots
+            .iter()
+            .map(|root| realized_order.iter().position(|id| id == root))
+            .collect::<Option<Vec<_>>>();
+        assert!(
+            positions.is_some_and(|positions| positions.windows(2).all(|pair| pair[0] < pair[1])),
+            "realized roots are missing or not in stable traversal order: roots={roots:?} realized={realized_order:?}"
+        );
+    }
+
     #[test]
     fn smoke_message_names_the_workspace() {
         assert_eq!(smoke_message(), "botster-tui smoke ok");
+    }
+
+    #[test]
+    fn workspaces_profile_is_explicit_and_ledgers_fail_closed() {
+        assert_eq!(
+            WorkspacesProfile::parse("plumbing"),
+            Ok(WorkspacesProfile::Plumbing)
+        );
+        assert_eq!(
+            WorkspacesProfile::parse("lifecycle"),
+            Ok(WorkspacesProfile::Lifecycle)
+        );
+        assert!(WorkspacesProfile::parse("").is_err());
+        assert!(WorkspacesProfile::parse("auto").is_err());
+
+        for profile in [WorkspacesProfile::Plumbing, WorkspacesProfile::Lifecycle] {
+            let required = match profile {
+                WorkspacesProfile::Plumbing => WorkspacesStage::plumbing().to_vec(),
+                WorkspacesProfile::Lifecycle => WorkspacesStage::lifecycle(),
+            };
+            let omitted = required[required.len() / 2];
+            let mut ledger = WorkspacesLedger::new(profile);
+            for stage in required {
+                if stage != omitted {
+                    ledger.record(stage);
+                }
+            }
+            let error = ledger
+                .assert_complete()
+                .expect_err("each profile must reject an incomplete ledger");
+            assert!(error.contains(&format!("{omitted:?}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn workspaces_lifecycle_ledger_is_a_strict_plumbing_superset() {
+        let plumbing = WorkspacesStage::plumbing()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let lifecycle = WorkspacesStage::lifecycle()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(plumbing.is_subset(&lifecycle));
+        assert!(lifecycle.len() > plumbing.len());
+    }
+
+    #[test]
+    fn workspaces_reference_order_uses_realized_traversal_not_prop_text() {
+        let mut group = node(UiNodeKind::Stack, "group", json!({}));
+        let mut first_wrapper = node(UiNodeKind::Stack, "first-wrapper", json!({}));
+        first_wrapper
+            .children
+            .push(child(node(UiNodeKind::Text, "first-root", json!({}))));
+        let mut second_wrapper = node(UiNodeKind::Stack, "second-wrapper", json!({}));
+        second_wrapper
+            .children
+            .push(child(node(UiNodeKind::Text, "second-root", json!({}))));
+        group.children = vec![child(first_wrapper), child(second_wrapper)];
+        let mut materialized = node(
+            UiNodeKind::Stack,
+            "surface",
+            json!({ "producer_metadata": "second-root" }),
+        );
+        materialized.children.push(child(group));
+
+        assert_realized_roots_follow_reference_order(
+            &materialized,
+            ["first-root".to_string(), "second-root".to_string()],
+        );
     }
 
     fn workspace_fixture() -> TuiApp {
@@ -10156,6 +10601,684 @@ mod tests {
         assert!(rendered.contains("connection:"));
 
         hub.shutdown().expect("isolated hub shuts down cleanly");
+    }
+
+    #[test]
+    fn workspaces_live_acceptance_runs_against_real_package() {
+        let Ok(profile_value) = std::env::var("BOTSTER_TUI_WORKSPACES_PROFILE") else {
+            if std::env::var_os("BOTSTER_TUI_REQUIRE_HUB_TEST").is_some() {
+                panic!("BOTSTER_TUI_WORKSPACES_PROFILE is required");
+            }
+            eprintln!("skipping Workspaces live acceptance; no explicit profile selected");
+            return;
+        };
+        let profile = WorkspacesProfile::parse(&profile_value)
+            .expect("select an explicit Workspaces acceptance profile");
+        let mut ledger = WorkspacesLedger::new(profile);
+        let package_path = validate_workspaces_package(Path::new(
+            &std::env::var("BOTSTER_WORKSPACES_PACKAGE_PATH")
+                .expect("BOTSTER_WORKSPACES_PACKAGE_PATH is required"),
+        ))
+        .expect("validate the explicit real Workspaces package checkout");
+        ledger.record(WorkspacesStage::PackageValidated);
+
+        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
+            skip_or_panic("BOTSTER_HUB_BIN");
+            return;
+        };
+        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
+            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
+            return;
+        };
+        let root = PathBuf::from(format!("/tmp/btw{}", short_suffix() % 1_000_000));
+        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(hub_bin)
+            .session_worker_bin(session_worker_bin)
+            .root(&root)
+            .name("botster-tui-workspaces-live-acceptance")
+            .start()
+            .expect("isolated hub starts for Workspaces acceptance");
+        let mut client = HubConnection::connect(hub.endpoint()).expect("connect to isolated hub");
+
+        let installed = client
+            .request(&DaemonRequest::InstallPackageLocalPath {
+                path: package_path.clone(),
+            })
+            .expect("install the explicit Workspaces package through the public Hub request");
+        assert_eq!(installed.kind, DaemonResponseKind::PackageDecision);
+        assert!(installed.error.is_none(), "install response: {installed:?}");
+        ledger.record(WorkspacesStage::PackageInstalled);
+
+        let enabled = client
+            .request(&DaemonRequest::EnablePackage {
+                package_name: WORKSPACES_PACKAGE_NAME.to_string(),
+            })
+            .expect("enable the installed Workspaces package through the public Hub request");
+        assert_eq!(enabled.kind, DaemonResponseKind::PackageDecision);
+        assert!(enabled.error.is_none(), "enable response: {enabled:?}");
+        let reloaded = client
+            .request(&DaemonRequest::ReloadPackage {
+                package_name: WORKSPACES_PACKAGE_NAME.to_string(),
+            })
+            .expect("reload the enabled Workspaces package through the public Hub request");
+        assert_eq!(reloaded.kind, DaemonResponseKind::PackageDecision);
+        assert!(reloaded.error.is_none(), "reload response: {reloaded:?}");
+        ledger.record(WorkspacesStage::PackageEnabledAndReloaded);
+
+        let created = client
+            .request(&DaemonRequest::PluginMcpCallTool {
+                name: "botster_workspaces.create".to_string(),
+                arguments: json!({ "name": "TUI acceptance workspace" }),
+            })
+            .expect("seed a workspace through the real plugin-worker MCP boundary");
+        assert_eq!(created.kind, DaemonResponseKind::PluginMcpToolResult);
+        assert_eq!(created.plugin_tool_result["ok"], true, "{created:?}");
+        let workspace_id = created.plugin_tool_result["workspace"]["id"]
+            .as_str()
+            .expect("Workspaces create returns the owner-generated workspace id")
+            .to_string();
+
+        let reference_count = match profile {
+            WorkspacesProfile::Plumbing => 1,
+            WorkspacesProfile::Lifecycle => 16,
+        };
+        let session_ids = (1..=reference_count)
+            .map(|index| format!("00000000-0000-4000-8000-{index:012x}"))
+            .collect::<Vec<_>>();
+        for session_id in &session_ids {
+            let added = client
+                .request(&DaemonRequest::PluginMcpCallTool {
+                    name: "botster_workspaces.add_session".to_string(),
+                    arguments: json!({
+                        "workspace_id": workspace_id,
+                        "session_id": session_id,
+                    }),
+                })
+                .expect("seed a deliberate session reference through the plugin MCP tool");
+            assert_eq!(added.kind, DaemonResponseKind::PluginMcpToolResult);
+            assert_eq!(added.plugin_tool_result["ok"], true, "{added:?}");
+        }
+
+        if profile == WorkspacesProfile::Lifecycle {
+            for session_id in &session_ids[..2] {
+                client
+                    .request(&DaemonRequest::Spawn {
+                        session_id: session_id.clone(),
+                        command: "while IFS= read -r line; do :; done".to_string(),
+                    })
+                    .expect("spawn a controlled authoritative Hub session");
+            }
+        }
+
+        let packages = client
+            .request(&DaemonRequest::ListPackages)
+            .expect("list packages after Workspaces enablement");
+        let apps = client
+            .request(&DaemonRequest::ListApps)
+            .expect("list apps after Workspaces enablement");
+        let navigation = client
+            .request(&DaemonRequest::ListPackageNavigation)
+            .expect("list admitted Workspaces navigation");
+        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
+        app.workspace_test_mode = true;
+        app.system_details_visible = true;
+        app.apply_response(packages);
+        app.apply_response(apps);
+        app.apply_response(navigation);
+        let snapshot_deadline = Instant::now() + Duration::from_secs(7);
+        while !app.session_entities.has_snapshot && Instant::now() < snapshot_deadline {
+            app.poll_hub();
+            thread::yield_now();
+        }
+        assert!(
+            app.session_entities.has_snapshot,
+            "Workspaces mode requires an authoritative session snapshot"
+        );
+        app.observed_requests.clear();
+
+        let navigation_index = app
+            .package_navigation
+            .iter()
+            .position(|entry| {
+                entry.package_name == WORKSPACES_PACKAGE_NAME
+                    && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE_ID)
+            })
+            .expect("Hub admits the real Workspaces navigation entry");
+        let (_navigation_lines, navigation_hits) =
+            renderer::render_to_lines(&app.surface(), 500, 240);
+        app.handle_dispatch(click_dispatch(
+            &navigation_hits,
+            &format!("tui-package-navigation-{navigation_index}-open"),
+        ));
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceRender {
+                    package_name: WORKSPACES_PACKAGE_NAME.to_string(),
+                    surface_id: WORKSPACES_SURFACE_ID.to_string(),
+                })
+        );
+        ledger.record(WorkspacesStage::NavigationOpened);
+
+        let owner_surface = app
+            .plugin_surface
+            .clone()
+            .expect("navigation applies the owner-authored Workspaces surface");
+        assert_eq!(owner_surface.package_name, WORKSPACES_PACKAGE_NAME);
+        assert_eq!(owner_surface.surface_id, WORKSPACES_SURFACE_ID);
+        let index_rendered = renderer::render_to_lines(&app.surface(), 500, 240)
+            .0
+            .join("\n");
+        assert!(
+            index_rendered.contains("TUI acceptance workspace"),
+            "{index_rendered}"
+        );
+        ledger.record(WorkspacesStage::OwnerIndexRendered);
+
+        let row_node = find_action_node(
+            &owner_surface.body,
+            "botster_workspaces.open",
+            "selected_workspace",
+            &workspace_id,
+        )
+        .expect("discover the owner-authored workspace row from delivered action metadata");
+        let row_node_id = row_node
+            .id
+            .as_ref()
+            .and_then(UiAuthoredNodeId::as_literal)
+            .expect("current Workspaces row identity is a producer-authored literal")
+            .clone();
+        let row_action = node_action(row_node);
+        let (_lines, row_hits) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            500,
+            240,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        );
+        let row_dispatch =
+            click_dispatch_for_surface(&row_hits, &row_node_id.0, Some(WORKSPACES_SURFACE_ID));
+        let row_request = match &row_dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("real workspace row must dispatch an action, got {other:?}"),
+        };
+        assert_eq!(row_request.action_id, row_action.id);
+        assert_eq!(row_request.node_id, Some(row_node_id));
+        assert_eq!(row_request.payload, row_action.payload);
+        app.handle_dispatch(row_dispatch);
+        assert_eq!(
+            app.plugin_action_result.as_ref().map(|result| result.state),
+            Some(botster_ui_contract::UiActionResultState::Accepted)
+        );
+        ledger.record(WorkspacesStage::OwnerRowSelected);
+        ledger.record(WorkspacesStage::MouseDispatch);
+        ledger.record(WorkspacesStage::LiteralActionIdentityObserved);
+        ledger.record(WorkspacesStage::AcceptedOwnerAction);
+
+        let detail_rendered = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            500,
+            240,
+            &RenderState::default(),
+            &app.plugin_presentation,
+        )
+        .0
+        .join("\n");
+        assert!(
+            detail_rendered.contains(&session_ids[0]),
+            "{detail_rendered}"
+        );
+        ledger.record(WorkspacesStage::OwnerDetailRendered);
+
+        if profile == WorkspacesProfile::Lifecycle {
+            let bindings = collect_session_bindings(&owner_surface.body);
+            for session_id in &session_ids {
+                let reference_bindings = bindings
+                    .iter()
+                    .filter(|binding| binding.session_uuid() == Some(session_id))
+                    .count();
+                assert!(
+                    reference_bindings <= 4,
+                    "retained reference {session_id} exceeds the approved four-bindings-per-reference ceiling with {reference_bindings} bindings"
+                );
+            }
+            for session_id in &session_ids {
+                let current = session_binding(&bindings, session_id, Some("current"));
+                let ended = session_binding(&bindings, session_id, Some("ended"));
+                let indeterminate = session_binding(&bindings, session_id, Some("indeterminate"));
+                let absence = session_binding(&bindings, session_id, None);
+                assert!(current.empty_template.is_none());
+                assert!(ended.empty_template.is_none());
+                assert!(indeterminate.empty_template.is_none());
+                assert!(absence.empty_template.is_some());
+            }
+            ledger.record(WorkspacesStage::SixteenReferenceScale);
+
+            let current_root = materialized_plugin_root(&app);
+            collect_realized_node_ids(&current_root)
+                .expect("current Workspaces render has unique realized identity");
+            for session_id in &session_ids[..2] {
+                assert_binding_realization(
+                    &current_root,
+                    session_binding(&bindings, session_id, Some("current")),
+                    true,
+                    false,
+                );
+                assert_binding_realization(
+                    &current_root,
+                    session_binding(&bindings, session_id, Some("ended")),
+                    false,
+                    false,
+                );
+                assert_binding_realization(
+                    &current_root,
+                    session_binding(&bindings, session_id, Some("indeterminate")),
+                    false,
+                    false,
+                );
+                assert_binding_realization(
+                    &current_root,
+                    session_binding(&bindings, session_id, None),
+                    true,
+                    false,
+                );
+            }
+            for session_id in &session_ids[2..] {
+                for lifecycle_class in ["current", "ended", "indeterminate"] {
+                    assert_binding_realization(
+                        &current_root,
+                        session_binding(&bindings, session_id, Some(lifecycle_class)),
+                        false,
+                        false,
+                    );
+                }
+                assert_binding_realization(
+                    &current_root,
+                    session_binding(&bindings, session_id, None),
+                    false,
+                    true,
+                );
+            }
+            assert_realized_roots_follow_reference_order(
+                &current_root,
+                session_ids[..2].iter().map(|session_id| {
+                    session_binding(&bindings, session_id, Some("current"))
+                        .item_root_id()
+                        .expect("literal current root")
+                        .to_string()
+                }),
+            );
+            assert_realized_roots_follow_reference_order(
+                &current_root,
+                session_ids[2..].iter().map(|session_id| {
+                    session_binding(&bindings, session_id, None)
+                        .empty_root_id()
+                        .expect("literal absent root")
+                        .to_string()
+                }),
+            );
+            ledger.record(WorkspacesStage::CurrentRendered);
+            ledger.record(WorkspacesStage::AbsentRendered);
+            ledger.record(WorkspacesStage::CanonicalItemRootIdentityObserved);
+
+            let absence_binding = session_binding(&bindings, &session_ids[0], None);
+            let absence_item_id = absence_binding
+                .item_root_id()
+                .expect("absence binding item template has literal producer identity");
+            let absence_item = find_ui_node_by_id(&current_root, absence_item_id)
+                .expect("present reference realizes absence-detection item template");
+            let (absence_lines, absence_hits) = renderer::render_to_lines(absence_item, 80, 8);
+            assert!(
+                absence_lines.join("\n").trim().is_empty(),
+                "presence detector item template must be visually inert"
+            );
+            assert!(
+                absence_hits
+                    .regions()
+                    .iter()
+                    .all(|region| region.node_id != absence_item_id),
+                "presence detector item template must not publish a hit region"
+            );
+            ledger.record(WorkspacesStage::AbsenceTemplateInert);
+
+            let descriptor_before_transition = owner_surface.body.clone();
+            let render_requests_before_transition = app
+                .observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
+                .count();
+            client
+                .request(&DaemonRequest::ShutdownSession {
+                    session_id: session_ids[1].clone(),
+                })
+                .expect("end the controlled referenced session through Hub authority");
+            let ended_deadline = Instant::now() + Duration::from_secs(7);
+            while app
+                .session_entities
+                .entities
+                .get(&session_ids[1])
+                .is_none_or(|entity| entity.lifecycle_class != "ended")
+                && Instant::now() < ended_deadline
+            {
+                app.poll_hub();
+                thread::yield_now();
+            }
+            assert_eq!(
+                app.session_entities.entities[&session_ids[1]].lifecycle_class,
+                "ended"
+            );
+            assert_eq!(
+                app.plugin_surface
+                    .as_ref()
+                    .expect("surface remains active")
+                    .body,
+                descriptor_before_transition,
+                "entity lifecycle transition must not replace the owner-authored surface tree"
+            );
+            assert_eq!(
+                app.observed_requests
+                    .iter()
+                    .filter(|request| matches!(
+                        request,
+                        ObservedRequest::PluginSurfaceRender { .. }
+                    ))
+                    .count(),
+                render_requests_before_transition,
+                "entity lifecycle transition must not request a fresh surface"
+            );
+            let ended_root = materialized_plugin_root(&app);
+            collect_realized_node_ids(&ended_root)
+                .expect("ended Workspaces render has unique realized identity");
+            assert_binding_realization(
+                &ended_root,
+                session_binding(&bindings, &session_ids[1], Some("current")),
+                false,
+                false,
+            );
+            assert_binding_realization(
+                &ended_root,
+                session_binding(&bindings, &session_ids[1], Some("ended")),
+                true,
+                false,
+            );
+            assert_binding_realization(
+                &ended_root,
+                session_binding(&bindings, &session_ids[1], None),
+                true,
+                false,
+            );
+            ledger.record(WorkspacesStage::EndedRendered);
+            ledger.record(WorkspacesStage::TransitionWithoutListOrSurfaceRefresh);
+
+            client
+                .request(&DaemonRequest::ShutdownSession {
+                    session_id: session_ids[0].clone(),
+                })
+                .expect("end the controlled session before removing Hub history");
+            let first_ended_deadline = Instant::now() + Duration::from_secs(7);
+            while app
+                .session_entities
+                .entities
+                .get(&session_ids[0])
+                .is_none_or(|entity| entity.lifecycle_class != "ended")
+                && Instant::now() < first_ended_deadline
+            {
+                app.poll_hub();
+                thread::yield_now();
+            }
+            client
+                .request(&DaemonRequest::RemoveSession {
+                    session_id: session_ids[0].clone(),
+                })
+                .expect("remove one controlled Hub session while retaining workspace history");
+            let removed_deadline = Instant::now() + Duration::from_secs(7);
+            while app.session_entities.entities.contains_key(&session_ids[0])
+                && Instant::now() < removed_deadline
+            {
+                app.poll_hub();
+                thread::yield_now();
+            }
+            assert!(!app.session_entities.entities.contains_key(&session_ids[0]));
+            let absent_root = materialized_plugin_root(&app);
+            collect_realized_node_ids(&absent_root)
+                .expect("absent Workspaces render has unique realized identity");
+            for lifecycle_class in ["current", "ended", "indeterminate"] {
+                assert_binding_realization(
+                    &absent_root,
+                    session_binding(&bindings, &session_ids[0], Some(lifecycle_class)),
+                    false,
+                    false,
+                );
+            }
+            assert_binding_realization(
+                &absent_root,
+                session_binding(&bindings, &session_ids[0], None),
+                false,
+                true,
+            );
+
+            let old_generation = app
+                .session_entities
+                .subscription_id
+                .clone()
+                .expect("pre-reconnect session generation exists");
+            app.force_reconnect();
+            let reconnect_deadline = Instant::now() + Duration::from_secs(7);
+            while (!app.session_entities.has_snapshot
+                || app.session_entities.subscription_id.as_deref() == Some(old_generation.as_str()))
+                && Instant::now() < reconnect_deadline
+            {
+                app.poll_hub();
+                thread::yield_now();
+            }
+            assert_ne!(
+                app.session_entities.subscription_id.as_deref(),
+                Some(old_generation.as_str())
+            );
+            assert!(app.session_entities.has_snapshot);
+            ledger.record(WorkspacesStage::FreshReconnectSubscription);
+            ledger.record(WorkspacesStage::FreshReconnectSnapshot);
+
+            let stale_seq = app.session_entities.snapshot_seq.unwrap_or_default() + 1;
+            assert!(
+                !app.session_entities
+                    .apply(DaemonEntityFrame::Patch {
+                        subscription_id: old_generation,
+                        entity_type: "session".to_string(),
+                        snapshot_seq: stale_seq,
+                        id: session_ids[1].clone(),
+                        patch: json!({ "lifecycle_class": "current" }),
+                    })
+                    .expect("stale prior-generation patch is rejected")
+            );
+            ledger.record(WorkspacesStage::StaleGenerationRejected);
+
+            let navigation_deadline = Instant::now() + Duration::from_secs(7);
+            while !app.package_navigation.iter().any(|entry| {
+                entry.package_name == WORKSPACES_PACKAGE_NAME
+                    && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE_ID)
+            }) && Instant::now() < navigation_deadline
+            {
+                app.poll_hub();
+                thread::yield_now();
+            }
+            app.system_details_visible = true;
+            let navigation_index = app
+                .package_navigation
+                .iter()
+                .position(|entry| {
+                    entry.package_name == WORKSPACES_PACKAGE_NAME
+                        && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE_ID)
+                })
+                .expect("reconnect refreshes admitted Workspaces navigation");
+            let (_lines, reconnect_navigation_hits) =
+                renderer::render_to_lines(&app.surface(), 500, 240);
+            app.handle_dispatch(click_dispatch(
+                &reconnect_navigation_hits,
+                &format!("tui-package-navigation-{navigation_index}-open"),
+            ));
+            let reopened_surface = app
+                .plugin_surface
+                .clone()
+                .expect("reconnect explicitly pulls the Workspaces surface");
+            let reopened_row = find_action_node(
+                &reopened_surface.body,
+                "botster_workspaces.open",
+                "selected_workspace",
+                &workspace_id,
+            )
+            .expect("reopened surface retains the workspace row");
+            let reopened_row_id = reopened_row
+                .id
+                .as_ref()
+                .and_then(UiAuthoredNodeId::as_literal)
+                .expect("reopened workspace row has literal identity")
+                .0
+                .clone();
+            let (_lines, reopened_hits) = renderer::render_to_lines_with_presentation_state(
+                &app.surface(),
+                500,
+                240,
+                &RenderState::default(),
+                &app.plugin_presentation,
+            );
+            app.handle_dispatch(click_dispatch_for_surface(
+                &reopened_hits,
+                &reopened_row_id,
+                Some(WORKSPACES_SURFACE_ID),
+            ));
+            ledger.record(WorkspacesStage::SurfaceReopened);
+
+            let rehydrated_root = materialized_plugin_root(&app);
+            collect_realized_node_ids(&rehydrated_root)
+                .expect("rehydrated Workspaces render has unique realized identity");
+            assert_binding_realization(
+                &rehydrated_root,
+                session_binding(&bindings, &session_ids[1], Some("ended")),
+                true,
+                false,
+            );
+            assert_binding_realization(
+                &rehydrated_root,
+                session_binding(&bindings, &session_ids[0], None),
+                false,
+                true,
+            );
+            assert_binding_realization(
+                &rehydrated_root,
+                session_binding(&bindings, &session_ids[2], None),
+                false,
+                true,
+            );
+            ledger.record(WorkspacesStage::HistoricalReferencesRehydrated);
+        }
+
+        let active_surface = app
+            .plugin_surface
+            .clone()
+            .expect("Workspaces retains its owner surface after row selection");
+        let (keyboard_node, keyboard_expectation) = match profile {
+            WorkspacesProfile::Plumbing => (
+                find_action_node(
+                    &active_surface.body,
+                    "botster_workspaces.open",
+                    "dialog",
+                    &format!("rename:{workspace_id}"),
+                )
+                .expect("discover an owner-authored detail action from the delivered tree"),
+                None,
+            ),
+            WorkspacesProfile::Lifecycle => (
+                find_action_node(
+                    &active_surface.body,
+                    "botster_workspaces.remove_session",
+                    "session_id",
+                    &session_ids[2],
+                )
+                .expect("discover the owner-authored membership action from the delivered tree"),
+                Some(&session_ids[2]),
+            ),
+        };
+        let keyboard_node_id = keyboard_node
+            .id
+            .as_ref()
+            .and_then(UiAuthoredNodeId::as_literal)
+            .expect("owner-authored keyboard action has literal identity")
+            .clone();
+        let keyboard_action = node_action(keyboard_node);
+        let mut router =
+            InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE_ID));
+        let (_lines, keyboard_hits) = renderer::render_to_lines_with_presentation_state(
+            &app.surface(),
+            500,
+            240,
+            &router.render_state(),
+            &app.plugin_presentation,
+        );
+        router.reconcile(&keyboard_hits);
+        let keyboard_region = keyboard_hits
+            .regions()
+            .iter()
+            .find(|region| region.node_id == keyboard_node_id.0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "owner-authored keyboard action {} is in the production hit map; regions={:?}",
+                    keyboard_node_id.0,
+                    keyboard_hits
+                        .regions()
+                        .iter()
+                        .map(|region| region.node_id.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        let focus_dispatch = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                keyboard_region.rect.x,
+                keyboard_region.rect.y,
+            ),
+            &keyboard_hits,
+        );
+        assert!(matches!(focus_dispatch, InputDispatch::Focus { .. }));
+        assert_eq!(router.focused_node_id(), Some(keyboard_node_id.0.as_str()));
+        let keyboard_dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &keyboard_hits,
+        );
+        let keyboard_request = match &keyboard_dispatch {
+            InputDispatch::Action(request) => request.clone(),
+            other => panic!("focused owner action must dispatch, got {other:?}"),
+        };
+        assert_eq!(keyboard_request.action_id, keyboard_action.id);
+        assert_eq!(keyboard_request.node_id, Some(keyboard_node_id));
+        assert_eq!(keyboard_request.payload, keyboard_action.payload);
+        app.handle_dispatch(keyboard_dispatch);
+        assert_eq!(
+            app.plugin_action_result.as_ref().map(|result| result.state),
+            Some(botster_ui_contract::UiActionResultState::Accepted)
+        );
+        if let Some(removed_membership_id) = keyboard_expectation {
+            let after_remove = renderer::render_to_lines_with_presentation_state(
+                &app.surface(),
+                500,
+                240,
+                &RenderState::default(),
+                &app.plugin_presentation,
+            )
+            .0
+            .join("\n");
+            assert!(
+                !after_remove.contains(removed_membership_id),
+                "{after_remove}"
+            );
+        }
+        ledger.record(WorkspacesStage::KeyboardDispatch);
+
+        hub.shutdown()
+            .expect("Workspaces acceptance isolated hub shuts down cleanly");
+        ledger.record(WorkspacesStage::CleanShutdown);
+        ledger
+            .assert_complete()
+            .expect("selected Workspaces ledger completes");
     }
 
     fn assert_live_attach_history_readback(hub: &botster_hub_test_support::IsolatedHub) {
