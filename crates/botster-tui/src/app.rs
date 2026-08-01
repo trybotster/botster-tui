@@ -4833,6 +4833,68 @@ mod tests {
     };
     use std::path::Path;
 
+    #[derive(Clone, Copy, Debug)]
+    enum SessionEntityExpectation<'a> {
+        Lifecycle(&'a str),
+        Absent,
+    }
+
+    fn session_entity_expectation_satisfied(
+        state: &SessionEntityState,
+        session_id: &str,
+        expectation: SessionEntityExpectation<'_>,
+    ) -> bool {
+        state.subscription_id.is_some()
+            && state.has_snapshot
+            && match expectation {
+                SessionEntityExpectation::Lifecycle(lifecycle_class) => state
+                    .entities
+                    .get(session_id)
+                    .is_some_and(|entity| entity.lifecycle_class == lifecycle_class),
+                SessionEntityExpectation::Absent => !state.entities.contains_key(session_id),
+            }
+    }
+
+    fn session_entity_expectation_diagnostic(
+        state: &SessionEntityState,
+        session_id: &str,
+        expectation: SessionEntityExpectation<'_>,
+    ) -> String {
+        let observed = state.entities.get(session_id).map_or_else(
+            || "absent".to_string(),
+            |entity| {
+                format!(
+                    "lifecycle_class={} lifecycle={:?} registry_state={}",
+                    entity.lifecycle_class, entity.lifecycle, entity.registry_state
+                )
+            },
+        );
+        format!(
+            "subscription_id={:?} has_snapshot={} snapshot_seq={:?} expected_session_id={session_id} expected={expectation:?} observed={observed}",
+            state.subscription_id, state.has_snapshot, state.snapshot_seq
+        )
+    }
+
+    fn wait_for_session_entity_expectation(
+        app: &mut TuiApp,
+        session_id: &str,
+        expectation: SessionEntityExpectation<'_>,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while !session_entity_expectation_satisfied(&app.session_entities, session_id, expectation)
+            && Instant::now() < deadline
+        {
+            app.poll_hub();
+            thread::yield_now();
+        }
+        assert!(
+            session_entity_expectation_satisfied(&app.session_entities, session_id, expectation,),
+            "{context}: {}",
+            session_entity_expectation_diagnostic(&app.session_entities, session_id, expectation,)
+        );
+    }
+
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
             kind,
@@ -5862,6 +5924,50 @@ mod tests {
         state.begin_generation(fresh_generation);
         assert!(state.apply(fresh).expect("fresh snapshot applies"));
         assert!(state.has_snapshot);
+    }
+
+    #[test]
+    fn session_entity_readiness_requires_the_exact_expected_row() {
+        let session_id = "expected-session";
+        let mut state = SessionEntityState::default();
+        state.begin_generation("readiness-generation".to_string());
+        assert!(
+            state
+                .apply(snapshot_frame("readiness-generation", 1, Vec::new()))
+                .expect("empty authoritative snapshot applies")
+        );
+
+        assert!(state.has_snapshot);
+        assert!(!session_entity_expectation_satisfied(
+            &state,
+            session_id,
+            SessionEntityExpectation::Lifecycle("current")
+        ));
+        assert!(session_entity_expectation_satisfied(
+            &state,
+            session_id,
+            SessionEntityExpectation::Absent
+        ));
+
+        assert!(
+            state
+                .apply(snapshot_frame(
+                    "readiness-generation",
+                    2,
+                    vec![session_entity(session_id, Some("running"))],
+                ))
+                .expect("authoritative snapshot containing the expected row applies")
+        );
+        assert!(session_entity_expectation_satisfied(
+            &state,
+            session_id,
+            SessionEntityExpectation::Lifecycle("current")
+        ));
+        assert!(!session_entity_expectation_satisfied(
+            &state,
+            session_id,
+            SessionEntityExpectation::Absent
+        ));
     }
 
     fn canonical_surface(
@@ -10699,17 +10805,6 @@ mod tests {
             assert_eq!(added.plugin_tool_result["ok"], true, "{added:?}");
         }
 
-        if profile == WorkspacesProfile::Lifecycle {
-            for session_id in &session_ids[..2] {
-                client
-                    .request(&DaemonRequest::Spawn {
-                        session_id: session_id.clone(),
-                        command: "while IFS= read -r line; do :; done".to_string(),
-                    })
-                    .expect("spawn a controlled authoritative Hub session");
-            }
-        }
-
         let packages = client
             .request(&DaemonRequest::ListPackages)
             .expect("list packages after Workspaces enablement");
@@ -10725,15 +10820,42 @@ mod tests {
         app.apply_response(packages);
         app.apply_response(apps);
         app.apply_response(navigation);
-        let snapshot_deadline = Instant::now() + Duration::from_secs(7);
-        while !app.session_entities.has_snapshot && Instant::now() < snapshot_deadline {
-            app.poll_hub();
-            thread::yield_now();
+        if profile == WorkspacesProfile::Lifecycle {
+            for session_id in &session_ids[..2] {
+                wait_for_session_entity_expectation(
+                    &mut app,
+                    session_id,
+                    SessionEntityExpectation::Absent,
+                    "controlled Workspaces session must be absent from the pre-spawn baseline",
+                );
+            }
+            for session_id in &session_ids[..2] {
+                client
+                    .request(&DaemonRequest::Spawn {
+                        session_id: session_id.clone(),
+                        command: "while IFS= read -r line; do :; done".to_string(),
+                    })
+                    .expect("spawn a controlled authoritative Hub session");
+            }
+            for session_id in &session_ids[..2] {
+                wait_for_session_entity_expectation(
+                    &mut app,
+                    session_id,
+                    SessionEntityExpectation::Lifecycle("current"),
+                    "controlled Workspaces session must become authoritative before surface open",
+                );
+            }
+        } else {
+            let snapshot_deadline = Instant::now() + Duration::from_secs(7);
+            while !app.session_entities.has_snapshot && Instant::now() < snapshot_deadline {
+                app.poll_hub();
+                thread::yield_now();
+            }
+            assert!(
+                app.session_entities.has_snapshot,
+                "Workspaces mode requires an authoritative session snapshot"
+            );
         }
-        assert!(
-            app.session_entities.has_snapshot,
-            "Workspaces mode requires an authoritative session snapshot"
-        );
         app.observed_requests.clear();
 
         let navigation_index = app
@@ -10951,17 +11073,12 @@ mod tests {
                     session_id: session_ids[1].clone(),
                 })
                 .expect("end the controlled referenced session through Hub authority");
-            let ended_deadline = Instant::now() + Duration::from_secs(7);
-            while app
-                .session_entities
-                .entities
-                .get(&session_ids[1])
-                .is_none_or(|entity| entity.lifecycle_class != "ended")
-                && Instant::now() < ended_deadline
-            {
-                app.poll_hub();
-                thread::yield_now();
-            }
+            wait_for_session_entity_expectation(
+                &mut app,
+                &session_ids[1],
+                SessionEntityExpectation::Lifecycle("ended"),
+                "controlled Workspaces session must become authoritative ended state",
+            );
             assert_eq!(
                 app.session_entities.entities[&session_ids[1]].lifecycle_class,
                 "ended"
@@ -11014,29 +11131,23 @@ mod tests {
                     session_id: session_ids[0].clone(),
                 })
                 .expect("end the controlled session before removing Hub history");
-            let first_ended_deadline = Instant::now() + Duration::from_secs(7);
-            while app
-                .session_entities
-                .entities
-                .get(&session_ids[0])
-                .is_none_or(|entity| entity.lifecycle_class != "ended")
-                && Instant::now() < first_ended_deadline
-            {
-                app.poll_hub();
-                thread::yield_now();
-            }
+            wait_for_session_entity_expectation(
+                &mut app,
+                &session_ids[0],
+                SessionEntityExpectation::Lifecycle("ended"),
+                "controlled Workspaces session must end before history removal",
+            );
             client
                 .request(&DaemonRequest::RemoveSession {
                     session_id: session_ids[0].clone(),
                 })
                 .expect("remove one controlled Hub session while retaining workspace history");
-            let removed_deadline = Instant::now() + Duration::from_secs(7);
-            while app.session_entities.entities.contains_key(&session_ids[0])
-                && Instant::now() < removed_deadline
-            {
-                app.poll_hub();
-                thread::yield_now();
-            }
+            wait_for_session_entity_expectation(
+                &mut app,
+                &session_ids[0],
+                SessionEntityExpectation::Absent,
+                "controlled Workspaces session must be authoritatively removed",
+            );
             assert!(!app.session_entities.entities.contains_key(&session_ids[0]));
             let absent_root = materialized_plugin_root(&app);
             collect_realized_node_ids(&absent_root)
@@ -11077,6 +11188,12 @@ mod tests {
             assert!(app.session_entities.has_snapshot);
             ledger.record(WorkspacesStage::FreshReconnectSubscription);
             ledger.record(WorkspacesStage::FreshReconnectSnapshot);
+            wait_for_session_entity_expectation(
+                &mut app,
+                &session_ids[1],
+                SessionEntityExpectation::Lifecycle("ended"),
+                "reconnect must rehydrate the exact controlled session in its authoritative ended state",
+            );
 
             let stale_seq = app.session_entities.snapshot_seq.unwrap_or_default() + 1;
             assert!(
@@ -11643,27 +11760,28 @@ mod tests {
         );
 
         let mut client = HubConnection::connect(hub.endpoint()).expect("connect to live hub");
-        let mut binding_app = TuiApp::new(Some(hub.endpoint().clone()));
-        binding_app.workspace_test_mode = true;
-        let snapshot_deadline = Instant::now() + Duration::from_secs(7);
-        while !binding_app.session_entities.has_snapshot && Instant::now() < snapshot_deadline {
-            binding_app.poll_hub();
-            thread::yield_now();
-        }
-        assert!(
-            binding_app.session_entities.has_snapshot,
-            "live TuiApp must hydrate its app-owned session store"
-        );
         let live_session_uuid = format!("tui-binding-{}", short_suffix());
         let missing_session_uuid = format!("tui-binding-missing-{}", short_suffix());
+        let mut binding_app = TuiApp::new(Some(hub.endpoint().clone()));
+        binding_app.workspace_test_mode = true;
+        wait_for_session_entity_expectation(
+            &mut binding_app,
+            &live_session_uuid,
+            SessionEntityExpectation::Absent,
+            "generated contract-matrix session must be absent from the pre-spawn baseline",
+        );
         client
             .request(&DaemonRequest::Spawn {
                 session_id: live_session_uuid.clone(),
                 command: "while IFS= read -r line; do :; done".to_string(),
             })
             .expect("spawn session after the TUI subscription baseline");
-        wait_for_authoritative_session(&mut binding_app, &live_session_uuid)
-            .expect("live spawn upsert reaches the TUI-owned store");
+        wait_for_session_entity_expectation(
+            &mut binding_app,
+            &live_session_uuid,
+            SessionEntityExpectation::Lifecycle("current"),
+            "live spawn must reach the TUI-owned entity store",
+        );
         binding_app.observed_requests.clear();
         binding_app.request_and_apply(DaemonRequest::PluginSurfaceRender {
             package_name: report.package_name.clone(),
@@ -11720,8 +11838,12 @@ mod tests {
             render_requests_before_reconnect,
             "reconnect must not refresh the plugin surface"
         );
-        wait_for_authoritative_session(&mut binding_app, &live_session_uuid)
-            .expect("fresh app-owned generation restores the bound row");
+        wait_for_session_entity_expectation(
+            &mut binding_app,
+            &live_session_uuid,
+            SessionEntityExpectation::Lifecycle("current"),
+            "fresh app-owned generation must restore the exact bound row",
+        );
         binding_app.request_and_apply(DaemonRequest::PluginSurfaceRender {
             package_name: report.package_name.clone(),
             surface_id: report.session_surface_id.clone(),
@@ -11739,17 +11861,12 @@ mod tests {
                 session_id: live_session_uuid.clone(),
             })
             .expect("shutdown live bound session");
-        let ended_deadline = Instant::now() + Duration::from_secs(7);
-        while binding_app
-            .session_entities
-            .entities
-            .get(&live_session_uuid)
-            .is_none_or(|entity| entity.lifecycle_class != "ended")
-            && Instant::now() < ended_deadline
-        {
-            binding_app.poll_hub();
-            thread::yield_now();
-        }
+        wait_for_session_entity_expectation(
+            &mut binding_app,
+            &live_session_uuid,
+            SessionEntityExpectation::Lifecycle("ended"),
+            "live bound session must become authoritative ended state",
+        );
         let ended = renderer::render_to_lines(&binding_app.surface(), 180, 60)
             .0
             .join("\n");
@@ -11759,16 +11876,12 @@ mod tests {
                 session_id: live_session_uuid.clone(),
             })
             .expect("remove live bound session");
-        let removed_deadline = Instant::now() + Duration::from_secs(7);
-        while binding_app
-            .session_entities
-            .entities
-            .contains_key(&live_session_uuid)
-            && Instant::now() < removed_deadline
-        {
-            binding_app.poll_hub();
-            thread::yield_now();
-        }
+        wait_for_session_entity_expectation(
+            &mut binding_app,
+            &live_session_uuid,
+            SessionEntityExpectation::Absent,
+            "live bound session must be authoritatively removed",
+        );
         let removed = renderer::render_to_lines(&binding_app.surface(), 180, 60)
             .0
             .join("\n");
