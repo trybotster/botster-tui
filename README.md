@@ -307,18 +307,73 @@ CARGO_TARGET_DIR=/tmp/botster-tui-live-target \
   script/test-live-hub
 ```
 
+The wrapper also exposes one production-shaped Workspaces mode with an explicit
+profile. It never discovers a sibling checkout: the caller supplies a clean
+`botster-workspaces` package path, and the harness validates the package
+manifest before starting an isolated Hub.
+
+```sh
+BOTSTER_HUB_BIN=/path/to/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
+BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/clean/botster-workspaces \
+CARGO_TARGET_DIR=/tmp/botster-tui-workspaces-plumbing-target \
+  script/test-live-hub workspaces plumbing
+```
+
+The `plumbing` profile installs, enables, and reloads the real package through
+public Hub requests; opens admitted Workspaces navigation; renders the
+owner-authored index and detail; and routes both mouse and keyboard actions
+from the production frame and hit map using the exact delivered node, action,
+and payload identity. It exits zero only after its named completion ledger and
+isolated-Hub cleanup are complete. This is package plumbing and generic TUI
+action proof, not Workspaces lifecycle product proof.
+
+The strict-superset lifecycle command is the downstream consumer gate:
+
+```sh
+BOTSTER_HUB_BIN=/path/to/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
+BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/clean/botster-workspaces \
+CARGO_TARGET_DIR=/tmp/botster-tui-workspaces-lifecycle-target \
+  script/test-live-hub workspaces lifecycle
+```
+
+That profile requires 16 retained references and the producer-authored
+`/session` binding contract: exact `session_uuid` plus `lifecycle_class`
+filters for `current`, `ended`, and `indeterminate`, plus a separate exact-UUID
+absence binding. It joins those delivered descriptors to realized
+`item_template`/`empty_template` roots, so it does not depend on headings,
+incidental node-id spelling, prose, or geometric renderer position. It also
+requires an individual group's realized roots to preserve the
+retained-reference order in structural render traversal, including when
+producer-authored wrappers sit between the group and its roots; lifecycle class
+is never inferred from that order. The profile further requires an
+entity-driven current-to-ended transition without a new surface request, an
+absent/deleted historical reference, inert presence-detection templates,
+unique canonical realized identity, real membership removal, a fresh
+reconnect subscription/snapshot, explicit surface reopen, historical
+rehydration, stale-generation rejection, and clean shutdown.
+
+Current `botster-workspaces` main intentionally lacks that lifecycle tree, so
+`workspaces lifecycle` fails closed with a diagnostic naming downstream
+`ticket_1785296184_677408`. That Workspaces-owned ticket must run this merged
+mode against its real package checkout; a fixture or a composed summary cannot
+replace the combined consumer proof.
+
 Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
 `BOTSTER_SESSION_WORKER_BIN` paths because `botster-tui` does not own those
 binaries. If a variable is omitted, the wrapper looks up the corresponding
 command on `PATH` and fails with a setup diagnostic if it is unavailable.
 `CARGO_TARGET_DIR` is optional; omitting it creates and cleans up a fresh
-temporary target. `BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` is required and must
-name a Hub contract-matrix fixture directory containing `botster-package.json`
-and `plugin.lua`; the parent acceptance run uses the extracted
+temporary target. In the default `contract-matrix` mode,
+`BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` is required and must name a Hub
+contract-matrix fixture directory containing `botster-package.json` and
+`plugin.lua`; the parent acceptance run uses the extracted
 `package/fixtures/plugin-contract-matrix` directory from public
 `@trybotster/hub-test-support@0.1.18`. The wrapper fails before building when
-the fixture is missing or invalid. Normal unit tests skip the isolated runtime
-when the binary variables are absent; the wrapper sets
+the selected mode's fixture/package path or Workspaces profile is missing or
+invalid. Normal unit tests skip the isolated runtime when the required live
+inputs are absent; the wrapper sets
 `BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
 binaries or plugin-surface proof cannot silently pass. The live-Hub test also
 asserts non-default compatibility descriptor values from the isolated daemon
