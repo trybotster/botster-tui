@@ -40,7 +40,7 @@ use crossterm::{
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 use serde_json::{Value, json};
 
-use crate::acceptance::{Config as AcceptanceConfig, EvidenceWriter, ScenarioCase};
+use crate::acceptance::{Config as AcceptanceConfig, EvidenceWriter, FailureContext, ScenarioCase};
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
@@ -3265,20 +3265,8 @@ struct AcceptanceRequestAudit {
 
 impl AcceptanceRequestAudit {
     fn record(&mut self, request: &DaemonRequest) {
-        if serde_json::to_value(request)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .as_deref()
-            == Some("list_sessions")
-        {
-            self.list_sessions += 1;
-        }
         match request {
+            DaemonRequest::ListSessions => self.list_sessions += 1,
             DaemonRequest::PluginSurfaceRender {
                 package_name,
                 surface_id,
@@ -3294,6 +3282,77 @@ impl AcceptanceRequestAudit {
     }
 }
 
+#[derive(Default)]
+struct AcceptanceDiagnostics {
+    case_id: Option<String>,
+    phase: String,
+    expected_condition: String,
+    subscription_id: Option<String>,
+    snapshot_seq: Option<u64>,
+    surface_render_count: usize,
+    focusable_ids: Vec<String>,
+    last_observation: Value,
+}
+
+impl AcceptanceDiagnostics {
+    fn stage(&mut self, phase: &str, case_id: Option<&str>, expected_condition: &str) {
+        self.phase = phase.to_string();
+        self.case_id = case_id.map(ToOwned::to_owned);
+        self.expected_condition = expected_condition.to_string();
+    }
+
+    fn observe_app(&mut self, app: &TuiApp) {
+        self.subscription_id = app.session_entities.subscription_id.clone();
+        self.snapshot_seq = app.session_entities.snapshot_seq;
+        self.surface_render_count = app
+            .acceptance_audit
+            .as_ref()
+            .map_or(0, |audit| audit.surface_renders.len());
+    }
+
+    fn observe_frame(&mut self, app: &TuiApp, hit_map: &HitMap) {
+        self.observe_app(app);
+        self.focusable_ids = focusable_ids(hit_map);
+    }
+
+    fn observe_request(&mut self, request: &UiActionRequest) {
+        self.last_observation = json!({
+            "kind": "action_request",
+            "request_id": request.request_id,
+            "surface_id": request.surface_id,
+            "action_id": request.action_id,
+            "node_id": request.node_id
+        });
+    }
+
+    fn observe_result(&mut self, result: &UiActionResult) {
+        self.last_observation = json!({
+            "kind": "action_result",
+            "request_id": result.request_id,
+            "surface_id": result.surface_id,
+            "action_id": result.action_id,
+            "node_id": result.node_id,
+            "state": result.state,
+            "field_errors": result.field_errors,
+            "form_errors": result.form_errors,
+            "error": result.error
+        });
+    }
+
+    fn failure_context(&self) -> FailureContext {
+        FailureContext {
+            case_id: self.case_id.clone(),
+            phase: self.phase.clone(),
+            expected_condition: self.expected_condition.clone(),
+            subscription_id: self.subscription_id.clone(),
+            snapshot_seq: self.snapshot_seq,
+            surface_render_count: self.surface_render_count,
+            focusable_ids: self.focusable_ids.clone(),
+            last_observation: self.last_observation.clone(),
+        }
+    }
+}
+
 const ACCEPTANCE_WIDTH: u16 = 500;
 const ACCEPTANCE_HEIGHT: u16 = 240;
 const ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -3302,11 +3361,20 @@ const WORKSPACES_SURFACE: &str = "workspaces";
 
 fn run_workspaces_acceptance(args: AppArgs, config: AcceptanceConfig) -> io::Result<()> {
     let mut evidence = EvidenceWriter::create(&config.evidence_path)?;
-    let result = drive_workspaces_acceptance(args, &config, &mut evidence);
+    let mut diagnostics = AcceptanceDiagnostics {
+        last_observation: json!({}),
+        ..AcceptanceDiagnostics::default()
+    };
+    diagnostics.stage(
+        "connect",
+        None,
+        "caller-injected Hub connection and data directory",
+    );
+    let result = drive_workspaces_acceptance(args, &config, &mut evidence, &mut diagnostics);
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            let _ = evidence.failure("driver", &error.to_string(), &[]);
+            let _ = evidence.failure(&diagnostics.failure_context(), &error.to_string());
             Err(error)
         }
     }
@@ -3316,6 +3384,7 @@ fn drive_workspaces_acceptance(
     args: AppArgs,
     config: &AcceptanceConfig,
     evidence: &mut EvidenceWriter,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
     if let Some(error) = args.connection_error.as_deref() {
         return Err(io::Error::new(
@@ -3352,17 +3421,30 @@ fn drive_workspaces_acceptance(
         ));
     }
     app.acceptance_audit = Some(AcceptanceRequestAudit::default());
-    wait_for_acceptance_state(&mut app, "authoritative session baseline", |app| {
-        app.session_entities.has_snapshot
-    })?;
-    wait_for_acceptance_state(&mut app, "admitted Workspaces navigation", |app| {
-        app.package_navigation.iter().any(|entry| {
-            entry.package_name == WORKSPACES_PACKAGE
-                && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE)
-                && entry.enabled
-                && !entry.blocked
-        })
-    })?;
+    diagnostics.stage(
+        "baseline",
+        None,
+        "authoritative session snapshot and admitted Workspaces navigation",
+    );
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "authoritative session baseline",
+        |app, _| app.session_entities.has_snapshot,
+    )?;
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "admitted Workspaces navigation",
+        |app, _| {
+            app.package_navigation.iter().any(|entry| {
+                entry.package_name == WORKSPACES_PACKAGE
+                    && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE)
+                    && entry.enabled
+                    && !entry.blocked
+            })
+        },
+    )?;
     evidence.event(
         "ready",
         None,
@@ -3379,11 +3461,17 @@ fn drive_workspaces_acceptance(
     )?;
 
     let mut router = InputRouter::new(renderer::action_request_context());
+    diagnostics.stage(
+        "initial_surface_open",
+        None,
+        "realized Workspaces navigation and exact workspace row",
+    );
     if !acceptance_has_action(
         &mut app,
         &mut router,
         "botster.tui.navigation.open",
         |payload| payload_field(payload, "surface_id") == Some(WORKSPACES_SURFACE),
+        diagnostics,
     )? {
         activate_acceptance_action(
             &mut app,
@@ -3392,6 +3480,7 @@ fn drive_workspaces_acceptance(
             |_| true,
             evidence,
             None,
+            diagnostics,
         )?;
     }
     open_workspaces_surface(
@@ -3399,6 +3488,7 @@ fn drive_workspaces_acceptance(
         &mut router,
         &config.scenario.workspace_id,
         evidence,
+        diagnostics,
     )?;
 
     let old_subscription = app
@@ -3417,6 +3507,11 @@ fn drive_workspaces_acceptance(
         );
     }
     router = InputRouter::new(renderer::action_request_context());
+    diagnostics.stage(
+        "reconnect",
+        None,
+        "keyboard-dispatched reconnect and fresh authoritative subscription",
+    );
     activate_acceptance_action(
         &mut app,
         &mut router,
@@ -3424,11 +3519,18 @@ fn drive_workspaces_acceptance(
         |_| true,
         evidence,
         None,
+        diagnostics,
     )?;
-    wait_for_acceptance_state(&mut app, "fresh reconnect snapshot", |app| {
-        app.session_entities.has_snapshot
-            && app.session_entities.subscription_id.as_deref() != Some(old_subscription.as_str())
-    })?;
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "fresh reconnect snapshot",
+        |app, _| {
+            app.session_entities.has_snapshot
+                && app.session_entities.subscription_id.as_deref()
+                    != Some(old_subscription.as_str())
+        },
+    )?;
     evidence.event(
         "reconnect",
         None,
@@ -3443,6 +3545,7 @@ fn drive_workspaces_acceptance(
         &mut router,
         &config.scenario.workspace_id,
         evidence,
+        diagnostics,
     )?;
 
     for case in &config.scenario.cases {
@@ -3452,6 +3555,7 @@ fn drive_workspaces_acceptance(
             &config.scenario.workspace_id,
             case,
             evidence,
+            diagnostics,
         )?;
     }
 
@@ -3488,6 +3592,7 @@ fn open_workspaces_surface(
     router: &mut InputRouter,
     workspace_id: &str,
     evidence: &mut EvidenceWriter,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
     activate_acceptance_action(
         app,
@@ -3499,6 +3604,7 @@ fn open_workspaces_surface(
         },
         evidence,
         None,
+        diagnostics,
     )?;
     *router = InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE));
     evidence.event(
@@ -3518,6 +3624,7 @@ fn open_workspaces_surface(
         },
         evidence,
         None,
+        diagnostics,
     )?;
     Ok(())
 }
@@ -3528,7 +3635,13 @@ fn drive_spawn_case(
     workspace_id: &str,
     case: &ScenarioCase,
     evidence: &mut EvidenceWriter,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
+    diagnostics.stage(
+        "spawn_dialog",
+        Some(&case.case_id),
+        "producer-authored target-first Spawn control",
+    );
     activate_acceptance_action(
         app,
         router,
@@ -3539,7 +3652,13 @@ fn drive_spawn_case(
         },
         evidence,
         Some(&case.case_id),
+        diagnostics,
     )?;
+    diagnostics.stage(
+        "target_selection",
+        Some(&case.case_id),
+        "exact rendered target option and accepted target-selection action",
+    );
     select_acceptance_value(
         app,
         router,
@@ -3547,6 +3666,7 @@ fn drive_spawn_case(
         &case.target_id,
         evidence,
         &case.case_id,
+        diagnostics,
     )?;
     activate_acceptance_action(
         app,
@@ -3555,9 +3675,35 @@ fn drive_spawn_case(
         |_| true,
         evidence,
         Some(&case.case_id),
+        diagnostics,
     )?;
-    select_only_acceptance_value(app, router, "template_id", evidence, &case.case_id)?;
-    type_acceptance_text(app, router, "branch", &case.branch, evidence, &case.case_id)?;
+    diagnostics.stage(
+        "spawn_form",
+        Some(&case.case_id),
+        "single eligible template and keyboard-typed requested branch",
+    );
+    select_only_acceptance_value(
+        app,
+        router,
+        "template_id",
+        evidence,
+        &case.case_id,
+        diagnostics,
+    )?;
+    type_acceptance_text(
+        app,
+        router,
+        "branch",
+        &case.branch,
+        evidence,
+        &case.case_id,
+        diagnostics,
+    )?;
+    diagnostics.stage(
+        "spawn_submit",
+        Some(&case.case_id),
+        "accepted correlated Spawn result with expected Hub facts",
+    );
     let request = activate_acceptance_action(
         app,
         router,
@@ -3565,6 +3711,7 @@ fn drive_spawn_case(
         |_| true,
         evidence,
         Some(&case.case_id),
+        diagnostics,
     )?;
     let result = app.plugin_action_result.clone().ok_or_else(|| {
         io::Error::new(
@@ -3586,11 +3733,6 @@ fn drive_spawn_case(
             result.payload
         ));
     }
-    evidence.event(
-        "action_result",
-        Some(&case.case_id),
-        serde_json::to_value(&result).map_err(io::Error::other)?,
-    )?;
     let payload = result.payload.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3631,10 +3773,16 @@ fn drive_spawn_case(
         .expect("acceptance audit enabled")
         .surface_renders
         .len();
+    diagnostics.stage(
+        "entity_reconciliation",
+        Some(&case.case_id),
+        "exact current session entity and rendered Workspaces membership metadata",
+    );
     wait_for_acceptance_state(
         app,
+        diagnostics,
         "spawned session entity and workspace membership",
-        |app| {
+        |app, diagnostics| {
             let current = app
                 .session_entities
                 .entities
@@ -3643,8 +3791,18 @@ fn drive_spawn_case(
             if !current {
                 return false;
             }
-            acceptance_frame(app, router)
-                .map(|(lines, _)| lines.join("\n").contains(&session_id))
+            acceptance_frame(app, router, diagnostics)
+                .map(|(_, hit_map)| {
+                    hit_map.regions().iter().any(|region| {
+                        region.action.as_ref().is_some_and(|action| {
+                            action.id.0 == "botster_workspaces.remove_session"
+                                && payload_field(&action.payload, "session_id")
+                                    == Some(session_id.as_str())
+                                && payload_field(&action.payload, "workspace_id")
+                                    == Some(workspace_id)
+                        })
+                    })
+                })
                 .unwrap_or(false)
         },
     )?;
@@ -3682,30 +3840,38 @@ fn drive_spawn_case(
 
 fn wait_for_acceptance_state(
     app: &mut TuiApp,
+    diagnostics: &mut AcceptanceDiagnostics,
     expectation: &str,
-    mut ready: impl FnMut(&mut TuiApp) -> bool,
+    mut ready: impl FnMut(&mut TuiApp, &mut AcceptanceDiagnostics) -> bool,
 ) -> io::Result<()> {
     let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     while Instant::now() < deadline {
         app.drain_session_subscription();
-        if ready(app) {
+        diagnostics.observe_app(app);
+        if ready(app, diagnostics) {
             return Ok(());
         }
-        thread::yield_now();
+        thread::sleep(Duration::from_millis(1));
     }
     invalid_acceptance(format!("timed out waiting for {expectation}"))
 }
 
-fn acceptance_frame(app: &mut TuiApp, router: &InputRouter) -> io::Result<(Vec<String>, HitMap)> {
+fn acceptance_frame(
+    app: &mut TuiApp,
+    router: &InputRouter,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> io::Result<(Vec<String>, HitMap)> {
     app.set_drafts(router.draft_values());
-    botster_tui_kit::render_to_lines_with_presentation_state(
+    let frame = botster_tui_kit::render_to_lines_with_presentation_state(
         &app.surface(),
         ACCEPTANCE_WIDTH,
         ACCEPTANCE_HEIGHT,
         &router.render_state(),
         &app.plugin_presentation,
     )
-    .map_err(io::Error::other)
+    .map_err(io::Error::other)?;
+    diagnostics.observe_frame(app, &frame.1);
+    Ok(frame)
 }
 
 fn acceptance_has_action(
@@ -3713,8 +3879,9 @@ fn acceptance_has_action(
     router: &mut InputRouter,
     action_id: &str,
     payload_matches: impl Fn(&Option<Value>) -> bool,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<bool> {
-    let (_, hit_map) = acceptance_frame(app, router)?;
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
     Ok(hit_map.regions().iter().any(|region| {
         region
             .action
@@ -3730,8 +3897,9 @@ fn activate_acceptance_action(
     payload_matches: impl Fn(&Option<Value>) -> bool,
     evidence: &mut EvidenceWriter,
     case_id: Option<&str>,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<UiActionRequest> {
-    let (lines, hit_map) = acceptance_frame(app, router)?;
+    let (lines, hit_map) = acceptance_frame(app, router, diagnostics)?;
     let matches = hit_map
         .regions()
         .iter()
@@ -3741,7 +3909,12 @@ fn activate_acceptance_action(
                 .as_ref()
                 .is_some_and(|action| action.id.0 == action_id && payload_matches(&action.payload))
         })
-        .map(|region| region.node_id.clone())
+        .map(|region| {
+            (
+                region.node_id.clone(),
+                region.action.clone().expect("filtered action"),
+            )
+        })
         .collect::<Vec<_>>();
     if matches.len() != 1 {
         return invalid_acceptance(format!(
@@ -3757,13 +3930,14 @@ fn activate_acceptance_action(
                 .join(" | ")
         ));
     }
-    focus_acceptance_node(router, &hit_map, &matches[0])?;
+    let (expected_node_id, expected_action) = &matches[0];
+    focus_acceptance_node(router, &hit_map, expected_node_id)?;
     evidence.event(
         "focused_control",
         case_id,
-        json!({ "node_id": matches[0], "action_id": action_id }),
+        json!({ "node_id": expected_node_id, "action_id": action_id }),
     )?;
-    let (_, hit_map) = acceptance_frame(app, router)?;
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
     let dispatch = router.dispatch_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &hit_map,
@@ -3776,6 +3950,30 @@ fn activate_acceptance_action(
             ));
         }
     };
+    let expected_surface_id = if action_id.starts_with("botster.tui.") {
+        renderer::WORKSPACE_SURFACE_ID
+    } else {
+        WORKSPACES_SURFACE
+    };
+    if request.action_id != expected_action.id
+        || request.node_id.as_ref().map(|node_id| node_id.0.as_str())
+            != Some(expected_node_id.as_str())
+        || request.surface_id.0 != expected_surface_id
+        || request.payload != expected_action.payload
+        || request.kind != botster_ui_contract::UiActionKind::Submit
+    {
+        return invalid_acceptance(format!(
+            "rendered action identity changed during keyboard dispatch: expected node={expected_node_id:?} action={:?} surface={expected_surface_id:?} payload={:?}; observed node={:?} action={:?} surface={:?} kind={:?} payload={:?}",
+            expected_action.id,
+            expected_action.payload,
+            request.node_id,
+            request.action_id,
+            request.surface_id,
+            request.kind,
+            request.payload
+        ));
+    }
+    diagnostics.observe_request(&request);
     evidence.event(
         "dispatched_action",
         case_id,
@@ -3784,6 +3982,24 @@ fn activate_acceptance_action(
     app.handle_dispatch(dispatch);
     if let Some(error) = app.error.as_deref() {
         return invalid_acceptance(format!("action {action_id} failed: {error}"));
+    }
+    if let Some(result) = app
+        .plugin_action_result
+        .clone()
+        .filter(|result| result.request_id == request.request_id)
+    {
+        diagnostics.observe_result(&result);
+        evidence.event(
+            "action_result",
+            case_id,
+            serde_json::to_value(&result).map_err(io::Error::other)?,
+        )?;
+        if result.state != botster_ui_contract::UiActionResultState::Accepted {
+            return invalid_acceptance(format!(
+                "action {action_id} was not accepted: state={:?} field_errors={:?} form_errors={:?} error={:?}",
+                result.state, result.field_errors, result.form_errors, result.error
+            ));
+        }
     }
     Ok(request)
 }
@@ -3816,8 +4032,9 @@ fn select_acceptance_value(
     expected: &str,
     evidence: &mut EvidenceWriter,
     case_id: &str,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
-    let (_, hit_map) = acceptance_frame(app, router)?;
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
     let fields = hit_map
         .regions()
         .iter()
@@ -3859,20 +4076,20 @@ fn select_acceptance_value(
         Some(case_id),
         json!({ "node_id": node_id, "field": field_name }),
     )?;
-    let (_, open_map) = acceptance_frame(app, router)?;
+    let (_, open_map) = acceptance_frame(app, router, diagnostics)?;
     router.dispatch_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &open_map,
     );
     let steps = (target_index + field.options.len() - current_index) % field.options.len();
     for _ in 0..steps {
-        let (_, map) = acceptance_frame(app, router)?;
+        let (_, map) = acceptance_frame(app, router, diagnostics)?;
         router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             &map,
         );
     }
-    let (_, commit_map) = acceptance_frame(app, router)?;
+    let (_, commit_map) = acceptance_frame(app, router, diagnostics)?;
     router.dispatch_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &commit_map,
@@ -3889,8 +4106,9 @@ fn select_only_acceptance_value(
     field_name: &str,
     evidence: &mut EvidenceWriter,
     case_id: &str,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
-    let (_, hit_map) = acceptance_frame(app, router)?;
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
     let field = hit_map
         .regions()
         .iter()
@@ -3921,7 +4139,15 @@ fn select_only_acceptance_value(
             )
         })?
         .to_string();
-    select_acceptance_value(app, router, field_name, &expected, evidence, case_id)
+    select_acceptance_value(
+        app,
+        router,
+        field_name,
+        &expected,
+        evidence,
+        case_id,
+        diagnostics,
+    )
 }
 
 fn type_acceptance_text(
@@ -3931,8 +4157,9 @@ fn type_acceptance_text(
     value: &str,
     evidence: &mut EvidenceWriter,
     case_id: &str,
+    diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
-    let (_, hit_map) = acceptance_frame(app, router)?;
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
     let fields = hit_map
         .regions()
         .iter()
@@ -3970,14 +4197,14 @@ fn type_acceptance_text(
         .map(|value| value.chars().count())
         .unwrap_or_default();
     for _ in 0..carried_characters {
-        let (_, map) = acceptance_frame(app, router)?;
+        let (_, map) = acceptance_frame(app, router, diagnostics)?;
         router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
             &map,
         );
     }
     for character in value.chars() {
-        let (_, map) = acceptance_frame(app, router)?;
+        let (_, map) = acceptance_frame(app, router, diagnostics)?;
         router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
             &map,
@@ -7848,6 +8075,36 @@ mod tests {
                 }),
             ],
         );
+        let presentation_child = |node_id: &str| {
+            UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf {
+                predicate: botster_ui_contract::UiPresentationPredicate::Equals {
+                    key: botster_ui_contract::UiPresentationKey("dialog".to_string()),
+                    value: json!("shared"),
+                },
+                node: Box::new(action(node_id)),
+            })
+        };
+        assert_collision(
+            &mut app,
+            "contract.identical-presentation",
+            "identical-presentation-action",
+            vec![
+                presentation_child("identical-presentation-action"),
+                presentation_child("identical-presentation-action"),
+            ],
+        );
+        assert_collision(
+            &mut app,
+            "contract.presentation-and-when",
+            "presentation-and-when-action",
+            vec![
+                presentation_child("presentation-and-when-action"),
+                responsive_child(
+                    UiWidthClass::Expanded,
+                    action("presentation-and-when-action"),
+                ),
+            ],
+        );
     }
 
     #[test]
@@ -11502,6 +11759,15 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_request_audit_detects_legacy_list_sessions() {
+        let mut audit = AcceptanceRequestAudit::default();
+
+        audit.record(&DaemonRequest::ListSessions);
+
+        assert_eq!(audit.list_sessions, 1);
+    }
+
+    #[test]
     fn reconnect_does_not_auto_attach_selected_running_session() {
         let mut app = TuiApp::new(None);
         app.observed_requests.clear();
@@ -11546,9 +11812,10 @@ mod tests {
                 "botster-tui source must not reintroduce private hub protocol plumbing: {pattern}"
             );
         }
-        assert!(
-            !source.contains(concat!("List", "Sessions")),
-            "session synchronization must not retain the legacy list request"
+        assert_eq!(
+            source.matches(concat!("List", "Sessions")).count(),
+            2,
+            "the legacy list request may appear only in the acceptance audit and its positive control"
         );
     }
 
@@ -11892,6 +12159,12 @@ mod tests {
             .expect("serialize installed-driver scenario"),
         )
         .expect("write installed-driver scenario");
+        let scenario_document: Value = serde_json::from_slice(
+            &std::fs::read(&scenario_path).expect("read installed-driver scenario"),
+        )
+        .expect("decode installed-driver scenario");
+        crate::acceptance::validate_contract_document(&scenario_document)
+            .expect("installed-driver scenario matches published schema");
 
         let output = std::process::Command::new(&hub_bin)
             .args([
@@ -11916,6 +12189,33 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("evidence line is JSON"))
             .collect::<Vec<_>>();
+        for record in &records {
+            crate::acceptance::validate_contract_document(record)
+                .expect("driver-produced evidence matches published schema");
+        }
+        let fixture_records = include_str!("../fixtures/workspaces-spawn-driver-v1.evidence.jsonl")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("fixture evidence line is JSON")
+            });
+        for fixture in fixture_records {
+            let fixture_payload_keys = fixture["payload"]
+                .as_object()
+                .expect("fixture payload is an object")
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                records.iter().any(|record| {
+                    record["kind"] == fixture["kind"]
+                        && record.get("case_id").is_some() == fixture.get("case_id").is_some()
+                        && record["payload"].as_object().is_some_and(|payload| {
+                            payload.keys().collect::<std::collections::BTreeSet<_>>()
+                                == fixture_payload_keys
+                        })
+                }),
+                "canonical fixture record is not shaped like producer output: {fixture}"
+            );
+        }
         assert_eq!(
             records
                 .iter()
@@ -11934,6 +12234,47 @@ mod tests {
             records
                 .iter()
                 .all(|record| record["schema"] == crate::acceptance::SCHEMA)
+        );
+        let mut failure_scenario = scenario_document;
+        failure_scenario["workspace_id"] = json!("workspace-not-rendered");
+        let failure_scenario_path = root.join("failure-scenario.json");
+        let failure_evidence_path = root.join("failure-evidence.jsonl");
+        std::fs::write(
+            &failure_scenario_path,
+            serde_json::to_vec_pretty(&failure_scenario)
+                .expect("serialize bounded-failure scenario"),
+        )
+        .expect("write bounded-failure scenario");
+        let failure_output = std::process::Command::new(&hub_bin)
+            .args([
+                "apps",
+                "open",
+                "--data-dir",
+                hub.data_dir().to_str().expect("Hub data path is UTF-8"),
+                "botster-tui",
+            ])
+            .env(crate::acceptance::SCENARIO_ENV, &failure_scenario_path)
+            .env(crate::acceptance::EVIDENCE_ENV, &failure_evidence_path)
+            .output()
+            .expect("launch installed TUI bounded-failure case");
+        assert!(!failure_output.status.success());
+        let failure_records = std::fs::read_to_string(&failure_evidence_path)
+            .expect("read bounded-failure evidence")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("failure line is JSON"))
+            .collect::<Vec<_>>();
+        let failure = failure_records.last().expect("terminal failure record");
+        crate::acceptance::validate_contract_document(failure)
+            .expect("driver-produced failure matches published schema");
+        assert_eq!(failure["kind"], "failure");
+        assert_eq!(failure["payload"]["phase"], "initial_surface_open");
+        assert!(failure["payload"]["subscription_id"].is_string());
+        assert!(failure["payload"]["snapshot_seq"].is_number());
+        assert!(failure["payload"]["surface_render_count"].is_number());
+        assert!(
+            failure["payload"]["focusable_ids"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
         );
         println!("installed-workspaces-driver: complete cases=3");
         hub.shutdown().expect("installed-driver Hub shuts down");

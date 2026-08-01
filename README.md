@@ -147,6 +147,15 @@ contains node ids or action payloads. The evidence path must not exist and must
 be distinct from the scenario path. Each JSONL record is flushed as a complete
 line, and exactly one `complete` or bounded `failure` record terminates a run.
 Stdout remains the foreground terminal application's unstructured UI channel.
+The JSON Schema pins the structural scenario matrix and every event payload;
+the binary additionally rejects duplicate case ids, surrounding whitespace,
+and expected target/branch values that do not equal their requested values,
+because standard JSON Schema cannot express those cross-field equalities.
+The two acceptance paths reach the installed child through the current
+`botster-hub apps open` caller-environment inheritance behavior; the package
+manifest declares only its normal Hub connection and data-directory injections.
+If Hub launch policy later replaces inherited caller environment with declared
+passthrough inputs, this contract must be routed to the Hub owner and migrated.
 
 This mode uses the same presentation-aware production UiNode tree and realized
 `HitMap` as interactive drawing at a fixed production-sized viewport. It finds
@@ -156,6 +165,15 @@ opens the Workspaces surface once initially and once after keyboard-activating
 the rendered Reconnect control. After that barrier, pushed session entity frames
 must update subsequent renders without `ListSessions`, polling reads, list
 refreshes, or synchronization surface renders.
+Acceptance mode replaces the interactive event loop; it does not instrument
+`run_loop`. Its request ledger therefore proves that pushed entity frames alone
+update the acceptance driver's production tree and that the driver's own request
+stream contains exactly two surface renders and no session-list reads. The
+zero-session-list counter is a regression tripwire for a request variant the
+interactive TUI does not currently construct. Scenario resolution classes are
+carried into evidence for the caller's independent Git/worktree verification;
+the TUI verifies returned target, branch, worktree, action, and entity facts but
+does not infer the producer's Git resolution class.
 
 The repository-owned installed-binary proof is:
 

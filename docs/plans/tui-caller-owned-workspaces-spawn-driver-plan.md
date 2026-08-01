@@ -316,7 +316,10 @@ scope overlap to fold at Plan time.
 - Assumption: `botster-hub apps open` remains the caller launch path. Its current
   foreground child inherits caller environment and receives the resolved Hub
   injections, so the parent can set both acceptance paths without changing the
-  package manifest or rebuilding attach plumbing.
+  package manifest or rebuilding attach plumbing. README documents this as an
+  explicit cross-repository assumption rather than a declared manifest
+  injection; a future Hub environment-sanitization change must be routed to the
+  Hub owner.
 - Assumption: acceptance mode deliberately calls the public, non-test
   `botster_tui_kit::render_to_lines_with_presentation_state` primitive at a
   fixed viewport with the router's `RenderState` and the app's
@@ -359,14 +362,16 @@ Expected changes:
   - focused unit and caller-owned driver tests.
 - `crates/botster-tui/src/acceptance.rs` (new)
   - strict v1 scenario types/validation, create-new JSONL evidence writer,
-    event records, bounded diagnostics, fixture/schema tests, and the direct
-    non-test call to TUI-kit's presentation-aware headless render primitive.
+    structured bounded diagnostics, and fixture/schema tests. Driver rendering
+    remains in `app.rs` beside private `TuiApp` presentation state rather than
+    widening application internals.
 - `crates/botster-tui/src/main.rs`
   - register the small acceptance module; normal entrypoint behavior remains in
     `AppArgs`/`app::run`.
 - `crates/botster-tui/Cargo.toml` and `Cargo.lock`
-  - add direct `serde` derive support already present transitively; no new
-    behavior/library dependency beyond typed JSON contracts.
+  - add direct `serde` derive support already present transitively and the
+    current `jsonschema` crate as a test-only validator for the published
+    cross-repository contract.
 - `crates/botster-tui/fixtures/workspaces-spawn-driver-v1.schema.json` (new)
   - parent-consumable canonical scenario and evidence event schema. This ticket
     establishes `crates/botster-tui/fixtures/` as a new in-repository canonical
@@ -375,7 +380,9 @@ Expected changes:
   - strict three-case example covering each resolution class without node ids
     or action payloads.
 - `crates/botster-tui/fixtures/workspaces-spawn-driver-v1.evidence.jsonl` (new)
-  - bounded example stream for parent parser tests.
+  - producer-shaped bounded example stream with every successful-run event
+    family, correlated request/result/entity exemplars, request summary, and
+    one terminal completion for parent parser tests.
 - `README.md`
   - installed shared-Hub invocation, ownership, schema, evidence, request
     budget, downstream proof, and the exact
@@ -460,8 +467,10 @@ Required implementation gates:
    unknown fields, duplicate/empty cases, invalid resolution matrix,
    scenario/evidence collision, existing evidence, and committed fixture decode.
 5. Focused evidence tests: valid JSONL per schema, create-new semantics, flush
-   ordering, correlation fields, bounded failure output, one terminal event,
-   and no stdout writes.
+   ordering, correlation fields, structured bounded failure output, one
+   terminal event, and no stdout writes. The installed-driver gate validates
+   every real record against the same checked-in schema and requires each
+   canonical fixture event shape to occur in producer output.
 6. Production-frame keyboard tests over a representative target-first two-form
    surface: Tab/Shift-Tab reaches the exact realized controls, select changes
    by key, text is typed through the router, Enter submits, and canonical
@@ -496,9 +505,12 @@ Required implementation gates:
    These remain regression/supporting evidence, not the caller-owned proof.
 10. `git diff --check` plus raw scans proving no absolute home paths, sibling
    discovery, production-driver Hub lifecycle/package mutation,
-   `ListSessions`, mouse helper, direct Workspaces action payload, timing sleep,
-   or new production policy. The explicitly named isolated test harness is the
-   only allowed Hub/package/Git lifecycle site in this repository.
+   mouse helper, direct Workspaces action payload, or new production policy.
+   `DaemonRequest::ListSessions` is allowed only in the allocation-free request
+   audit match and its positive-control unit test; a one-millisecond wait-loop
+   backoff is allowed only as CPU protection after exact pushed-frame readiness
+   checks. The explicitly named isolated test harness is the only allowed
+   Hub/package/Git lifecycle site in this repository.
 
 Required downstream runtime proof is owned by
 `ticket_1785192726_335558` after this TUI commit is merged. From one fresh
