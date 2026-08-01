@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://botster.dev/contracts/tui/workspaces-spawn-driver-v1.schema.json",
+  "title": "Botster TUI Workspaces Spawn driver v1",
+  "$defs": {
+    "schema": { "const": "botster.tui.workspaces-spawn-driver/v1" },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "branch", "worktree_path"],
+      "properties": {
+        "target_id": { "$ref": "#/$defs/nonEmpty" },
+        "branch": { "$ref": "#/$defs/nonEmpty" },
+        "worktree_path": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "target_id", "branch", "resolution", "expected"],
+      "properties": {
+        "case_id": { "$ref": "#/$defs/nonEmpty" },
+        "target_id": { "$ref": "#/$defs/nonEmpty" },
+        "branch": { "$ref": "#/$defs/nonEmpty" },
+        "resolution": { "enum": ["existing_worktree", "existing_branch", "missing_branch"] },
+        "expected": { "$ref": "#/$defs/expected" }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "workspace_id", "cases"],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "workspace_id": { "$ref": "#/$defs/nonEmpty" },
+        "cases": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/case" },
+          "allOf": [
+            { "contains": { "properties": { "resolution": { "const": "existing_worktree" } }, "required": ["resolution"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "resolution": { "const": "existing_branch" } }, "required": ["resolution"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "resolution": { "const": "missing_branch" } }, "required": ["resolution"] }, "minContains": 1, "maxContains": 1 }
+          ]
+        }
+      }
+    },
+    "focusedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/nonEmpty" },
+        "action_id": { "$ref": "#/$defs/nonEmpty" },
+        "field": { "$ref": "#/$defs/nonEmpty" }
+      },
+      "oneOf": [
+        { "required": ["action_id"], "not": { "required": ["field"] } },
+        { "required": ["field"], "not": { "required": ["action_id"] } }
+      ]
+    },
+    "actionRequestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "surface_id", "action_id", "node_id", "kind"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/nonEmpty" },
+        "surface_id": { "$ref": "#/$defs/nonEmpty" },
+        "action_id": { "$ref": "#/$defs/nonEmpty" },
+        "node_id": { "$ref": "#/$defs/nonEmpty" },
+        "kind": { "enum": ["submit", "reset", "validate", "cancel"] },
+        "values": { "type": "object" },
+        "payload": { "type": ["object", "null"] }
+      }
+    },
+    "actionResultPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "surface_id", "action_id", "node_id", "state"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/nonEmpty" },
+        "surface_id": { "$ref": "#/$defs/nonEmpty" },
+        "action_id": { "$ref": "#/$defs/nonEmpty" },
+        "node_id": { "$ref": "#/$defs/nonEmpty" },
+        "state": { "enum": ["accepted", "rejected", "deferred", "error"] },
+        "field_errors": { "type": "object" },
+        "form_errors": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "normalized_values": { "type": "object" },
+        "presentation": { "type": "array" },
+        "replacement": { "type": "object" },
+        "payload": { "type": ["object", "null"] },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "kind", "payload"],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "kind": {
+          "enum": [
+            "ready", "baseline", "surface_request", "focused_control",
+            "dispatched_action", "action_result", "entity_state",
+            "case_complete", "request_summary", "reconnect", "complete", "failure"
+          ]
+        },
+        "case_id": { "$ref": "#/$defs/nonEmpty" },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "ready" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["workspace_id", "case_count"], "properties": { "workspace_id": { "$ref": "#/$defs/nonEmpty" }, "case_count": { "const": 3 } } } } } },
+        { "if": { "properties": { "kind": { "const": "baseline" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["subscription_id", "snapshot_seq", "has_snapshot"], "properties": { "subscription_id": { "$ref": "#/$defs/nonEmpty" }, "snapshot_seq": { "type": "integer", "minimum": 0 }, "has_snapshot": { "const": true } } } } } },
+        { "if": { "properties": { "kind": { "const": "surface_request" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["package_name", "surface_id"], "properties": { "package_name": { "$ref": "#/$defs/nonEmpty" }, "surface_id": { "$ref": "#/$defs/nonEmpty" } } } } } },
+        { "if": { "properties": { "kind": { "const": "focused_control" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/focusedPayload" } } } },
+        { "if": { "properties": { "kind": { "const": "dispatched_action" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/actionRequestPayload" } } } },
+        { "if": { "properties": { "kind": { "const": "action_result" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/actionResultPayload" } } } },
+        { "if": { "properties": { "kind": { "const": "entity_state" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["session_id", "lifecycle_class", "subscription_id", "snapshot_seq"], "properties": { "session_id": { "$ref": "#/$defs/nonEmpty" }, "lifecycle_class": { "$ref": "#/$defs/nonEmpty" }, "subscription_id": { "$ref": "#/$defs/nonEmpty" }, "snapshot_seq": { "type": "integer", "minimum": 0 } } } } } },
+        { "if": { "properties": { "kind": { "const": "case_complete" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["resolution", "request_id", "session_id"], "properties": { "resolution": { "enum": ["existing_worktree", "existing_branch", "missing_branch"] }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "session_id": { "$ref": "#/$defs/nonEmpty" } } } } } },
+        { "if": { "properties": { "kind": { "const": "request_summary" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["surface_render_count", "surface_action_count", "list_sessions_count", "surface_renders"], "properties": { "surface_render_count": { "const": 2 }, "surface_action_count": { "type": "integer", "minimum": 1 }, "list_sessions_count": { "const": 0 }, "surface_renders": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "array", "prefixItems": [{ "$ref": "#/$defs/nonEmpty" }, { "$ref": "#/$defs/nonEmpty" }], "minItems": 2, "maxItems": 2 } } } } } } },
+        { "if": { "properties": { "kind": { "const": "reconnect" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["previous_subscription_id", "subscription_id", "snapshot_seq"], "properties": { "previous_subscription_id": { "$ref": "#/$defs/nonEmpty" }, "subscription_id": { "$ref": "#/$defs/nonEmpty" }, "snapshot_seq": { "type": "integer", "minimum": 0 } } } } } },
+        { "if": { "properties": { "kind": { "const": "complete" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["case_count", "workspace_id"], "properties": { "case_count": { "const": 3 }, "workspace_id": { "$ref": "#/$defs/nonEmpty" } } } } } },
+        { "if": { "properties": { "kind": { "const": "failure" } } }, "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["phase", "message", "expected_condition", "subscription_id", "snapshot_seq", "surface_render_count", "focusable_ids", "last_observation"], "properties": { "phase": { "$ref": "#/$defs/nonEmpty" }, "message": { "type": "string", "maxLength": 512 }, "expected_condition": { "$ref": "#/$defs/nonEmpty" }, "subscription_id": { "type": ["string", "null"] }, "snapshot_seq": { "type": ["integer", "null"], "minimum": 0 }, "surface_render_count": { "type": "integer", "minimum": 0 }, "focusable_ids": { "type": "array", "maxItems": 24, "items": { "$ref": "#/$defs/nonEmpty" } }, "last_observation": { "type": "object" } } } } } }
+      ]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/scenario" },
+    { "$ref": "#/$defs/evidence" }
+  ]
+}
