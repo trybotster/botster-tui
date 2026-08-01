@@ -184,6 +184,18 @@ pub struct EvidenceWriter {
     terminal_written: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct FailureContext {
+    pub case_id: Option<String>,
+    pub phase: String,
+    pub expected_condition: String,
+    pub subscription_id: Option<String>,
+    pub snapshot_seq: Option<u64>,
+    pub surface_render_count: usize,
+    pub focusable_ids: Vec<String>,
+    pub last_observation: Value,
+}
+
 impl EvidenceWriter {
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -211,20 +223,41 @@ impl EvidenceWriter {
         Ok(())
     }
 
-    pub fn failure(
-        &mut self,
-        phase: &str,
-        message: &str,
-        focusable_ids: &[String],
-    ) -> io::Result<()> {
+    pub fn failure(&mut self, context: &FailureContext, message: &str) -> io::Result<()> {
         let bounded_message = message.chars().take(512).collect::<String>();
-        let bounded_ids = focusable_ids.iter().take(24).cloned().collect::<Vec<_>>();
+        let bounded_ids = context
+            .focusable_ids
+            .iter()
+            .take(24)
+            .cloned()
+            .collect::<Vec<_>>();
         self.event(
             "failure",
-            None,
-            json!({ "phase": phase, "message": bounded_message, "focusable_ids": bounded_ids }),
+            context.case_id.as_deref(),
+            json!({
+                "phase": context.phase,
+                "message": bounded_message,
+                "expected_condition": context.expected_condition,
+                "subscription_id": context.subscription_id,
+                "snapshot_seq": context.snapshot_seq,
+                "surface_render_count": context.surface_render_count,
+                "focusable_ids": bounded_ids,
+                "last_observation": context.last_observation
+            }),
         )
     }
+}
+
+#[cfg(test)]
+pub fn validate_contract_document(document: &Value) -> Result<(), String> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../fixtures/workspaces-spawn-driver-v1.schema.json"
+    ))
+    .map_err(|error| error.to_string())?;
+    let validator = jsonschema::validator_for(&schema).map_err(|error| error.to_string())?;
+    validator
+        .validate(document)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Serialize)]
@@ -249,10 +282,10 @@ mod tests {
 
     #[test]
     fn checked_in_scenario_is_strict_and_complete() {
-        scenario()
-            .validate()
-            .expect("checked-in scenario validates");
-        let mut value = serde_json::to_value(scenario()).unwrap();
+        let scenario = scenario();
+        scenario.validate().expect("checked-in scenario validates");
+        let mut value = serde_json::to_value(scenario).unwrap();
+        validate_contract_document(&value).expect("checked-in scenario matches published schema");
         value["unknown"] = json!(true);
         assert!(serde_json::from_value::<Scenario>(value).is_err());
     }
@@ -324,6 +357,10 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("fixture line is JSON"))
             .collect::<Vec<_>>();
+        for record in &records {
+            validate_contract_document(record)
+                .expect("checked-in evidence record matches published schema");
+        }
         let request = records
             .iter()
             .find(|record| record["kind"] == "dispatched_action")
@@ -337,6 +374,25 @@ mod tests {
             result["payload"]["request_id"]
         );
         assert!(records.iter().all(|record| record["schema"] == SCHEMA));
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record["kind"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "ready",
+                "baseline",
+                "surface_request",
+                "focused_control",
+                "dispatched_action",
+                "action_result",
+                "entity_state",
+                "case_complete",
+                "request_summary",
+                "reconnect",
+                "complete",
+            ])
+        );
         assert_eq!(
             records
                 .iter()
@@ -355,15 +411,17 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let path = root.join("evidence.jsonl");
         let mut writer = EvidenceWriter::create(&path).unwrap();
-        writer
-            .failure(
-                "driver",
-                &"x".repeat(1_024),
-                &(0..40)
-                    .map(|index| format!("node-{index}"))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
+        let context = FailureContext {
+            case_id: Some("case-a".to_string()),
+            phase: "entity_reconciliation".to_string(),
+            expected_condition: "exact current session membership".to_string(),
+            subscription_id: Some("subscription-a".to_string()),
+            snapshot_seq: Some(7),
+            surface_render_count: 2,
+            focusable_ids: (0..40).map(|index| format!("node-{index}")).collect(),
+            last_observation: json!({ "request_id": "request-a", "state": "accepted" }),
+        };
+        writer.failure(&context, &"x".repeat(1_024)).unwrap();
         assert!(writer.event("ready", None, json!({})).is_err());
         let record: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(record["payload"]["message"].as_str().unwrap().len(), 512);
@@ -371,5 +429,9 @@ mod tests {
             record["payload"]["focusable_ids"].as_array().unwrap().len(),
             24
         );
+        assert_eq!(record["case_id"], "case-a");
+        assert_eq!(record["payload"]["subscription_id"], "subscription-a");
+        assert_eq!(record["payload"]["surface_render_count"], 2);
+        validate_contract_document(&record).expect("failure evidence matches published schema");
     }
 }
