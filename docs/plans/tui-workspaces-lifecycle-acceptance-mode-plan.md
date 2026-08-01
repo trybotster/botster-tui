@@ -3,17 +3,18 @@
 ## Outcome
 
 Add a production-shaped `botster-tui` live acceptance mode that accepts an
-explicit real `botster-workspaces` package checkout, installs and enables that
-package in an isolated Hub, opens its owner-authored `workspaces` surface, and
-drives the delivered tree through the same `TuiApp`, session entity reducer,
+explicit real `botster-workspaces` package checkout and an explicit
+`plumbing` or `lifecycle` profile. Both profiles install and enable that
+package in an isolated Hub, open its owner-authored `workspaces` surface, and
+drive the delivered tree through the same `TuiApp`, session entity reducer,
 Ratatui frame, `HitMap`, and `InputRouter` used by the interactive client.
 
-The mode is a reusable downstream consumer gate. It must prove that the TUI's
-generic `/session` binding path moves a referenced session from current to
-ended from entity frames without a list or surface refresh, that reconnect
-rebuilds the view through a fresh sanctioned subscription plus explicit route
-pull, that ended and absent/deleted references remain legible until an
-owner-authored action removes membership, and that keyboard and mouse
+The mode is a reusable downstream consumer gate. Its `lifecycle` profile must
+prove that the TUI's generic `/session` binding path moves a referenced session
+from current to ended from entity frames without a list or surface refresh,
+that reconnect rebuilds the view through a fresh sanctioned subscription plus
+explicit route pull, that ended and absent/deleted references remain legible
+until an owner-authored action removes membership, and that keyboard and mouse
 activation dispatch the exact rendered Hub action with canonical row identity.
 
 This ticket does not implement the Workspaces lifecycle surface. The durable
@@ -159,36 +160,43 @@ Baseline verification on the clean planning branch passed:
    no package name, workspace lifecycle label, workspace node id, or action id
    may enter non-test application behavior.
 3. Seed deterministic package state through the real plugin-worker/MCP boundary
-   only as test setup. Use canonical UUIDs for a stable current session, a
+   only as test setup. The `plumbing` profile creates the minimum workspace and
+   reference state needed to open detail and exercise an owner action. The
+   `lifecycle` profile uses canonical UUIDs for a stable current session, a
    session that transitions current to ended, and a deliberate missing/deleted
-   reference. Do not hand-author a plugin surface, action request, entity frame,
-   or Workspaces response.
+   reference. Neither profile may hand-author a plugin surface, action request,
+   entity frame, or Workspaces response.
 4. Open the package from the TUI's rendered package navigation and select the
    owner-authored workspace row through the production frame/hit map/router.
    Derive package/surface/action/node/payload identity from the delivered tree;
    do not reproduce action payloads in the test.
-5. While the owner surface remains active, cause the authoritative Hub session
-   to end, drain the real entity subscription, and prove the next production
-   frame moves the referenced UUID from the owner-authored current region to
-   the ended/history region. Assert the transition occurs without
-   `ListSessions`, a new `PluginSurfaceRender`, a package reload, or an
-   imperative TUI refresh.
-6. Prove ended and missing/deleted references remain visible and operable.
-   Activate one owner-authored membership action through a second real input
-   path (keyboard if selection used mouse, or vice versa), require the exact
-   canonical realized row/node identity and delivered payload at the outgoing
-   `PluginSurfaceAction` seam, and verify only the explicitly removed reference
-   disappears.
-7. Force the TUI connection lifecycle through its production reconnect path.
-   Require a new session subscription id and authoritative snapshot, reject
-   stale-generation deltas, reopen the package through refreshed admitted
-   navigation, reselect the workspace through its delivered action, and prove
-   current/ended/missing references rehydrate without a legacy list refresh.
-8. Add positive completion evidence for every required stage. The Workspaces
-   mode must fail closed if the package path is absent/invalid, the package or
-   surface was not installed/opened, any lifecycle stage was skipped, either
-   input path did not dispatch, reconnect did not establish a fresh baseline,
-   or cleanup did not complete.
+5. In the `lifecycle` profile, while the owner surface remains active, cause the
+   authoritative Hub session to end, drain the real entity subscription, and
+   prove the next production frame moves the referenced UUID from the
+   owner-authored current region to the ended/history region. Assert the
+   transition occurs without `ListSessions`, a new `PluginSurfaceRender`, a
+   package reload, or an imperative TUI refresh.
+6. In the `lifecycle` profile, prove ended and missing/deleted references
+   remain visible and operable. Activate one owner-authored membership action
+   through a second real input path (keyboard if selection used mouse, or vice
+   versa), require the exact delivered action metadata and the canonical
+   identity admitted by the Hub contract, and verify only the explicitly
+   removed reference disappears. For a bound list this oracle stops at the
+   direct `item_template` root identity admitted by contract 0.2.0; it does not
+   claim bound descendant-control identity.
+7. In the `lifecycle` profile, force the TUI connection lifecycle through its
+   production reconnect path. Require a new session subscription id and
+   authoritative snapshot, reject stale-generation deltas, reopen the package
+   through refreshed admitted navigation, reselect the workspace through its
+   delivered action, and prove current/ended/missing references rehydrate
+   without a legacy list refresh.
+8. Add positive completion evidence against one explicitly declared stage
+   profile; there is no auto-detection or permissive fallback. The `plumbing`
+   ledger is runnable and must pass in this ticket against current Workspaces
+   main. The `lifecycle` ledger is a strict superset and must pass downstream
+   after Workspaces owns the lifecycle regions. A missing profile fails before
+   Hub setup, and either profile fails if one of its own required stages is
+   absent.
 9. Keep the existing contract-matrix live mode green. Any shared script/test
    harness changes must explicitly preserve its fixture validation, execution,
    and completion oracle.
@@ -202,8 +210,9 @@ its README and source explicitly defer that behavior to the downstream ticket.
 The human answer forbids consuming that sibling worktree and requires this mode
 to merge first. Therefore this ticket's own proof is split deliberately:
 
-- run the current real package through install/enable/navigation/detail/action
-  plumbing using public Hub/plugin-worker paths;
+- run `script/test-live-hub workspaces plumbing` green against the current real
+  package, with a plumbing-only completion ledger, using public
+  Hub/plugin-worker paths;
 - run the canonical Hub-owned session-binding scenario through the exact TUI
   entity/frame/render/identity/input/reconnect path that the mode composes;
 - unit-test required-mode validation, stage accounting, and failure behavior;
@@ -261,12 +270,18 @@ package checkout before satisfying its Web/TUI consumer gate.
   `ticket_1785545085_392193`; this TUI run does not substitute for browser
   parity.
 
-There is no new upstream implementation prerequisite at Plan time. All generic
-TUI/Hub/TUI-kit capabilities needed by the mode are merged in current pins.
-This ticket is itself a registered blocking dependency of the Workspaces
-lifecycle ticket. If implementation exposes a missing generic producer or kit
-mechanic, stop and register a narrow dependency against that repository's
-target instead of patching around it here.
+There is no new upstream implementation prerequisite for the admitted
+direct-item-root identity proof at Plan time. Open Hub ticket
+`ticket_1785443253_376782`, target
+`tgt_7e208a0c76a44980a83b63af976b1f22`, owns deterministic bound identity for
+BindList descendants. It is a known non-blocking contract limit, not an
+ordering dependency while both profiles assert only direct item-root bound
+identity (and literal producer-owned control ids in current Workspaces). If the
+downstream owner surface requires a bound descendant-control identity, register
+that Hub ticket as a dependency rather than synthesizing an id in TUI. This
+ticket remains a registered blocking dependency of the Workspaces lifecycle
+ticket. Route any other missing producer or kit mechanic to its owner instead
+of patching around it here.
 
 ## Assumptions and unknowns
 
@@ -280,10 +295,11 @@ target instead of patching around it here.
 - Assumption: ending a controlled Hub session through public lifecycle control
   is sufficient to produce the canonical current-to-ended entity transition;
   the TUI must not derive the resulting class.
-- Assumption: reconnect legitimately clears the active plugin surface in the
-  current TUI policy. Rehydration therefore means fresh session snapshot plus
-  the explicit package navigation/surface pull and owner-authored selection
-  action, not retaining a stale surface across transport generations.
+- Verified base behavior: `TuiApp::force_reconnect` clears the active plugin
+  surface before invalidating the session generation (`app.rs:1056` at Plan
+  time). The acceptance assertion therefore requires a fresh session snapshot
+  plus explicit package navigation/surface pull and owner-authored selection,
+  never stale-surface retention across transport generations.
 - Assumption: package-specific expected UUID visibility and lifecycle grouping
   assertions are acceptable in the acceptance test module, but never in
   production client logic.
@@ -292,11 +308,10 @@ target instead of patching around it here.
   keep the semantic oracle limited to UUID visibility and owner-authored
   current/ended/unavailable regions. If no stable cross-client semantic signal
   exists, stop and ask rather than keying the mode to incidental prose.
-- Unknown: the cleanest mode switch may be a dedicated argument to
-  `script/test-live-hub` or a narrowly named sibling wrapper. Prefer extending
-  the existing wrapper without making Workspaces inputs mandatory for the
-  contract-matrix mode; choose the smallest shape that prevents skip conflicts
-  and duplicated build/Hub setup.
+- Decision: extend `script/test-live-hub` with the exact positional shape
+  `script/test-live-hub workspaces <plumbing|lifecycle>`. The profile is
+  mandatory. It does not make Workspaces inputs mandatory for the existing
+  contract-matrix mode and both profiles share one Hub/test implementation.
 - Convention conflict: none. The plan preserves repository ownership, uses
   public Hub and kit primitives, keeps product semantics in the package, uses
   cold single-path state/action contracts, and treats final product proof as a
@@ -319,14 +334,16 @@ Keep production behavior unchanged unless the real mode exposes a generic bug.
    - waiting on authoritative session entity stages;
    - locating and activating delivered regions without constructing requests;
    - rendering lifecycle stages through the production app frame; and
-   - recording a named completion ledger.
-2. Add one focused live test for the Workspaces mode rather than widening the
-   existing contract-matrix oracle. Both tests may reuse existing
+   - recording one of two explicit completion ledgers.
+2. Add one focused live test for the Workspaces mode with a required profile
+   parameter rather than widening the existing contract-matrix oracle. The
+   Workspaces test and existing contract-matrix test may reuse existing
    `HubConnection`, `TuiApp`, render, click/key, and request-observation helpers.
 3. Extend live-wrapper mode selection and validation so the contract-matrix
-   mode keeps its current required fixture and the Workspaces mode requires the
-   explicit package path. Every successful exit validates its mode-specific
-   completion evidence.
+   mode keeps its current required fixture and `workspaces` requires both the
+   explicit package path and one explicit profile. Every successful exit
+   validates exactly that profile's completion evidence; `plumbing` never
+   silently upgrades to or waives `lifecycle`.
 4. If a generic renderer/client defect appears, make the smallest fix at the
    existing owner boundary and add a focused production-path regression plus a
    negative control. Route kit/schema/Hub defects to their owners.
@@ -391,9 +408,11 @@ single-source contract audit; it is not routine scope for this ticket.
   Mitigation: assert the UUID remains visible until a real membership action is
   accepted, then assert only that reference disappears.
 - **Identity ambiguity:** selecting row 1 while asserting row 2 payload can
-  still produce plausible actions. Mitigation: require exact realized node id,
-  payload UUID/workspace id, distinct hit rectangles, and one keyboard plus one
-  mouse path.
+  still produce plausible actions. Mitigation: require exact realized direct
+  item-root id (or current producer-owned literal control id), payload
+  UUID/workspace id, distinct hit rectangles, and one keyboard plus one mouse
+  path. Do not claim or synthesize bound descendant identity while Hub ticket
+  `ticket_1785443253_376782` remains open.
 - **Shared harness regression:** changing fixture inputs or event observations
   can alter the existing contract-matrix reader. Mitigation: keep oracles
   mode-specific and rerun the current required live mode unchanged.
@@ -413,11 +432,21 @@ single-source contract audit; it is not routine scope for this ticket.
 - Workspaces mode with no path, a missing directory, wrong package manifest,
   or missing `plugin.lua` fails before Hub setup with an actionable diagnostic.
 - Required mode plus any legacy skip setting still executes or fails closed.
-- The completion ledger requires, at minimum: package validated, installed,
-  enabled, navigation opened, owner row selected, current rendered, ended
-  rendered, absent/deleted rendered, mouse dispatch, keyboard dispatch, fresh
-  reconnect snapshot, surface reopened, historical refs rehydrated, and clean
-  shutdown. A unit regression that removes one stage must fail.
+- The `plumbing` ledger requires: profile selected, package validated,
+  installed, enabled/reloaded, admitted navigation opened, owner index and
+  detail rendered, owner row selected, literal producer-owned action identity
+  observed, mouse dispatch, keyboard dispatch, accepted owner action, and clean
+  shutdown.
+- The `lifecycle` ledger requires every plumbing stage plus: direct item-root
+  canonical bound identity observed, current rendered, ended rendered,
+  absent/deleted rendered, transition without list/surface refresh, fresh
+  reconnect subscription/snapshot, surface reopened, historical refs
+  rehydrated, and stale-generation rejection.
+- Unit regressions remove one stage from each ledger and must fail. Selecting
+  `lifecycle` against current Workspaces main must fail closed at the first
+  missing lifecycle-region assertion with a diagnostic naming downstream
+  `ticket_1785296184_677408`; that expected failure is diagnostic evidence, not
+  the green repository gate for this ticket.
 - Existing canonical session binding tests continue to prove snapshot,
   current-to-ended patch, remove/unavailable, reconnect, exact bound row ids,
   keyboard/mouse dispatch, and stale-generation rejection through the
@@ -441,6 +470,22 @@ isolated current Hub:
 Record this as package plumbing and generic action proof, not lifecycle product
 proof.
 
+Run it as a required positive repository gate against a clean checkout of
+current Workspaces main:
+
+```sh
+BOTSTER_HUB_BIN=/path/to/current/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/path/to/current/botster-session-worker \
+BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/clean/botster-workspaces \
+CARGO_TARGET_DIR=/private/tmp/botster-tui-workspaces-plumbing-target \
+  script/test-live-hub workspaces plumbing
+```
+
+Expected outcome: exit zero only after every `plumbing` ledger stage is
+recorded. Missing/invalid inputs, a skipped live test, failure to open the real
+owner surface, either absent input dispatch, an unaccepted action, or incomplete
+cleanup is nonzero.
+
 ### Required downstream real-package lifecycle proof
 
 After `ticket_1785296184_677408` implements its owner-authored lifecycle tree,
@@ -452,8 +497,8 @@ documented in README, with inputs equivalent to:
 BOTSTER_HUB_BIN=/path/to/current/botster-hub \
 BOTSTER_SESSION_WORKER_BIN=/path/to/current/botster-session-worker \
 BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/clean/botster-workspaces \
-CARGO_TARGET_DIR=/private/tmp/botster-tui-workspaces-live-target \
-  script/test-live-hub workspaces
+CARGO_TARGET_DIR=/private/tmp/botster-tui-workspaces-lifecycle-target \
+  script/test-live-hub workspaces lifecycle
 ```
 
 That command must positively prove in one isolated run:
@@ -464,8 +509,8 @@ That command must positively prove in one isolated run:
 4. its authoritative entity transition moves it to ended without
    `ListSessions`, `PluginSurfaceRender`, package reload, or manual refresh;
 5. ended and missing/deleted references stay legible;
-6. real mouse and keyboard actions dispatch exact rendered metadata and
-   canonical realized row identity;
+6. real mouse and keyboard actions dispatch exact rendered metadata and the
+   canonical direct item-root bound identity admitted by contract 0.2.0;
 7. explicit membership removal is the only tested operation that drops a
    deliberate reference;
 8. reconnect uses a new session subscription snapshot, then explicit admitted
@@ -489,9 +534,14 @@ git diff --check main...HEAD
 ```
 
 Also rerun the existing required contract-matrix live command with exact Hub,
-session-worker, and public fixture inputs. Pre-existing failures are not a
-blanket waiver; attribute any failure to an exact command and base/branch
-comparison.
+session-worker, and public fixture inputs. Run the positive
+`script/test-live-hub workspaces plumbing` command above against a clean current
+Workspaces checkout and attach its zero-exit output and complete plumbing
+ledger. Separately run `script/test-live-hub workspaces lifecycle` against that
+same current checkout and retain its expected fail-closed diagnostic as proof
+that the profile cannot silently pass without the downstream lifecycle tree.
+Pre-existing failures are not a blanket waiver; attribute any failure to an
+exact command and base/branch comparison.
 
 ## Pipeline checklist and artifacts
 
