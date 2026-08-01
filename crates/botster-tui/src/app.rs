@@ -3358,6 +3358,7 @@ const ACCEPTANCE_HEIGHT: u16 = 240;
 const ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(12);
 const WORKSPACES_PACKAGE: &str = "botster-workspaces";
 const WORKSPACES_SURFACE: &str = "workspaces";
+const WORKSPACES_SPAWN_OPENER_ACTION: &str = "botster_workspaces.open_spawn";
 
 fn run_workspaces_acceptance(args: AppArgs, config: AcceptanceConfig) -> io::Result<()> {
     let mut evidence = EvidenceWriter::create(&config.evidence_path)?;
@@ -3642,18 +3643,21 @@ fn drive_spawn_case(
         Some(&case.case_id),
         "producer-authored target-first Spawn control",
     );
-    activate_acceptance_action(
+    let opener = activate_acceptance_action(
         app,
         router,
-        "botster_workspaces.open",
-        |payload| {
-            payload_field(payload, "selected_workspace") == Some(workspace_id)
-                && payload_field(payload, "dialog") == Some(&format!("spawn-target:{workspace_id}"))
-        },
+        WORKSPACES_SPAWN_OPENER_ACTION,
+        |_| true,
         evidence,
         Some(&case.case_id),
         diagnostics,
     )?;
+    if payload_field(&opener.payload, "selected_workspace") != Some(workspace_id) {
+        return invalid_acceptance(format!(
+            "case {:?} rendered Spawn opener payload did not identify workspace {workspace_id:?}",
+            case.case_id
+        ));
+    }
     diagnostics.stage(
         "target_selection",
         Some(&case.case_id),
@@ -3900,38 +3904,9 @@ fn activate_acceptance_action(
     diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<UiActionRequest> {
     let (lines, hit_map) = acceptance_frame(app, router, diagnostics)?;
-    let matches = hit_map
-        .regions()
-        .iter()
-        .filter(|region| {
-            region
-                .action
-                .as_ref()
-                .is_some_and(|action| action.id.0 == action_id && payload_matches(&action.payload))
-        })
-        .map(|region| {
-            (
-                region.node_id.clone(),
-                region.action.clone().expect("filtered action"),
-            )
-        })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return invalid_acceptance(format!(
-            "expected one rendered action {action_id}, found {}; focusable={:?}; rendered={:?}",
-            matches.len(),
-            focusable_ids(&hit_map),
-            lines
-                .iter()
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
-                .take(30)
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
-    }
-    let (expected_node_id, expected_action) = &matches[0];
-    focus_acceptance_node(router, &hit_map, expected_node_id)?;
+    let (expected_node_id, expected_action) =
+        unique_acceptance_action(&hit_map, action_id, payload_matches, &lines)?;
+    focus_acceptance_node(router, &hit_map, &expected_node_id)?;
     evidence.event(
         "focused_control",
         case_id,
@@ -4002,6 +3977,45 @@ fn activate_acceptance_action(
         }
     }
     Ok(request)
+}
+
+fn unique_acceptance_action(
+    hit_map: &HitMap,
+    action_id: &str,
+    payload_matches: impl Fn(&Option<Value>) -> bool,
+    lines: &[String],
+) -> io::Result<(String, botster_ui_contract::UiAction)> {
+    let matches = hit_map
+        .regions()
+        .iter()
+        .filter(|region| {
+            region
+                .action
+                .as_ref()
+                .is_some_and(|action| action.id.0 == action_id && payload_matches(&action.payload))
+        })
+        .map(|region| {
+            (
+                region.node_id.clone(),
+                region.action.clone().expect("filtered action"),
+            )
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return invalid_acceptance(format!(
+            "expected one rendered action {action_id}, found {}; focusable={:?}; rendered={:?}",
+            matches.len(),
+            focusable_ids(hit_map),
+            lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .take(30)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    Ok(matches.into_iter().next().expect("one match"))
 }
 
 fn focus_acceptance_node(
@@ -11768,6 +11782,71 @@ mod tests {
     }
 
     #[test]
+    fn spawn_opener_selection_uses_realized_semantic_action_not_visible_copy() {
+        let workspace_id = "workspace-semantic-action";
+        let semantic_node_id = "opaque-producer-node-7f3a";
+        let semantic_payload = json!({
+            "selected_workspace": workspace_id,
+            "dialog": "spawn-target:workspace-semantic-action"
+        });
+        let mut root = node(UiNodeKind::Stack, "semantic-action-fixture", json!({}));
+        root.children = vec![
+            child(button(
+                semantic_node_id,
+                "Create session",
+                "botster_workspaces.open_spawn",
+                semantic_payload.clone(),
+            )),
+            child(button(
+                "visible-spawn-generic-decoy",
+                "Spawn",
+                "botster_workspaces.open",
+                json!({
+                    "selected_workspace": workspace_id,
+                    "dialog": "spawn-target:workspace-semantic-action"
+                }),
+            )),
+        ];
+        let mut router = InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE));
+        let (lines, hit_map) = botster_tui_kit::render_to_lines_with_presentation_state(
+            &root,
+            120,
+            48,
+            &router.render_state(),
+            &Default::default(),
+        )
+        .expect("render semantic action fixture through the real frame backend");
+        assert!(lines.join("\n").contains("Spawn"));
+
+        let (selected_node_id, selected_action) =
+            unique_acceptance_action(&hit_map, WORKSPACES_SPAWN_OPENER_ACTION, |_| true, &lines)
+                .expect("select the unique semantic Spawn opener");
+        assert_eq!(selected_node_id, semantic_node_id);
+        assert_eq!(selected_action.payload, Some(semantic_payload.clone()));
+
+        focus_acceptance_node(&mut router, &hit_map, &selected_node_id)
+            .expect("focus semantic action with keyboard traversal");
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &hit_map,
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("focused semantic action must dispatch through InputRouter");
+        };
+        assert_eq!(
+            request.node_id,
+            Some(UiNodeId(semantic_node_id.to_string()))
+        );
+        assert_eq!(request.action_id.0, "botster_workspaces.open_spawn");
+        assert_eq!(request.payload, Some(semantic_payload));
+        assert_ne!(
+            request.node_id,
+            Some(UiNodeId("visible-spawn-generic-decoy".to_string()))
+        );
+        assert_ne!(request.action_id.0, "botster_workspaces.open");
+    }
+
+    #[test]
     fn reconnect_does_not_auto_attach_selected_running_session() {
         let mut app = TuiApp::new(None);
         app.observed_requests.clear();
@@ -12230,6 +12309,38 @@ mod tests {
                 .count(),
             3
         );
+        for (case_id, _, _) in &branches {
+            for kind in ["focused_control", "dispatched_action"] {
+                let matching = records
+                    .iter()
+                    .filter(|record| {
+                        record["kind"] == kind
+                            && record["case_id"] == *case_id
+                            && record["payload"]["action_id"] == "botster_workspaces.open_spawn"
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "case {case_id} must record one {kind} for the semantic Spawn opener"
+                );
+                assert!(matching[0]["payload"]["node_id"].is_string());
+                if kind == "dispatched_action" {
+                    assert_eq!(
+                        matching[0]["payload"]["payload"]["selected_workspace"],
+                        workspace_id
+                    );
+                }
+            }
+            assert!(
+                records.iter().all(|record| {
+                    record["case_id"] != *case_id
+                        || record["kind"] != "dispatched_action"
+                        || record["payload"]["action_id"] != "botster_workspaces.open"
+                }),
+                "case {case_id} must not dispatch the deprecated generic action as Spawn"
+            );
+        }
         assert!(
             records
                 .iter()

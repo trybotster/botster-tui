@@ -159,8 +159,11 @@ passthrough inputs, this contract must be routed to the Hub owner and migrated.
 
 This mode uses the same presentation-aware production UiNode tree and realized
 `HitMap` as interactive drawing at a fixed production-sized viewport. It finds
-producer-authored metadata but reaches every control with bounded Tab traversal,
-selects and types with key events, and submits only through `InputRouter`. It
+the detail Spawn opener by the producer-authored semantic action
+`botster_workspaces.open_spawn`, independent of its visible label, and dispatches
+the exact node id, action id, surface, kind, and payload read back from that frame.
+Every control is reached with bounded Tab traversal; values are selected and typed
+with key events, and submission happens only through `InputRouter`. It
 opens the Workspaces surface once initially and once after keyboard-activating
 the rendered Reconnect control. After that barrier, pushed session entity frames
 must update subsequent renders without `ListSessions`, polling reads, list
