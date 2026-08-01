@@ -341,7 +341,15 @@ CARGO_TARGET_DIR=/tmp/botster-tui-workspaces-lifecycle-target \
 That profile requires 16 retained references and the producer-authored
 `/session` binding contract: exact `session_uuid` plus `lifecycle_class`
 filters for `current`, `ended`, and `indeterminate`, plus a separate exact-UUID
-absence binding. It joins those delivered descriptors to realized
+absence binding. Before spawning its two controlled lifecycle sessions, the
+harness establishes the TUI-owned subscription and authoritative baseline and
+proves both UUIDs are absent. It then requires both exact rows to become
+authoritative `current` rows before opening the Workspaces surface. The
+subsequent `current` -> `ended` -> removal barriers also match the exact UUID
+and state; an empty snapshot alone is never readiness for an expected row.
+Timeout diagnostics retain only the active subscription id, snapshot state and
+sequence, expected UUID/state, and that row's last observed state or absence.
+It joins the delivered descriptors to realized
 `item_template`/`empty_template` roots, so it does not depend on headings,
 incidental node-id spelling, prose, or geometric renderer position. It also
 requires an individual group's realized roots to preserve the
