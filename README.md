@@ -126,7 +126,54 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 ```
 
 The visible System details diagnostics are intentionally local-client
-diagnostics, not private hub probes. They distinguish:
+diagnostics, not private hub probes.
+
+## Caller-owned Workspaces Spawn acceptance
+
+The installed TUI exposes one deterministic file-based acceptance mode for a
+caller that already owns a shared Hub, package setup, Git fixtures, sequencing,
+and cleanup. Set both paths when launching the installed package:
+
+```sh
+BOTSTER_TUI_ACCEPTANCE_SCENARIO=/path/to/scenario.json \
+BOTSTER_TUI_ACCEPTANCE_EVIDENCE=/path/to/new-evidence.jsonl \
+  botster-hub apps open --data-dir /path/to/shared-hub botster-tui
+```
+
+The v1 schema and consumer fixtures live under
+`crates/botster-tui/fixtures/workspaces-spawn-driver-v1.*`. The scenario names
+the existing workspace and the three assigned target/branch cases; it never
+contains node ids or action payloads. The evidence path must not exist and must
+be distinct from the scenario path. Each JSONL record is flushed as a complete
+line, and exactly one `complete` or bounded `failure` record terminates a run.
+Stdout remains the foreground terminal application's unstructured UI channel.
+
+This mode uses the same presentation-aware production UiNode tree and realized
+`HitMap` as interactive drawing at a fixed production-sized viewport. It finds
+producer-authored metadata but reaches every control with bounded Tab traversal,
+selects and types with key events, and submits only through `InputRouter`. It
+opens the Workspaces surface once initially and once after keyboard-activating
+the rendered Reconnect control. After that barrier, pushed session entity frames
+must update subsequent renders without `ListSessions`, polling reads, list
+refreshes, or synchronization surface renders.
+
+The repository-owned installed-binary proof is:
+
+```sh
+BOTSTER_HUB_BIN=/path/to/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
+BOTSTER_WORKSPACES_PACKAGE_PATH=/clean/path/to/botster-workspaces \
+  script/test-live-hub workspaces installed-driver
+```
+
+That test alone owns an isolated Hub and Git matrix so it can execute the exact
+installed package through `apps open` before merge. Production acceptance mode
+never starts or stops a Hub, installs or enables packages, creates fixtures, or
+performs shared cleanup. The downstream Workspaces integration remains
+responsible for independently proving Hub, Git, worktree, package, membership,
+and session truth from its one long-lived shared Hub.
+
+The System details diagnostics distinguish:
 
 - missing, malformed, or invalid `BOTSTER_HUB_CONNECTION` configuration;
 - local hub unavailable, disconnected, or reconnecting;
