@@ -39,9 +39,51 @@ resolve_contract_matrix_fixture() {
   printf '%s\n' "$configured"
 }
 
+resolve_workspaces_package() {
+  configured="${BOTSTER_WORKSPACES_PACKAGE_PATH:-}"
+  if [ -z "$configured" ]; then
+    echo "BOTSTER_WORKSPACES_PACKAGE_PATH is required for the Workspaces live acceptance mode" >&2
+    exit 1
+  fi
+  if [ ! -d "$configured" ]; then
+    echo "BOTSTER_WORKSPACES_PACKAGE_PATH is not a directory: $configured" >&2
+    exit 1
+  fi
+  if [ ! -f "$configured/botster-package.json" ] || [ ! -f "$configured/plugin.lua" ]; then
+    echo "BOTSTER_WORKSPACES_PACKAGE_PATH must contain botster-package.json and plugin.lua: $configured" >&2
+    exit 1
+  fi
+  printf '%s\n' "$configured"
+}
+
+mode="${1:-contract-matrix}"
+profile="${2:-}"
+case "$mode" in
+  contract-matrix)
+    if [ "$#" -gt 1 ]; then
+      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle>" >&2
+      exit 1
+    fi
+    contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
+    test_filter="app::tests::headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available"
+    ;;
+  workspaces)
+    if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ]; }; then
+      echo "usage: script/test-live-hub workspaces <plumbing|lifecycle>" >&2
+      exit 1
+    fi
+    workspaces_package="$(resolve_workspaces_package)"
+    test_filter="app::tests::workspaces_live_acceptance_runs_against_real_package"
+    ;;
+  *)
+    echo "unknown live-Hub mode: $mode" >&2
+    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle>" >&2
+    exit 1
+    ;;
+esac
+
 hub_bin="$(resolve_binary BOTSTER_HUB_BIN botster-hub)"
 session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
-contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   target_dir="$CARGO_TARGET_DIR"
 else
@@ -50,13 +92,41 @@ else
 fi
 
 cargo build -p botster-tui --target-dir "$target_dir" --locked
-mkdir -p target/debug
-cp "$target_dir/debug/botster-tui" target/debug/botster-tui
+if [ "$mode" = "contract-matrix" ]; then
+  mkdir -p target/debug
+  cp "$target_dir/debug/botster-tui" target/debug/botster-tui
+fi
 
-BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
-BOTSTER_ENV=test \
-BOTSTER_HUB_BIN="$hub_bin" \
-BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
-BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="$contract_matrix_fixture" \
-CARGO_TARGET_DIR="$target_dir" \
-cargo test -p botster-tui headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available -- --nocapture
+test_output="$target_dir/live-test-output"
+if BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
+  BOTSTER_ENV=test \
+  BOTSTER_HUB_BIN="$hub_bin" \
+  BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
+  BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="${contract_matrix_fixture:-}" \
+  BOTSTER_WORKSPACES_PACKAGE_PATH="${workspaces_package:-}" \
+  BOTSTER_TUI_WORKSPACES_PROFILE="$profile" \
+  CARGO_TARGET_DIR="$target_dir" \
+  cargo test -p botster-tui "$test_filter" -- --exact --nocapture >"$test_output" 2>&1
+then
+  test_status=0
+else
+  test_status=$?
+fi
+cat "$test_output"
+if [ "$test_status" -ne 0 ]; then
+  exit "$test_status"
+fi
+if ! grep -F "test $test_filter ... ok" "$test_output" >/dev/null; then
+  echo "required live-Hub test did not execute exactly once: $test_filter" >&2
+  exit 1
+fi
+if [ "$mode" = "workspaces" ]; then
+  case "$profile" in
+    plumbing) profile_label="Plumbing" ;;
+    lifecycle) profile_label="Lifecycle" ;;
+  esac
+  if ! grep -F "workspaces-acceptance: profile=$profile_label ledger=complete" "$test_output" >/dev/null; then
+    echo "Workspaces $profile acceptance ledger did not complete" >&2
+    exit 1
+  fi
+fi
