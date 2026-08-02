@@ -5545,7 +5545,14 @@ fn plugin_surface_render_root(
     if let Some(result) = result {
         apply_plugin_result_errors(&mut root, result);
     }
-    if let Err(error) = root.validate() {
+    validated_materialized_plugin_surface_node(surface, root)
+}
+
+fn validated_materialized_plugin_surface_node(
+    surface: &DaemonPluginSurface,
+    root: UiNode,
+) -> UiNode {
+    if let Err(error) = root.validate_realized() {
         return node(
             UiNodeKind::Text,
             "tui-plugin-surface-materialized-invalid",
@@ -5557,7 +5564,7 @@ fn plugin_surface_render_root(
             }),
         );
     }
-    if let Err(error) = renderer::tui_capabilities().validate_node(&root) {
+    if let Err(error) = renderer::tui_capabilities().validate_realized_node(&root) {
         return node(
             UiNodeKind::Text,
             "tui-plugin-surface-materialized-unsupported",
@@ -7395,11 +7402,29 @@ mod tests {
             !expected_rows.is_empty(),
             "published oracle must retain an action row"
         );
-        let keyboard_target = &expected_rows
+        for row in expected_rows {
+            assert_eq!(
+                row.controls
+                    .iter()
+                    .map(|control| control.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["spawn", "rename", "remove"],
+                "published row {} must retain the three ordered controls",
+                row.node_id
+            );
+        }
+        let keyboard_target = expected_rows
             .last()
             .expect("checked nonempty rows")
-            .controls[1];
-        let mouse_target = &expected_rows[0].controls[2];
+            .controls
+            .iter()
+            .find(|control| control.key == "rename")
+            .expect("published final row retains the rename control");
+        let mouse_target = expected_rows[0]
+            .controls
+            .iter()
+            .find(|control| control.key == "remove")
+            .expect("published first row retains the remove control");
         let expected_controls = expected_rows
             .iter()
             .flat_map(|row| row.controls.iter())
@@ -7435,28 +7460,66 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(region_rects.len(), expected_controls.len());
 
-        let mut focused = std::collections::BTreeSet::new();
+        let first_region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == expected_controls[0].node_id)
+            .expect("first producer control has a hit region");
+        let second_region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == expected_controls[1].node_id)
+            .expect("second producer control has a hit region");
+        assert!(matches!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    first_region.rect.x,
+                    first_region.rect.y,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Focus { .. }
+        ));
+        assert!(matches!(
+            router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    second_region.rect.x,
+                    second_region.rect.y,
+                ),
+                &hit_map,
+            ),
+            InputDispatch::Ignored
+        ));
+        assert_eq!(
+            router.focused_node_id(),
+            Some(expected_controls[0].node_id.as_str())
+        );
+        let mut focused = vec![expected_controls[0].node_id.clone()];
         for _ in 0..=(2 * hit_map.regions().len() + 1) {
             if let InputDispatch::Focus { node_id } = router.dispatch_event(
                 Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 &hit_map,
-            ) {
-                focused.insert(node_id);
-            }
-            if expected_controls
+            ) && expected_controls
                 .iter()
-                .all(|control| focused.contains(&control.node_id))
+                .any(|control| control.node_id == node_id)
+                && !focused.contains(&node_id)
             {
+                focused.push(node_id);
+            }
+            if focused.len() == expected_controls.len() {
                 break;
             }
         }
-        for control in &expected_controls {
-            assert!(
-                focused.contains(&control.node_id),
-                "Tab traversal did not reach {}",
-                control.node_id
-            );
-        }
+        assert_eq!(
+            focused,
+            expected_controls
+                .iter()
+                .map(|control| control.node_id.clone())
+                .collect::<Vec<_>>(),
+            "Tab traversal must follow producer control order"
+        );
         for _ in 0..=hit_map.regions().len() {
             if router.focused_node_id() == Some(keyboard_target.node_id.as_str()) {
                 break;
@@ -7536,7 +7599,18 @@ mod tests {
             .iter()
             .find(|candidate| candidate.node_id == keyboard_target.node_id)
             .expect("neighboring control remains in the production hit map");
-        let mismatched = mouse_router.dispatch_event(
+        let mut mismatched_router =
+            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
+        let mismatched_down = mismatched_router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                region.rect.x,
+                region.rect.y,
+            ),
+            &mouse_hits,
+        );
+        assert!(matches!(mismatched_down, InputDispatch::Focus { .. }));
+        let mismatched_up = mismatched_router.dispatch_event(
             mouse_event(
                 crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
                 neighboring_region.rect.x,
@@ -7544,7 +7618,18 @@ mod tests {
             ),
             &mouse_hits,
         );
-        assert!(matches!(mismatched, InputDispatch::Ignored));
+        assert!(matches!(mismatched_up, InputDispatch::Ignored));
+        let mut unpaired_router =
+            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
+        let unpaired_up = unpaired_router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                neighboring_region.rect.x,
+                neighboring_region.rect.y,
+            ),
+            &mouse_hits,
+        );
+        assert!(matches!(unpaired_up, InputDispatch::Ignored));
         app.observed_requests.clear();
         app.handle_dispatch(InputDispatch::Action(
             keyboard_request.expect("Enter produced a typed request"),
@@ -8650,6 +8735,45 @@ mod tests {
     }
 
     #[test]
+    fn realized_validation_rejects_surviving_sentinels_before_hit_regions() {
+        let unresolved = ui_node(json!({
+            "type": "button",
+            "id": "unresolved-required-label",
+            "props": {
+                "label": { "$bind": "@/lifecycle_class" },
+                "action": { "id": "contract.unresolved" }
+            }
+        }));
+        unresolved
+            .validate()
+            .expect("required bindable sentinel is valid authored content");
+        let surface = canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.unresolved-realized",
+            unresolved.clone(),
+        );
+        let diagnostic = validated_materialized_plugin_surface_node(&surface, unresolved);
+        assert_eq!(
+            diagnostic
+                .id
+                .as_ref()
+                .and_then(UiAuthoredNodeId::as_literal),
+            Some(&UiNodeId(
+                "tui-plugin-surface-materialized-invalid".to_string()
+            ))
+        );
+        let (lines, hit_map) = renderer::render_to_lines(&diagnostic, 120, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("failed UiNode validate"), "{rendered}");
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "unresolved-required-label")
+        );
+    }
+
+    #[test]
     fn canonical_descendant_identity_is_utf8_safe_injective_and_collision_checked() {
         let first_row = "会話:1-😀";
         let first_key = "remove:🧹";
@@ -8742,6 +8866,115 @@ mod tests {
         assert_eq!(
             materialize_plugin_surface(&collision, &state).unwrap_err(),
             format!("duplicate materialized node id {:?}", first_id.0)
+        );
+    }
+
+    #[test]
+    fn nested_bind_lists_reset_descendant_row_identity_context() {
+        let body = ui_node(json!({
+            "type": "panel",
+            "id": "nested-identity-panel",
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": "row-a" },
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": "detach" },
+                        "props": { "label": "Outer detach", "action": { "id": "contract.outer" } }
+                    }, {
+                        "$kind": "bind_list",
+                        "source": "/session",
+                        "where": { "session_uuid": "row-b" },
+                        "item_template": {
+                            "type": "inline",
+                            "id": { "$bind": "@/session_uuid" },
+                            "children": [{
+                                "type": "button",
+                                "id": { "$kind": "bind_list_descendant_id", "key": "detach" },
+                                "props": { "label": "Inner detach", "action": { "id": "contract.inner-detach" } }
+                            }, {
+                                "type": "button",
+                                "id": { "$kind": "bind_list_descendant_id", "key": "rename" },
+                                "props": { "label": "Inner rename", "action": { "id": "contract.inner-rename" } }
+                            }]
+                        }
+                    }]
+                }
+            }]
+        }));
+        body.validate()
+            .expect("nested templates own independent descendant key scopes");
+        let mut state = SessionEntityState::default();
+        state.begin_generation("nested-identity-generation".to_string());
+        state
+            .apply(snapshot_frame(
+                "nested-identity-generation",
+                1,
+                vec![
+                    session_entity("row-a", Some("running")),
+                    session_entity("row-b", Some("running")),
+                ],
+            ))
+            .expect("nested identity snapshot applies");
+        let materialized = materialize_plugin_surface(&body, &state)
+            .expect("nested descendant identities materialize");
+        for (row_id, key) in [
+            ("row-a", "detach"),
+            ("row-b", "detach"),
+            ("row-b", "rename"),
+        ] {
+            let expected =
+                realize_bind_list_descendant_id(row_id, key).expect("nested canonical identity");
+            assert!(
+                find_ui_node_by_id(&materialized, &expected.0).is_some(),
+                "missing {row_id}/{key} canonical identity"
+            );
+        }
+        assert!(
+            find_ui_node_by_id(
+                &materialized,
+                &realize_bind_list_descendant_id("row-a", "rename")
+                    .expect("wrong outer identity is structurally valid")
+                    .0,
+            )
+            .is_none(),
+            "inner distinct key must not inherit the outer row identity"
+        );
+
+        let invalid_empty_descendant = ui_node(json!({
+            "type": "panel",
+            "id": "nested-empty-context-panel",
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": "row-a" },
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
+                        "$kind": "bind_list",
+                        "source": "/session",
+                        "where": { "session_uuid": "missing-row" },
+                        "item_template": {
+                            "type": "inline",
+                            "id": { "$bind": "@/session_uuid" }
+                        },
+                        "empty_template": {
+                            "type": "button",
+                            "id": { "$kind": "bind_list_descendant_id", "key": "must-not-leak" },
+                            "props": { "label": "Invalid empty descendant", "action": { "id": "contract.invalid" } }
+                        }
+                    }]
+                }
+            }]
+        }));
+        assert_eq!(
+            materialize_plugin_surface(&invalid_empty_descendant, &state).unwrap_err(),
+            "bound list descendant id requires a realized item template root id"
         );
     }
 
