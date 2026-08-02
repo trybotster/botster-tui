@@ -26,7 +26,7 @@ use botster_hub_client::{
 use botster_ui_contract::{
     PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest,
     UiActionResult, UiAuthoredNodeId, UiChild, UiCondition, UiConditional, UiFormValues, UiNode,
-    UiNodeId, UiNodeKind, UiWidthClass,
+    UiNodeId, UiNodeKind, UiWidthClass, realize_bind_list_descendant_id,
 };
 use crossterm::{
     cursor::Show,
@@ -52,7 +52,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 25;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 27;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -4975,16 +4975,16 @@ fn navigation_unsupported_text(entry: &DaemonPackageNavigationEntry) -> String {
 }
 
 fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, String> {
-    // Binding sentinels intentionally do not satisfy the final rendered prop
-    // schema. Static delivered trees can be validated immediately; bound trees
-    // are validated after materialization in plugin_surface_render_root.
+    // Authored validation owns binding context and descendant-key diagnostics.
+    // Renderer capabilities still inspect only concrete trees because bound prop
+    // sentinels are materialized in plugin_surface_render_root.
+    surface.body.validate().map_err(|error| {
+        format!(
+            "plugin surface {}:{} failed UiNode validate: {error}",
+            surface.package_name, surface.surface_id
+        )
+    })?;
     if !node_requires_binding_materialization(&surface.body) {
-        surface.body.validate().map_err(|error| {
-            format!(
-                "plugin surface {}:{} failed UiNode validate: {error}",
-                surface.package_name, surface.surface_id
-            )
-        })?;
         renderer::tui_capabilities()
             .validate_node(&surface.body)
             .map_err(|error| {
@@ -5022,7 +5022,7 @@ fn materialize_plugin_surface(
 ) -> Result<UiNode, String> {
     let materialized = if node_requires_binding_materialization(root) {
         let rows = session_entities.binding_rows()?;
-        materialize_binding_node(root, &rows, None, false)?
+        materialize_binding_node(root, &rows, None, None, false)?
     } else {
         root.clone()
     };
@@ -5031,8 +5031,10 @@ fn materialize_plugin_surface(
 }
 
 fn node_requires_binding_materialization(node: &UiNode) -> bool {
-    matches!(node.id, Some(UiAuthoredNodeId::Bind(_)))
-        || node.props.values().any(value_contains_binding)
+    matches!(
+        node.id,
+        Some(UiAuthoredNodeId::Bind(_) | UiAuthoredNodeId::BindListDescendant(_))
+    ) || node.props.values().any(value_contains_binding)
         || node
             .children
             .iter()
@@ -5069,9 +5071,11 @@ fn materialize_binding_node(
     source: &UiNode,
     session_rows: &[Value],
     item: Option<&Value>,
+    row_id: Option<&UiNodeId>,
     bound_id_allowed: bool,
 ) -> Result<UiNode, String> {
     let mut node = source.clone();
+    let mut descendant_row_id = row_id.cloned();
     node.id = match source.id.as_ref() {
         None => None,
         Some(UiAuthoredNodeId::Literal(id)) => Some(UiAuthoredNodeId::Literal(id.clone())),
@@ -5089,18 +5093,33 @@ fn materialize_binding_node(
             if id.trim().is_empty() {
                 return Err("bound node id resolved to a blank string".to_string());
             }
-            Some(UiAuthoredNodeId::Literal(UiNodeId(id.to_string())))
+            let id = UiNodeId(id.to_string());
+            descendant_row_id = Some(id.clone());
+            Some(UiAuthoredNodeId::Literal(id))
+        }
+        Some(UiAuthoredNodeId::BindListDescendant(descendant_id)) => {
+            let row_id = descendant_row_id.as_ref().ok_or_else(|| {
+                "bound list descendant id requires a realized item template root id".to_string()
+            })?;
+            let id = realize_bind_list_descendant_id(&row_id.0, descendant_id.key())
+                .map_err(|error| format!("bound list descendant id failed: {error}"))?;
+            Some(UiAuthoredNodeId::Literal(id))
         }
     };
     for value in node.props.values_mut() {
         *value = materialize_binding_value(value, item)?;
     }
-    node.children = materialize_binding_children(&source.children, session_rows, item)?;
+    node.children = materialize_binding_children(
+        &source.children,
+        session_rows,
+        item,
+        descendant_row_id.as_ref(),
+    )?;
     node.slots = source
         .slots
         .iter()
         .map(|(name, children)| {
-            materialize_binding_children(children, session_rows, item)
+            materialize_binding_children(children, session_rows, item, descendant_row_id.as_ref())
                 .map(|children| (name.clone(), children))
         })
         .collect::<Result<_, _>>()?;
@@ -5111,30 +5130,49 @@ fn materialize_binding_children(
     children: &[UiChild],
     session_rows: &[Value],
     item: Option<&Value>,
+    row_id: Option<&UiNodeId>,
 ) -> Result<Vec<UiChild>, String> {
     let mut materialized = Vec::new();
     for child in children {
         match child {
             UiChild::Node(node) => materialized.push(UiChild::Node(Box::new(
-                materialize_binding_node(node, session_rows, item, false)?,
+                materialize_binding_node(node, session_rows, item, row_id, false)?,
             ))),
             UiChild::Conditional(UiConditional::When { condition, node }) => {
                 materialized.push(UiChild::Conditional(UiConditional::When {
                     condition: condition.clone(),
-                    node: Box::new(materialize_binding_node(node, session_rows, item, false)?),
+                    node: Box::new(materialize_binding_node(
+                        node,
+                        session_rows,
+                        item,
+                        row_id,
+                        false,
+                    )?),
                 }));
             }
             UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
                 materialized.push(UiChild::Conditional(UiConditional::Hidden {
                     condition: condition.clone(),
-                    node: Box::new(materialize_binding_node(node, session_rows, item, false)?),
+                    node: Box::new(materialize_binding_node(
+                        node,
+                        session_rows,
+                        item,
+                        row_id,
+                        false,
+                    )?),
                 }));
             }
             UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { predicate, node }) => {
                 materialized.push(UiChild::BindIf(
                     botster_ui_contract::UiBindIf::PresentationIf {
                         predicate: predicate.clone(),
-                        node: Box::new(materialize_binding_node(node, session_rows, item, false)?),
+                        node: Box::new(materialize_binding_node(
+                            node,
+                            session_rows,
+                            item,
+                            row_id,
+                            false,
+                        )?),
                     },
                 ));
             }
@@ -5145,6 +5183,7 @@ fn materialize_binding_children(
                         node,
                         session_rows,
                         item,
+                        row_id,
                         false,
                     )?)));
                 }
@@ -5180,6 +5219,7 @@ fn materialize_binding_children(
                             empty_template,
                             session_rows,
                             None,
+                            None,
                             false,
                         )?)));
                     }
@@ -5189,6 +5229,7 @@ fn materialize_binding_children(
                             item_template,
                             session_rows,
                             Some(row),
+                            None,
                             true,
                         )?)));
                     }
@@ -7069,7 +7110,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_4_revision_25_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_4_revision_27_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
@@ -7077,7 +7118,7 @@ mod tests {
             MINIMUM_CONFORMANCE_FIXTURE_REVISION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 4);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 25);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 27);
         assert!(
             requirement
                 .required_features
@@ -7091,13 +7132,13 @@ mod tests {
                 .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
         );
 
-        for revision in 16..25 {
+        for revision in 16..27 {
             let mut older_hub = DaemonCompatibility::current();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-presentation fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 25"));
+            assert!(error.diagnostic.contains("requires at least 27"));
         }
         for protocol_version in 2..4 {
             let mut older_hub = DaemonCompatibility::current();
@@ -7112,11 +7153,11 @@ mod tests {
             assert!(error.diagnostic.contains("requires at least 4"));
         }
         botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 4 fixture revision 25 hub should connect");
+            .expect("protocol 4 fixture revision 27 hub should connect");
         let mut future_hub = DaemonCompatibility::current();
-        future_hub.conformance_fixture_revision = 26;
+        future_hub.conformance_fixture_revision = 28;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 26");
+            .expect("runtime compatibility must preserve minimum semantics for revision 28");
     }
 
     #[test]
@@ -7287,20 +7328,54 @@ mod tests {
         node: &UiNode,
         rows: &mut Vec<botster_hub_test_support::SessionPluginMaterializedRow>,
     ) {
-        if let Some(id) = node.id.as_ref().and_then(UiAuthoredNodeId::as_literal)
-            && node
-                .props
-                .get("action")
-                .and_then(|action| action.get("id"))
-                .and_then(Value::as_str)
-                == Some("contract.action")
-        {
-            rows.push(botster_hub_test_support::SessionPluginMaterializedRow {
-                node_id: id.0.clone(),
-                action_payload: node_action(node)
-                    .payload
-                    .expect("canonical row action has a payload"),
-            });
+        if let Some(id) = node.id.as_ref().and_then(UiAuthoredNodeId::as_literal) {
+            let controls = node
+                .children
+                .iter()
+                .filter_map(static_child_node)
+                .filter_map(|control| {
+                    let action: botster_ui_contract::UiAction = control
+                        .props
+                        .get("action")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())?;
+                    (action.id.0 == "contract.action").then(|| {
+                        let action_payload = action
+                            .payload
+                            .expect("canonical descendant action has a payload");
+                        let key = action_payload
+                            .get("operation")
+                            .and_then(Value::as_str)
+                            .expect("canonical descendant action names its operation")
+                            .to_string();
+                        let node_id = control
+                            .id
+                            .as_ref()
+                            .and_then(UiAuthoredNodeId::as_literal)
+                            .expect("canonical descendant identity is materialized")
+                            .0
+                            .clone();
+                        let label = control
+                            .props
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .expect("canonical descendant label is materialized")
+                            .to_string();
+                        botster_hub_test_support::SessionPluginMaterializedControl {
+                            key,
+                            node_id,
+                            label,
+                            action_payload,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !controls.is_empty() {
+                rows.push(botster_hub_test_support::SessionPluginMaterializedRow {
+                    node_id: id.0.clone(),
+                    controls,
+                });
+            }
         }
         for child in node
             .children
@@ -7312,15 +7387,24 @@ mod tests {
         }
     }
 
-    fn assert_multi_row_keyboard_and_mouse_dispatch(
+    fn assert_keyboard_and_mouse_dispatch(
         app: &mut TuiApp,
         expected_rows: &[botster_hub_test_support::SessionPluginMaterializedRow],
     ) {
         assert!(
-            expected_rows.len() >= 2,
-            "published oracle must remain multi-row"
+            !expected_rows.is_empty(),
+            "published oracle must retain an action row"
         );
-        let target = &expected_rows[1];
+        let keyboard_target = &expected_rows
+            .last()
+            .expect("checked nonempty rows")
+            .controls[1];
+        let mouse_target = &expected_rows[0].controls[2];
+        let expected_controls = expected_rows
+            .iter()
+            .flat_map(|row| row.controls.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(expected_controls.len(), expected_rows.len() * 3);
         let mut router =
             InputRouter::new(renderer::action_request_context_for("contract.sessions"));
         let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
@@ -7331,13 +7415,13 @@ mod tests {
             &app.plugin_presentation,
         );
         router.reconcile(&hit_map);
-        let region_rects = expected_rows
+        let region_rects = expected_controls
             .iter()
-            .map(|row| {
+            .map(|control| {
                 hit_map
                     .regions()
                     .iter()
-                    .find(|region| region.node_id == row.node_id)
+                    .find(|region| region.node_id == control.node_id)
                     .map(|region| {
                         (
                             region.rect.x,
@@ -7346,10 +7430,10 @@ mod tests {
                             region.rect.height,
                         )
                     })
-                    .expect("each producer row has a distinct production hit region")
+                    .expect("each producer control has a distinct production hit region")
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(region_rects.len(), expected_rows.len());
+        assert_eq!(region_rects.len(), expected_controls.len());
 
         let mut focused = std::collections::BTreeSet::new();
         for _ in 0..=(2 * hit_map.regions().len() + 1) {
@@ -7359,22 +7443,22 @@ mod tests {
             ) {
                 focused.insert(node_id);
             }
-            if expected_rows
+            if expected_controls
                 .iter()
-                .all(|row| focused.contains(&row.node_id))
+                .all(|control| focused.contains(&control.node_id))
             {
                 break;
             }
         }
-        for row in expected_rows {
+        for control in &expected_controls {
             assert!(
-                focused.contains(&row.node_id),
+                focused.contains(&control.node_id),
                 "Tab traversal did not reach {}",
-                row.node_id
+                control.node_id
             );
         }
         for _ in 0..=hit_map.regions().len() {
-            if router.focused_node_id() == Some(target.node_id.as_str()) {
+            if router.focused_node_id() == Some(keyboard_target.node_id.as_str()) {
                 break;
             }
             router.dispatch_event(
@@ -7382,7 +7466,10 @@ mod tests {
                 &hit_map,
             );
         }
-        assert_eq!(router.focused_node_id(), Some(target.node_id.as_str()));
+        assert_eq!(
+            router.focused_node_id(),
+            Some(keyboard_target.node_id.as_str())
+        );
 
         let mut keyboard_request = None;
         for code in [KeyCode::Enter, KeyCode::Char(' ')] {
@@ -7391,10 +7478,16 @@ mod tests {
                 &hit_map,
             );
             let InputDispatch::Action(request) = &dispatch else {
-                panic!("focused row must dispatch for {code:?}, got {dispatch:?}");
+                panic!("focused control must dispatch for {code:?}, got {dispatch:?}");
             };
-            assert_eq!(request.node_id, Some(UiNodeId(target.node_id.clone())));
-            assert_eq!(request.payload.as_ref(), Some(&target.action_payload));
+            assert_eq!(
+                request.node_id,
+                Some(UiNodeId(keyboard_target.node_id.clone()))
+            );
+            assert_eq!(
+                request.payload.as_ref(),
+                Some(&keyboard_target.action_payload)
+            );
             keyboard_request.get_or_insert_with(|| request.clone());
         }
 
@@ -7410,8 +7503,8 @@ mod tests {
         let region = mouse_hits
             .regions()
             .iter()
-            .find(|region| region.node_id == target.node_id)
-            .expect("target row remains in the production hit map");
+            .find(|region| region.node_id == mouse_target.node_id)
+            .expect("target control remains in the production hit map");
         let down = mouse_router.dispatch_event(
             mouse_event(
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -7430,10 +7523,28 @@ mod tests {
             &mouse_hits,
         );
         let InputDispatch::Action(request) = &up else {
-            panic!("target row mouse release must dispatch, got {up:?}");
+            panic!("target control mouse release must dispatch, got {up:?}");
         };
-        assert_eq!(request.node_id, Some(UiNodeId(target.node_id.clone())));
-        assert_eq!(request.payload.as_ref(), Some(&target.action_payload));
+        assert_eq!(
+            request.node_id,
+            Some(UiNodeId(mouse_target.node_id.clone()))
+        );
+        assert_eq!(request.payload.as_ref(), Some(&mouse_target.action_payload));
+
+        let neighboring_region = mouse_hits
+            .regions()
+            .iter()
+            .find(|candidate| candidate.node_id == keyboard_target.node_id)
+            .expect("neighboring control remains in the production hit map");
+        let mismatched = mouse_router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                neighboring_region.rect.x,
+                neighboring_region.rect.y,
+            ),
+            &mouse_hits,
+        );
+        assert!(matches!(mismatched, InputDispatch::Ignored));
         app.observed_requests.clear();
         app.handle_dispatch(InputDispatch::Action(
             keyboard_request.expect("Enter produced a typed request"),
@@ -7441,15 +7552,15 @@ mod tests {
         assert!(app.observed_requests.iter().any(|observed| matches!(
             observed,
             ObservedRequest::PluginSurfaceAction { request, .. }
-                if request.node_id == Some(UiNodeId(target.node_id.clone()))
-                    && request.payload.as_ref() == Some(&target.action_payload)
+                if request.node_id == Some(UiNodeId(keyboard_target.node_id.clone()))
+                    && request.payload.as_ref() == Some(&keyboard_target.action_payload)
         )));
     }
 
     #[test]
     fn canonical_session_bindings_follow_published_oracle_through_frames_and_reconnect() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
-        assert_eq!(scenario.conformance_fixture_revision, 25);
+        assert_eq!(scenario.conformance_fixture_revision, 27);
         let body =
             serde_json::from_value(scenario.surface.clone()).expect("published surface is typed");
         let mut app = TuiApp::new(None);
@@ -7479,12 +7590,25 @@ mod tests {
             &initial_frames,
         )
         .expect("producer initial rows materialize");
+        assert_eq!(initial_rows, scenario.row_expected.initial);
         assert_eq!(
-            initial_rows
-                .iter()
-                .map(|row| row.node_id.clone())
-                .collect::<Vec<_>>(),
-            scenario.row_expected.initial
+            initial_rows.len(),
+            2,
+            "published initial oracle is multi-row"
+        );
+        assert_keyboard_and_mouse_dispatch(&mut app, &initial_rows);
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "botster.plugin-contract-matrix",
+            "contract.sessions",
+            serde_json::from_value(scenario.surface.clone())
+                .expect("published surface remains typed after dispatch proof"),
+        )));
+        app.session_entities
+            .begin_generation(generation_one.clone());
+        assert!(
+            app.session_entities
+                .apply(scenario.initial_snapshot.clone())
+                .expect("initial snapshot reapplies after dispatch proof")
         );
         assert_session_binding_frame(
             &app,
@@ -7492,7 +7616,6 @@ mod tests {
             &scenario.references,
             &initial_rows,
         );
-        assert_multi_row_keyboard_and_mouse_dispatch(&mut app, &initial_rows);
         app.apply_response(plugin_surface_response(canonical_surface(
             "botster.plugin-contract-matrix",
             "contract.sessions",
@@ -7550,6 +7673,10 @@ mod tests {
             .apply(scenario.initial_snapshot.clone())
             .expect("initial snapshot reapplies");
         let removed_row = initial_rows.first().expect("initial row removed by patch");
+        let removed_control = removed_row
+            .controls
+            .first()
+            .expect("removed row has identity-bearing controls");
         let mut removal_router =
             InputRouter::new(renderer::action_request_context_for("contract.sessions"));
         let (_lines, initial_removal_hits) = renderer::render_to_lines_with_presentation_state(
@@ -7561,7 +7688,7 @@ mod tests {
         );
         removal_router.reconcile(&initial_removal_hits);
         for _ in 0..=initial_removal_hits.regions().len() {
-            if removal_router.focused_node_id() == Some(removed_row.node_id.as_str()) {
+            if removal_router.focused_node_id() == Some(removed_control.node_id.as_str()) {
                 break;
             }
             removal_router.dispatch_event(
@@ -7571,7 +7698,7 @@ mod tests {
         }
         assert_eq!(
             removal_router.focused_node_id(),
-            Some(removed_row.node_id.as_str())
+            Some(removed_control.node_id.as_str())
         );
         let transition_expectations = [
             (
@@ -7605,18 +7732,15 @@ mod tests {
                 &stage_frames,
             )
             .expect("producer transition rows materialize");
-            assert_eq!(
-                expected_rows
-                    .iter()
-                    .map(|row| row.node_id.clone())
-                    .collect::<Vec<_>>(),
-                *row_expected
-            );
+            assert_eq!(expected_rows, *row_expected);
             assert_session_binding_frame(&app, expected, &scenario.references, &expected_rows);
             if stage == 0 {
-                let surviving_row = expected_rows
+                let surviving_control = expected_rows
                     .first()
-                    .expect("ended patch preserves one canonical row");
+                    .expect("ended patch preserves one canonical row")
+                    .controls
+                    .first()
+                    .expect("surviving row retains controls");
                 let (_lines, removed_hits) = renderer::render_to_lines_with_presentation_state(
                     &app.surface(),
                     180,
@@ -7628,15 +7752,16 @@ mod tests {
                     !removed_hits
                         .regions()
                         .iter()
-                        .any(|region| region.node_id == removed_row.node_id)
+                        .any(|region| region.node_id == removed_control.node_id)
                 );
                 removal_router.reconcile(&removed_hits);
                 assert_ne!(
                     removal_router.focused_node_id(),
-                    Some(removed_row.node_id.as_str())
+                    Some(removed_control.node_id.as_str())
                 );
                 for _ in 0..=removed_hits.regions().len() {
-                    if removal_router.focused_node_id() == Some(surviving_row.node_id.as_str()) {
+                    if removal_router.focused_node_id() == Some(surviving_control.node_id.as_str())
+                    {
                         break;
                     }
                     removal_router.dispatch_event(
@@ -7653,9 +7778,12 @@ mod tests {
                 };
                 assert_eq!(
                     request.node_id,
-                    Some(UiNodeId(surviving_row.node_id.clone()))
+                    Some(UiNodeId(surviving_control.node_id.clone()))
                 );
-                assert_eq!(request.payload, Some(surviving_row.action_payload.clone()));
+                assert_eq!(
+                    request.payload,
+                    Some(surviving_control.action_payload.clone())
+                );
             }
         }
 
@@ -7682,19 +7810,14 @@ mod tests {
             &reconnect_frames,
         )
         .expect("producer reconnect rows materialize");
-        assert_eq!(
-            reconnect_rows
-                .iter()
-                .map(|row| row.node_id.clone())
-                .collect::<Vec<_>>(),
-            scenario.row_expected.after_reconnect
-        );
+        assert_eq!(reconnect_rows, scenario.row_expected.after_reconnect);
         assert_session_binding_frame(
             &app,
             &scenario.expected.after_reconnect,
             &scenario.references,
             &reconnect_rows,
         );
+        assert_keyboard_and_mouse_dispatch(&mut app, &reconnect_rows);
     }
 
     #[test]
@@ -8413,6 +8536,212 @@ mod tests {
         assert_eq!(
             materialize_plugin_surface(&blank, &blank_state).unwrap_err(),
             "bound node id resolved to a blank string"
+        );
+    }
+
+    #[test]
+    fn authored_descendant_identity_diagnostics_precede_materialization() {
+        let invalid_cases = [
+            (
+                "blank",
+                ui_node(json!({
+                    "type": "panel",
+                    "id": "sessions",
+                    "children": [{
+                        "$kind": "bind_list",
+                        "source": "/session",
+                        "item_template": {
+                            "type": "inline",
+                            "id": { "$bind": "@/session_uuid" },
+                            "children": [{
+                                "type": "button",
+                                "id": { "$kind": "bind_list_descendant_id", "key": " \t" },
+                                "props": {
+                                    "label": "Blank",
+                                    "action": { "id": "contract.action" }
+                                }
+                            }]
+                        }
+                    }]
+                })),
+                "key cannot be blank",
+            ),
+            (
+                "misplaced",
+                ui_node(json!({
+                    "type": "button",
+                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                    "props": {
+                        "label": "Misplaced",
+                        "action": { "id": "contract.action" }
+                    }
+                })),
+                "valid only below a bind_list item_template root",
+            ),
+            (
+                "duplicate-siblings",
+                ui_node(json!({
+                    "type": "panel",
+                    "id": "sessions",
+                    "children": [{
+                        "$kind": "bind_list",
+                        "source": "/session",
+                        "item_template": {
+                            "type": "inline",
+                            "id": { "$bind": "@/session_uuid" },
+                            "children": [{
+                                "type": "button",
+                                "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                                "props": { "label": "Remove", "action": { "id": "contract.action" } }
+                            }, {
+                                "type": "button",
+                                "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                                "props": { "label": "Remove again", "action": { "id": "contract.action" } }
+                            }]
+                        }
+                    }]
+                })),
+                "key must be unique across the complete bind_list item template",
+            ),
+            (
+                "duplicate-exclusive-branches",
+                ui_node(json!({
+                    "type": "panel",
+                    "id": "sessions",
+                    "children": [{
+                        "$kind": "bind_list",
+                        "source": "/session",
+                        "item_template": {
+                            "type": "inline",
+                            "id": { "$bind": "@/session_uuid" },
+                            "children": [{
+                                "$kind": "when",
+                                "condition": { "width": "compact" },
+                                "node": {
+                                    "type": "button",
+                                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                                    "props": { "label": "Remove", "action": { "id": "contract.action" } }
+                                }
+                            }, {
+                                "$kind": "hidden",
+                                "condition": { "width": "compact" },
+                                "node": {
+                                    "type": "button",
+                                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
+                                    "props": { "label": "Remove expanded", "action": { "id": "contract.action" } }
+                                }
+                            }]
+                        }
+                    }]
+                })),
+                "key must be unique across the complete bind_list item template",
+            ),
+        ];
+
+        for (surface_id, body, expected) in invalid_cases {
+            let error = plugin_surface_body_node(&canonical_surface(
+                "botster.plugin-contract-matrix",
+                surface_id,
+                body,
+            ))
+            .expect_err("authored descendant identity must fail before materialization");
+            assert!(error.contains(expected), "{surface_id}: {error}");
+        }
+    }
+
+    #[test]
+    fn canonical_descendant_identity_is_utf8_safe_injective_and_collision_checked() {
+        let first_row = "会話:1-😀";
+        let first_key = "remove:🧹";
+        let second_row = "会話";
+        let second_key = ":1-😀remove:🧹";
+        assert_eq!(
+            format!("{first_row}{first_key}"),
+            format!("{second_row}{second_key}")
+        );
+
+        let body = ui_node(json!({
+            "type": "panel",
+            "id": "identity-panel",
+            "children": [{
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": first_row },
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": first_key },
+                        "props": { "label": "First", "action": { "id": "contract.first" } }
+                    }]
+                }
+            }, {
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": second_row },
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": second_key },
+                        "props": { "label": "Second", "action": { "id": "contract.second" } }
+                    }]
+                }
+            }]
+        }));
+        body.validate().expect("authored identity tree is valid");
+        let mut state = SessionEntityState::default();
+        state.begin_generation("unicode-identity-generation".to_string());
+        state
+            .apply(snapshot_frame(
+                "unicode-identity-generation",
+                1,
+                vec![
+                    session_entity(first_row, Some("running")),
+                    session_entity(second_row, Some("running")),
+                ],
+            ))
+            .expect("unicode identity snapshot applies");
+        let materialized =
+            materialize_plugin_surface(&body, &state).expect("canonical identities do not collide");
+        let first_id = realize_bind_list_descendant_id(first_row, first_key)
+            .expect("first canonical identity");
+        let second_id = realize_bind_list_descendant_id(second_row, second_key)
+            .expect("second canonical identity");
+        assert_ne!(first_id, second_id);
+        assert!(find_ui_node_by_id(&materialized, &first_id.0).is_some());
+        assert!(find_ui_node_by_id(&materialized, &second_id.0).is_some());
+
+        let collision = ui_node(json!({
+            "type": "panel",
+            "id": "collision-panel",
+            "children": [{
+                "type": "button",
+                "id": first_id.0,
+                "props": { "label": "Static", "action": { "id": "contract.static" } }
+            }, {
+                "$kind": "bind_list",
+                "source": "/session",
+                "where": { "session_uuid": first_row },
+                "item_template": {
+                    "type": "inline",
+                    "id": { "$bind": "@/session_uuid" },
+                    "children": [{
+                        "type": "button",
+                        "id": { "$kind": "bind_list_descendant_id", "key": first_key },
+                        "props": { "label": "Bound", "action": { "id": "contract.bound" } }
+                    }]
+                }
+            }]
+        }));
+        collision
+            .validate()
+            .expect("authored identity cannot predict a realized collision");
+        assert_eq!(
+            materialize_plugin_surface(&collision, &state).unwrap_err(),
+            format!("duplicate materialized node id {:?}", first_id.0)
         );
     }
 
@@ -13539,6 +13868,157 @@ mod tests {
             assert!(!rendered.contains(fallback), "{rendered}");
         }
 
+        let materialized = materialize_plugin_surface(
+            &binding_app
+                .plugin_surface
+                .as_ref()
+                .expect("live session surface")
+                .body,
+            &binding_app.session_entities,
+        )
+        .expect("live Hub surface materializes canonical controls");
+        let mut live_rows = Vec::new();
+        collect_session_action_rows(&materialized, &mut live_rows);
+        let live_row = live_rows
+            .iter()
+            .find(|row| row.node_id == live_session_uuid)
+            .expect("live session owns a materialized action row");
+        assert_eq!(
+            live_row
+                .controls
+                .iter()
+                .map(|control| control.key.as_str())
+                .collect::<Vec<_>>(),
+            ["spawn", "rename", "remove"]
+        );
+        for control in &live_row.controls {
+            assert_eq!(
+                control.node_id,
+                realize_bind_list_descendant_id(&live_session_uuid, &control.key)
+                    .expect("live canonical descendant identity")
+                    .0
+            );
+            assert_eq!(
+                control.action_payload,
+                json!({
+                    "operation": control.key,
+                    "session_uuid": live_session_uuid,
+                })
+            );
+        }
+
+        let rename = &live_row.controls[1];
+        let mut key_router = InputRouter::new(renderer::action_request_context_for(
+            &report.session_surface_id,
+        ));
+        let (_lines, key_hits) = renderer::render_to_lines_with_presentation_state(
+            &binding_app.surface(),
+            180,
+            60,
+            &key_router.render_state(),
+            &binding_app.plugin_presentation,
+        );
+        key_router.reconcile(&key_hits);
+        for _ in 0..=key_hits.regions().len() {
+            if key_router.focused_node_id() == Some(rename.node_id.as_str()) {
+                break;
+            }
+            key_router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &key_hits,
+            );
+        }
+        let rename_dispatch = key_router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &key_hits,
+        );
+        let InputDispatch::Action(rename_request) = &rename_dispatch else {
+            panic!("live rename must dispatch through keyboard, got {rename_dispatch:?}");
+        };
+        assert_eq!(
+            rename_request.node_id,
+            Some(UiNodeId(rename.node_id.clone()))
+        );
+        assert_eq!(
+            rename_request.payload.as_ref(),
+            Some(&rename.action_payload)
+        );
+        binding_app.handle_dispatch(rename_dispatch);
+        let rename_result = binding_app
+            .plugin_action_result
+            .as_ref()
+            .expect("live Hub returns rename result");
+        assert_eq!(
+            rename_result.node_id,
+            Some(UiNodeId(rename.node_id.clone()))
+        );
+        assert_eq!(rename_result.payload.as_ref(), Some(&rename.action_payload));
+        assert_eq!(
+            serde_json::to_value(rename_result.state).unwrap(),
+            json!("accepted")
+        );
+
+        let remove = &live_row.controls[2];
+        let mut mouse_router = InputRouter::new(renderer::action_request_context_for(
+            &report.session_surface_id,
+        ));
+        let (_lines, mouse_hits) = renderer::render_to_lines_with_presentation_state(
+            &binding_app.surface(),
+            180,
+            60,
+            &mouse_router.render_state(),
+            &binding_app.plugin_presentation,
+        );
+        let remove_region = mouse_hits
+            .regions()
+            .iter()
+            .find(|region| region.node_id == remove.node_id)
+            .expect("live remove has a production hit region");
+        assert!(matches!(
+            mouse_router.dispatch_event(
+                mouse_event(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                    remove_region.rect.x,
+                    remove_region.rect.y,
+                ),
+                &mouse_hits,
+            ),
+            InputDispatch::Focus { .. }
+        ));
+        let remove_dispatch = mouse_router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                remove_region.rect.x,
+                remove_region.rect.y,
+            ),
+            &mouse_hits,
+        );
+        let InputDispatch::Action(remove_request) = &remove_dispatch else {
+            panic!("live remove must dispatch through mouse, got {remove_dispatch:?}");
+        };
+        assert_eq!(
+            remove_request.node_id,
+            Some(UiNodeId(remove.node_id.clone()))
+        );
+        assert_eq!(
+            remove_request.payload.as_ref(),
+            Some(&remove.action_payload)
+        );
+        binding_app.handle_dispatch(remove_dispatch);
+        let remove_result = binding_app
+            .plugin_action_result
+            .as_ref()
+            .expect("live Hub returns remove result");
+        assert_eq!(
+            remove_result.node_id,
+            Some(UiNodeId(remove.node_id.clone()))
+        );
+        assert_eq!(remove_result.payload.as_ref(), Some(&remove.action_payload));
+        assert_eq!(
+            serde_json::to_value(remove_result.state).unwrap(),
+            json!("accepted")
+        );
+
         let prior_generation = binding_app
             .session_entities
             .subscription_id
@@ -15224,6 +15704,7 @@ mod tests {
             cleanup: None,
             coordination: None,
             plugin_worker_counters: None,
+            plugin_resource_counters: None,
             error: None,
             diagnostics: Vec::new(),
         }
