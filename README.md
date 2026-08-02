@@ -27,10 +27,10 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`3bf8ae81d3e716b196fae8e4a7560dd5fc5c2e69` and the kit, Hub client, and this
+`76e2085632f2da2f4423100cec85f23527373524` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
-`fab44c5de7b28a8756268608662d2b870efb001a`. Runnable-entrypoint connection
+`e8febabf73259cfd922592346b244ec473c17323`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
@@ -100,7 +100,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`fab44c5de7b28a8756268608662d2b870efb001a`. The protocol source is
+`e8febabf73259cfd922592346b244ec473c17323`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -268,7 +268,7 @@ terminal readback, package navigation, resize, and plugin surface render/action.
 A running but incompatible hub is reported as a compatibility mismatch instead
 of being collapsed into the generic unavailable/reconnecting state.
 The cold compatibility floor is daemon protocol version 4 and conformance
-fixture revision 25. Protocol versions 2–3 and fixture revisions 16–24 fail
+fixture revision 27. Protocol versions 2–3 and fixture revisions 16–26 fail
 through the structured compatibility diagnostic; there is no fallback path.
 
 When the Hub delivers a plugin surface, the TUI keeps a stable client-owned
@@ -291,22 +291,28 @@ surface, derive lifecycle classes, or keep a second session store. Missing
 references select the authored empty template, while malformed or unsupported
 bindings render a diagnostic instead of masquerading as unavailable. The TUI
 resolves producer-authored item-relative row IDs while each `bind_list` row is
-in context, then gives the renderer distinct literal IDs. Duplicate realized
-IDs that can coexist in one materialized render fail visibly before focus or
-action routing, including collisions between a bound row and a static sibling;
-mutually exclusive responsive alternatives may reuse an ID.
+in context, then realizes every producer-keyed descendant with the canonical
+Hub contract helper before handing distinct literal IDs to TUI-kit. Bound
+required labels remain authored binding sentinels until the same materialization
+pass. Duplicate realized IDs that can coexist in one materialized render fail
+visibly before focus or action routing, including collisions between a bound
+row and a static sibling; mutually exclusive responsive alternatives may reuse
+an ID.
 
 The live-hub smoke also runs the hub-owned plugin contract matrix harness from
 `botster-hub-test-support`, then independently requests the real fixture's
 package list, package detail, navigation, app, empty, settings, and
-session-binding surfaces through `botster-hub-client`. It renders the same typed package descriptors
-after List and Show, activates Show and resolved navigation Open through the
-production frame hit map and Crossterm input router, and restores the complete
-package list through Refresh. Those delivered
-surface bodies arrive as typed `botster_ui_contract::UiNode`, are validated
-against the Hub-owned contract, checked against TUI renderer capabilities, and rendered with
-the production TUI kit. An arbitrary delivered plugin control is likewise
-activated through the real hit map/input path, and its typed action result must
+session-binding surfaces through `botster-hub-client`. It renders the same typed
+package descriptors after List and Show, activates Show and resolved navigation
+Open through the production frame hit map and Crossterm input router, and
+restores the complete package list through Refresh. Those delivered surface
+bodies arrive as typed `botster_ui_contract::UiNode`, are validated against the
+Hub-owned contract, checked against TUI renderer capabilities, and rendered
+with the production TUI kit. The session-binding proof drives a canonical
+descendant `rename` by keyboard and `remove` by mouse, then requires the live
+Hub results to echo each exact control ID and row payload. An arbitrary
+delivered plugin control is likewise activated through the real hit map/input
+path, and its typed action result must
 change visible presentation. Unsupported client primitives fail with the
 capability-validation diagnostic, including the node id and primitive, instead
 of being treated as a passing render.
