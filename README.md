@@ -28,10 +28,10 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`76e2085632f2da2f4423100cec85f23527373524` and the kit, Hub client, and this
+`551feb151f531d59d362efdae0cc7d3a34d8e311` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
-`e8febabf73259cfd922592346b244ec473c17323`. Runnable-entrypoint connection
+`8a60bd58841179f8b1fd4040d9362d18ea244230`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
@@ -73,8 +73,9 @@ The default surface is session-first:
 - The contextual toolbar promotes one relevant action—Spawn, Attach, or
   Detach—keeps valid alternatives inline until width pressure moves them into
   kit-owned overflow, and requires confirmation before Shutdown or Remove.
-- System details contains package, app, plugin, compatibility, configuration,
-  diagnostics, and command editing in a scrollable secondary surface.
+- System details contains Hub software identity, package, app, plugin,
+  compatibility, configuration, diagnostics, and command editing in a scrollable
+  secondary surface.
 
 Expanded (`>=120` columns) terminals use a fixed 40-column session navigator;
 regular (`80..119`) terminals use a 40/60 split. Compact terminals (`<80`)
@@ -126,7 +127,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`e8febabf73259cfd922592346b244ec473c17323`. The protocol source is
+`8a60bd58841179f8b1fd4040d9362d18ea244230`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -153,6 +154,31 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
+
+### Known gap — all three Workspaces live-acceptance lanes are blocked
+
+`script/test-live-hub workspaces installed-driver`, `plumbing`, and `lifecycle`
+all exit non-zero without running, blocked pending `ticket_1785984128_479155`.
+
+One root cause, not three: `botster-workspaces` declares the legacy capability
+scope `session_template_managed_git_spawn`, Hub `8a60bd58` grants
+`session_type_managed_git_spawn` instead, and `PackageRegistry::enable`
+hard-denies an ungranted scope rather than warning, so every profile fails at
+`EnablePackage` for the same reason. Because `enable` hard-denies, this is not a
+narrow testing artifact: the installed Workspaces package cannot be enabled on a
+protocol-6 Hub on any real device.
+
+Consequently unproven: the repo-source session-type path and the
+installed-Workspaces spawn driver are unverified against a protocol-6 Hub. The
+live-Hub evidence for the current pinned revision therefore comes from the
+`contract-matrix` lane, which is unaffected.
+
+Two independent conditions must both clear before these lanes can pass —
+`ticket_1785984128_479155` must land so the granted capability scope matches,
+and `botster-tui` must be pinned to protocol 6 (done at the revisions above),
+because exact protocol matching means a protocol-4 client cannot talk to a
+protocol-6 Hub regardless of anything Workspaces does. Removing the guard and
+proving all three lanes green is owned by `ticket_1786036326_597046`.
 
 ## Caller-owned Workspaces Spawn acceptance
 
@@ -226,6 +252,10 @@ The System details diagnostics distinguish:
 - local hub unavailable, disconnected, or reconnecting;
 - compatibility mismatch and unsupported feature diagnostics from the
   `botster-hub-client` compatibility handshake;
+- authoritative Hub software identity from `DaemonStatus.software`, including
+  product name, product id, version, and build revision when the Hub reports
+  one. Hub identity is never derived from an installed package row, and an
+  absent build revision renders as absent rather than as a placeholder;
 - observed daemon compatibility descriptor values from status, including
   protocol, protocol version, feature list, conformance fixture revision, and
   status schema version;
@@ -294,9 +324,12 @@ terminal surface: sessions, session entity subscriptions, terminal streaming,
 terminal readback, package navigation, resize, and plugin surface render/action.
 A running but incompatible hub is reported as a compatibility mismatch instead
 of being collapsed into the generic unavailable/reconnecting state.
-The cold compatibility floor is daemon protocol version 4 and conformance
-fixture revision 27. Protocol versions 2–3 and fixture revisions 16–26 fail
-through the structured compatibility diagnostic; there is no fallback path.
+The daemon protocol version is matched **exactly**, not as a floor: the client
+requires protocol version 6 and refuses any other, so a newer Hub is rejected as
+firmly as an older one. The conformance fixture revision keeps minimum
+semantics with a floor of 31. Fixture revisions 16–30 and every protocol version
+other than 6 fail through the structured compatibility diagnostic; there is no
+fallback path.
 
 When the Hub delivers a plugin surface, the TUI keeps a stable client-owned
 status/navigation shell and makes the plugin tree the interactive content
