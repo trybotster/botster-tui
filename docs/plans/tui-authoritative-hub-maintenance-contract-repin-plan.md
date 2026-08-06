@@ -244,12 +244,26 @@ prohibition on `[patch]`, vendoring, and path overrides applies with full force
 here: those are exactly the workarounds an implementer reaches for when the
 prerequisite is missing.
 
+**Ordering correction, added after the Implement pass ran this check.** Steps 1
+and 2 are *separable facts that can diverge*: a merged PR can sit under a ticket
+nobody closed, and a closed ticket can sit over an unmerged PR. **The binding
+conditions are step 2 (the merge) and step 3 (the rev reachable on the default
+branch). Step 1 is corroboration, not proof.** Both failed together on the first
+Implement attempt so nothing turned on it there, but a future reader must not
+treat "ticket closed" as the load-bearing condition. Confirmed by the
+orchestrator in `question_1786037066_473294`, which also reports having seen a
+run finish Verify and sit with an unmerged PR under an open ticket for half an
+hour. This is the operational sharpening of
+[[closed dependency tickets signal merged source not a consumable release]]:
+that note says what "closed" is worth; this says which check actually gates.
+
 1. Call `project_pipelines_current_context` and
    `project_pipelines_get_ticket` for `ticket_1786032168_294170`. Require
    `status == "closed"`. Do not accept an in-flight run, an approved plan, or an
    orchestrator assertion as a substitute — per
    [[closed dependency tickets signal merged source not a consumable release]],
-   only a merged, pinnable commit satisfies this.
+   only a merged, pinnable commit satisfies this. Corroborating only; see the
+   ordering correction above.
 2. Identify the exact `botster-tui-kit` commit that ticket produced, and verify it
    is **merged to the authoritative `trybotster/botster-tui-kit` repository** and
    reachable from its default branch — not merely present on a run worktree or a
@@ -929,9 +943,13 @@ the gates must be workspace-scoped because DTO field changes ripple.
   as a placeholder, and a pre-connect app renders unknown rather than a fabricated
   version.
 - A deterministic check that `script/test-live-hub workspaces <profile>` exits
-  non-zero with `ticket_1785984128_479155` on stderr and no `test result: ok` on
-  stdout, for **each** of `installed-driver`, `plumbing`, and `lifecycle`, and
-  that `contract-matrix` mode is unaffected by the guard.
+  non-zero with **both** `ticket_1785984128_479155` (root cause) and
+  `ticket_1786036326_597046` (un-skip owner) on stderr and no `test result: ok`
+  on stdout, for **each** of `installed-driver`, `plumbing`, and `lifecycle`, and
+  that `contract-matrix` mode is unaffected by the guard. The two-ticket naming
+  is the authorized deviation recorded above. **Executed:**
+  `app::tests::blocked_workspaces_lanes_report_a_known_gap_for_every_profile`
+  passes, and was confirmed to go red when the guard is deleted.
 - Existing entity-reducer, rendering, and plugin-surface tests still pass
   unchanged in intent, preserving
   [[acceptance readiness requires the exact expected entity not any authoritative snapshot]].
@@ -950,7 +968,33 @@ compiling is not proof that the production path changed.
   protocol 6 / conformance 31 Hub, and that the session entity subscription
   reducer consumes real Hub frames.
 - Record the Hub and session-worker binary provenance (revision they were built
-  from) alongside the result, per risk 6.
+  from) alongside the result, per risk 6. **Executed:** `botster-hub` built from
+  `8a60bd58841179f8b1fd4040d9362d18ea244230`; `botster-session-worker` built from
+  `botster-core` `33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`, the revision
+  `botster-hub`'s own `Cargo.lock` pins at that commit. Both source checkouts
+  were clean at those exact revisions.
+- **RESULT — state both halves together, never one alone.** The lane proves the
+  full protocol-6 contract green: handshake at protocol 6 / conformance 31,
+  entity frames, plugin surfaces, package operations, and settings
+  configuration all pass. It then **fails on its final assertion**
+  (`app.rs:13258`, `assert!(rendered.contains("connection:"))`) for a
+  pre-existing shell defect unrelated to this bump, now owned by
+  `ticket_1786038825_352271`. The process exit code is therefore non-zero.
+
+  Proven pre-existing rather than assumed: an identical isolated probe added to
+  a scratch worktree at base `fe03a90` **with the old protocol-4 pins** and to
+  this branch produced byte-identical results — `has_hub_unavailable=true
+  has_connection_colon=false`, same assertion failing on both. Probe removed and
+  scratch worktree deleted. The naive fix
+  (`|| self.connection_error.is_some()` in `legacy_test_needs_system_details()`)
+  is disproven: it drops the unit suite from 152 to 136 passing and merely
+  relocates the live failure, because rendering System details displaces the
+  Terminal panel carrying "Hub unavailable".
+
+  Scope decision authorized in `question_1786038777_664168`, option (a): stay
+  scoped to the repin, route the defect to its own ticket. **This lane must not
+  be reported as passing, and must not be reported as failing without the
+  qualifier — both misrepresent it.**
 - `script/test-live-hub workspaces` lanes — `installed-driver`, `plumbing`, and
   `lifecycle`: **not run**, blocked pending `ticket_1785984128_479155` per
   decisions 3 and 4. Acceptance is the guard specified in scope item 6 — its
@@ -1043,6 +1087,60 @@ compiling is not proof that the production path changed.
   fail-closed entry check and proceeds only if every condition holds. The
   dependency edge is advisory in this environment, so sequencing is a claim
   verified at the transition, never a guarantee assumed in advance.
+
+## Implementation deviations — Implement pass, commit `466adb3`
+
+Recorded here per [[implementation deviations must resync committed plan acceptance checks]]:
+an accepted deviation belongs in the committed plan contract, not only in the
+implementation report.
+
+1. **The entry check found the prerequisite unmet, and the run stopped.** The
+   first Implement activation ran checks 1–4 and failed 3 of 4: the kit ticket
+   was open, `trybotster/botster-tui-kit#29` was open (mergeable/clean but
+   unmerged), and kit `origin/main` was still `76e2085` pinning `e8febabf`. No
+   file was edited, no gate submitted; escalated as
+   `question_1786037066_473294`. The orchestrator merged the PR and closed the
+   ticket; all four checks were re-run and passed before any edit. **The
+   fail-closed check did the job it was specified for.** The pinned kit revision
+   is `551feb151f531d59d362efdae0cc7d3a34d8e311`, confirmed to be kit
+   `origin/main` HEAD independently via `git ls-remote`.
+2. **Both blocking tickets are named at the guard site, not just one.**
+   Authorized in `question_1786037066_473294`, deviating from the ticket text
+   that says to name `ticket_1785984128_479155` alone. The guard message, both
+   `app.rs` test doc comments, and the `README.md` note now name
+   `ticket_1785984128_479155` as the root-cause owner **and**
+   `ticket_1786036326_597046` as the un-skip owner. `ticket_1786036326_597046`
+   was created after this plan's last pass and confirms rather than contradicts
+   scope item 6.
+3. **A 14th forced breakage the plan did not enumerate: `DaemonResponse.hub_update`.**
+   The plan listed 13; `base_response` also needed `hub_update: None`. Mechanical,
+   same class as the other renames. `CheckHubUpdate` presentation remains out of
+   scope per the non-scope list — only the required field is populated.
+4. **A forced adaptation the compiler could not catch: the live settings
+   assertion moved from `mode=write` to `mode=read`.** The Hub conformance
+   scenario at `8a60bd58` adds a *third* `mode` mutation (`read`) inside its new
+   `contract_matrix_advance_package_entities` step, placed **after** its own
+   `mode=write` settings check, to drive a package-entity generation bump.
+   `e8febabf` had only two mutations, both before that check, so the scenario's
+   end state moved. Verified by comparing both revisions' `hub-test-support`
+   sources directly. This is a string assertion, so nothing but the live lane
+   surfaces it — the reason the live lane is not optional for a repin.
+5. **Environment prerequisite, not a repository change:
+   `CARGO_NET_GIT_FETCH_WITH_CLI=true`.** Cargo's built-in libgit2 fetch cannot
+   read the macOS keychain credential helper, so fetching the previously
+   uncached kit revision fails with "failed to authenticate". The git CLI
+   authenticates fine. Reported as an environment artifact per risk 7 rather
+   than fixed by adding repository `.cargo/config.toml`, which would be
+   unrequested scope. Every gate and live lane in this run was executed with it
+   exported.
+6. **`session_entity_value` helper plus struct-update syntax.** Rather than
+   adding six `None` lines to each of the entity literals the bump broke, the
+   typed `session_entity` helper is reused through `..session_entity(...)` and a
+   thin `Value`-producing helper feeds the now-generic frames. This is the
+   plan's stated preferred shape and keeps the six new fields in exactly two
+   places.
+7. **Live-Hub evidence carries a qualifier, and it is not a pass.** See the
+   updated "Downstream live-Hub proof" acceptance below.
 
 ## Vault gaps worth capturing
 
