@@ -1,9 +1,10 @@
 # botster-tui
 
-`botster-tui` is Botster's first-party daily-use terminal workspace. It presents
-authoritative hub sessions, keeps selection separate from terminal attachment,
-and adapts from wide split panes to a compact stacked layout. It is a hub client
-over core APIs and the shared TUI renderer kit, not a runtime policy owner.
+`botster-tui` is Botster's first-party terminal client. Like the web client, it
+is an application ecosystem around a Hub rather than a single terminal
+workspace. It presents authoritative hub state through app-owned navigation and
+pages, and uses the shared TUI renderer kit for controls, input, and responsive
+rendering. It is a hub client over core APIs, not a runtime policy owner.
 
 ## Role
 
@@ -41,9 +42,8 @@ focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
 occlusion barriers. The kit owns reusable
 Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
 input forwarding. Semantic controls focus and capture on left Down, then
-activate only on matching-node left Up; `terminal_view` deliberately keeps its
-left-Down focus/attach behavior and forwards the trailing SGR release when
-mouse mode is focused.
+activate only on matching-node left Up; `terminal_view` keeps left-Down focus
+behavior and forwards the trailing SGR release when mouse mode is focused.
 
 The app does not yet display multi-click counts or drive the optional scroll
 normalizer poll/deadline clock, and it needs no app-specific occlusion helpers
@@ -57,6 +57,8 @@ detached readback clears the client shadow to safe-off.
 `botster-tui` owns the first-party hub client app, including workspace
 composition, hub connection setup, session presentation, packages, installed
 apps, marketplace diagnostics, and terminal attach/input/resize/drain behavior.
+The application owns its outer Ratatui shell geometry and places contract-owned
+`UiNode` app and plugin content into kit-rendered regions.
 
 ## Session workspace
 
@@ -68,18 +70,42 @@ The default surface is session-first:
   running/failed/exited lifecycle, local selection, and the attached stream.
 - The focused pane explains why attachment is available or disabled and shows
   terminal content only for the explicit attachment.
-- The contextual toolbar keeps Spawn and Attach reachable, moves secondary
-  actions into kit-owned overflow, and requires confirmation before Shutdown or
-  Remove.
+- The contextual toolbar promotes one relevant action—Spawn, Attach, or
+  Detach—keeps valid alternatives inline until width pressure moves them into
+  kit-owned overflow, and requires confirmation before Shutdown or Remove.
 - System details contains package, app, plugin, compatibility, configuration,
   diagnostics, and command editing in a scrollable secondary surface.
 
-Expanded (`>=120` columns) and regular (`80..119`) terminals use side-by-side
-navigation and focus panes. Compact terminals (`<80`) stack them vertically.
+Expanded (`>=120` columns) terminals use a fixed 40-column session navigator;
+regular (`80..119`) terminals use a 40/60 split. Compact terminals (`<80`)
+stack a content-sized navigator above the terminal.
 Tab and Shift-Tab move focus; arrows navigate focused controls; Enter or Space
 activates; PageUp/PageDown and the mouse wheel scroll; `Esc` cancels an open
 confirmation, returns from plugin-owned content to the System shell, or exits
 from the base shell. `q` and `Ctrl-C` also exit.
+
+Activating a running session row attaches that session. Moving selection with
+the keyboard does not attach until Enter or Space activates the row. Clicking
+the terminal only focuses an already attached terminal; it never initiates an
+attachment.
+
+## Application architecture
+
+The target shell mirrors the web client's information architecture while
+remaining native to a terminal:
+
+- **Home** is the landing page for recent sessions and common next actions.
+- **Apps** browses and launches installed apps and hosts plugin-owned surfaces.
+- **Hub settings** owns General, Spawn points, Session types, Extensions, and
+  Support sections.
+- **Session** is a focused terminal workspace reached by activating a session.
+- Hub-admitted plugin navigation extends the app shell without taking ownership
+  of it.
+
+The application owns routes, navigation, page composition, and shell geometry.
+`UiNode` descriptors define app and plugin content inside those pages, while
+`botster-tui-kit` owns reusable rendering, focus, input routing, and genuine
+width-constrained overflow.
 
 ## Commands
 
@@ -249,9 +275,10 @@ reasons, diagnostics, and action descriptors; app action descriptors are
 display-only in this client path.
 
 The focused terminal distinguishes selected session from attached stream.
-Selecting a row changes the attach target; terminal input is sent only after an
-attach state is observed for that stream. Until then, the pane reports terminal
-stream unavailable rather than silently treating selection as an attached PTY.
+Focusing a row changes the attach target; activating it explicitly requests the
+attachment. Terminal input is sent only after an attach state is observed for
+that stream. Until then, the pane reports terminal stream unavailable rather
+than silently treating focus as an attached PTY.
 
 The session navigator opens one explicit `session` entity subscription per hub
 connection. Its authoritative snapshot and strictly ordered upsert, patch, and

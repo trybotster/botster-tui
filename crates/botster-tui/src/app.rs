@@ -37,7 +37,13 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+#[cfg(test)]
+use ratatui::backend::TestBackend;
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+};
 use serde_json::{Value, json};
 
 use crate::acceptance::{Config as AcceptanceConfig, EvidenceWriter, FailureContext, ScenarioCase};
@@ -53,6 +59,7 @@ const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 27;
+const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppArgs {
@@ -520,6 +527,10 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
 }
 
 fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &TuiApp, render_state: &RenderState) {
+    if app.uses_workspace_shell() {
+        draw_workspace_shell(frame, hit_map, app, render_state);
+        return;
+    }
     let node = app.surface();
     renderer::render_node_with_presentation_state(
         frame,
@@ -529,6 +540,193 @@ fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &TuiApp, render_state:
         render_state,
         &app.plugin_presentation,
     );
+}
+
+fn draw_workspace_shell(
+    frame: &mut Frame<'_>,
+    hit_map: &mut HitMap,
+    app: &TuiApp,
+    render_state: &RenderState,
+) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // This is deliberately a multi-root render into one HitMap. Confirmation
+    // dialogs and plugin surfaces must remain excluded by uses_workspace_shell:
+    // a modal root clears regions registered by earlier roots.
+    let width_class = renderer::viewport_for_area(area).width_class;
+    let status = app.status_summary_node(width_class);
+    let alert = app.connection_alert();
+    let toolbar = app.workspace_toolbar();
+    let navigator = app.session_navigator();
+    let focused_session = app.focused_session_panel();
+    for node in [
+        Some(&status),
+        alert.as_ref(),
+        Some(&toolbar),
+        Some(&navigator),
+        Some(&focused_session),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        node.validate()
+            .expect("workspace shell node should satisfy the core UI contract");
+        renderer::tui_capabilities()
+            .validate_node(node)
+            .expect("workspace shell node should fit TUI renderer capabilities");
+    }
+
+    let status_area = Rect::new(area.x, area.y, area.width, 1);
+    renderer::render_node_with_presentation_state(
+        frame,
+        status_area,
+        &status,
+        hit_map,
+        render_state,
+        &app.plugin_presentation,
+    );
+
+    let mut next_y = area.y.saturating_add(1);
+    if let Some(alert) = &alert {
+        let alert_area = Rect::new(area.x, next_y, area.width, 1);
+        renderer::render_node_with_presentation_state(
+            frame,
+            alert_area,
+            alert,
+            hit_map,
+            render_state,
+            &app.plugin_presentation,
+        );
+        next_y = next_y.saturating_add(1);
+    }
+
+    if next_y >= area.y.saturating_add(area.height) {
+        return;
+    }
+    let toolbar_y = next_y;
+    let toolbar_area = Rect::new(
+        area.x,
+        toolbar_y,
+        area.width,
+        area.y.saturating_add(area.height).saturating_sub(toolbar_y),
+    );
+    let overflow_open = render_state.is_expanded(WORKSPACE_TOOLBAR_OVERFLOW_ID);
+    if !overflow_open {
+        renderer::render_node_with_presentation_state(
+            frame,
+            toolbar_area,
+            &toolbar,
+            hit_map,
+            render_state,
+            &app.plugin_presentation,
+        );
+    }
+
+    next_y = next_y.saturating_add(1);
+    let body = Rect::new(
+        area.x,
+        next_y,
+        area.width,
+        area.y.saturating_add(area.height).saturating_sub(next_y),
+    );
+    if body.width > 0 && body.height > 0 {
+        let panes = workspace_panes(body, app.sessions.len());
+        if let Some(navigator_area) = panes.first().copied() {
+            renderer::render_node_with_presentation_state(
+                frame,
+                navigator_area,
+                &navigator,
+                hit_map,
+                render_state,
+                &app.plugin_presentation,
+            );
+        }
+        if let Some(terminal_area) = panes.get(1).copied() {
+            renderer::render_node_with_presentation_state(
+                frame,
+                terminal_area,
+                &focused_session,
+                hit_map,
+                render_state,
+                &app.plugin_presentation,
+            );
+        }
+    }
+
+    if overflow_open {
+        // Render an open overflow last so its occluder and regions win hit
+        // testing. The menu captures focus traversal while it is expanded.
+        renderer::render_node_with_presentation_state(
+            frame,
+            toolbar_area,
+            &toolbar,
+            hit_map,
+            render_state,
+            &app.plugin_presentation,
+        );
+    }
+}
+
+fn workspace_panes(area: Rect, session_count: usize) -> Vec<Rect> {
+    match renderer::viewport_for_area(area).width_class {
+        UiWidthClass::Expanded => Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(40), Constraint::Min(1)])
+            .split(area)
+            .to_vec(),
+        UiWidthClass::Regular => Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Min(1)])
+            .split(area)
+            .to_vec(),
+        UiWidthClass::Compact => compact_workspace_panes(area, session_count),
+    }
+}
+
+fn compact_workspace_panes(area: Rect, session_count: usize) -> Vec<Rect> {
+    if area.height < 2 {
+        return vec![area];
+    }
+    let maximum_navigator_height = (area.height / 2)
+        .clamp(3, 10)
+        .min(area.height.saturating_sub(1));
+    let navigator_height = u16::try_from(session_count.max(2))
+        .unwrap_or(maximum_navigator_height)
+        .saturating_add(2)
+        .min(maximum_navigator_height)
+        .max(1);
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(navigator_height), Constraint::Min(1)])
+        .split(area)
+        .to_vec()
+}
+
+#[cfg(test)]
+fn render_app_to_lines(
+    app: &TuiApp,
+    width: u16,
+    height: u16,
+    state: &RenderState,
+) -> (Vec<String>, HitMap) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test backend should initialize");
+    let mut hit_map = HitMap::default();
+    terminal
+        .draw(|frame| draw(frame, &mut hit_map, app, state))
+        .expect("application shell should render");
+    let buffer = terminal.backend().buffer();
+    let lines = (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .collect();
+    (lines, hit_map)
 }
 
 fn should_quit(key: KeyEvent) -> bool {
@@ -871,16 +1069,6 @@ impl TuiApp {
         match action_id.as_str() {
             "botster.tui.connect" => self.force_reconnect(),
             "botster.tui.spawn" => self.spawn_session(),
-            "botster.tui.select" => {
-                if let Some(session_id) = session_id_from_payload(&payload)
-                    && self
-                        .sessions
-                        .iter()
-                        .any(|session| session.session_id == session_id)
-                {
-                    self.selected_session = Some(session_id);
-                }
-            }
             "botster.tui.attach" => {
                 if let Some(session_id) = payload
                     .as_ref()
@@ -1043,7 +1231,9 @@ impl TuiApp {
                     });
                 }
             }
-            "botster.terminal.focus" => self.attach_selected_or_first(),
+            // The input router already focuses the terminal. Attachment is an
+            // explicit session activation and must not be a terminal side effect.
+            "botster.terminal.focus" => {}
             _ => {}
         }
     }
@@ -2072,27 +2262,16 @@ impl TuiApp {
             "workspace-root",
             json!({ "direction": "vertical" }),
         );
-        root.children = vec![
-            child(self.status_summary()),
-            child(self.workspace_toolbar()),
-        ];
+        root.children = self.status_summary_children();
+        if let Some(alert) = self.connection_alert() {
+            root.children.push(child(alert));
+        }
+        root.children.push(child(self.workspace_toolbar()));
         if self.system_details_visible {
             root.children.push(child(self.system_details_panel()));
         } else {
-            root.children.extend([
-                responsive_child(
-                    UiWidthClass::Expanded,
-                    self.workspace_layout("workspace-expanded", "horizontal"),
-                ),
-                responsive_child(
-                    UiWidthClass::Regular,
-                    self.workspace_layout("workspace-regular", "horizontal"),
-                ),
-                responsive_child(
-                    UiWidthClass::Compact,
-                    self.workspace_layout("workspace-compact", "vertical"),
-                ),
-            ]);
+            root.children.push(child(self.session_navigator()));
+            root.children.push(child(self.focused_session_panel()));
         }
         root.validate()
             .expect("workspace UiNode should satisfy the core UI contract");
@@ -2100,6 +2279,20 @@ impl TuiApp {
             .validate_node(&root)
             .expect("workspace UiNode should fit TUI renderer capabilities");
         root
+    }
+
+    fn uses_workspace_shell(&self) -> bool {
+        if self.confirmation.is_some()
+            || self.plugin_surface.is_some()
+            || self.system_details_visible
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if !self.workspace_test_mode && self.legacy_test_needs_system_details() {
+            return false;
+        }
+        true
     }
 
     fn plugin_shell_surface(&self) -> UiNode {
@@ -2112,19 +2305,17 @@ impl TuiApp {
             "plugin-shell",
             json!({ "direction": "vertical" }),
         );
-        root.children = vec![
-            child(self.status_summary()),
-            child(node(
-                UiNodeKind::Text,
-                "plugin-shell-owner",
-                json!({
-                    "text": format!(
-                        "Plugin: {} / {} | Esc returns to System",
-                        surface.package_name, surface.surface_id
-                    )
-                }),
-            )),
-        ];
+        root.children = self.status_summary_children();
+        root.children.push(child(node(
+            UiNodeKind::Text,
+            "plugin-shell-owner",
+            json!({
+                "text": format!(
+                    "Plugin: {} / {} | Esc returns to System",
+                    surface.package_name, surface.surface_id
+                )
+            }),
+        )));
         if let Some(error) = &self.connection_error {
             root.children.push(child(node(
                 UiNodeKind::Text,
@@ -2176,114 +2367,158 @@ impl TuiApp {
             || !self.drafts.is_empty()
     }
 
-    fn status_summary(&self) -> UiNode {
+    fn status_summary_children(&self) -> Vec<UiChild> {
+        [
+            UiWidthClass::Expanded,
+            UiWidthClass::Regular,
+            UiWidthClass::Compact,
+        ]
+        .into_iter()
+        .map(|width| responsive_child(width, self.status_summary_node(width)))
+        .collect()
+    }
+
+    fn status_summary_node(&self, width: UiWidthClass) -> UiNode {
         let selected = self.selected_session.as_deref().unwrap_or("none");
         let attached = self.attached_session.as_deref().unwrap_or("none");
-        node(
+        let session_count = match self.sessions.len() {
+            1 => "1 session".to_string(),
+            count => format!("{count} sessions"),
+        };
+        let compact = match self.attached_session.as_deref() {
+            Some(attached) => format!("Botster · {} · attached: {attached}", self.status),
+            None => format!("Botster · {} · {session_count}", self.status),
+        };
+        match width {
+            UiWidthClass::Expanded => node(
+                UiNodeKind::Text,
+                "workspace-status-expanded",
+                json!({
+                    "text": format!(
+                        "Botster · Hub: {} · {session_count} · Selected: {selected} · Attached: {attached}",
+                        self.status,
+                    )
+                }),
+            ),
+            UiWidthClass::Regular => node(
+                UiNodeKind::Text,
+                "workspace-status-regular",
+                json!({
+                    "text": format!(
+                        "Botster · {} · {session_count} · Selected: {selected} · Attached: {attached}",
+                        self.status,
+                    )
+                }),
+            ),
+            UiWidthClass::Compact => node(
+                UiNodeKind::Text,
+                "workspace-status-compact",
+                json!({ "text": compact }),
+            ),
+        }
+    }
+
+    fn connection_alert(&self) -> Option<UiNode> {
+        let connection_error = self.connection_error.as_ref()?;
+        Some(node(
             UiNodeKind::Text,
-            "workspace-status",
+            "workspace-connection-alert",
             json!({
                 "text": format!(
-                    "Botster | hub: {} | protocol: {PROTOCOL} | sessions: {} | selected: {selected} | attached: {attached}",
-                    self.status,
-                    self.sessions.len()
+                    "Connection unavailable: {connection_error} · Expected protocol: {PROTOCOL}."
                 )
             }),
-        )
+        ))
     }
 
     fn workspace_toolbar(&self) -> UiNode {
         let selected = self.selected_session_row();
-        let attach_disabled = selected.is_none_or(|session| !session.is_attachable());
-        let shutdown_disabled = selected.is_none_or(|session| !session.is_attachable());
-        let remove_disabled = selected.is_none_or(|session| {
-            session.pending || matches!(session.lifecycle.as_str(), "running" | "pending")
+        let selected_is_attached = selected.is_some_and(|session| {
+            self.attached_session.as_deref() == Some(session.session_id.as_str())
         });
+        let selected_is_attachable = selected.is_some_and(SessionRow::is_attachable);
+        let selected_is_removable = selected.is_some_and(|session| {
+            !session.pending && !matches!(session.lifecycle.as_str(), "running" | "pending")
+        });
+        let attach_is_primary = selected_is_attachable && !selected_is_attached;
+        let detach_is_primary = self.attached_session.is_some() && !attach_is_primary;
+        let spawn_is_primary = !attach_is_primary && !detach_is_primary;
         let payload = json!({ "session_id": self.selected_session });
 
-        let mut toolbar = node(UiNodeKind::Toolbar, "workspace-toolbar", json!({}));
-        toolbar.slots.insert(
-            "actions".to_string(),
-            vec![
-                child(workspace_button(
-                    "tui-spawn",
-                    "Spawn",
-                    "botster.tui.spawn",
-                    json!({}),
-                    "never",
-                    false,
-                    None,
-                )),
-                child(workspace_button(
-                    "workspace-attach",
-                    "Attach",
-                    "botster.tui.attach",
-                    payload.clone(),
-                    "never",
-                    attach_disabled,
-                    None,
-                )),
-                child(workspace_button(
-                    "tui-detach",
-                    "Detach",
-                    "botster.tui.detach",
-                    json!({}),
-                    "auto",
-                    self.attached_session.is_none(),
-                    None,
-                )),
-                child(workspace_button(
-                    "workspace-system-details",
-                    if self.system_details_visible {
-                        "Workspace"
-                    } else {
-                        "System details"
-                    },
-                    "botster.tui.system.toggle",
-                    json!({}),
-                    "auto",
-                    false,
-                    None,
-                )),
-                child(workspace_button(
-                    "workspace-refresh",
-                    "Refresh",
-                    "botster.tui.refresh",
-                    json!({}),
-                    "auto",
-                    false,
-                    None,
-                )),
-                child(workspace_button(
-                    "workspace-shutdown",
-                    "Shutdown",
-                    "botster.tui.session.shutdown",
-                    payload.clone(),
-                    "always",
-                    shutdown_disabled,
-                    Some("danger"),
-                )),
-                child(workspace_button(
-                    "workspace-remove",
-                    "Remove",
-                    "botster.tui.session.remove",
-                    payload,
-                    "always",
-                    remove_disabled,
-                    Some("danger"),
-                )),
-            ],
-        );
-        toolbar
-    }
+        let mut actions = vec![child(workspace_button(
+            "tui-spawn",
+            "Spawn",
+            "botster.tui.spawn",
+            json!({}),
+            if spawn_is_primary { "never" } else { "auto" },
+            None,
+        ))];
+        if attach_is_primary {
+            actions.push(child(workspace_button(
+                "workspace-attach",
+                "Attach",
+                "botster.tui.attach",
+                payload.clone(),
+                "never",
+                None,
+            )));
+        }
+        if self.attached_session.is_some() {
+            actions.push(child(workspace_button(
+                "tui-detach",
+                "Detach",
+                "botster.tui.detach",
+                json!({}),
+                if detach_is_primary { "never" } else { "auto" },
+                None,
+            )));
+        }
+        actions.extend([
+            child(workspace_button(
+                "workspace-system-details",
+                if self.system_details_visible {
+                    "Workspace"
+                } else {
+                    "System details"
+                },
+                "botster.tui.system.toggle",
+                json!({}),
+                "auto",
+                None,
+            )),
+            child(workspace_button(
+                "workspace-refresh",
+                "Refresh",
+                "botster.tui.refresh",
+                json!({}),
+                "auto",
+                None,
+            )),
+        ]);
+        if selected_is_attachable {
+            actions.push(child(workspace_button(
+                "workspace-shutdown",
+                "Shutdown",
+                "botster.tui.session.shutdown",
+                payload.clone(),
+                "auto",
+                Some("danger"),
+            )));
+        }
+        if selected_is_removable {
+            actions.push(child(workspace_button(
+                "workspace-remove",
+                "Remove",
+                "botster.tui.session.remove",
+                payload,
+                "auto",
+                Some("danger"),
+            )));
+        }
 
-    fn workspace_layout(&self, id: &str, direction: &str) -> UiNode {
-        let mut layout = node(UiNodeKind::Stack, id, json!({ "direction": direction }));
-        layout.children = vec![
-            child(self.session_navigator()),
-            child(self.focused_session_panel()),
-        ];
-        layout
+        let mut toolbar = node(UiNodeKind::Toolbar, "workspace-toolbar", json!({}));
+        toolbar.slots.insert("actions".to_string(), actions);
+        toolbar
     }
 
     fn session_navigator(&self) -> UiNode {
@@ -2328,9 +2563,6 @@ impl TuiApp {
             session.lifecycle.as_str()
         };
         let mut label = format!("{} · {state}", session.session_id);
-        if selected && !attached {
-            label.push_str(" · selected");
-        }
         if let Some(reason) = &session.failure_reason {
             label.push_str(&format!(" · {reason}"));
         }
@@ -2341,7 +2573,7 @@ impl TuiApp {
                 "selected": selected,
                 "value": session.session_id,
                 "activation": {
-                    "id": "botster.tui.select",
+                    "id": "botster.tui.attach",
                     "payload": { "session_id": session.session_id }
                 }
             }),
@@ -2358,48 +2590,11 @@ impl TuiApp {
     }
 
     fn focused_session_panel(&self) -> UiNode {
-        let mut panel = node(
-            UiNodeKind::Panel,
-            "workspace-focused-session",
-            json!({ "title": "Focused session" }),
-        );
         let mut body = node(
             UiNodeKind::Stack,
-            "workspace-focused-body",
+            "workspace-focused-session",
             json!({ "direction": "vertical" }),
         );
-        let detail = match self.selected_session_row() {
-            Some(session) if session.pending => format!(
-                "{} is pending authoritative lifecycle state. Attachment is disabled.",
-                session.session_id
-            ),
-            Some(session) if session.is_attachable() => format!(
-                "{} is running. Selection is local; choose Attach to open its terminal stream.",
-                session.session_id
-            ),
-            Some(session) => format!(
-                "{} is {}. Attachment is disabled{}.",
-                session.session_id,
-                session.lifecycle,
-                session
-                    .failure_reason
-                    .as_deref()
-                    .map(|reason| format!(": {reason}"))
-                    .unwrap_or_default()
-            ),
-            None if self.connection_error.is_some() => {
-                "Hub unavailable. Reconnect from System details; Spawn remains available when connected."
-                    .to_string()
-            }
-            None => "Choose a session, or Spawn to create one.".to_string(),
-        };
-        if let Some(connection_error) = &self.connection_error {
-            body.children.push(child(node(
-                UiNodeKind::Text,
-                "workspace-connection-error",
-                json!({ "text": format!("connection: {connection_error}") }),
-            )));
-        }
         if let Some(error) = &self.error {
             body.children.push(child(node(
                 UiNodeKind::Text,
@@ -2407,23 +2602,8 @@ impl TuiApp {
                 json!({ "text": format!("error: {error}") }),
             )));
         }
-        if let Some(feedback) = &self.action_feedback {
-            body.children.push(child(node(
-                UiNodeKind::Text,
-                "workspace-action-feedback",
-                json!({ "text": format!("action: {feedback}") }),
-            )));
-        }
-        body.children.extend([
-            child(node(
-                UiNodeKind::Text,
-                "workspace-focused-detail",
-                json!({ "text": detail }),
-            )),
-            child(self.terminal_panel()),
-        ]);
-        panel.slots.insert("body".to_string(), vec![child(body)]);
-        panel
+        body.children.push(child(self.terminal_panel()));
+        body
     }
 
     fn selected_session_row(&self) -> Option<&SessionRow> {
@@ -2450,7 +2630,6 @@ impl TuiApp {
                 "botster.tui.confirm.cancel",
                 json!({}),
                 "never",
-                false,
                 None,
             )),
             child(workspace_button(
@@ -2459,7 +2638,6 @@ impl TuiApp {
                 "botster.tui.confirm.accept",
                 json!({}),
                 "never",
-                false,
                 Some("danger"),
             )),
         ];
@@ -3033,22 +3211,45 @@ impl TuiApp {
 
     fn terminal_title(&self) -> String {
         match (&self.attached_session, &self.selected_session) {
-            (Some(attached), _) => format!("terminal attached: {attached}"),
-            (None, Some(selected)) => format!("terminal stream unavailable: selected {selected}"),
-            (None, None) => "terminal stream unavailable: no session selected".to_string(),
+            (Some(attached), _) => format!("Terminal · {attached}"),
+            (None, Some(selected)) => format!("Terminal · {selected} · detached"),
+            (None, None) => "Terminal".to_string(),
         }
     }
 
     fn terminal_content(&self) -> String {
         if !self.terminal_output.is_empty() {
+            if self.attached_session.is_none() {
+                return format!(
+                    "Detached · terminal history is read-only.\n{}",
+                    self.terminal_output
+                );
+            }
             return self.terminal_output.clone();
         }
-        match (&self.attached_session, &self.selected_session) {
-            (Some(session_id), _) => format!("waiting for terminal output from {session_id}"),
-            (None, Some(session_id)) => {
-                format!("terminal stream unavailable: attach selected session {session_id}")
+        if self.attached_session.is_some() {
+            return "Waiting for terminal output.".to_string();
+        }
+        match self.selected_session_row() {
+            Some(session) if session.pending => {
+                "This session is pending; attachment is unavailable.".to_string()
             }
-            (None, None) => "terminal stream unavailable: no session selected".to_string(),
+            Some(session) if session.is_attachable() => {
+                "Activate this session to open its terminal.".to_string()
+            }
+            Some(session) => format!(
+                "This session is {}; attachment is unavailable{}.",
+                session.lifecycle,
+                session
+                    .failure_reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            None if self.connection_error.is_some() => {
+                "Hub unavailable. Reconnect from System details.".to_string()
+            }
+            None => "Choose a session, or Spawn to create one.".to_string(),
         }
     }
 }
@@ -4307,7 +4508,7 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     }
     #[cfg(test)]
     {
-        let rendered = renderer::render_to_lines(&app.surface(), 200, 48)
+        let rendered = render_app_to_lines(&app, 200, 48, &RenderState::default())
             .0
             .join("\n");
         assert!(rendered.contains("pending spawn"));
@@ -4335,7 +4536,7 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
     #[cfg(test)]
     {
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let (lines, hit_map) = render_app_to_lines(&app, 200, 48, &RenderState::default());
         let rendered = lines.join("\n");
         let compatibility = app
             .compatibility
@@ -4360,7 +4561,7 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
             );
         }
         assert!(rendered.contains("Sessions"));
-        assert!(rendered.contains("Focused session"));
+        assert!(rendered.contains("Terminal ·"));
         assert!(rendered.contains(HEADLESS_OUTPUT));
         assert!(
             !hit_map
@@ -4464,14 +4665,12 @@ fn button(id: &str, label: &str, action_id: &str, payload: Value) -> UiNode {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn workspace_button(
     id: &str,
     label: &str,
     action_id: &str,
     payload: Value,
     toolbar_overflow: &str,
-    disabled: bool,
     tone: Option<&str>,
 ) -> UiNode {
     let mut control = button(id, label, action_id, payload);
@@ -4483,14 +4682,6 @@ fn workspace_button(
         control
             .props
             .insert("tone".to_string(), Value::String(tone.to_string()));
-    }
-    if disabled
-        && let Some(action) = control
-            .props
-            .get_mut("action")
-            .and_then(Value::as_object_mut)
-    {
-        action.insert("disabled".to_string(), Value::Bool(true));
     }
     control
 }
@@ -6748,36 +6939,104 @@ mod tests {
     fn workspace_uses_semantic_widths_for_wide_regular_and_compact_layouts() {
         let app = workspace_fixture();
 
-        for (width, height, horizontal) in [(140, 42, true), (96, 30, true), (72, 24, false)] {
-            let (lines, hit_map) = renderer::render_to_lines_with_state(
-                &app.surface(),
-                width,
-                height,
-                &RenderState::default(),
-            );
+        for (width, height, horizontal) in [
+            (240, 50, true),
+            (140, 42, true),
+            (96, 30, true),
+            (72, 24, false),
+        ] {
+            let (lines, hit_map) =
+                render_app_to_lines(&app, width, height, &RenderState::default());
             let rendered = lines.join("\n");
             let navigator = hit_map
                 .regions()
                 .iter()
                 .find(|region| region.node_id == "workspace-session-navigator")
                 .expect("session navigator should render");
-            let focused = hit_map
+            let terminal = hit_map
                 .regions()
                 .iter()
-                .find(|region| region.node_id == "workspace-focused-session")
-                .expect("focused session should render");
+                .find(|region| region.node_id == "tui-terminal")
+                .expect("focused terminal should render");
 
-            assert!(rendered.contains("Botster | hub: connected"));
-            assert!(rendered.contains("session-alpha"));
-            assert!(rendered.contains("terminal stream unavailable"));
-            if horizontal {
-                assert_eq!(navigator.rect.y, focused.rect.y);
-                assert_ne!(navigator.rect.x, focused.rect.x);
+            if width >= 120 {
+                assert!(rendered.contains("Botster · Hub: connected"), "{rendered}");
             } else {
-                assert_eq!(navigator.rect.x, focused.rect.x);
-                assert!(focused.rect.y > navigator.rect.y);
+                assert!(rendered.contains("Botster · connected"), "{rendered}");
+            }
+            if width == 72 {
+                assert!(!rendered.contains("Selected:"), "{rendered}");
+            } else {
+                assert!(rendered.contains("Selected: session-alpha"), "{rendered}");
+            }
+            assert!(!rendered.contains("protocol:"), "{rendered}");
+            assert!(rendered.contains("session-alpha"), "{rendered}");
+            assert!(
+                rendered.contains("Activate this session to open"),
+                "{rendered}"
+            );
+            assert_eq!(navigator.rect.y, 2, "{rendered}");
+            if horizontal {
+                assert_eq!(navigator.rect.y, terminal.rect.y);
+                assert_ne!(navigator.rect.x, terminal.rect.x);
+                assert!(navigator.rect.width < terminal.rect.width, "{rendered}");
+            } else {
+                assert_eq!(navigator.rect.x, terminal.rect.x);
+                assert!(terminal.rect.y > navigator.rect.y);
             }
         }
+    }
+
+    #[test]
+    fn compact_workspace_reserves_usable_terminal_height() {
+        let panes = workspace_panes(Rect::new(0, 0, 60, 12), 20);
+
+        assert_eq!(panes.len(), 2);
+        assert!(panes[1].height >= 6, "{panes:?}");
+    }
+
+    #[test]
+    fn short_compact_workspace_keeps_session_navigation_reachable() {
+        let app = workspace_fixture();
+        let (_lines, hit_map) = render_app_to_lines(&app, 60, 10, &RenderState::default());
+
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id.starts_with("tui-session-session-")),
+            "short compact layout should retain a focusable session row"
+        );
+    }
+
+    #[test]
+    fn detached_terminal_marks_preserved_history_as_read_only() {
+        let mut app = workspace_fixture();
+        app.attached_session = Some("session-alpha".to_string());
+        app.terminal_output = "last visible screen".to_string();
+
+        let attached = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+        app.attached_session = None;
+        let detached = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+
+        assert!(attached.contains("Terminal · session-alpha"), "{attached}");
+        assert!(
+            !attached.contains("terminal history is read-only"),
+            "{attached}"
+        );
+        assert!(
+            detached.contains("Terminal · session-alpha · detached"),
+            "{detached}"
+        );
+        assert!(
+            detached.contains("Detached · terminal history is read-only."),
+            "{detached}"
+        );
+        assert!(detached.contains("last visible screen"), "{detached}");
     }
 
     #[test]
@@ -6786,42 +7045,45 @@ mod tests {
 
         app.sessions.clear();
         app.selected_session = None;
-        let empty = renderer::render_to_lines(&app.surface(), 96, 30)
+        let empty = render_app_to_lines(&app, 96, 30, &RenderState::default())
             .0
             .join("\n");
         assert!(empty.contains("No sessions yet"));
 
         app.sessions = vec![SessionRow::pending("session-pending")];
         app.selected_session = Some("session-pending".to_string());
-        let pending = renderer::render_to_lines(&app.surface(), 96, 30)
+        let pending = render_app_to_lines(&app, 96, 30, &RenderState::default())
             .0
             .join("\n");
         assert!(pending.contains("pending spawn"));
-        assert!(pending.contains("disabled: Attach"));
+        assert!(pending.contains("session is pending"), "{pending}");
+        assert!(pending.contains("1 session"), "{pending}");
+        assert!(!pending.contains("1 sessions"), "{pending}");
 
         app.sessions = session_rows([("session-active", "running"), ("session-old", "exited")]);
         app.selected_session = Some("session-active".to_string());
-        let running = renderer::render_to_lines(&app.surface(), 96, 30)
+        let running = render_app_to_lines(&app, 96, 30, &RenderState::default())
             .0
             .join("\n");
-        assert!(running.contains("session-active · running · selected"));
+        assert!(running.contains("session-active · running"));
+        assert!(!running.contains("running · selected"));
         assert!(running.contains("session-old · exited"));
 
         app.attached_session = Some("session-active".to_string());
         app.attached_subscription_id = Some("sub-current".to_string());
         app.subscription_id = "sub-current".to_string();
-        let attached = renderer::render_to_lines(&app.surface(), 96, 30)
+        let attached = render_app_to_lines(&app, 96, 30, &RenderState::default())
             .0
             .join("\n");
         assert!(attached.contains("session-active · attached"));
-        assert!(attached.contains("terminal attached: session-active"));
+        assert!(attached.contains("Terminal · session-active"));
 
         app.sessions.clear();
         app.selected_session = None;
         app.attached_session = None;
         app.status = "hub unavailable; reconnecting".to_string();
         app.connection_error = Some("daemon is not running".to_string());
-        let unavailable = renderer::render_to_lines(&app.surface(), 96, 30)
+        let unavailable = render_app_to_lines(&app, 96, 30, &RenderState::default())
             .0
             .join("\n");
         assert!(unavailable.contains("Hub unavailable"));
@@ -6829,35 +7091,44 @@ mod tests {
     }
 
     #[test]
-    fn constrained_toolbar_keeps_primary_actions_and_removes_hidden_hits() {
-        let app = workspace_fixture();
-        let (_wide, wide_hits) = renderer::render_to_lines(&app.surface(), 140, 42);
+    fn contextual_toolbar_shows_valid_actions_and_overflows_only_when_constrained() {
+        let mut app = workspace_fixture();
+        let (_wide, wide_hits) = render_app_to_lines(&app, 140, 42, &RenderState::default());
+        for action in [
+            "workspace-attach",
+            "tui-spawn",
+            "workspace-system-details",
+            "workspace-refresh",
+            "workspace-shutdown",
+        ] {
+            assert!(
+                wide_hits
+                    .regions()
+                    .iter()
+                    .any(|region| region.node_id == action),
+                "valid action {action} should render when the toolbar has room"
+            );
+        }
         assert!(
-            wide_hits
+            !wide_hits
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "workspace-attach")
+                .any(|region| region.node_id == "workspace-remove")
+        );
+        assert!(
+            !wide_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == WORKSPACE_TOOLBAR_OVERFLOW_ID)
         );
 
-        let (narrow, narrow_hits) = renderer::render_to_lines(&app.surface(), 72, 24);
+        let (narrow, narrow_hits) = render_app_to_lines(&app, 40, 24, &RenderState::default());
         assert!(narrow.iter().any(|line| line.contains("…+")));
         assert!(
             narrow_hits
                 .regions()
                 .iter()
-                .any(|region| region.node_id == "tui-spawn")
-        );
-        assert!(
-            narrow_hits
-                .regions()
-                .iter()
                 .any(|region| region.node_id == "workspace-attach")
-        );
-        assert!(
-            !narrow_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "workspace-shutdown")
         );
         assert!(
             !narrow_hits
@@ -6865,41 +7136,129 @@ mod tests {
                 .iter()
                 .any(|region| region.node_id == "workspace-remove")
         );
+        let overflow = narrow_hits
+            .regions()
+            .iter()
+            .find(|region| region.node_id == WORKSPACE_TOOLBAR_OVERFLOW_ID)
+            .expect("constrained shell should expose toolbar overflow")
+            .rect;
+        let mut router = InputRouter::new(renderer::action_request_context());
+        router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                overflow.x,
+                overflow.y,
+            ),
+            &narrow_hits,
+        );
+        router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                overflow.x,
+                overflow.y,
+            ),
+            &narrow_hits,
+        );
+        assert!(
+            router
+                .render_state()
+                .is_expanded(WORKSPACE_TOOLBAR_OVERFLOW_ID)
+        );
+        let (_open, open_hits) = render_app_to_lines(&app, 40, 24, &router.render_state());
+        let hidden_action = [
+            "tui-spawn",
+            "workspace-system-details",
+            "workspace-refresh",
+            "workspace-shutdown",
+        ]
+        .into_iter()
+        .find(|action| {
+            !narrow_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == *action)
+        })
+        .expect("a constrained toolbar should hide at least one automatic action");
+        assert!(
+            open_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == hidden_action)
+        );
+
+        app.sessions.clear();
+        app.selected_session = None;
+        let (_empty, empty_hits) = render_app_to_lines(&app, 72, 24, &RenderState::default());
+        assert!(
+            empty_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-spawn")
+        );
+        assert!(
+            !empty_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-attach")
+        );
+
+        app.sessions = session_rows([("session-alpha", "running")]);
+        app.selected_session = Some("session-alpha".to_string());
+        app.attached_session = Some("session-alpha".to_string());
+        let (_attached, attached_hits) =
+            render_app_to_lines(&app, 240, 50, &RenderState::default());
+        assert!(
+            attached_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-detach")
+        );
+        assert!(
+            !attached_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-attach")
+        );
+        assert!(
+            !attached_hits
+                .regions()
+                .iter()
+                .any(|region| region.node_id == WORKSPACE_TOOLBAR_OVERFLOW_ID)
+        );
     }
 
     #[test]
-    fn disabled_attach_is_visible_but_cannot_dispatch() {
+    fn workspace_hides_transient_action_feedback() {
+        let mut app = workspace_fixture();
+        app.action_feedback = Some("detach requested: session-alpha".to_string());
+
+        let rendered = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+
+        assert!(!rendered.contains("action:"), "{rendered}");
+        assert!(rendered.contains("session-alpha · running"), "{rendered}");
+    }
+
+    #[test]
+    fn unavailable_attach_yields_to_spawn_and_cannot_dispatch() {
         let mut app = workspace_fixture();
         app.sessions = vec![SessionRow::pending("session-pending")];
         app.selected_session = Some("session-pending".to_string());
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 96, 30);
-        let attach = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "workspace-attach")
-            .expect("disabled attach should remain visible");
-        assert!(lines.iter().any(|line| line.contains("disabled: Attach")));
-        assert!(attach.action.is_none());
-
-        let mut router = InputRouter::new(renderer::action_request_context());
-        let down = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                attach.rect.x,
-                attach.rect.y,
-            ),
-            &hit_map,
+        let (lines, hit_map) = render_app_to_lines(&app, 96, 30, &RenderState::default());
+        assert!(lines.iter().all(|line| !line.contains("disabled: Attach")));
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-spawn")
         );
-        let up = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                attach.rect.x,
-                attach.rect.y,
-            ),
-            &hit_map,
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "workspace-attach")
         );
-        assert!(!matches!(down, InputDispatch::Action(_)));
-        assert!(!matches!(up, InputDispatch::Action(_)));
     }
 
     #[test]
@@ -6910,7 +7269,7 @@ mod tests {
             .collect();
         app.selected_session = Some("session-00".to_string());
 
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 72, 16);
+        let (_lines, hit_map) = render_app_to_lines(&app, 72, 16, &RenderState::default());
         let bounds = hit_map
             .scroll_bounds("tui-session-list")
             .expect("session navigator should expose scroll bounds");
@@ -6934,7 +7293,7 @@ mod tests {
             None,
             Some(json!({ "session_id": "session-alpha" })),
         );
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 96, 30);
+        let (lines, hit_map) = render_app_to_lines(&app, 96, 30, &RenderState::default());
         let rendered = lines.join("\n");
         assert!(rendered.contains("Shut down session session-alpha?"));
         assert!(
@@ -6958,7 +7317,7 @@ mod tests {
             None,
             Some(json!({ "session_id": "session-alpha" })),
         );
-        let (_lines, confirm_hits) = renderer::render_to_lines(&app.surface(), 96, 30);
+        let (_lines, confirm_hits) = render_app_to_lines(&app, 96, 30, &RenderState::default());
         let confirm = confirm_hits
             .regions()
             .iter()
@@ -11058,12 +11417,12 @@ mod tests {
 
         app.apply_response(attach_state_response("session-beta", "attached"));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let rendered = lines.join("\n");
         assert_eq!(app.attached_session.as_deref(), Some("session-beta"));
-        assert!(rendered.contains("attached: session-beta"));
+        assert!(rendered.contains("Attached: session-beta"));
         assert!(rendered.contains("session-beta · attached"));
-        assert!(rendered.contains("terminal attached: session-beta"));
+        assert!(rendered.contains("Terminal · session-beta"));
     }
 
     #[test]
@@ -11645,7 +12004,7 @@ mod tests {
         assert_eq!(app.terminal_output, "last visible screen");
         assert!(app.snapshot_metadata.is_none());
         assert!(
-            renderer::render_to_lines(&app.surface(), 120, 48)
+            render_app_to_lines(&app, 120, 48, &RenderState::default())
                 .0
                 .join("\n")
                 .contains("last visible screen")
@@ -11715,12 +12074,12 @@ mod tests {
     }
 
     #[test]
-    fn focused_session_list_row_updates_attach_selection() {
+    fn activating_session_list_row_attaches_that_session() {
         let mut app = TuiApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
         app.observed_requests.clear();
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let mut router = InputRouter::new(renderer::action_request_context());
         let second_row = hit_map
             .regions()
@@ -11752,13 +12111,10 @@ mod tests {
         ));
         app.handle_dispatch(up_dispatch);
 
-        assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
-        assert_eq!(app.attached_session, None);
-        assert!(
-            !app.observed_requests
-                .iter()
-                .any(|request| matches!(request, ObservedRequest::Attach { .. }))
-        );
+        assert!(app.observed_requests.iter().any(|request| matches!(
+            request,
+            ObservedRequest::Attach { session_id, .. } if session_id == "session-beta"
+        )));
     }
 
     #[test]
@@ -11766,7 +12122,7 @@ mod tests {
         let mut app = TuiApp::new(None);
         app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
         app.selected_session = Some("session-alpha".to_string());
-        let (_lines, frame_n_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, frame_n_hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let first_row = frame_n_hit_map
             .regions()
             .iter()
@@ -11788,7 +12144,8 @@ mod tests {
         ));
 
         app.sessions.reverse();
-        let (_lines, frame_n_plus_one_hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, frame_n_plus_one_hit_map) =
+            render_app_to_lines(&app, 120, 48, &RenderState::default());
         let moved_under_pointer = frame_n_plus_one_hit_map
             .lookup(column, row)
             .expect("reordered row should remain under the pointer");
@@ -11811,12 +12168,12 @@ mod tests {
     }
 
     #[test]
-    fn focused_terminal_mouse_pair_attaches_once_and_preserves_key_forwarding() {
+    fn focused_terminal_mouse_pair_does_not_attach_and_preserves_key_forwarding() {
         let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
         app.observed_requests.clear();
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let terminal = hit_map
             .regions()
             .iter()
@@ -11860,7 +12217,7 @@ mod tests {
                 .iter()
                 .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
                 .count(),
-            1
+            0
         );
 
         app.attached_session = Some("session-alpha".to_string());
@@ -11932,7 +12289,7 @@ mod tests {
                 .iter()
                 .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
                 .count(),
-            1
+            0
         );
 
         app.attached_session = Some("session-alpha".to_string());
@@ -11961,7 +12318,7 @@ mod tests {
                 .iter()
                 .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
                 .count(),
-            1
+            0
         );
         assert_eq!(
             app.observed_requests
@@ -11990,7 +12347,7 @@ mod tests {
         assert_eq!(app.current_terminal_mouse_mode(), 9);
 
         for _ in 0..2 {
-            let (_lines, mut hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+            let (_lines, mut hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
             let terminal = hit_map
                 .regions()
                 .iter()
@@ -12069,7 +12426,7 @@ mod tests {
             "read_mode_flags",
         );
 
-        let (_lines, mut hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, mut hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         app.apply_terminal_mouse_mode(&mut hit_map);
         let terminal = hit_map
             .regions()
@@ -12170,7 +12527,7 @@ mod tests {
                 pending: false,
             }]
         );
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let rendered = lines.join("\n");
         assert!(rendered.contains("session-alpha · failed"));
         assert!(rendered.contains("worker exited"));
@@ -12214,7 +12571,7 @@ mod tests {
             pending: false,
         }];
         app.selected_session = Some("session-beta".to_string());
-        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let mut router = InputRouter::new(renderer::action_request_context());
         let session_row = hit_map
             .regions()
@@ -12253,7 +12610,7 @@ mod tests {
         app.handle_dispatch(key_dispatch);
 
         assert!(app.observed_requests.is_empty());
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let rendered = lines.join("\n");
         assert!(rendered.contains("session-beta · exited"));
         assert!(
@@ -12266,7 +12623,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_focus_attach_rejects_non_running_session_before_daemon_attach() {
+    fn terminal_focus_does_not_attempt_to_attach_non_running_session() {
         let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow {
             session_id: "session-beta".to_string(),
@@ -12294,10 +12651,7 @@ mod tests {
         ));
 
         assert!(app.observed_requests.is_empty());
-        assert_eq!(
-            app.error.as_deref(),
-            Some("session-beta stopped - cannot attach")
-        );
+        assert_eq!(app.error, None);
     }
 
     #[test]
