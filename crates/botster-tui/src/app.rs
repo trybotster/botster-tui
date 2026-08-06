@@ -16,12 +16,12 @@ use botster_hub_client::{
     DaemonEntityFrame, DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason,
     DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonTransportError,
-    DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_STREAMING, PROTOCOL,
-    connect_and_hello_with_requirement, read_frame_from_reader, subscribe_session_entities,
-    write_frame,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSoftwareIdentity,
+    DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION,
+    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_RESIZE,
+    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
+    read_frame_from_reader, subscribe_session_entities, write_frame,
 };
 use botster_ui_contract::{
     PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest,
@@ -58,7 +58,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 27;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 31;
 const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -248,6 +248,10 @@ impl SessionEntityState {
                 if !self.matches(&subscription_id, &entity_type) {
                     return Ok(false);
                 }
+                let items = items
+                    .into_iter()
+                    .map(decode_session_entity)
+                    .collect::<Result<Vec<_>, String>>()?;
                 self.entity_order = items
                     .iter()
                     .map(|entity| entity.session_uuid.clone())
@@ -270,6 +274,7 @@ impl SessionEntityState {
                 if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
                     return Ok(false);
                 }
+                let entity = decode_session_entity(entity)?;
                 if id != entity.session_uuid {
                     return Err(format!(
                         "session entity id mismatch: frame={id} entity={}",
@@ -325,6 +330,19 @@ impl SessionEntityState {
                 self.snapshot_seq = Some(snapshot_seq);
                 Ok(true)
             }
+            DaemonEntityFrame::Error {
+                subscription_id,
+                entity_type,
+                code,
+                message,
+            } => {
+                if !self.matches(&subscription_id, &entity_type) {
+                    return Ok(false);
+                }
+                Err(format!(
+                    "session entity subscription error: code={code} message={message}"
+                ))
+            }
         }
     }
 
@@ -365,6 +383,23 @@ impl SessionEntityState {
     }
 }
 
+/// Decodes one authoritative entity record into the typed session projection.
+///
+/// Hub entity frames carry validated records as [`Value`]; `botster-hub-client`
+/// prescribes deserializing them as [`DaemonSessionEntity`]. A malformed record
+/// surfaces as an error through the reducer's existing diagnostic channel rather
+/// than being silently dropped.
+fn decode_session_entity(entity: Value) -> Result<DaemonSessionEntity, String> {
+    serde_json::from_value(entity)
+        .map_err(|error| format!("session entity failed to decode: {error}"))
+}
+
+/// Builds an intentionally exhaustive session-entity row so bind-list templates
+/// observe every key, including those the Hub omits when absent.
+///
+/// The values are deliberately reference-shaped placeholders: only
+/// [`session_binding_reference_row`]'s keys are consumed, and the TUI must not
+/// imply ownership of the Hub's role/interaction/lifecycle vocabulary.
 fn session_binding_reference_row() -> serde_json::Map<String, Value> {
     serde_json::to_value(DaemonSessionEntity {
         session_uuid: "reference-session".to_string(),
@@ -376,6 +411,12 @@ fn session_binding_reference_row() -> serde_json::Map<String, Value> {
         updated_at: 1,
         exit_code: Some(0),
         failure_reason: Some("reference failure".to_string()),
+        session_type_id: Some("reference-session-type".to_string()),
+        session_type_source: Some("reference-source".to_string()),
+        role: Some("reference-role".to_string()),
+        traits: vec!["reference-trait".to_string()],
+        interaction: Some("reference-interaction".to_string()),
+        session_type_lifecycle: Some("reference-lifecycle".to_string()),
     })
     .expect("exhaustive session binding reference row must serialize")
     .as_object()
@@ -743,6 +784,9 @@ struct TuiApp {
     error: Option<String>,
     action_feedback: Option<String>,
     compatibility: Option<DaemonCompatibility>,
+    /// Authoritative Hub identity, sourced only from `DaemonStatus.software`.
+    /// Hub identity is never derived from an installed package row.
+    software: Option<DaemonSoftwareIdentity>,
     diagnostics: Vec<DaemonDiagnostic>,
     package_count: usize,
     enabled_package_count: usize,
@@ -812,6 +856,7 @@ impl TuiApp {
             error: None,
             action_feedback: None,
             compatibility: None,
+            software: None,
             diagnostics: Vec::new(),
             package_count: 0,
             enabled_package_count: 0,
@@ -1867,6 +1912,7 @@ impl TuiApp {
             self.clear_connection_diagnostics();
             self.schema_version = Some(status.schema_version);
             self.compatibility = Some(status.compatibility);
+            self.software = Some(status.software);
             self.record_diagnostics(status.diagnostics);
             self.status = format!("connected ({})", status.lifecycle_state);
             self.package_count = status.package_count;
@@ -2677,6 +2723,11 @@ impl TuiApp {
             )),
             child(node(
                 UiNodeKind::Text,
+                "tui-hub-software",
+                json!({ "text": self.hub_software_text() }),
+            )),
+            child(node(
+                UiNodeKind::Text,
                 "tui-compatibility",
                 json!({ "text": self.compatibility_text() }),
             )),
@@ -3141,6 +3192,28 @@ impl TuiApp {
                     )
                 }),
             ),
+        }
+    }
+
+    /// Renders authoritative Hub identity from `DaemonStatus.software` alone.
+    ///
+    /// An absent `build_revision` is omitted rather than filled with a
+    /// placeholder, and a Hub that has not reported status reads as unknown —
+    /// the same convention [`TuiApp::compatibility_text`] uses for
+    /// `schema_version`. No value here is ever derived from a package row.
+    fn hub_software_text(&self) -> String {
+        match &self.software {
+            Some(software) => {
+                let mut text = format!(
+                    "hub software: {} {} ({})",
+                    software.product_name, software.version, software.product_id
+                );
+                if let Some(build_revision) = &software.build_revision {
+                    text.push_str(&format!("; build {build_revision}"));
+                }
+                text
+            }
+            None => "hub software: unknown".to_string(),
         }
     }
 
@@ -4719,7 +4792,7 @@ impl HubConnection {
 fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
     DaemonCompatibilityRequirement {
         protocol: PROTOCOL.to_string(),
-        minimum_protocol_version: botster_hub_client::PROTOCOL_VERSION,
+        protocol_version: botster_hub_client::PROTOCOL_VERSION,
         required_features: vec![
             FEATURE_SESSIONS.to_string(),
             FEATURE_TERMINAL_STREAMING.to_string(),
@@ -7476,15 +7549,19 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_4_revision_27_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_6_revision_31_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
             requirement.minimum_conformance_fixture_revision,
             MINIMUM_CONFORMANCE_FIXTURE_REVISION
         );
-        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 4);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 27);
+        assert_eq!(
+            requirement.protocol_version,
+            botster_hub_client::PROTOCOL_VERSION
+        );
+        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 6);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 31);
         assert!(
             requirement
                 .required_features
@@ -7498,32 +7575,36 @@ mod tests {
                 .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
         );
 
-        for revision in 16..27 {
+        for revision in 16..31 {
             let mut older_hub = DaemonCompatibility::current();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-                .expect_err("pre-presentation fixture revision must be rejected");
+                .expect_err("pre-session-type fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 27"));
+            assert!(error.diagnostic.contains("requires at least 31"));
         }
-        for protocol_version in 2..4 {
-            let mut older_hub = DaemonCompatibility::current();
-            older_hub.protocol_version = protocol_version;
-            let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-                .expect_err("older protocol must be rejected");
+        // `ensure_compatible` now matches protocol version exactly rather than as a
+        // floor, so a *newer* hub is rejected as firmly as an older one. Both
+        // directions are covered deliberately: dropping the newer-protocol case
+        // would silently restore the old minimum semantics this bump replaced.
+        for protocol_version in (2..6).chain(7..10) {
+            let mut mismatched_hub = DaemonCompatibility::current();
+            mismatched_hub.protocol_version = protocol_version;
+            let error = botster_hub_client::ensure_compatible(&requirement, &mismatched_hub)
+                .expect_err("protocol version must match the client exactly");
             assert!(
                 error
                     .diagnostic
                     .contains(&format!("version {protocol_version}"))
             );
-            assert!(error.diagnostic.contains("requires at least 4"));
+            assert!(error.diagnostic.contains("client requires 6"));
         }
         botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 4 fixture revision 27 hub should connect");
+            .expect("protocol 6 fixture revision 31 hub should connect");
         let mut future_hub = DaemonCompatibility::current();
-        future_hub.conformance_fixture_revision = 28;
+        future_hub.conformance_fixture_revision = 32;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 28");
+            .expect("runtime compatibility must preserve minimum semantics for revision 32");
     }
 
     #[test]
@@ -8004,7 +8085,7 @@ mod tests {
     #[test]
     fn canonical_session_bindings_follow_published_oracle_through_frames_and_reconnect() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
-        assert_eq!(scenario.conformance_fixture_revision, 27);
+        assert_eq!(scenario.conformance_fixture_revision, 31);
         let body =
             serde_json::from_value(scenario.surface.clone()).expect("published surface is typed");
         let mut app = TuiApp::new(None);
@@ -8086,17 +8167,11 @@ mod tests {
                     entity_type: "session".to_string(),
                     snapshot_seq: 2,
                     id: missing_uuid.clone(),
-                    entity: DaemonSessionEntity {
-                        session_uuid: missing_uuid.clone(),
+                    entity: session_entity_value(DaemonSessionEntity {
                         registry_state: "running".to_string(),
-                        lifecycle: Some("running".to_string()),
-                        lifecycle_class: "current".to_string(),
-                        rows: 24,
-                        cols: 80,
                         updated_at: 2,
-                        exit_code: None,
-                        failure_reason: None,
-                    },
+                        ..session_entity(&missing_uuid, Some("running"))
+                    }),
                 })
                 .expect("authoritative upsert applies")
         );
@@ -8320,17 +8395,10 @@ mod tests {
                 subscription_id: "bound-action-generation".to_string(),
                 entity_type: "session".to_string(),
                 snapshot_seq: 1,
-                items: vec![DaemonSessionEntity {
-                    session_uuid: "session-action".to_string(),
+                items: vec![session_entity_value(DaemonSessionEntity {
                     registry_state: "running".to_string(),
-                    lifecycle: Some("running".to_string()),
-                    lifecycle_class: "current".to_string(),
-                    rows: 24,
-                    cols: 80,
-                    updated_at: 1,
-                    exit_code: None,
-                    failure_reason: None,
-                }],
+                    ..session_entity("session-action", Some("running"))
+                })],
                 resync_reason: None,
             })
             .expect("snapshot applies");
@@ -8371,17 +8439,10 @@ mod tests {
                 subscription_id: "bound-action-generation".to_string(),
                 entity_type: "session".to_string(),
                 snapshot_seq: 1,
-                items: vec![DaemonSessionEntity {
-                    session_uuid: "session-action".to_string(),
+                items: vec![session_entity_value(DaemonSessionEntity {
                     registry_state: "running".to_string(),
-                    lifecycle: Some("running".to_string()),
-                    lifecycle_class: "current".to_string(),
-                    rows: 24,
-                    cols: 80,
-                    updated_at: 1,
-                    exit_code: None,
-                    failure_reason: None,
-                }],
+                    ..session_entity("session-action", Some("running"))
+                })],
                 resync_reason: None,
             })
             .expect("focus-removal baseline applies");
@@ -8882,17 +8943,10 @@ mod tests {
                 subscription_id: "invalid-binding-generation".to_string(),
                 entity_type: "session".to_string(),
                 snapshot_seq: 1,
-                items: vec![DaemonSessionEntity {
-                    session_uuid: "session-invalid".to_string(),
+                items: vec![session_entity_value(DaemonSessionEntity {
                     registry_state: "running".to_string(),
-                    lifecycle: Some("running".to_string()),
-                    lifecycle_class: "current".to_string(),
-                    rows: 24,
-                    cols: 80,
-                    updated_at: 1,
-                    exit_code: None,
-                    failure_reason: None,
-                }],
+                    ..session_entity("session-invalid", Some("running"))
+                })],
                 resync_reason: None,
             })
             .expect("snapshot applies");
@@ -9346,7 +9400,7 @@ mod tests {
             entity_type: "session".to_string(),
             snapshot_seq: 1,
             id: "session-alpha".to_string(),
-            entity: session_entity("session-alpha", Some("running")),
+            entity: session_entity_value(session_entity("session-alpha", Some("running"))),
         };
         assert!(
             !state
@@ -9364,6 +9418,141 @@ mod tests {
                 .apply(snapshot_frame("generation-1", 99, Vec::new()))
                 .expect("prior generation ignored")
         );
+    }
+
+    #[test]
+    fn session_reducer_decodes_generic_entity_records_into_the_typed_projection() {
+        let mut state = SessionEntityState::default();
+        state.begin_generation("generation-decode".to_string());
+
+        assert!(
+            state
+                .apply(snapshot_frame(
+                    "generation-decode",
+                    1,
+                    vec![DaemonSessionEntity {
+                        session_type_id: Some("botster.pipeline".to_string()),
+                        session_type_source: Some("device".to_string()),
+                        role: Some("botster.agent".to_string()),
+                        traits: vec!["managed-git".to_string(), "long-lived".to_string()],
+                        interaction: Some("interactive".to_string()),
+                        session_type_lifecycle: Some("long_running".to_string()),
+                        ..session_entity("session-typed", Some("running"))
+                    }],
+                ))
+                .expect("value-carrying snapshot decodes")
+        );
+
+        let entity = state
+            .entities
+            .get("session-typed")
+            .expect("decoded entity is retained under its session uuid");
+        assert_eq!(entity.session_type_id.as_deref(), Some("botster.pipeline"));
+        assert_eq!(entity.session_type_source.as_deref(), Some("device"));
+        assert_eq!(entity.role.as_deref(), Some("botster.agent"));
+        assert_eq!(entity.traits, vec!["managed-git", "long-lived"]);
+        assert_eq!(entity.interaction.as_deref(), Some("interactive"));
+        assert_eq!(
+            entity.session_type_lifecycle.as_deref(),
+            Some("long_running")
+        );
+    }
+
+    #[test]
+    fn session_reducer_surfaces_undecodable_records_instead_of_dropping_them() {
+        let mut state = SessionEntityState::default();
+        state.begin_generation("generation-malformed".to_string());
+        state
+            .apply(snapshot_frame("generation-malformed", 1, Vec::new()))
+            .expect("baseline applies");
+
+        let error = state
+            .apply(DaemonEntityFrame::Upsert {
+                subscription_id: "generation-malformed".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 2,
+                id: "session-malformed".to_string(),
+                entity: json!({ "registry_state": "running" }),
+            })
+            .expect_err("a record without session_uuid must not be silently dropped");
+        assert!(error.contains("session entity failed to decode"));
+        assert!(state.entities.is_empty());
+    }
+
+    #[test]
+    fn session_reducer_reports_matching_subscription_errors_and_ignores_foreign_ones() {
+        let mut state = SessionEntityState::default();
+        state.begin_generation("generation-error".to_string());
+
+        let error = state
+            .apply(DaemonEntityFrame::Error {
+                subscription_id: "generation-error".to_string(),
+                entity_type: "session".to_string(),
+                code: "subscription_failed".to_string(),
+                message: "hub dropped the session projection".to_string(),
+            })
+            .expect_err("a matching subscription error surfaces as a diagnostic");
+        assert!(error.contains("subscription_failed"));
+        assert!(error.contains("hub dropped the session projection"));
+
+        assert!(
+            !state
+                .apply(DaemonEntityFrame::Error {
+                    subscription_id: "generation-other".to_string(),
+                    entity_type: "session".to_string(),
+                    code: "subscription_failed".to_string(),
+                    message: "unrelated subscription".to_string(),
+                })
+                .expect("a non-matching subscription error is ignored")
+        );
+    }
+
+    #[test]
+    fn session_binding_reference_row_exposes_every_session_type_key() {
+        let reference = session_binding_reference_row();
+
+        for key in [
+            "session_type_id",
+            "session_type_source",
+            "role",
+            "traits",
+            "interaction",
+            "session_type_lifecycle",
+        ] {
+            assert!(
+                reference.contains_key(key),
+                "bind-list templates must observe the {key} key"
+            );
+        }
+    }
+
+    #[test]
+    fn session_binding_rows_carry_the_session_type_keys_for_every_entity() {
+        let mut state = SessionEntityState::default();
+        state.begin_generation("generation-binding".to_string());
+        state
+            .apply(snapshot_frame(
+                "generation-binding",
+                1,
+                vec![session_entity("session-plain", Some("running"))],
+            ))
+            .expect("baseline applies");
+
+        let rows = state.binding_rows().expect("binding rows serialize");
+        let row = rows[0].as_object().expect("binding row is an object");
+        // The Hub omits these when absent; the reference row backfills them so a
+        // template never sees a missing key for one session and a present key for
+        // another.
+        for key in [
+            "session_type_id",
+            "session_type_source",
+            "role",
+            "traits",
+            "interaction",
+            "session_type_lifecycle",
+        ] {
+            assert!(row.contains_key(key), "binding row must carry {key}");
+        }
     }
 
     #[test]
@@ -9420,7 +9609,7 @@ mod tests {
                 entity_type: "session".to_string(),
                 snapshot_seq: 1,
                 id: "session-alpha".to_string(),
-                entity: session_entity("session-alpha", Some("running")),
+                entity: session_entity_value(session_entity("session-alpha", Some("running"))),
             })
             .expect("authoritative upsert applies");
         app.rebuild_session_rows();
@@ -9527,6 +9716,91 @@ mod tests {
         assert!(
             rendered.contains("features sessions,terminal_streaming,resize,package_navigation")
         );
+    }
+
+    #[test]
+    fn daemon_status_renders_authoritative_hub_software_identity() {
+        let mut app = TuiApp::new(None);
+
+        app.apply_response(status_response("running", 7));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("hub software: Botster Hub 9.9.9-test (botster-hub)"));
+        assert!(rendered.contains("build test-build-revision"));
+    }
+
+    #[test]
+    fn hub_software_identity_is_never_sourced_from_an_installed_package_row() {
+        let mut app = TuiApp::new(None);
+
+        app.apply_response(status_response_with_package_counts("running", 7, 2, 1));
+        app.apply_response(packages_response(vec![
+            package(
+                "botster-hub",
+                "0.0.1-package-row",
+                "first-party",
+                "enabled",
+                Vec::new(),
+                false,
+            ),
+            package(
+                "workspaces",
+                "0.4.2",
+                "first-party",
+                "installed",
+                Vec::new(),
+                false,
+            ),
+        ]));
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 64);
+        let rendered = lines.join("\n");
+        let software_line = rendered
+            .lines()
+            .find(|line| line.contains("hub software:"))
+            .expect("hub software identity is rendered");
+
+        // A package row literally named `botster-hub` carries a different version.
+        // Hub identity must still come from `DaemonStatus.software`.
+        assert!(software_line.contains("9.9.9-test"));
+        assert!(!software_line.contains("0.0.1-package-row"));
+    }
+
+    #[test]
+    fn hub_software_omits_absent_build_revision_rather_than_fabricating_one() {
+        let mut app = TuiApp::new(None);
+        let mut response = status_response("running", 7);
+        response
+            .status
+            .as_mut()
+            .expect("status fixture carries a status")
+            .software
+            .build_revision = None;
+
+        app.apply_response(response);
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+        let software_line = rendered
+            .lines()
+            .find(|line| line.contains("hub software:"))
+            .expect("hub software identity is rendered");
+
+        assert!(software_line.contains("Botster Hub 9.9.9-test"));
+        assert!(!software_line.contains("build"));
+    }
+
+    #[test]
+    fn hub_software_reads_unknown_before_any_status_response() {
+        let mut app = TuiApp::new(None);
+        app.system_details_visible = true;
+
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("hub software: unknown"));
     }
 
     #[test]
@@ -12986,6 +13260,73 @@ mod tests {
         hub.shutdown().expect("isolated hub shuts down cleanly");
     }
 
+    /// Proves every waived Workspaces lane reads as a known gap rather than a pass.
+    ///
+    /// Hermetic: the `script/test-live-hub` guard precedes every `resolve_*` call,
+    /// so no Hub binaries or live-Hub environment are required. This fails the
+    /// moment someone deletes the guard without re-enabling the lanes, which is the
+    /// regression worth catching. All three profiles are covered because all three
+    /// are waived.
+    #[test]
+    fn blocked_workspaces_lanes_report_a_known_gap_for_every_profile() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../script/test-live-hub");
+
+        for profile in ["installed-driver", "plumbing", "lifecycle"] {
+            let output = std::process::Command::new(&script)
+                .args(["workspaces", profile])
+                .env_remove("BOTSTER_WORKSPACES_PACKAGE_PATH")
+                .env_remove("BOTSTER_HUB_BIN")
+                .env_remove("BOTSTER_SESSION_WORKER_BIN")
+                .output()
+                .unwrap_or_else(|error| panic!("{profile} guard runs: {error}"));
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert!(
+                !output.status.success(),
+                "{profile} must exit non-zero so no operator or CI path reads it as success"
+            );
+            assert!(
+                stderr.contains("ticket_1785984128_479155"),
+                "{profile} must name the blocking ticket by ID; stderr was: {stderr}"
+            );
+            assert!(
+                stderr.contains("ticket_1786036326_597046"),
+                "{profile} must name the un-skip owner by ID; stderr was: {stderr}"
+            );
+            assert!(
+                !stdout.contains("test result: ok"),
+                "{profile} must not emit a passing test line; stdout was: {stdout}"
+            );
+        }
+
+        // The guard is scoped to the workspaces case only. contract-matrix must
+        // still fail on its own missing-fixture path, never on the blocked-lane
+        // message, because it supplies this run's live-Hub evidence.
+        let contract_matrix = std::process::Command::new(&script)
+            .arg("contract-matrix")
+            .env_remove("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
+            .output()
+            .expect("contract-matrix mode runs");
+        let stderr = String::from_utf8_lossy(&contract_matrix.stderr);
+        assert!(
+            stderr.contains("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required"),
+            "contract-matrix must reach its own validation; stderr was: {stderr}"
+        );
+        assert!(
+            !stderr.contains("ticket_1785984128_479155"),
+            "the blocked-lane guard must not leak into contract-matrix mode"
+        );
+    }
+
+    /// Blocked pending ticket_1785984128_479155 (botster-workspaces session-types
+    /// migration): botster-workspaces declares the legacy capability scope
+    /// `session_template_managed_git_spawn`, Hub 8a60bd58 no longer grants it, and
+    /// `PackageRegistry::enable` hard-denies rather than warns, so this lane fails
+    /// at `EnablePackage`. The installed-Workspaces spawn driver is consequently
+    /// unverified against a protocol-6 Hub. Un-skip owner:
+    /// ticket_1786036326_597046.
     #[test]
     fn installed_workspaces_spawn_driver_runs_through_apps_open() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -13012,12 +13353,12 @@ mod tests {
             repository.join("bin/acceptance-session.sh"),
             "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
         )
-        .expect("write repo session template command");
+        .expect("write repo session type command");
         std::fs::write(
-            repository.join(".botster/session-templates.json"),
-            r#"{"session_templates":[{"id":"acceptance","command":"bin/acceptance-session.sh","working_directory":{"policy":"package_root"}}]}"#,
+            repository.join(".botster/session-types.json"),
+            r#"{"session_types":[{"id":"acceptance","command":"bin/acceptance-session.sh","working_directory":{"policy":"package_root"}}]}"#,
         )
-        .expect("write repo session template");
+        .expect("write repo session type");
         run_fixture_command(&repository, "chmod", &["+x", "bin/acceptance-session.sh"]);
         run_fixture_command(&repository, "git", &["init", "-b", "main"]);
         run_fixture_command(
@@ -13329,6 +13670,15 @@ mod tests {
             .collect()
     }
 
+    /// Backs both the `plumbing` and `lifecycle` profiles, and both are blocked
+    /// pending ticket_1785984128_479155 for the same single root cause as
+    /// `installed_workspaces_spawn_driver_runs_through_apps_open`:
+    /// botster-workspaces declares the legacy capability scope
+    /// `session_template_managed_git_spawn`, Hub 8a60bd58 no longer grants it, and
+    /// `PackageRegistry::enable` hard-denies rather than warns, so this lane fails
+    /// at `EnablePackage`. The repo-source session-type path is consequently
+    /// unverified against a protocol-6 Hub. Un-skip owner:
+    /// ticket_1786036326_597046.
     #[test]
     fn workspaces_live_acceptance_runs_against_real_package() {
         let Ok(profile_value) = std::env::var("BOTSTER_TUI_WORKSPACES_PROFILE") else {
@@ -14831,7 +15181,14 @@ mod tests {
             &report.client_render_check.settings_surface_node_id,
             "api_token_state=redacted",
         );
-        assert!(settings_rendered.contains("mode=write"));
+        // `read`, not `write`: the conformance scenario's own settings check runs
+        // against `mode=write`, but its later `contract_matrix_advance_package_entities`
+        // step re-sets `mode` to `read` to drive a package-entity generation bump.
+        // That third mutation is new at Hub 8a60bd58 (e8febabf had only the rejected
+        // `sideways` and the `write` mutation, both before the settings render), so
+        // the scenario's end state moved. This asserts the TUI renders whatever the
+        // Hub currently holds, which is the point of the check.
+        assert!(settings_rendered.contains("mode=read"));
         assert!(
             settings_rendered
                 .contains("endpoint=https://example.invalid/plugin-contract-matrix/acceptance")
@@ -15195,7 +15552,19 @@ mod tests {
             updated_at: 1,
             exit_code: None,
             failure_reason: None,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         }
+    }
+
+    /// Renders a typed session entity as the [`Value`] record Hub entity frames
+    /// now carry, so frame construction sites do not duplicate entity literals.
+    fn session_entity_value(entity: DaemonSessionEntity) -> Value {
+        serde_json::to_value(entity).expect("session entity serializes as a value")
     }
 
     fn snapshot_frame(
@@ -15207,7 +15576,7 @@ mod tests {
             subscription_id: subscription_id.to_string(),
             entity_type: "session".to_string(),
             snapshot_seq,
-            items,
+            items: items.into_iter().map(session_entity_value).collect(),
             resync_reason: None,
         }
     }
@@ -15236,6 +15605,19 @@ mod tests {
                     FEATURE_TERMINAL_READBACK.to_string(),
                 ],
                 conformance_fixture_revision: 1,
+            },
+            software: botster_hub_client::DaemonSoftwareIdentity {
+                product_id: "botster-hub".to_string(),
+                product_name: "Botster Hub".to_string(),
+                version: "9.9.9-test".to_string(),
+                build_revision: Some("test-build-revision".to_string()),
+            },
+            installation: botster_hub_client::DaemonInstallationIdentity {
+                mode: botster_hub_client::DaemonInstallationMode::Development,
+                provenance: "test".to_string(),
+                release_channel: None,
+                provider: None,
+                diagnostics: Vec::new(),
             },
             host_id: "test-host".to_string(),
             host_display_name: "test host".to_string(),
@@ -16096,7 +16478,6 @@ mod tests {
             requested_capabilities: vec![capability("mcp", Some("tools"))],
             compatibility: botster_hub_client::DaemonPackageCompatibility {
                 botster_requirement: ">=0.1.0".to_string(),
-                hub_version: "0.1.0".to_string(),
                 result: "compatible".to_string(),
                 diagnostics: vec!["requires current hub".to_string()],
             },
@@ -16262,8 +16643,9 @@ mod tests {
             kind,
             status: None,
             sessions: Vec::new(),
-            session_templates: Vec::new(),
-            resolved_session_template: None,
+            session_types: Vec::new(),
+            resolved_session_type: None,
+            hub_update: None,
             session_context: None,
             read_screen: None,
             mode_flags: None,
