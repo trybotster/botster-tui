@@ -86,7 +86,7 @@
 ```sh
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-ticket_1785970234_132113"
 script/fmt
-script/test   # 162 + 1 package_manifest passed (no BOTSTER_HUB_BIN / REQUIRE env)
+script/test   # 169 + 1 package_manifest passed (no BOTSTER_HUB_BIN / REQUIRE env)
 script/clippy
 git diff --check
 ```
@@ -138,3 +138,10 @@ Addressed open findings:
 | Weak authoring test | low | Renamed to pure helper test; added end-to-end launch request + dialog tests |
 | delete mutation source | low | Repo delete uses `source_name` |
 | Conformance assertion | low | Hermetic pin fixture asserts exactly 32; client MINIMUM stays 31 |
+
+
+## Pass-2 review hygiene (`review_1786079857_674703`)
+
+- `cargo fmt --all` applied; `script/fmt` exit 0.
+- Fixed raw-newline `lines.join` literals to `"\n"`.
+- `delete_session_type` test now drives production path and asserts `ObservedRequest::DeleteSessionType { source: Repo { shared-git }, ... }`.

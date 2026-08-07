@@ -712,7 +712,6 @@ struct LaunchTargetOption {
     label: String,
 }
 
-
 fn join_tokens(values: &[String]) -> String {
     values.join(", ")
 }
@@ -2916,9 +2915,15 @@ impl TuiApp {
             DaemonRequest::UpdateSessionType { .. } => self
                 .observed_requests
                 .push(ObservedRequest::UpdateSessionType),
-            DaemonRequest::DeleteSessionType { .. } => self
+            DaemonRequest::DeleteSessionType {
+                source,
+                session_type_id,
+            } => self
                 .observed_requests
-                .push(ObservedRequest::DeleteSessionType),
+                .push(ObservedRequest::DeleteSessionType {
+                    source: source.clone(),
+                    session_type_id: session_type_id.clone(),
+                }),
             DaemonRequest::SpawnSessionType {
                 session_type_id,
                 session_id,
@@ -4802,9 +4807,7 @@ impl TuiApp {
             "tui-target-first-spawn",
             json!({ "title": "Target-first spawn", "presentation": "auto" }),
         );
-        dialog
-            .slots
-            .insert("body".to_string(), vec![child(body)]);
+        dialog.slots.insert("body".to_string(), vec![child(body)]);
         dialog
     }
 
@@ -4936,7 +4939,10 @@ enum ObservedRequest {
     ShowSessionTypeDefinition(String),
     CreateSessionType,
     UpdateSessionType,
-    DeleteSessionType,
+    DeleteSessionType {
+        source: DaemonSessionTypeMutationSource,
+        session_type_id: String,
+    },
     SpawnSessionType {
         session_type_id: String,
         session_id: String,
@@ -9119,13 +9125,14 @@ mod tests {
         app.session_types_supported = true;
         app.begin_target_first_spawn();
 
-        assert_eq!(app.error.as_deref(), Some("no launch targets available (no admitted spawn targets and no session types)"));
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
-        assert!(
-            lines
-                .join("\n")
-                .contains("error: no launch targets available (no admitted spawn targets and no session types)")
+        assert_eq!(
+            app.error.as_deref(),
+            Some("no launch targets available (no admitted spawn targets and no session types)")
         );
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        assert!(lines.join("\n").contains(
+            "error: no launch targets available (no admitted spawn targets and no session types)"
+        ));
     }
 
     #[test]
@@ -13218,7 +13225,10 @@ mod tests {
         app.session_types_supported = true;
         app.system_details_visible = true;
         app.begin_target_first_spawn();
-        assert_eq!(app.error.as_deref(), Some("no launch targets available (no admitted spawn targets and no session types)"));
+        assert_eq!(
+            app.error.as_deref(),
+            Some("no launch targets available (no admitted spawn targets and no session types)")
+        );
 
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
@@ -13234,7 +13244,9 @@ mod tests {
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 160, 70);
         let rendered = lines.join("\n");
-        assert!(!rendered.contains("error: no launch targets available (no admitted spawn targets and no session types)"));
+        assert!(!rendered.contains(
+            "error: no launch targets available (no admitted spawn targets and no session types)"
+        ));
         assert!(rendered.contains("Target-first spawn"));
         assert!(app.target_first_spawn.is_some());
     }
@@ -18385,7 +18397,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn authoring_seed_and_wholesale_definition_preserve_path_and_environment() {
         let editable = DaemonSessionTypeEditableDefinition {
@@ -18494,16 +18505,18 @@ mod tests {
         assert_eq!(app.error, None);
         app.spawn_pick_target("device:local");
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
-        let rendered = lines.join("
-");
+        let rendered = lines.join("\n");
         assert!(rendered.contains("Target-first spawn"), "{rendered}");
         assert!(
+            hit_map.regions().iter().any(|region| region
+                .node_id
+                .contains("tui-spawn-session-type-device/shell")),
+            "{:?}",
             hit_map
                 .regions()
                 .iter()
-                .any(|region| region.node_id.contains("tui-spawn-session-type-device/shell")),
-            "{:?}",
-            hit_map.regions().iter().map(|r| &r.node_id).collect::<Vec<_>>()
+                .map(|r| &r.node_id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -18524,8 +18537,7 @@ mod tests {
         app.handle_action("botster.tui.spawn".to_string(), None, None);
         assert!(app.target_first_spawn.is_some());
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
-        let rendered = lines.join("
-");
+        let rendered = lines.join("\n");
         assert!(rendered.contains("Target-first spawn"), "{rendered}");
         assert!(
             hit_map
@@ -18583,8 +18595,7 @@ mod tests {
             Some("zsh")
         );
         let (lines, _) = render_app_to_lines(&app, 220, 80, &RenderState::default());
-        let rendered = lines.join("
-");
+        let rendered = lines.join("\n");
         assert!(rendered.contains("zsh"), "{rendered}");
     }
 
@@ -18635,26 +18646,30 @@ mod tests {
 
     #[test]
     fn delete_session_type_uses_source_name_for_repo_mutation_source() {
+        let mut app = TuiApp::new(None);
         let mut entity = sample_session_type("shared-git/type-a", "repo", true);
         entity.source_name = "shared-git".to_string();
         entity.target_id = "authored-other-target".to_string();
         entity.id = "type-a".to_string();
-        assert_ne!(entity.source_name, entity.target_id);
-        let source = match entity.source.as_str() {
-            "repo" => DaemonSessionTypeMutationSource::Repo {
-                target_id: if !entity.source_name.is_empty() {
-                    entity.source_name.clone()
-                } else {
-                    entity.target_id.clone()
-                },
-            },
-            other => panic!("expected repo, got {other}"),
-        };
-        assert_eq!(
-            source,
-            DaemonSessionTypeMutationSource::Repo {
-                target_id: "shared-git".to_string()
-            }
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entities
+            .insert(entity.session_type_id.clone(), entity);
+        app.session_type_entities
+            .entity_order
+            .push("shared-git/type-a".to_string());
+        app.observed_requests.clear();
+        app.delete_session_type("shared-git/type-a");
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::DeleteSessionType {
+                    source: DaemonSessionTypeMutationSource::Repo { target_id },
+                    session_type_id,
+                } if target_id == "shared-git" && session_type_id == "type-a"
+            )),
+            "{:?}",
+            app.observed_requests
         );
     }
 
@@ -18667,7 +18682,6 @@ mod tests {
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
-
 
     #[test]
     fn product_toolbar_spawn_opens_target_first_flow_not_freeform_spawn() {
@@ -18767,13 +18781,11 @@ mod tests {
             .iter()
             .filter_map(|node| node.props.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
-            .join("
-");
+            .join("\n");
         assert!(text.contains("unavailable"), "{text}");
         assert!(text.contains("missing binary"), "{text}");
         assert!(text.contains("repo-a/svc"), "{text}");
     }
-
 
     #[test]
     fn session_type_real_input_create_button_dispatches_through_input_router() {
