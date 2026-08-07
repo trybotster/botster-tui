@@ -31,7 +31,7 @@ The workspace uses `botster-tui-kit` pinned to revision
 `551feb151f531d59d362efdae0cc7d3a34d8e311` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
-`8a60bd58841179f8b1fd4040d9362d18ea244230`. Runnable-entrypoint connection
+`302190ec2acc5ecee744432a6c9ffd1f040ebe01`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
@@ -73,7 +73,7 @@ The default surface is session-first:
 - The contextual toolbar promotes one relevant action—Spawn, Attach, or
   Detach—keeps valid alternatives inline until width pressure moves them into
   kit-owned overflow, and requires confirmation before Shutdown or Remove.
-- System details contains Hub software identity, package, app, plugin,
+- System details contains Hub software identity, package, app, plugin, Session types management (list/detail/create/edit/delete via Hub authoring reads), target-first spawn, and
   compatibility, configuration, diagnostics, and command editing in a scrollable
   secondary surface.
 
@@ -98,7 +98,9 @@ remaining native to a terminal:
 - **Home** is the landing page for recent sessions and common next actions.
 - **Apps** browses and launches installed apps and hosts plugin-owned surfaces.
 - **Hub settings** owns General, Spawn points, Session types, Extensions, and
-  Support sections.
+  Support sections. **Session types currently ships under System details** and
+  moves into Hub settings when that multi-page shell exists; the aspirational
+  IA above is not the shipped navigation path yet.
 - **Session** is a focused terminal workspace reached by activating a session.
 - Hub-admitted plugin navigation extends the app shell without taking ownership
   of it.
@@ -127,7 +129,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`8a60bd58841179f8b1fd4040d9362d18ea244230`. The protocol source is
+`302190ec2acc5ecee744432a6c9ffd1f040ebe01`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -155,13 +157,47 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
 
+### Session types (System details)
+
+Session types are authoritative Hub descriptors consumed through the
+`session_type` entity subscription (`session_type_entity_subscriptions`).
+
+- Rows group by Hub `source` and render Hub labels/roles/traits/lifecycle as
+  delivered; package rows are read-only when `editable == false`.
+- Edit is **lossless**: the TUI opens the editor only after
+  `ShowSessionTypeDefinition` and submits wholesale `UpdateSessionType`
+  definitions. Entity rows are never used as edit seeds (they omit relative
+  working-directory path and environment).
+- Product launch is **target-first** `SpawnSessionType` only. Freeform
+  `DaemonRequest::Spawn { command }` is not a product affordance (live harness
+  seeding may still use raw Spawn).
+- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 31` and does
+  **not** require `session_type_entity_subscriptions` globally; when the feature
+  is missing, Session types shows a surface-local unsupported notice.
+- Pins: Hub crates `302190ec2acc5ecee744432a6c9ffd1f040ebe01`, kit
+  `902650dfbd56a5bdc99c1e88c04ba2e62442f703`. Cargo.lock must keep a single
+  `botster-ui-contract` at that Hub rev and dual `botster-core` sources
+  (direct `16bf08f2…` plus `branch=main` at `33ebcd98…` via hub-test-support).
+
+Live proof (independent of contract-matrix):
+
+```sh
+# Prefer Hub + session-worker binaries built from >= 302190e (exact pin preferred).
+# In pipeline worktrees whose path contains `:`, set a colon-free target dir:
+export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
+script/test-live-hub session-types
+```
+
+The profile fail-closes when the live handshake reports conformance &lt; 32 or
+missing `session_type_entity_subscriptions`.
+
 ### Workspaces live-acceptance lanes
 
 `script/test-live-hub workspaces installed-driver`, `plumbing`, and `lifecycle`
 are the repository-owned runtime proof that the installed Workspaces package,
 including the spawn-form `session_type_id` field and lifecycle bindings, works
 against a protocol-6 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `8a60bd58841179f8b1fd4040d9362d18ea244230`) and an
+this crate pins, currently `302190ec2acc5ecee744432a6c9ffd1f040ebe01`) and an
 explicit clean post-migration `botster-workspaces` package path via
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
 also pins the acceptance driver field key so a silent `template_id` revert
@@ -304,8 +340,8 @@ than silently treating focus as an attached PTY.
 The session navigator opens one explicit `session` entity subscription per hub
 connection. Its authoritative snapshot and strictly ordered upsert, patch, and
 remove frames drive the visible rows; normal synchronization does not poll a
-session list. Spawn adds an immediate client-local pending row, then the matching
-authoritative entity replaces it. Spawn, selection, and terminal attachment are
+session list. Target-first SpawnSessionType adds an immediate client-local pending
+row, then the matching authoritative entity replaces it. Spawn, selection, and terminal attachment are
 separate actions, so neither appearance nor reconnect automatically attaches a
 PTY. A reconnect discards the prior subscription generation and waits for the
 fresh generation's snapshot before accepting deltas.
