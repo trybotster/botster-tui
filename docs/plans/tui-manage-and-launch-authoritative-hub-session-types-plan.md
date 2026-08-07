@@ -177,69 +177,69 @@ Live binaries for acceptance must be built from Hub ≥ `302190e` with protocol 
 
 ### In scope
 
-0. **Prerequisite consumption (first Implement actions)**  
-   - Pin kit `902650d` + Hub crates `302190e`.  
-   - Confirm single `botster-ui-contract` in `Cargo.lock`.  
-   - Confirm `botster-core?branch=main` == `33ebcd98…`.  
+0. **Prerequisite consumption (first Implement actions)**
+   - Pin kit `902650d` + Hub crates `302190e`.
+   - Confirm single `botster-ui-contract` in `Cargo.lock`.
+   - Confirm `botster-core?branch=main` == `33ebcd98…`.
    - Preflight: protocol 6 / conformance 32; matrix includes `session_type_authoring`.
 
-1. **`session_type` entity subscription and store**  
-   - Held-open `subscribe_entities(..., "session_type", ...)`.  
-   - Store parallel to `SessionEntityState`, keyed by Hub `session_type_id`, decode → `DaemonSessionType`.  
-   - snapshot / upsert / remove; unexpected patch → diagnostic failure.  
-   - `entity_error` surfaces Hub `code` + `message`; no resubscribe loop; no list-refresh fallback as truth.  
-   - Connect/reconnect lifecycle mirrors sessions.  
+1. **`session_type` entity subscription and store**
+   - Held-open `subscribe_entities(..., "session_type", ...)`.
+   - Store parallel to `SessionEntityState`, keyed by Hub `session_type_id`, decode → `DaemonSessionType`.
+   - snapshot / upsert / remove; unexpected patch → diagnostic failure.
+   - `entity_error` surfaces Hub `code` + `message`; no resubscribe loop; no list-refresh fallback as truth.
+   - Connect/reconnect lifecycle mirrors sessions.
    - Missing `session_type_entity_subscriptions` → surface-local unsupported state from Hub feature list.
 
-2. **Session types management UI (keyboard-accessible)**  
-   - First-class **Session types** section inside System details (surgical entry; not a full multi-page Hub settings shell).  
-   - List grouped by Hub `source`; rows render Hub descriptors only (`label` never humanized from `id`; unknown roles/traits as literals).  
-   - Detail shows command/args/policy/overrides/context keys/override chain.  
-   - **Edit/Delete** gated solely on Hub `editable`.  
-   - **Create** gated on writable sources: device; plus enabled admitted repo targets from `ListSpawnTargets`.  
-   - **Update (lossless):**  
-     - Open edit **only** after `ShowSessionTypeDefinition { session_type_id }` succeeds.  
-     - Seed form from `DaemonSessionTypeEditableDefinition.definition` + retain `source` for the mutation.  
-     - Submit `UpdateSessionType { source, definition }` as **wholesale** replacement of that definition (user-edited fields overlaid on the authoring read).  
-     - **Forbidden:** seeding edit UI from entity row / `DaemonSessionType` (drops `environment` and relative working-directory path).  
-   - Package rows: no edit/delete; static read-only from `editable == false`; Hub package mutation errors still render if forced.  
+2. **Session types management UI (keyboard-accessible)**
+   - First-class **Session types** section inside System details (surgical entry; not a full multi-page Hub settings shell).
+   - List grouped by Hub `source`; rows render Hub descriptors only (`label` never humanized from `id`; unknown roles/traits as literals).
+   - Detail shows command/args/policy/overrides/context keys/override chain.
+   - **Edit/Delete** gated solely on Hub `editable`.
+   - **Create** gated on writable sources: device; plus enabled admitted repo targets from `ListSpawnTargets`.
+   - **Update (lossless):**
+     - Open edit **only** after `ShowSessionTypeDefinition { session_type_id }` succeeds.
+     - Seed form from `DaemonSessionTypeEditableDefinition.definition` + retain `source` for the mutation.
+     - Submit `UpdateSessionType { source, definition }` as **wholesale** replacement of that definition (user-edited fields overlaid on the authoring read).
+     - **Forbidden:** seeding edit UI from entity row / `DaemonSessionType` (drops `environment` and relative working-directory path).
+   - Package rows: no edit/delete; static read-only from `editable == false`; Hub package mutation errors still render if forced.
    - Form semantic rejections: Hub `kind` + `message` only.
 
-3. **Target-first product launch**  
-   - Operator toolbar `botster.tui.spawn` opens target-first flow → `DaemonRequest::SpawnSessionType { session_type_id, session_id, request }`.  
-   - Ordering: admitted target first → session types for that `target_id` (show `available == false` disabled with diagnostics, never silently drop) → optional context (e.g. prompt for interactive) → spawn.  
+3. **Target-first product launch**
+   - Operator toolbar `botster.tui.spawn` opens target-first flow → `DaemonRequest::SpawnSessionType { session_type_id, session_id, request }`.
+   - Ordering: admitted target first → session types for that `target_id` (show `available == false` disabled with diagnostics, never silently drop) → optional context (e.g. prompt for interactive) → spawn.
    - Use Hub effective `session_type_id` values exactly.
 
-4. **Freeform Spawn product removal (decided contract — product path only)**  
-   - Remove System details command form as a product spawn affordance.  
-   - Stop routing product `botster.tui.spawn` to freeform `DaemonRequest::Spawn { command }`.  
-   - Delete product fields `self.command` / `DEFAULT_COMMAND` **or** confine them to `#[cfg(test)]` helpers only.  
-   - **Mandatory rewrites (product path):**  
-     - Hermetic tests using `app.command = DEFAULT_COMMAND` + toolbar spawn (`run_headless_live_runtime` ~4574, spawn toolbar ~7317, pending spawn ~9584, and any other product-toolbar Spawn tests).  
-   - **Explicitly allowed to keep raw `DaemonRequest::Spawn`:**  
-     - Live-lane **test harness** Hub seeding inside Workspaces lifecycle / attach history / contract-matrix helpers (`~13793`, `~14387`, `~14664`, `~14753`). These are not operator product affordances; rewriting them would force session-type fixtures into Workspaces lifecycle seeding and risk regressing `ticket_1786036326_597046`.  
+4. **Freeform Spawn product removal (decided contract — product path only)**
+   - Remove System details command form as a product spawn affordance.
+   - Stop routing product `botster.tui.spawn` to freeform `DaemonRequest::Spawn { command }`.
+   - Delete product fields `self.command` / `DEFAULT_COMMAND` **or** confine them to `#[cfg(test)]` helpers only.
+   - **Mandatory rewrites (product path):**
+     - Hermetic tests using `app.command = DEFAULT_COMMAND` + toolbar spawn (`run_headless_live_runtime` ~4574, spawn toolbar ~7317, pending spawn ~9584, and any other product-toolbar Spawn tests).
+   - **Explicitly allowed to keep raw `DaemonRequest::Spawn`:**
+     - Live-lane **test harness** Hub seeding inside Workspaces lifecycle / attach history / contract-matrix helpers (`~13793`, `~14387`, `~14664`, `~14753`). These are not operator product affordances; rewriting them would force session-type fixtures into Workspaces lifecycle seeding and risk regressing `ticket_1786036326_597046`.
    - Product hermetic invariant: activating **toolbar** Spawn never emits freeform `DaemonRequest::Spawn { command }`.
 
-5. **Session classification presentation**  
+5. **Session classification presentation**
    - When present on session entities, show Hub `session_type_id` / `session_type_source` / `role` / `traits` / `interaction` / `session_type_lifecycle` without reclassifying.
 
-6. **Tests and docs**  
-   - Hermetic + real-input + dedicated live `session-types` profile (below).  
+6. **Tests and docs**
+   - Hermetic + real-input + dedicated live `session-types` profile (below).
    - README: Session types surface, lossless edit contract, target-first launch, pin/feature expectations, live profile, CARGO_TARGET_DIR workaround.
 
 ### Non-scope
 
-- Hub protocol implementation (consume only).  
-- `botster-tui-kit` product/renderer work (kit already merged).  
-- Full multi-page Hub settings IA.  
-- `botster-web` / Workspaces package code.  
-- `ticket_1786038825_352271` contract-matrix fix and `legacy_test_needs_system_details()` redesign.  
-- Row-seeded editors.  
-- Client-side reimplementation of Hub validation.  
-- `session_template*` aliases.  
-- Local filesystem writes of `.botster/session-types.json`.  
-- Speculative `ResolveSessionType` preflight as a product gate.  
-- Rewriting live test-harness `DaemonRequest::Spawn` seeding into `SpawnSessionType`.  
+- Hub protocol implementation (consume only).
+- `botster-tui-kit` product/renderer work (kit already merged).
+- Full multi-page Hub settings IA.
+- `botster-web` / Workspaces package code.
+- `ticket_1786038825_352271` contract-matrix fix and `legacy_test_needs_system_details()` redesign.
+- Row-seeded editors.
+- Client-side reimplementation of Hub validation.
+- `session_template*` aliases.
+- Local filesystem writes of `.botster/session-types.json`.
+- Speculative `ResolveSessionType` preflight as a product gate.
+- Rewriting live test-harness `DaemonRequest::Spawn` seeding into `SpawnSessionType`.
 - Chasing hub tip past `302190e` / core tip past `33ebcd98`.
 
 ## Repository ownership boundaries and cross-repo dependencies
@@ -274,21 +274,21 @@ App policy, Session types UI, entity projection, Hub request dispatch, target-fi
 
 ### Assumptions (explicit)
 
-1. Acceptance requires Hub **`302190e`** (conformance 32 + authoring view), verified against hub source and support matrix at that rev — not hub tip.  
-2. Canonical entity type string is `session_type`; frames are snapshot/upsert/remove/error (no patch).  
-3. Effective `session_type_id` values are Hub-authoritative (qualified `source/id` form).  
-4. `ListSpawnTargets` is the public control-plane enumeration for target pickers (not a parallel owner of session-type state).  
-5. System details is the surgical Session types entry point; full Hub settings shell remains out of scope.  
-6. Operator Spawn is exclusively target-first `SpawnSessionType`.  
-7. This run does not modify `legacy_test_needs_system_details()` visibility policy.  
-8. Prior-run incident: engine activated Implement while kit dependency was open. **On this run both dependencies are closed**; Implement still records kit + hub + core lock SHAs in evidence as belt-and-braces.  
-9. Live harness may continue to seed sessions via public Hub client `DaemonRequest::Spawn` without reintroducing product freeform spawn UI.  
+1. Acceptance requires Hub **`302190e`** (conformance 32 + authoring view), verified against hub source and support matrix at that rev — not hub tip.
+2. Canonical entity type string is `session_type`; frames are snapshot/upsert/remove/error (no patch).
+3. Effective `session_type_id` values are Hub-authoritative (qualified `source/id` form).
+4. `ListSpawnTargets` is the public control-plane enumeration for target pickers (not a parallel owner of session-type state).
+5. System details is the surgical Session types entry point; full Hub settings shell remains out of scope.
+6. Operator Spawn is exclusively target-first `SpawnSessionType`.
+7. This run does not modify `legacy_test_needs_system_details()` visibility policy.
+8. Prior-run incident: engine activated Implement while kit dependency was open. **On this run both dependencies are closed**; Implement still records kit + hub + core lock SHAs in evidence as belt-and-braces.
+9. Live harness may continue to seed sessions via public Hub client `DaemonRequest::Spawn` without reintroducing product freeform spawn UI.
 10. Branch-tracked `botster-core` through hub-test-support must be **precisely** `33ebcd98…` after the repin.
 
 ### Unknowns (non-blocking for Plan)
 
-1. Whether default empty hub fixtures need create-first for live accessory cases (likely create-then-assert).  
-2. Dense form focus order under System details scroll — prove via InputRouter.  
+1. Whether default empty hub fixtures need create-first for live accessory cases (likely create-then-assert).
+2. Dense form focus order under System details scroll — prove via InputRouter.
 3. Exact line numbers in `app.rs` will shift after large edits; tests should be identified by name, not frozen line numbers.
 
 ## Affected surfaces / files
@@ -344,21 +344,21 @@ Plan Review (prior run) verified base is green under a colon-free `CARGO_TARGET_
 
 ### Hermetic proof (under `script/test`)
 
-1. Session-type entity reducer: snapshot, upsert, remove, generation ignore, error frame.  
-2. Rendering: editable vs package read-only; overrides/diagnostics; unknown role/trait literals.  
-3. Create/delete dispatch payloads match Hub sources/definitions.  
-4. **Lossless edit:** open edit path issues `ShowSessionTypeDefinition`; Update body preserves authored relative working-directory path and environment keys that were not edited; negative test: production path does not build Update solely from `DaemonSessionType` fields.  
-5. Target-first launch: no type control before target; toolbar Spawn → `SpawnSessionType`.  
-6. Product freeform spawn absent: **toolbar / System details product path** does not emit `DaemonRequest::Spawn { command }`.  
+1. Session-type entity reducer: snapshot, upsert, remove, generation ignore, error frame.
+2. Rendering: editable vs package read-only; overrides/diagnostics; unknown role/trait literals.
+3. Create/delete dispatch payloads match Hub sources/definitions.
+4. **Lossless edit:** open edit path issues `ShowSessionTypeDefinition`; Update body preserves authored relative working-directory path and environment keys that were not edited; negative test: production path does not build Update solely from `DaemonSessionType` fields.
+5. Target-first launch: no type control before target; toolbar Spawn → `SpawnSessionType`.
+6. Product freeform spawn absent: **toolbar / System details product path** does not emit `DaemonRequest::Spawn { command }`.
 7. Real keyboard path via InputRouter + HitMap for list/detail/create/edit/delete/launch.
 
 ### Live Hub proof — **`session-types` profile only**
 
 Add `script/test-live-hub session-types` (or equivalent name) that:
 
-- Builds/uses Hub + session-worker binaries from **≥ `302190e`** (prefer exact pin).  
-- Does **not** invoke the red contract-matrix headless path that asserts never-connected `connection:`.  
-- Does **not** depend on `legacy_test_needs_system_details()` sibling ownership.  
+- Builds/uses Hub + session-worker binaries from **≥ `302190e`** (prefer exact pin).
+- Does **not** invoke the red contract-matrix headless path that asserts never-connected `connection:`.
+- Does **not** depend on `legacy_test_needs_system_details()` sibling ownership.
 - Proves:
 
 | Case | Observation |
@@ -378,38 +378,42 @@ Add `script/test-live-hub session-types` (or equivalent name) that:
 
 ### Downstream / peer
 
-- Kit: already merged; only consume pin.  
-- Web parity: edit via authoring read (behavioral parity), no shared code.  
+- Kit: already merged; only consume pin.
+- Web parity: edit via authoring read (behavioral parity), no shared code.
 - Workspaces: no package change; live harness Spawn seeding preserved.
 
 ## Implementation sequence
 
-1. Pin kit `902650d` + Hub `302190e` crates; force core branch source to `33ebcd98…`; verify single ui-contract; run default gates.  
-2. Add `SessionTypeEntityState` + pump + reconnect (`FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS`).  
-3. Session types System details section (list/detail).  
-4. Create/delete + **ShowSessionTypeDefinition → Update** path.  
-5. Target-first SpawnSessionType; remove product freeform spawn; rewrite **product-path** tests only.  
-6. Hermetic + real-input tests.  
-7. Live `session-types` profile + README.  
+1. Pin kit `902650d` + Hub `302190e` crates; force core branch source to `33ebcd98…`; verify single ui-contract; run default gates.
+2. Add `SessionTypeEntityState` + pump + reconnect (`FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS`).
+3. Session types System details section (list/detail).
+4. Create/delete + **ShowSessionTypeDefinition → Update** path.
+5. Target-first SpawnSessionType; remove product freeform spawn; rewrite **product-path** tests only.
+6. Hermetic + real-input tests.
+7. Live `session-types` profile + README.
 8. Default gates + live evidence in Implement report (record kit/hub/core SHAs + single-source proofs).
 
 ## Product decision ledger
 
-- **Default:** Entity subscription owns session-type state.  
-- **Default:** Product launch is target-first `SpawnSessionType` only.  
-- **Default:** Edit seed = `ShowSessionTypeDefinition` only; Update is wholesale definition replacement.  
-- **Default:** Hub pin `302190e`; kit pin `902650d`; core branch source `33ebcd98…`.  
-- **Default:** Freeform command spawn is not a product affordance; harness may still seed via raw Spawn.  
-- **Non-goal:** Full Hub settings shell; kit renderer features; contract-matrix fix; row-seeded edit; rewriting Workspaces live seeding.  
+- **Default:** Entity subscription owns session-type state.
+- **Default:** Product launch is target-first `SpawnSessionType` only.
+- **Default:** Edit seed = `ShowSessionTypeDefinition` only; Update is wholesale definition replacement.
+- **Default:** Hub pin `302190e`; kit pin `902650d`; core branch source `33ebcd98…`.
+- **Default:** Freeform command spawn is not a product affordance; harness may still seed via raw Spawn.
+- **Default (answered `question_1786075802_958194`):** `MINIMUM_CONFORMANCE_FIXTURE_REVISION` stays **31**. Session types degrade surface-locally when authoring / `session_type_entity_subscriptions` is missing. Do not hard-refuse conformance-31 Hubs.
+- **Default:** `FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS` deliberately stays **out** of `required_features`.
+- **Default:** Live `session-types` profile fail-closes on observed handshake conformance `>= 32` and feature presence (evidence provenance, not the global client minimum).
+- **Default:** Lock invariants record **one** `botster-ui-contract` at Hub `302190e` and **two** `botster-core` sources: direct rev `16bf08f2…` (unchanged) and `branch=main` at `33ebcd98…` via hub-test-support.
+- **Non-goal:** Full Hub settings shell; kit renderer features; contract-matrix fix; row-seeded edit; rewriting Workspaces live seeding.
 - **Ask-human threshold:** only if `902650d` or `302190e` become unresolvable or dual ui-contract sources cannot be eliminated without further kit work.
 
 ## Vault gaps worth capturing
 
-1. TUI Session types entry under System details vs future Hub settings shell.  
-2. Client cold-cut: freeform product `Spawn` → `SpawnSessionType` as product launch (harness Spawn remains valid).  
-3. Lossless edit requires authoring view (entity row is not an edit seed) — cross-client gotcha.  
-4. `botster-hub-test-support` branch-tracked core must be re-locked to the hub pin's recorded core rev on every consumer repin.  
-5. Pipeline worktree `:` vs Cargo DYLD — after owner ticket lands.  
+1. TUI Session types entry under System details vs future Hub settings shell.
+2. Client cold-cut: freeform product `Spawn` → `SpawnSessionType` as product launch (harness Spawn remains valid).
+3. Lossless edit requires authoring view (entity row is not an edit seed) — cross-client gotcha.
+4. `botster-hub-test-support` branch-tracked core must be re-locked to the hub pin's recorded core rev on every consumer repin.
+5. Pipeline worktree `:` vs Cargo DYLD — after owner ticket lands.
 6. Capture after Implement with exact pins and proof commands — not at Plan time as decisions.
 
 ## Botster layers touched
@@ -418,9 +422,9 @@ TUI application policy + hub client consumption + coordinated pin. Not: Hub runt
 
 ## Worktree / target assumptions
 
-- Implement only in the pipeline worktree for `tgt_c3d470bab78549df920a41e8fb0e58d8`.  
-- Always use colon-free `CARGO_TARGET_DIR` for `script/test` / `script/clippy` in this worktree.  
-- Do not treat ambient `Projects/` checkouts as edit authority.  
+- Implement only in the pipeline worktree for `tgt_c3d470bab78549df920a41e8fb0e58d8`.
+- Always use colon-free `CARGO_TARGET_DIR` for `script/test` / `script/clippy` in this worktree.
+- Do not treat ambient `Projects/` checkouts as edit authority.
 - Do not pin early dual-source states; kit is already merged so pin kit + hub in one coherent step.
 
 ## Pipeline gates and artifacts
