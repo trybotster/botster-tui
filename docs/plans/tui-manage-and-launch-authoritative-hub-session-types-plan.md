@@ -30,7 +30,7 @@
 | Pipeline / run | `botster_stack_delivery` / `run_1786074731_672724` |
 | Current step | `botster_stack_plan` |
 | Base | `main` at `16d10b4` (PR #46 Workspaces acceptance restore) |
-| Worktree | Pipeline worktree for this ticket; authoritative `base_target_path` is `/Users/jasonconigliari/Projects/botster-tui` |
+| Worktree | Pipeline worktree for this ticket; authoritative base_target_path is the botster-tui checkout for `tgt_c3d470bab78549df920a41e8fb0e58d8` |
 
 Authoritative target comes from the ticket/run `target_id`, **not** from the process working directory name.
 
@@ -397,6 +397,7 @@ Add `script/test-live-hub session-types` (or equivalent name) that:
 
 - **Default:** Entity subscription owns session-type state.
 - **Default:** Product launch is target-first `SpawnSessionType` only.
+- **Default (Review fix):** Launch step-one is the union of `ListSpawnTargets` and distinct `session_type.target_id` values from the entity store (synthetic labels for `device:local` / `package:*`); spawn flow is a workspace dialog reachable from the toolbar without System details.
 - **Default:** Edit seed = `ShowSessionTypeDefinition` only; Update is wholesale definition replacement.
 - **Default:** Hub pin `302190e`; kit pin `902650d`; core branch source `33ebcd98…`.
 - **Default:** Freeform command spawn is not a product affordance; harness may still seed via raw Spawn.

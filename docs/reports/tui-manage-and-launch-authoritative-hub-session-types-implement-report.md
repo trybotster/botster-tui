@@ -121,3 +121,20 @@ script/test-live-hub session-types
 2. Device session type `command` must be a **relative path under `<hub-data-dir>/session-types`**, not an absolute shell string — cross-client gotcha for product SpawnSessionType cold cut.
 3. Dual `botster-core` identity (direct rev + hub-test-support branch) must be stated on every consumer repin (recorded in plan + this report).
 4. Client-wide conformance minimum vs surface-local feature degradation (answered; capture as vault note candidate after pipeline).
+
+
+## Review return fixes (`review_1786078722_260151`)
+
+Addressed open findings:
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Device/package types unlaunchable | blocker | Launch targets = admitted spawn targets ∪ entity `target_id`s (`device:local`, `package:*`) |
+| Toolbar Spawn dead end | high | Target-first flow is a Dialog from `surface()`, not System details |
+| Blind form editing | high | TextInputs prefer `self.drafts` like package config; keystroke render test |
+| Empty token clear ignored | medium | `parse_token_list` / `parse_environment` empty clears rather than restoring seeds |
+| ensure_headless writes hub data dir | medium | Helper `#[cfg(test)]` only; production headless smoke uses freeform Spawn harness |
+| Plan absolute home path | medium | Path-neutral base_target_path wording |
+| Weak authoring test | low | Renamed to pure helper test; added end-to-end launch request + dialog tests |
+| delete mutation source | low | Repo delete uses `source_name` |
+| Conformance assertion | low | Hermetic pin fixture asserts exactly 32; client MINIMUM stays 31 |

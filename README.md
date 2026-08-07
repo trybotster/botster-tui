@@ -168,9 +168,13 @@ Session types are authoritative Hub descriptors consumed through the
   `ShowSessionTypeDefinition` and submits wholesale `UpdateSessionType`
   definitions. Entity rows are never used as edit seeds (they omit relative
   working-directory path and environment).
-- Product launch is **target-first** `SpawnSessionType` only. Freeform
-  `DaemonRequest::Spawn { command }` is not a product affordance (live harness
-  seeding may still use raw Spawn).
+- Product launch is **target-first** `SpawnSessionType` only, opened as a
+  dialog from the toolbar (not buried under System details). The first step
+  lists admitted spawn targets **plus** synthetic launch targets derived from
+  session-type entity `target_id` values (`device:local`, `package:<name>`), so
+  device- and package-source types are launchable. Freeform
+  `DaemonRequest::Spawn { command }` is not a product affordance (headless /
+  Workspaces harness seeding may still use raw Spawn).
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 31` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
