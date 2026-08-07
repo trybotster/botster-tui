@@ -18731,6 +18731,221 @@ mod tests {
         assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 31);
     }
 
+    /// Re-run of the round-1 blocker probe, inverted: device AND package types must
+    /// now be launchable end to end through the real action ids.
+    #[test]
+    fn review2_probe_device_and_package_types_launch_through_real_actions() {
+        for (session_type_id, source, target_id) in [
+            ("device/shell", "device", "device:local"),
+            (
+                "package.workspaces/init",
+                "package",
+                "package:package.workspaces",
+            ),
+        ] {
+            let mut app = TuiApp::new(None);
+            app.session_types_supported = true;
+            app.system_details_visible = false;
+            // Admitted repo targets exist too; the synthetic one must not displace them.
+            app.spawn_targets = vec![DaemonSpawnTarget {
+                target_id: "repo-a".to_string(),
+                label: "Repo A".to_string(),
+                root: std::path::PathBuf::from("/tmp/repo-a"),
+                enabled: true,
+                kind: "git".to_string(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            }];
+            let mut entity = sample_session_type(session_type_id, source, source != "package");
+            entity.target_id = target_id.to_string();
+            entity.available = true;
+            app.session_type_entities.begin_generation("st".to_string());
+            app.session_type_entities
+                .entity_order
+                .push(entity.session_type_id.clone());
+            app.session_type_entities
+                .entities
+                .insert(entity.session_type_id.clone(), entity);
+            app.session_type_entities.has_snapshot = true;
+            app.observed_requests.clear();
+
+            app.handle_action("botster.tui.spawn".to_string(), None, None);
+            let (_lines, hit_map) = render_app_to_lines(&app, 220, 90, &RenderState::default());
+            assert!(
+                hit_map
+                    .regions()
+                    .iter()
+                    .any(|region| region.node_id == format!("tui-spawn-target-{target_id}")),
+                "{target_id} must be offered as a launch target: {:?}",
+                hit_map
+                    .regions()
+                    .iter()
+                    .map(|r| &r.node_id)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                hit_map
+                    .regions()
+                    .iter()
+                    .any(|region| region.node_id == "tui-spawn-target-repo-a"),
+                "admitted repo target must still be offered"
+            );
+
+            app.handle_action(
+                "botster.tui.spawn.pick_target".to_string(),
+                None,
+                Some(json!({ "target_id": target_id })),
+            );
+            let (_lines, hit_map) = render_app_to_lines(&app, 220, 90, &RenderState::default());
+            assert!(
+                hit_map.regions().iter().any(|region| region.node_id
+                    == format!("tui-spawn-session-type-{session_type_id}")),
+                "{session_type_id} must be pickable"
+            );
+
+            app.handle_action(
+                "botster.tui.spawn.pick_session_type".to_string(),
+                None,
+                Some(json!({ "session_type_id": session_type_id })),
+            );
+            assert!(
+                app.observed_requests.iter().any(|request| matches!(
+                    request,
+                    ObservedRequest::SpawnSessionType { session_type_id: id, .. }
+                        if id == session_type_id
+                )),
+                "{session_type_id} must emit SpawnSessionType: {:?}",
+                app.observed_requests
+            );
+            assert!(
+                !app.observed_requests
+                    .iter()
+                    .any(|request| matches!(request, ObservedRequest::Spawn { .. })),
+                "product path must never emit freeform Spawn"
+            );
+        }
+    }
+
+    /// Re-run of the round-1 clearing probe through the real UiFormValues seam,
+    /// not by mutating the draft struct directly.
+    #[test]
+    fn review2_probe_clearing_through_form_values_seam_emits_empty_collections() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.session_type_form = Some(SessionTypeFormDraft::from_authoring(
+            DaemonSessionTypeEditableDefinition {
+                session_type_id: "device/shell".to_string(),
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: DaemonSessionTypeDefinition {
+                    id: "shell".to_string(),
+                    label: "Shell".to_string(),
+                    description: None,
+                    icon: Some("icon.png".to_string()),
+                    role: "botster.agent".to_string(),
+                    interaction: "interactive".to_string(),
+                    traits: vec!["old.trait".to_string()],
+                    lifecycle: "task".to_string(),
+                    command: "run.sh".to_string(),
+                    args: vec!["--old".to_string()],
+                    working_directory: DaemonSessionTypeWorkingDirectory::Relative {
+                        path: "nested/path".to_string(),
+                    },
+                    environment: BTreeMap::from([("STALE".to_string(), "1".to_string())]),
+                    allowed_environment_overrides: vec!["STALE".to_string()],
+                    context: vec!["prompt".to_string()],
+                    target_id: None,
+                },
+            },
+        ));
+        let mut cleared = serde_json::Map::new();
+        for key in [
+            "session_type_traits",
+            "session_type_args",
+            "session_type_environment",
+            "session_type_allowed_environment_overrides",
+            "session_type_context_keys",
+        ] {
+            cleared.insert(key.to_string(), Value::String(String::new()));
+        }
+        app.apply_session_type_form_values(&UiFormValues(cleared));
+        let form = app.session_type_form.clone().expect("form");
+        let definition = definition_from_session_type_form(&form);
+        assert!(definition.traits.is_empty(), "{:?}", definition.traits);
+        assert!(definition.args.is_empty());
+        assert!(definition.environment.is_empty());
+        assert!(definition.allowed_environment_overrides.is_empty());
+        assert!(definition.context.is_empty());
+        // Untouched non-collection fields must still survive wholesale replacement.
+        assert_eq!(
+            definition.working_directory,
+            DaemonSessionTypeWorkingDirectory::Relative {
+                path: "nested/path".to_string()
+            }
+        );
+        assert_eq!(definition.icon.as_deref(), Some("icon.png"));
+    }
+
+    /// Untouched-form regression guard for the clearing fix: submitting without
+    /// editing anything must not wipe the authored collections.
+    #[test]
+    fn review2_probe_untouched_form_still_preserves_authored_collections() {
+        let form = SessionTypeFormDraft::from_authoring(DaemonSessionTypeEditableDefinition {
+            session_type_id: "device/shell".to_string(),
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: DaemonSessionTypeDefinition {
+                id: "shell".to_string(),
+                label: "Shell".to_string(),
+                description: None,
+                icon: None,
+                role: "botster.agent".to_string(),
+                interaction: "interactive".to_string(),
+                traits: vec!["a".to_string(), "b".to_string()],
+                lifecycle: "task".to_string(),
+                command: "run.sh".to_string(),
+                args: vec!["--x".to_string()],
+                working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+                environment: BTreeMap::from([("K".to_string(), "v".to_string())]),
+                allowed_environment_overrides: vec!["K".to_string()],
+                context: vec!["prompt".to_string()],
+                target_id: None,
+            },
+        });
+        let definition = definition_from_session_type_form(&form);
+        assert_eq!(definition.traits, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(definition.args, vec!["--x".to_string()]);
+        assert_eq!(definition.environment.get("K").map(String::as_str), Some("v"));
+        assert_eq!(definition.allowed_environment_overrides, vec!["K".to_string()]);
+        assert_eq!(definition.context, vec!["prompt".to_string()]);
+    }
+
+    /// The shipped delete test reimplements the production match arm instead of
+    /// calling it. This one calls the production function.
+    #[test]
+    fn review2_probe_delete_session_type_calls_production_path() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        let mut entity = sample_session_type("shared-git/type-a", "repo", true);
+        entity.source_name = "shared-git".to_string();
+        entity.target_id = "authored-other-target".to_string();
+        entity.id = "type-a".to_string();
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entity_order
+            .push(entity.session_type_id.clone());
+        app.session_type_entities
+            .entities
+            .insert(entity.session_type_id.clone(), entity);
+        app.observed_requests.clear();
+        app.delete_session_type("shared-git/type-a");
+        assert!(
+            app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::DeleteSessionType)),
+            "production delete path must issue DeleteSessionType: {:?}",
+            app.observed_requests
+        );
+    }
+
     #[test]
     fn target_first_spawn_lists_unavailable_session_types_without_dropping_them() {
         let mut app = TuiApp::new(None);
