@@ -4,21 +4,20 @@
 
 | Field | Value |
 | --- | --- |
-| Pass | 2 — Plan Review `changes_required` (`review_1786071830_585081`) |
+| Pass | **3** — restarted Plan after kit merge and cancelled Implement incident |
+| Prior run | `run_1786070915_943794` (cancelled after premature Implement activation while kit dependency was open) |
+| This run | `run_1786074731_672724` — workspace *"Pipeline - TUI manage Hub session types (post-kit 902650d)"* |
 | Product decision | **A** — full management including lossless Update (`question_1786071947_442525`) |
-| Open findings closed by this revision | all seven from `review_1786071830_585081` |
+| Approved plan review (prior) | `review_1786072459_764932` (approved with two medium findings carried into this pass) |
 
-### Finding disposition
+### Finding disposition (this pass)
 
 | Finding | Severity | Disposition |
 | --- | --- | --- |
-| `finding_1786071830_619143` — edit path at pin 8a60bd58 drops authored cwd path + environment | blocker | **Adopt A.** Repin to Hub `302190e` (conformance 32). Edit seeds **only** from `ShowSessionTypeDefinition`. Never row-seed from `DaemonSessionType`. |
-| `finding_1786071830_659401` — repin drags unregistered kit dependency | blocker | **Adopt.** Registered blocking kit ticket `ticket_1786071998_949850` on `tgt_3dfae49c02454037bf13554f552baf7f` (`dependency_1786072005_676257`). Implement must not start until that ticket is closed and a consumable kit commit exists. |
-| `finding_1786071830_862984` — no plan artifact | blocker | **Adopt.** Commit this plan on the run branch; attach via `project_pipelines_add_artifact` (`kind=plan`); cite returned artifact id in gate evidence. |
-| `finding_1786071830_538769` — live contract-matrix lane red / sibling owns it | high | **Adopt.** Session-types live profile is independent of contract-matrix and of the never-connected `connection:` assertion. Sibling `ticket_1786038825_352271` remains the owner of contract-matrix + `legacy_test_needs_system_details()` policy; this run does not change that helper. |
-| `finding_1786071830_111578` — script/test fails in colon-bearing worktree | high | **Adopt.** Document colon-free `CARGO_TARGET_DIR`. Raised non-blocking owner ticket `ticket_1786071999_889350` on project-pipelines target. |
-| `finding_1786071831_219670` — closed Hub dep without consumed-artifact check | medium | **Adopt.** Explicit consumed-artifact section: git-rev consumption, required coordinate Hub `302190e` / conformance 32 / `session_type_authoring`. |
-| `finding_1786071831_832844` — product Spawn preference not contract | low | **Adopt.** Decision ledger pins toolbar → `SpawnSessionType` only; freeform command spawn removed from product UI; tests named for rewrite. |
+| Prior pass-2 blockers (edit seed / kit / artifact / live lane / colon / consumed artifact / freeform product contract) | blocker–low | **Already closed** in pass 2; restated here with consumable pins filled in. |
+| `finding_1786072459_713781` — lock invariant omits botster-core (hub-test-support tracks core by branch) | medium | **Adopt.** After repin, assert `Cargo.lock` `botster-core?branch=main` equals hub@`302190e`'s recorded core rev **`33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`**, using `cargo update -p botster-core --precise` if needed. |
+| `finding_1786072459_445277` — freeform-Spawn rewrite list includes test-harness Hub seeding | medium | **Adopt.** Cold-cut is **product toolbar / System details only**. Live-lane harness may keep `DaemonRequest::Spawn` for controlled Hub seeding (Workspaces lifecycle restored by `ticket_1786036326_597046`). Mandatory rewrites limited to product-path tests. |
+| `finding_1786072459_895473` — Assumption 8 / engine dependency enforcement | low (waived) | **Keep operational hold language historically correct** (Implement activated while kit open on prior run). On **this** run both dependencies are **closed**; no Implement hold remains for kit. |
 
 ## Target repository and target_id
 
@@ -27,11 +26,11 @@
 | Target repository | `botster-tui` (`git@github.com:trybotster/botster-tui.git`) |
 | Target id | `tgt_c3d470bab78549df920a41e8fb0e58d8` |
 | Ticket | `ticket_1785970234_132113` — "TUI: manage and launch authoritative Hub session types" |
-| Project | `project_1785970196_204877` |
-| Pipeline / run | `botster_stack_delivery` / `run_1786070915_943794` |
-| Current step | `botster_stack_plan` (return visit after Plan Review) |
+| Project | `project_1785970196_204877` — Botster session types and Hub maintenance control plane |
+| Pipeline / run | `botster_stack_delivery` / `run_1786074731_672724` |
+| Current step | `botster_stack_plan` |
 | Base | `main` at `16d10b4` (PR #46 Workspaces acceptance restore) |
-| Worktree | Pipeline worktree for this ticket; authoritative path from run `base_target_path` `/Users/jasonconigliari/Projects/botster-tui` |
+| Worktree | Pipeline worktree for this ticket; authoritative `base_target_path` is `/Users/jasonconigliari/Projects/botster-tui` |
 
 Authoritative target comes from the ticket/run `target_id`, **not** from the process working directory name.
 
@@ -63,7 +62,7 @@ Authoritative target comes from the ticket/run `target_id`, **not** from the pro
 
 - [[tui and browser are equal clients]]
 - [[botster tui consumes tui kit through a thin app policy adapter]]
-- [[botster-tui-kit-playbook]] — renderer/input mechanics consumed; **kit pin is a blocking cross-repo dependency**
+- [[botster-tui-kit-playbook]] — renderer/input mechanics consumed; kit pin now consumable
 - [[tui client attach uses hub protocol not session protocol]]
 - [[tui and socket terminal streams use clientworker transport adapters]]
 - [[botster tui uinode event routing captures hit regions during draw]]
@@ -90,9 +89,9 @@ Authoritative target comes from the ticket/run `target_id`, **not** from the pro
 
 - `botster-web` Session types management + lossless `show_session_type_definition` edit path on `@trybotster/hub-test-support@0.1.25` (tickets `ticket_1785970233_750553`, `ticket_1786039279_917823`).
 
-### Deliberately not loaded
+### Deliberately not loaded as implementation scope
 
-- [[project-pipelines-playbook]] as implementation scope — no Project Pipelines package/plugin code is edited. Owner ticket for worktree naming is registered separately against the project-pipelines target.
+- [[project-pipelines-playbook]] — no Project Pipelines package/plugin code is edited in this ticket. Infra owner tickets for worktree `:` and step-activation dependency enforcement are registered separately against the project-pipelines target.
 
 ## Context loaded
 
@@ -111,26 +110,30 @@ Consume the authoritative Hub session-type contract in `botster-tui`:
 
 **A** from `question_1786071947_442525` (answered): full management including lossless Update. Do **not** ship a row-seeded editor. Do **not** choose B.
 
-Exact pin from the answer: Hub **`302190e`** (`302190ec2acc5ecee744432a6c9ffd1f040ebe01`), origin/main tip after PR #196. `c57d388` would also be acceptable; do not pin earlier than `2b8361b` / `6ad6dfa`. This plan standardizes on **`302190e`**.
+Exact pin from the answer: Hub **`302190e`** (`302190ec2acc5ecee744432a6c9ffd1f040ebe01`), origin/main tip after PR #196 at decision time. `c57d388` would also be acceptable; do not pin earlier than `2b8361b` / `6ad6dfa`. This plan standardizes on **`302190e`**.
+
+Note: hub `origin/main` tip has advanced past `302190e` (e.g. Ghostty/Zig 0.16 work). **Do not chase hub tip** for this ticket; pin the authoring-view / conformance-32 coordinate the kit already resolved against.
 
 ### Registered dependencies
 
 | Depends on | Title | Target | Status |
 | --- | --- | --- | --- |
 | `ticket_1785970233_236046` | Hub: make session types flexible, editable, and authoritative | hub | **closed** (merged source; not the consumable pin) |
-| `ticket_1786071998_949850` | TUI kit: repin botster-ui-contract to Hub 302190e | `tgt_3dfae49c02454037bf13554f552baf7f` | **open — blocking** (`dependency_1786072005_676257`) |
+| `ticket_1786071998_949850` | TUI kit: repin botster-ui-contract to Hub 302190e | `tgt_3dfae49c02454037bf13554f552baf7f` | **closed** — kit main merge **`902650d`** (`902650dfbd56a5bdc99c1e88c04ba2e62442f703`, PR #30) |
 
 ### Same-target sibling (non-blocking, non-owned)
 
 | Ticket | Title | Relation |
 | --- | --- | --- |
-| `ticket_1786038825_352271` | contract-matrix live failure / System-details visibility | Owns red `script/test-live-hub contract-matrix` (`assert!(rendered.contains("connection:"))` at `app.rs:13258`) and `legacy_test_needs_system_details()` policy. FILE CONTENTION section names this ticket. **Do not run concurrent `app.rs` ownership fights.** This run does **not** change `legacy_test_needs_system_details()`. |
+| `ticket_1786038825_352271` | contract-matrix live failure / System-details visibility | Owns red `script/test-live-hub contract-matrix` (`assert!(rendered.contains("connection:"))` near `app.rs:13258`) and `legacy_test_needs_system_details()` policy. FILE CONTENTION section names this ticket. **Do not run concurrent ownership fights on that helper.** This run does **not** change `legacy_test_needs_system_details()`. |
 
-### Non-blocking owner ticket (pipeline infra)
+### Non-blocking owner tickets (pipeline infra)
 
 | Ticket | Title |
 | --- | --- |
 | `ticket_1786071999_889350` | Project Pipelines: worktree directory names must not contain `:` |
+| (filed by orchestrator) | Project Pipelines: enforce open blocking dependencies at step activation (incident on prior run) |
+| (filed by orchestrator) | Project Pipelines: `resolve_finding` must not INSERT-crash on unknown `finding_id` |
 
 ## Consumed artifact (required)
 
@@ -139,39 +142,46 @@ Per [[closed dependency tickets signal merged source not a consumable release]]:
 | Question | Answer |
 | --- | --- |
 | How does botster-tui consume Hub? | **Git rev** pins in `crates/botster-tui/Cargo.toml` for `botster-hub-client`, `botster-ui-contract`, and `botster-hub-test-support` from `https://github.com/trybotster/botster-hub.git`. Not npm. |
-| Base pin today | `8a60bd58841179f8b1fd4040d9362d18ea244230` — protocol **6**, conformance **31**. Has session-type CRUD + entity subscriptions. **Lacks** `ShowSessionTypeDefinition` / `session_type_authoring`. |
-| Required pin for this ticket | **`302190e`** (`302190ec2acc5ecee744432a6c9ffd1f040ebe01`) — protocol **6**, conformance **32**. Contains `DaemonRequest::ShowSessionTypeDefinition`, `DaemonSessionTypeEditableDefinition`, support-matrix `session_type_authoring`, and the published `hub-test-support` **0.1.25** package tree. |
+| How does botster-tui consume kit? | **Git rev** pin for `botster-tui-kit` from `https://github.com/trybotster/botster-tui-kit.git`. Prior art pins **merge commits** on kit main (e.g. `551feb1` for PR #29). |
+| Base pin today (TUI main / this worktree base) | Hub crates at `8a60bd58841179f8b1fd4040d9362d18ea244230` — protocol **6**, conformance **31**. Kit at `551feb151f531d59d362efdae0cc7d3a34d8e311`. Has session-type CRUD shapes + entity subscriptions. **Lacks** `ShowSessionTypeDefinition` / `session_type_authoring` in the pin. |
+| Required Hub pin | **`302190e`** (`302190ec2acc5ecee744432a6c9ffd1f040ebe01`) — protocol **6**, conformance **32**. Contains `DaemonRequest::ShowSessionTypeDefinition`, `DaemonSessionTypeEditableDefinition`, support-matrix `session_type_authoring`, published `hub-test-support` **0.1.25** package tree. |
+| Required kit pin | **`902650d`** (`902650dfbd56a5bdc99c1e88c04ba2e62442f703`) — "Merge pull request #30" on kit main; kit `Cargo.toml` already pins `botster-ui-contract` to Hub `302190e`. |
 | Authoring source commit | `2b8361b` — lossless session-type authoring view; conformance 31 → 32. |
-| Proof tokens at `302190e` | `PROTOCOL_VERSION == 6`, `CONFORMANCE_FIXTURE_REVISION == 32`; matrix section `session_type_authoring.request_type == "show_session_type_definition"`; authored fields absent from published row: `context`, `environment`, `working_directory`. |
-| Kit coupling | Kit `origin/main` still pins `botster-ui-contract` to `8a60bd58`. TUI cannot bump alone without dual `botster-ui-contract` sources (documented by prior bump `466adb3` + kit `551feb1`). |
+| Proof tokens at Hub `302190e` | `PROTOCOL_VERSION == 6`, `CONFORMANCE_FIXTURE_REVISION == 32`; matrix section `session_type_authoring.request_type == "show_session_type_definition"`; authored fields absent from published row: full `environment`, relative working-directory **path** (row only has `working_directory_policy`). |
+| Core lock side-effect | `botster-hub-test-support` depends on `botster-core` by **branch=main**. Hub@`302190e` `Cargo.lock` records **`33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`**. TUI base today has `e36435f2…` for that source. Implement must re-lock to **`33ebcd98…`**, not tip of core main (post-Zig-0.16 tip is not what hub@`302190e` was tested against). |
 
-**Implement must not begin** until `ticket_1786071998_949850` is closed with a **merged** kit commit this repository can pin, then this repo pins:
+**Implement first actions (no longer blocked on kit):**
 
-1. kit → that merged commit  
-2. `botster-hub-client` / `botster-ui-contract` / `botster-hub-test-support` → Hub `302190e`  
-3. `Cargo.lock` resolves **exactly one** `botster-ui-contract` source  
+1. Pin `botster-tui-kit` → `902650d`
+2. Pin `botster-hub-client` / `botster-ui-contract` / `botster-hub-test-support` → Hub `302190e`
+3. Ensure `Cargo.lock` has **exactly one** `botster-ui-contract` source at Hub `302190e`
+4. Ensure `Cargo.lock` `botster-core?branch=main` is **`33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`** (`cargo update -p botster-core --precise 33ebcd98d19031d23e91b03d8da0ee3f8d1410d4` if needed)
+5. Preflight: client constants protocol 6 / conformance 32; matrix includes `session_type_authoring`
 
-Live binaries for acceptance must be built from Hub ≥ `302190e` (same protocol 6 / conformance ≥ 32).
+Live binaries for acceptance must be built from Hub ≥ `302190e` with protocol 6 / conformance ≥ 32 (prefer building the exact pin).
 
 ## Code reality on base (`16d10b4`)
 
 | Surface | Current state |
 | --- | --- |
 | Entity subscriptions | Only `subscribe_session_entities` (`session`). No `session_type` store/pump |
+| Feature flag | Hub exports `FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS` (`session_type_entity_subscriptions`) at `302190e` |
 | Product Spawn | `botster.tui.spawn` → `spawn_session()` → `DaemonRequest::Spawn { command }` with `DEFAULT_COMMAND` (`app.rs:53`, `:1116`, `:1521`) |
 | Command form | System details `command_form()` still offers freeform Spawn |
 | Session types UI | None |
 | Spawn targets | No production `ListSpawnTargets` consumption |
 | README IA | Aspirational Hub settings → Session types; code has workspace + System details |
+| Live harness seeding | Workspaces / attach / contract-matrix helpers use raw `DaemonRequest::Spawn` as **Hub-client test scaffolding** (~13793, ~14387, ~14664, ~14753) — **allowed to remain** |
 
 ## Scope
 
 ### In scope
 
-0. **Prerequisite consumption (first Implement actions, after kit closed)**  
-   - Pin kit + Hub crates to the coordinated revs above.  
+0. **Prerequisite consumption (first Implement actions)**  
+   - Pin kit `902650d` + Hub crates `302190e`.  
    - Confirm single `botster-ui-contract` in `Cargo.lock`.  
-   - Preflight: client constants protocol 6 / conformance 32; matrix includes `session_type_authoring`.
+   - Confirm `botster-core?branch=main` == `33ebcd98…`.  
+   - Preflight: protocol 6 / conformance 32; matrix includes `session_type_authoring`.
 
 1. **`session_type` entity subscription and store**  
    - Held-open `subscribe_entities(..., "session_type", ...)`.  
@@ -196,20 +206,19 @@ Live binaries for acceptance must be built from Hub ≥ `302190e` (same protocol
    - Form semantic rejections: Hub `kind` + `message` only.
 
 3. **Target-first product launch**  
-   - Operator toolbar `botster.tui.spawn` opens target-first flow → `DaemonRequest::SpawnSessionType`.  
+   - Operator toolbar `botster.tui.spawn` opens target-first flow → `DaemonRequest::SpawnSessionType { session_type_id, session_id, request }`.  
    - Ordering: admitted target first → session types for that `target_id` (show `available == false` disabled with diagnostics, never silently drop) → optional context (e.g. prompt for interactive) → spawn.  
    - Use Hub effective `session_type_id` values exactly.
 
-4. **Freeform Spawn product removal (decided contract)**  
+4. **Freeform Spawn product removal (decided contract — product path only)**  
    - Remove System details command form as a product spawn affordance.  
-   - Remove or stop routing product `botster.tui.spawn` to freeform `DaemonRequest::Spawn { command }`.  
+   - Stop routing product `botster.tui.spawn` to freeform `DaemonRequest::Spawn { command }`.  
    - Delete product fields `self.command` / `DEFAULT_COMMAND` **or** confine them to `#[cfg(test)]` helpers only.  
-   - **Tests that must be rewritten** (currently call raw `DaemonRequest::Spawn` or depend on command spawn):  
-     - `workspaces_live_acceptance_runs_against_real_package` (`app.rs` ~13793) — keep Workspaces package spawn path (plugin), not freeform command; do not reintroduce product freeform spawn.  
-     - `assert_live_attach_history_readback` (~14387, ~14664) — reseed sessions via `SpawnSessionType` or a `#[cfg(test)]` helper that is not product UI.  
-     - `assert_plugin_contract_matrix_renders_through_tui` (~14753) — same.  
-     - Any hermetic tests using `app.command = DEFAULT_COMMAND` + toolbar spawn (~4574 `run_headless_live_runtime`, ~9584 pending spawn, ~7317 spawn toolbar).  
-   - Product hermetic invariant: activating toolbar Spawn never emits freeform `DaemonRequest::Spawn { command }`.
+   - **Mandatory rewrites (product path):**  
+     - Hermetic tests using `app.command = DEFAULT_COMMAND` + toolbar spawn (`run_headless_live_runtime` ~4574, spawn toolbar ~7317, pending spawn ~9584, and any other product-toolbar Spawn tests).  
+   - **Explicitly allowed to keep raw `DaemonRequest::Spawn`:**  
+     - Live-lane **test harness** Hub seeding inside Workspaces lifecycle / attach history / contract-matrix helpers (`~13793`, `~14387`, `~14664`, `~14753`). These are not operator product affordances; rewriting them would force session-type fixtures into Workspaces lifecycle seeding and risk regressing `ticket_1786036326_597046`.  
+   - Product hermetic invariant: activating **toolbar** Spawn never emits freeform `DaemonRequest::Spawn { command }`.
 
 5. **Session classification presentation**  
    - When present on session entities, show Hub `session_type_id` / `session_type_source` / `role` / `traits` / `interaction` / `session_type_lifecycle` without reclassifying.
@@ -221,7 +230,7 @@ Live binaries for acceptance must be built from Hub ≥ `302190e` (same protocol
 ### Non-scope
 
 - Hub protocol implementation (consume only).  
-- `botster-tui-kit` product/renderer work beyond the registered pin ticket.  
+- `botster-tui-kit` product/renderer work (kit already merged).  
 - Full multi-page Hub settings IA.  
 - `botster-web` / Workspaces package code.  
 - `ticket_1786038825_352271` contract-matrix fix and `legacy_test_needs_system_details()` redesign.  
@@ -229,59 +238,65 @@ Live binaries for acceptance must be built from Hub ≥ `302190e` (same protocol
 - Client-side reimplementation of Hub validation.  
 - `session_template*` aliases.  
 - Local filesystem writes of `.botster/session-types.json`.  
-- Speculative `resolve_session_type` preflight.
+- Speculative `ResolveSessionType` preflight as a product gate.  
+- Rewriting live test-harness `DaemonRequest::Spawn` seeding into `SpawnSessionType`.  
+- Chasing hub tip past `302190e` / core tip past `33ebcd98`.
 
 ## Repository ownership boundaries and cross-repo dependencies
 
 ### Owned here
 
-App policy, Session types UI, entity projection, Hub request dispatch, target-first launch, freeform spawn removal, acceptance harnesses, README, Cargo pins **after** kit merge.
+App policy, Session types UI, entity projection, Hub request dispatch, target-first launch, freeform product-spawn removal, acceptance harnesses, README, Cargo pins to already-merged kit + Hub coordinates.
 
 ### Not owned here
 
 | Concern | Owner |
 | --- | --- |
 | Session-type policy, authoring view, entity frames | `botster-hub` (consume `302190e`) |
-| `botster-ui-contract` pin inside the kit | `botster-tui-kit` / `ticket_1786071998_949850` |
+| `botster-ui-contract` pin inside the kit | `botster-tui-kit` (done: PR #30 / `902650d`) |
 | Browser Session types UX | `botster-web` |
 | Workspaces package spawn form | `botster-workspaces` |
 | contract-matrix never-connected assertion | sibling `ticket_1786038825_352271` |
 | Pipeline worktree path characters | `ticket_1786071999_889350` |
+| Step-activation dependency enforcement | Project Pipelines engine tickets (orchestrator-filed) |
 
 ### Cross-repo actions
 
 | Action | Status |
 | --- | --- |
-| Kit repin ticket created | `ticket_1786071998_949850` |
-| Dependency registered | `dependency_1786072005_676257` on this ticket |
-| Implement hold | Wait for closed kit ticket + merged kit commit before TUI pin edits |
+| Kit repin ticket | **closed** `ticket_1786071998_949850` |
+| Dependency registration | `dependency_1786072005_676257` **closed** |
+| Consumable kit merge commit | **`902650d`** (record in Implement evidence) |
 | Project-pipelines colon ticket | `ticket_1786071999_889350` (non-blocking) |
+| Implement hold for kit | **lifted** on this run |
 
 ## Assumptions and unknowns
 
 ### Assumptions (explicit)
 
-1. **Invalidated:** “pin 8a60bd58 is sufficient.” Replaced by: acceptance requires Hub **`302190e`** (conformance 32 + authoring view), verified against hub source and support matrix at that rev.  
+1. Acceptance requires Hub **`302190e`** (conformance 32 + authoring view), verified against hub source and support matrix at that rev — not hub tip.  
 2. Canonical entity type string is `session_type`; frames are snapshot/upsert/remove/error (no patch).  
-3. Effective `session_type_id` values are Hub-authoritative.  
+3. Effective `session_type_id` values are Hub-authoritative (qualified `source/id` form).  
 4. `ListSpawnTargets` is the public control-plane enumeration for target pickers (not a parallel owner of session-type state).  
 5. System details is the surgical Session types entry point; full Hub settings shell remains out of scope.  
 6. Operator Spawn is exclusively target-first `SpawnSessionType`.  
 7. This run does not modify `legacy_test_needs_system_details()` visibility policy.  
-8. Engine dependency gates on **run start**, not every step activation — Implement must still **manually** verify kit dependency closed before editing pins (record kit commit in Implement evidence).
+8. Prior-run incident: engine activated Implement while kit dependency was open. **On this run both dependencies are closed**; Implement still records kit + hub + core lock SHAs in evidence as belt-and-braces.  
+9. Live harness may continue to seed sessions via public Hub client `DaemonRequest::Spawn` without reintroducing product freeform spawn UI.  
+10. Branch-tracked `botster-core` through hub-test-support must be **precisely** `33ebcd98…` after the repin.
 
 ### Unknowns (non-blocking for Plan)
 
-1. Exact kit merged commit hash (unknown until `ticket_1786071998_949850` lands).  
-2. Whether default empty hub fixtures need create-first for live accessory cases (likely create-then-assert).  
-3. Dense form focus order under System details scroll — prove via InputRouter.
+1. Whether default empty hub fixtures need create-first for live accessory cases (likely create-then-assert).  
+2. Dense form focus order under System details scroll — prove via InputRouter.  
+3. Exact line numbers in `app.rs` will shift after large edits; tests should be identified by name, not frozen line numbers.
 
 ## Affected surfaces / files
 
 | Path | Change |
 | --- | --- |
-| `crates/botster-tui/Cargo.toml` + `Cargo.lock` | Pin hub crates to `302190e`; pin kit to closed kit commit |
-| `crates/botster-tui/src/app.rs` | session_type store/pump; System details Session types; ShowSessionTypeDefinition edit; CRUD; target-first SpawnSessionType; remove product freeform spawn; rewrite named tests |
+| `crates/botster-tui/Cargo.toml` + `Cargo.lock` | Pin kit `902650d`; hub crates `302190e`; lock core branch source to `33ebcd98…` |
+| `crates/botster-tui/src/app.rs` | session_type store/pump; System details Session types; ShowSessionTypeDefinition edit; CRUD; target-first SpawnSessionType; remove product freeform spawn; rewrite **product-path** tests |
 | `script/test-live-hub` | Add `session-types` profile **independent** of contract-matrix |
 | `README.md` | Surface, edit contract, launch, pins, live profile, CARGO_TARGET_DIR |
 | `docs/plans/tui-manage-and-launch-authoritative-hub-session-types-plan.md` | This plan (committed on the run branch) |
@@ -290,12 +305,14 @@ App policy, Session types UI, entity projection, Hub request dispatch, target-fi
 
 | Risk | Mitigation |
 | --- | --- |
-| Dual `botster-ui-contract` sources | Kit dependency first; lockfile single-source check |
-| Row-seeded edit data loss | Hard rule: edit only after authoring read; hermetic test fails if Update is built from entity row fields |
+| Dual `botster-ui-contract` sources | Pin kit first then hub crates; lockfile single-source check |
+| Core branch drift / Zig tip | Precise pin `33ebcd98…`; assert in Implement evidence |
+| Row-seeded edit data loss | Hard rule: edit only after authoring read; hermetic negative test |
 | Parallel list-refresh ownership | Entity subscription is store of truth |
-| Freeform Spawn residual | Product removal + hermetic invariant on toolbar path |
+| Freeform Spawn residual in product UI | Product removal + hermetic invariant on **toolbar** path only |
+| Accidental rewrite of Workspaces live seeding | Explicit allow-list for harness `DaemonRequest::Spawn` |
 | contract-matrix red misread as this ticket | Separate live profile; sibling ownership explicit |
-| Colon worktree aborts tests | Documented `CARGO_TARGET_DIR` |
+| Colon worktree aborts tests | Documented colon-free `CARGO_TARGET_DIR` |
 | Concurrent `app.rs` edits with sibling | Coordinate; do not take ownership of sibling helpers |
 | Stale live binaries | Preflight protocol/conformance/features against ≥ `302190e` |
 
@@ -313,7 +330,7 @@ script/test
 script/clippy
 ```
 
-Plan Review verified base is green under a colon-free `CARGO_TARGET_DIR` (153 + 1 passed). `script/test-live-hub` already uses mktemp target dirs. Owner fix: `ticket_1786071999_889350`.
+Plan Review (prior run) verified base is green under a colon-free `CARGO_TARGET_DIR` (153 + 1 passed). `script/test-live-hub` already uses mktemp target dirs. Owner fix: `ticket_1786071999_889350`.
 
 ### Default gates (required)
 
@@ -321,23 +338,25 @@ Plan Review verified base is green under a colon-free `CARGO_TARGET_DIR` (153 + 
 - `script/test` (with colon-free `CARGO_TARGET_DIR` as above)
 - `script/clippy` (same)
 - `git diff --check`
-- `Cargo.lock` contains a single `botster-ui-contract` source at Hub `302190e`
+- `Cargo.lock` contains a **single** `botster-ui-contract` source at Hub `302190e`
+- `Cargo.lock` `botster-core?branch=main` source equals **`33ebcd98d19031d23e91b03d8da0ee3f8d1410d4`**
+- Kit pin in `Cargo.toml` / lock equals **`902650d`**
 
 ### Hermetic proof (under `script/test`)
 
 1. Session-type entity reducer: snapshot, upsert, remove, generation ignore, error frame.  
 2. Rendering: editable vs package read-only; overrides/diagnostics; unknown role/trait literals.  
 3. Create/delete dispatch payloads match Hub sources/definitions.  
-4. **Lossless edit:** open edit path issues `ShowSessionTypeDefinition`; Update body preserves authored relative working-directory path and environment keys that were not edited; negative test: building Update solely from `DaemonSessionType` fields is not used by production path (source-scan or unit assertion).  
+4. **Lossless edit:** open edit path issues `ShowSessionTypeDefinition`; Update body preserves authored relative working-directory path and environment keys that were not edited; negative test: production path does not build Update solely from `DaemonSessionType` fields.  
 5. Target-first launch: no type control before target; toolbar Spawn → `SpawnSessionType`.  
-6. Product freeform spawn absent: toolbar / System details product path does not emit `DaemonRequest::Spawn { command }`.  
+6. Product freeform spawn absent: **toolbar / System details product path** does not emit `DaemonRequest::Spawn { command }`.  
 7. Real keyboard path via InputRouter + HitMap for list/detail/create/edit/delete/launch.
 
 ### Live Hub proof — **`session-types` profile only**
 
 Add `script/test-live-hub session-types` (or equivalent name) that:
 
-- Builds/uses Hub + session-worker binaries from **≥ `302190e`**.  
+- Builds/uses Hub + session-worker binaries from **≥ `302190e`** (prefer exact pin).  
 - Does **not** invoke the red contract-matrix headless path that asserts never-connected `connection:`.  
 - Does **not** depend on `legacy_test_needs_system_details()` sibling ownership.  
 - Proves:
@@ -359,39 +378,39 @@ Add `script/test-live-hub session-types` (or equivalent name) that:
 
 ### Downstream / peer
 
-- Kit: only the registered pin ticket.  
+- Kit: already merged; only consume pin.  
 - Web parity: edit via authoring read (behavioral parity), no shared code.  
-- Workspaces: no package change.
+- Workspaces: no package change; live harness Spawn seeding preserved.
 
 ## Implementation sequence
 
-1. **Hold** until kit `ticket_1786071998_949850` closed; record merged kit commit.  
-2. Pin kit + Hub `302190e` crates; verify single ui-contract; run default gates.  
-3. Add `SessionTypeEntityState` + pump + reconnect.  
-4. Session types System details section (list/detail).  
-5. Create/delete + **ShowSessionTypeDefinition → Update** path.  
-6. Target-first SpawnSessionType; remove product freeform spawn; rewrite named tests.  
-7. Hermetic + real-input tests.  
-8. Live `session-types` profile + README.  
-9. Default gates + live evidence in Implement report.
+1. Pin kit `902650d` + Hub `302190e` crates; force core branch source to `33ebcd98…`; verify single ui-contract; run default gates.  
+2. Add `SessionTypeEntityState` + pump + reconnect (`FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS`).  
+3. Session types System details section (list/detail).  
+4. Create/delete + **ShowSessionTypeDefinition → Update** path.  
+5. Target-first SpawnSessionType; remove product freeform spawn; rewrite **product-path** tests only.  
+6. Hermetic + real-input tests.  
+7. Live `session-types` profile + README.  
+8. Default gates + live evidence in Implement report (record kit/hub/core SHAs + single-source proofs).
 
 ## Product decision ledger
 
 - **Default:** Entity subscription owns session-type state.  
 - **Default:** Product launch is target-first `SpawnSessionType` only.  
 - **Default:** Edit seed = `ShowSessionTypeDefinition` only; Update is wholesale definition replacement.  
-- **Default:** Hub pin `302190e`; kit pin from closed kit ticket.  
-- **Default:** Freeform command spawn is not a product affordance.  
-- **Non-goal:** Full Hub settings shell; kit renderer features; contract-matrix fix; row-seeded edit.  
-- **Ask-human threshold:** only if Hub `302190e` is not consumable after kit merge (unexpected).
+- **Default:** Hub pin `302190e`; kit pin `902650d`; core branch source `33ebcd98…`.  
+- **Default:** Freeform command spawn is not a product affordance; harness may still seed via raw Spawn.  
+- **Non-goal:** Full Hub settings shell; kit renderer features; contract-matrix fix; row-seeded edit; rewriting Workspaces live seeding.  
+- **Ask-human threshold:** only if `902650d` or `302190e` become unresolvable or dual ui-contract sources cannot be eliminated without further kit work.
 
 ## Vault gaps worth capturing
 
 1. TUI Session types entry under System details vs future Hub settings shell.  
-2. Client cold-cut: freeform `Spawn` → `SpawnSessionType` as product launch.  
+2. Client cold-cut: freeform product `Spawn` → `SpawnSessionType` as product launch (harness Spawn remains valid).  
 3. Lossless edit requires authoring view (entity row is not an edit seed) — cross-client gotcha.  
-4. Pipeline worktree `:` vs Cargo DYLD — after owner ticket lands.  
-5. Capture after Implement with exact pins and proof commands — not at Plan time as decisions.
+4. `botster-hub-test-support` branch-tracked core must be re-locked to the hub pin's recorded core rev on every consumer repin.  
+5. Pipeline worktree `:` vs Cargo DYLD — after owner ticket lands.  
+6. Capture after Implement with exact pins and proof commands — not at Plan time as decisions.
 
 ## Botster layers touched
 
@@ -401,7 +420,8 @@ TUI application policy + hub client consumption + coordinated pin. Not: Hub runt
 
 - Implement only in the pipeline worktree for `tgt_c3d470bab78549df920a41e8fb0e58d8`.  
 - Always use colon-free `CARGO_TARGET_DIR` for `script/test` / `script/clippy` in this worktree.  
-- Do not treat ambient `Projects/` checkouts as edit authority.
+- Do not treat ambient `Projects/` checkouts as edit authority.  
+- Do not pin early dual-source states; kit is already merged so pin kit + hub in one coherent step.
 
 ## Pipeline gates and artifacts
 
@@ -409,7 +429,7 @@ TUI application policy + hub client consumption + coordinated pin. Not: Hub runt
 | --- | --- |
 | Plan file | `docs/plans/tui-manage-and-launch-authoritative-hub-session-types-plan.md` committed on the run branch |
 | `project_pipelines_add_artifact` | `kind=plan`, uri to that path; artifact id in gate evidence |
-| `botster_stack_plan_gate` | All required fields; reference decision A, kit dependency, consumed pin `302190e` |
+| `botster_stack_plan_gate` | All required fields; reference decision A, kit pin `902650d`, Hub pin `302190e`, core lock `33ebcd98…` |
 
 ## Convention conflicts
 
