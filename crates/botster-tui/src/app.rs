@@ -13346,8 +13346,9 @@ mod tests {
         )
         .expect("write repo session type command");
         // Protocol-6 PackageSessionType requires label/role/interaction/lifecycle in addition
-        // to id/command. Incomplete repo-local files make CreateSpawnTarget disconnect with
-        // "unexpected daemon response" on Hub 8a60bd58 instead of a structured operator error.
+        // to id/command. Incomplete repo-local files make CreateSpawnTarget fail with
+        // ClientDisconnected on Hub 8a60bd58 instead of a structured operator error
+        // (hub-side stderr may also say "unexpected daemon response").
         std::fs::write(
             repository.join(".botster/session-types.json"),
             r#"{"session_types":[{"id":"acceptance","label":"Acceptance","role":"botster.acceptance","interaction":"interactive","lifecycle":"task","command":"bin/acceptance-session.sh","working_directory":{"policy":"package_root"}}]}"#,

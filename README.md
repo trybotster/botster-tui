@@ -488,11 +488,10 @@ reconnect subscription/snapshot, explicit surface reopen, historical
 rehydration, stale-generation rejection, and clean shutdown.
 
 Producer lifecycle bindings for current/ended/unavailable groups shipped on
-`botster-workspaces` (closed `ticket_1785296184_677408`). Completing the TUI
-lifecycle consumer gate — green `script/test-live-hub workspaces lifecycle`, or
-an exact residual finding — is owned by this repository via
-`ticket_1786036326_597046`. A fixture or a composed summary cannot replace the
-combined consumer proof against a real package checkout.
+`botster-workspaces` (closed `ticket_1785296184_677408`). The TUI lifecycle
+consumer gate is proven by a green `script/test-live-hub workspaces lifecycle`
+against a pin-matched Hub and a real `botster-workspaces` checkout; a fixture
+or a composed summary cannot replace that combined consumer proof.
 
 Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
 `BOTSTER_SESSION_WORKER_BIN` paths because `botster-tui` does not own those
