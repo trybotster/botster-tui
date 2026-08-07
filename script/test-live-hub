@@ -72,26 +72,6 @@ case "$mode" in
       echo "usage: script/test-live-hub workspaces <plumbing|lifecycle|installed-driver>" >&2
       exit 1
     fi
-    # All three Workspaces profiles are blocked pending ticket_1785984128_479155.
-    # One root cause, not three: botster-workspaces declares the legacy capability
-    # scope session_template_managed_git_spawn, Hub 8a60bd58 no longer grants it,
-    # and PackageRegistry::enable hard-denies rather than warns, so every profile
-    # fails at EnablePackage for the same reason. This is not a narrow testing
-    # artifact -- because enable hard-denies, the installed Workspaces package
-    # cannot be enabled on a protocol-6 Hub on any real device.
-    #
-    # The guard sits before resolve_workspaces_package so it needs no live-Hub
-    # environment. Removing it without re-enabling the lanes is caught by
-    # app::tests::blocked_workspaces_lanes_report_a_known_gap_for_every_profile.
-    #
-    # Everything below this guard in the workspaces) case is deliberately retained
-    # rather than deleted: it is unreachable today, and deleting the guard block is
-    # exactly what restores it. This is kept, not overlooked.
-    echo "script/test-live-hub workspaces $profile is BLOCKED pending ticket_1785984128_479155 (botster-workspaces session-types migration)." >&2
-    echo "Root cause: botster-workspaces declares the legacy capability scope session_template_managed_git_spawn; Hub 8a60bd58 grants session_type_managed_git_spawn instead, and PackageRegistry::enable hard-denies an ungranted scope, so plumbing, lifecycle, and installed-driver all fail at EnablePackage for this one reason." >&2
-    echo "Consequently unproven: the repo-source session-type path and the installed-Workspaces spawn driver are unverified against a protocol-6 Hub." >&2
-    echo "Un-skip owner: ticket_1786036326_597046 (TUI: restore Workspaces acceptance coverage after the session-types migration) removes this guard and must prove all three profiles green." >&2
-    exit 1
     workspaces_package="$(resolve_workspaces_package)"
     if [ "$profile" = "installed-driver" ]; then
       test_filter="app::tests::installed_workspaces_spawn_driver_runs_through_apps_open"
