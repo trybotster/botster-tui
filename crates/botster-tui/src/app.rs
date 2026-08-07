@@ -3958,12 +3958,12 @@ fn drive_spawn_case(
     diagnostics.stage(
         "spawn_form",
         Some(&case.case_id),
-        "single eligible template and keyboard-typed requested branch",
+        "single eligible session type and keyboard-typed requested branch",
     );
     select_only_acceptance_value(
         app,
         router,
-        "template_id",
+        "session_type_id",
         evidence,
         &case.case_id,
         diagnostics,
@@ -13260,50 +13260,11 @@ mod tests {
         hub.shutdown().expect("isolated hub shuts down cleanly");
     }
 
-    /// Proves every waived Workspaces lane reads as a known gap rather than a pass.
-    ///
-    /// Hermetic: the `script/test-live-hub` guard precedes every `resolve_*` call,
-    /// so no Hub binaries or live-Hub environment are required. This fails the
-    /// moment someone deletes the guard without re-enabling the lanes, which is the
-    /// regression worth catching. All three profiles are covered because all three
-    /// are waived.
+    /// Hermetic: contract-matrix mode must fail closed when its fixture env is
+    /// missing, independent of any Workspaces profile path.
     #[test]
-    fn blocked_workspaces_lanes_report_a_known_gap_for_every_profile() {
+    fn contract_matrix_mode_requires_its_fixture_env_var() {
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../script/test-live-hub");
-
-        for profile in ["installed-driver", "plumbing", "lifecycle"] {
-            let output = std::process::Command::new(&script)
-                .args(["workspaces", profile])
-                .env_remove("BOTSTER_WORKSPACES_PACKAGE_PATH")
-                .env_remove("BOTSTER_HUB_BIN")
-                .env_remove("BOTSTER_SESSION_WORKER_BIN")
-                .output()
-                .unwrap_or_else(|error| panic!("{profile} guard runs: {error}"));
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            assert!(
-                !output.status.success(),
-                "{profile} must exit non-zero so no operator or CI path reads it as success"
-            );
-            assert!(
-                stderr.contains("ticket_1785984128_479155"),
-                "{profile} must name the blocking ticket by ID; stderr was: {stderr}"
-            );
-            assert!(
-                stderr.contains("ticket_1786036326_597046"),
-                "{profile} must name the un-skip owner by ID; stderr was: {stderr}"
-            );
-            assert!(
-                !stdout.contains("test result: ok"),
-                "{profile} must not emit a passing test line; stdout was: {stdout}"
-            );
-        }
-
-        // The guard is scoped to the workspaces case only. contract-matrix must
-        // still fail on its own missing-fixture path, never on the blocked-lane
-        // message, because it supplies this run's live-Hub evidence.
         let contract_matrix = std::process::Command::new(&script)
             .arg("contract-matrix")
             .env_remove("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
@@ -13311,22 +13272,52 @@ mod tests {
             .expect("contract-matrix mode runs");
         let stderr = String::from_utf8_lossy(&contract_matrix.stderr);
         assert!(
+            !contract_matrix.status.success(),
+            "contract-matrix without fixture must exit non-zero"
+        );
+        assert!(
             stderr.contains("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required"),
             "contract-matrix must reach its own validation; stderr was: {stderr}"
         );
+    }
+
+    /// Default-gate cold-cut invariant: the installed Workspaces spawn-form driver
+    /// must key the form field as session_type_id, never the retired template
+    /// field name. Live lanes prove the field works end-to-end; this scan keeps a
+    /// silent revert from surviving `script/test`.
+    #[test]
+    fn workspaces_spawn_acceptance_uses_session_type_id_field_key() {
+        let source = source_without_line_comments();
+        let call_site = concat!(
+            "select_only_acceptance_value(\n",
+            "        app,\n",
+            "        router,\n",
+            "        \"",
+            "session",
+            "_type_id\",\n"
+        );
         assert!(
-            !stderr.contains("ticket_1785984128_479155"),
-            "the blocked-lane guard must not leak into contract-matrix mode"
+            source.contains(call_site),
+            "acceptance spawn-form selector must pass the session type field name"
+        );
+
+        let forbidden_field = concat!("template", "_id");
+        assert!(
+            !source.contains(forbidden_field),
+            "acceptance source must not retain the retired spawn form field key"
+        );
+
+        let fixture = include_str!("../fixtures/workspaces-spawn-driver-v1.evidence.jsonl");
+        assert!(
+            !fixture.contains(forbidden_field),
+            "checked-in spawn-driver evidence example must not teach the retired field key"
+        );
+        assert!(
+            fixture.contains(concat!("\"", "session", "_type_id\"")),
+            "checked-in spawn-driver evidence example must use the session type field key"
         );
     }
 
-    /// Blocked pending ticket_1785984128_479155 (botster-workspaces session-types
-    /// migration): botster-workspaces declares the legacy capability scope
-    /// `session_template_managed_git_spawn`, Hub 8a60bd58 no longer grants it, and
-    /// `PackageRegistry::enable` hard-denies rather than warns, so this lane fails
-    /// at `EnablePackage`. The installed-Workspaces spawn driver is consequently
-    /// unverified against a protocol-6 Hub. Un-skip owner:
-    /// ticket_1786036326_597046.
     #[test]
     fn installed_workspaces_spawn_driver_runs_through_apps_open() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -13347,16 +13338,20 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create installed-driver fixture root");
         let repository = root.join("repository");
         std::fs::create_dir_all(repository.join(".botster"))
-            .expect("create repo template directory");
+            .expect("create repo session-types directory");
         std::fs::create_dir_all(repository.join("bin")).expect("create repo bin directory");
         std::fs::write(
             repository.join("bin/acceptance-session.sh"),
             "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
         )
         .expect("write repo session type command");
+        // Protocol-6 PackageSessionType requires label/role/interaction/lifecycle in addition
+        // to id/command. Incomplete repo-local files make CreateSpawnTarget fail with
+        // ClientDisconnected on Hub 8a60bd58 instead of a structured operator error
+        // (hub-side stderr may also say "unexpected daemon response").
         std::fs::write(
             repository.join(".botster/session-types.json"),
-            r#"{"session_types":[{"id":"acceptance","command":"bin/acceptance-session.sh","working_directory":{"policy":"package_root"}}]}"#,
+            r#"{"session_types":[{"id":"acceptance","label":"Acceptance","role":"botster.acceptance","interaction":"interactive","lifecycle":"task","command":"bin/acceptance-session.sh","working_directory":{"policy":"package_root"}}]}"#,
         )
         .expect("write repo session type");
         run_fixture_command(&repository, "chmod", &["+x", "bin/acceptance-session.sh"]);
@@ -13670,15 +13665,8 @@ mod tests {
             .collect()
     }
 
-    /// Backs both the `plumbing` and `lifecycle` profiles, and both are blocked
-    /// pending ticket_1785984128_479155 for the same single root cause as
-    /// `installed_workspaces_spawn_driver_runs_through_apps_open`:
-    /// botster-workspaces declares the legacy capability scope
-    /// `session_template_managed_git_spawn`, Hub 8a60bd58 no longer grants it, and
-    /// `PackageRegistry::enable` hard-denies rather than warns, so this lane fails
-    /// at `EnablePackage`. The repo-source session-type path is consequently
-    /// unverified against a protocol-6 Hub. Un-skip owner:
-    /// ticket_1786036326_597046.
+    /// Backs both the `plumbing` and `lifecycle` profiles against a real
+    /// `botster-workspaces` package path supplied by the live-hub wrapper.
     #[test]
     fn workspaces_live_acceptance_runs_against_real_package() {
         let Ok(profile_value) = std::env::var("BOTSTER_TUI_WORKSPACES_PROFILE") else {
