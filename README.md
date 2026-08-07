@@ -155,30 +155,21 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
 
-### Known gap — all three Workspaces live-acceptance lanes are blocked
+### Workspaces live-acceptance lanes
 
 `script/test-live-hub workspaces installed-driver`, `plumbing`, and `lifecycle`
-all exit non-zero without running, blocked pending `ticket_1785984128_479155`.
+are the repository-owned runtime proof that the installed Workspaces package,
+including the spawn-form `session_type_id` field and lifecycle bindings, works
+against a protocol-6 Hub. They require pin-matched Hub binaries (the revision
+this crate pins, currently `8a60bd58841179f8b1fd4040d9362d18ea244230`) and an
+explicit clean post-migration `botster-workspaces` package path via
+`BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
+also pins the acceptance driver field key so a silent `template_id` revert
+cannot hide behind env-gated live tests.
 
-One root cause, not three: `botster-workspaces` declares the legacy capability
-scope `session_template_managed_git_spawn`, Hub `8a60bd58` grants
-`session_type_managed_git_spawn` instead, and `PackageRegistry::enable`
-hard-denies an ungranted scope rather than warning, so every profile fails at
-`EnablePackage` for the same reason. Because `enable` hard-denies, this is not a
-narrow testing artifact: the installed Workspaces package cannot be enabled on a
-protocol-6 Hub on any real device.
-
-Consequently unproven: the repo-source session-type path and the
-installed-Workspaces spawn driver are unverified against a protocol-6 Hub. The
-live-Hub evidence for the current pinned revision therefore comes from the
-`contract-matrix` lane, which is unaffected.
-
-Two independent conditions must both clear before these lanes can pass —
-`ticket_1785984128_479155` must land so the granted capability scope matches,
-and `botster-tui` must be pinned to protocol 6 (done at the revisions above),
-because exact protocol matching means a protocol-4 client cannot talk to a
-protocol-6 Hub regardless of anything Workspaces does. Removing the guard and
-proving all three lanes green is owned by `ticket_1786036326_597046`.
+`ticket_1786036326_597046` owns restoring and proving these three lanes. Open
+sibling `ticket_1786038825_352271` owns the separate `contract-matrix` live
+failure when that lane is red; it is not the Workspaces proof path.
 
 ## Caller-owned Workspaces Spawn acceptance
 
@@ -496,11 +487,12 @@ unique canonical realized identity, real membership removal, a fresh
 reconnect subscription/snapshot, explicit surface reopen, historical
 rehydration, stale-generation rejection, and clean shutdown.
 
-Current `botster-workspaces` main intentionally lacks that lifecycle tree, so
-`workspaces lifecycle` fails closed with a diagnostic naming downstream
-`ticket_1785296184_677408`. That Workspaces-owned ticket must run this merged
-mode against its real package checkout; a fixture or a composed summary cannot
-replace the combined consumer proof.
+Producer lifecycle bindings for current/ended/unavailable groups shipped on
+`botster-workspaces` (closed `ticket_1785296184_677408`). Completing the TUI
+lifecycle consumer gate — green `script/test-live-hub workspaces lifecycle`, or
+an exact residual finding — is owned by this repository via
+`ticket_1786036326_597046`. A fixture or a composed summary cannot replace the
+combined consumer proof against a real package checkout.
 
 Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
 `BOTSTER_SESSION_WORKER_BIN` paths because `botster-tui` does not own those
