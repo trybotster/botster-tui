@@ -16,12 +16,15 @@ use botster_hub_client::{
     DaemonEntityFrame, DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason,
     DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSoftwareIdentity,
-    DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_NAVIGATION,
-    FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_RESIZE,
-    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
+    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
+    DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
+    DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
+    FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
+    FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
     FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
-    read_frame_from_reader, subscribe_session_entities, write_frame,
+    read_frame_from_reader, subscribe_entities, subscribe_session_entities, write_frame,
 };
 use botster_ui_contract::{
     PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest,
@@ -158,6 +161,12 @@ struct SessionRow {
     lifecycle: String,
     failure_reason: Option<String>,
     pending: bool,
+    session_type_id: Option<String>,
+    session_type_source: Option<String>,
+    role: Option<String>,
+    traits: Vec<String>,
+    interaction: Option<String>,
+    session_type_lifecycle: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +198,12 @@ impl SessionRow {
             lifecycle: "running".to_string(),
             failure_reason: None,
             pending: false,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         }
     }
 
@@ -198,6 +213,12 @@ impl SessionRow {
             lifecycle: "pending".to_string(),
             failure_reason: None,
             pending: true,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         }
     }
 
@@ -210,6 +231,12 @@ impl SessionRow {
                 .unwrap_or_else(|| entity.registry_state.clone()),
             failure_reason: entity.failure_reason.clone(),
             pending: false,
+            session_type_id: entity.session_type_id.clone(),
+            session_type_source: entity.session_type_source.clone(),
+            role: entity.role.clone(),
+            traits: entity.traits.clone(),
+            interaction: entity.interaction.clone(),
+            session_type_lifecycle: entity.session_type_lifecycle.clone(),
         }
     }
 
@@ -380,6 +407,431 @@ impl SessionEntityState {
                 Ok(value)
             })
             .collect()
+    }
+}
+
+#[derive(Default)]
+struct SessionTypeEntityState {
+    subscription_id: Option<String>,
+    has_snapshot: bool,
+    snapshot_seq: Option<u64>,
+    entity_order: Vec<String>,
+    entities: BTreeMap<String, DaemonSessionType>,
+}
+
+impl SessionTypeEntityState {
+    fn begin_generation(&mut self, subscription_id: String) {
+        self.subscription_id = Some(subscription_id);
+        self.has_snapshot = false;
+        self.snapshot_seq = None;
+        self.entity_order.clear();
+        self.entities.clear();
+    }
+
+    fn apply(&mut self, frame: DaemonEntityFrame) -> Result<bool, String> {
+        match frame {
+            DaemonEntityFrame::Snapshot {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                items,
+                ..
+            } => {
+                if !self.matches(&subscription_id, &entity_type) {
+                    return Ok(false);
+                }
+                let items = items
+                    .into_iter()
+                    .map(decode_session_type_entity)
+                    .collect::<Result<Vec<_>, String>>()?;
+                self.entity_order = items
+                    .iter()
+                    .map(|entity| entity.session_type_id.clone())
+                    .collect();
+                self.entities = items
+                    .into_iter()
+                    .map(|entity| (entity.session_type_id.clone(), entity))
+                    .collect();
+                self.has_snapshot = true;
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+            DaemonEntityFrame::Upsert {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                id,
+                entity,
+            } => {
+                if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
+                    return Ok(false);
+                }
+                let entity = decode_session_type_entity(entity)?;
+                if id != entity.session_type_id {
+                    return Err(format!(
+                        "session type entity id mismatch: frame={id} entity={}",
+                        entity.session_type_id
+                    ));
+                }
+                if !self.entities.contains_key(&id) {
+                    self.entity_order.push(id.clone());
+                }
+                self.entities.insert(id, entity);
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+            DaemonEntityFrame::Patch {
+                subscription_id,
+                entity_type,
+                ..
+            } => {
+                if !self.matches(&subscription_id, &entity_type) {
+                    return Ok(false);
+                }
+                Err(
+                    "session type entity patch is unsupported; expected snapshot/upsert/remove only"
+                        .to_string(),
+                )
+            }
+            DaemonEntityFrame::Remove {
+                subscription_id,
+                entity_type,
+                snapshot_seq,
+                id,
+            } => {
+                if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
+                    return Ok(false);
+                }
+                self.entities.remove(&id);
+                self.entity_order.retain(|entity_id| entity_id != &id);
+                self.snapshot_seq = Some(snapshot_seq);
+                Ok(true)
+            }
+            DaemonEntityFrame::Error {
+                subscription_id,
+                entity_type,
+                code,
+                message,
+            } => {
+                if !self.matches(&subscription_id, &entity_type) {
+                    return Ok(false);
+                }
+                Err(format!(
+                    "session type entity subscription error: code={code} message={message}"
+                ))
+            }
+        }
+    }
+
+    fn matches(&self, subscription_id: &str, entity_type: &str) -> bool {
+        entity_type == "session_type" && self.subscription_id.as_deref() == Some(subscription_id)
+    }
+
+    fn accepts_delta(&self, subscription_id: &str, entity_type: &str, snapshot_seq: u64) -> bool {
+        self.has_snapshot
+            && self.matches(subscription_id, entity_type)
+            && self
+                .snapshot_seq
+                .is_none_or(|current| snapshot_seq > current)
+    }
+
+    fn ordered(&self) -> Vec<&DaemonSessionType> {
+        self.entity_order
+            .iter()
+            .filter_map(|id| self.entities.get(id))
+            .collect()
+    }
+}
+
+fn decode_session_type_entity(entity: Value) -> Result<DaemonSessionType, String> {
+    serde_json::from_value(entity)
+        .map_err(|error| format!("session type entity failed to decode: {error}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionTypeFormMode {
+    Create,
+    Edit,
+}
+
+/// Draft for create/edit. Edit is seeded only from ShowSessionTypeDefinition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionTypeFormDraft {
+    mode: SessionTypeFormMode,
+    source: String,
+    source_target_id: String,
+    /// Effective Hub session_type_id while editing; unused for create.
+    session_type_id: Option<String>,
+    /// Lossless seed retained for edit wholesale replacement.
+    seed_definition: Option<DaemonSessionTypeDefinition>,
+    seed_source: Option<DaemonSessionTypeMutationSource>,
+    id: String,
+    label: String,
+    description: String,
+    icon: String,
+    role: String,
+    interaction: String,
+    traits: String,
+    lifecycle: String,
+    command: String,
+    args: String,
+    working_directory_policy: String,
+    working_directory_path: String,
+    environment: String,
+    allowed_environment_overrides: String,
+    context_keys: String,
+    /// Preserved authored collections when text controls are left untouched.
+    seeded_traits: Option<Vec<String>>,
+    seeded_args: Option<Vec<String>>,
+    seeded_context: Option<Vec<String>>,
+    seeded_allowed_environment_overrides: Option<Vec<String>>,
+    seeded_environment: Option<BTreeMap<String, String>>,
+    definition_target_id: String,
+    error: Option<String>,
+}
+
+impl SessionTypeFormDraft {
+    fn create_default() -> Self {
+        Self {
+            mode: SessionTypeFormMode::Create,
+            source: "device".to_string(),
+            source_target_id: String::new(),
+            session_type_id: None,
+            seed_definition: None,
+            seed_source: None,
+            id: String::new(),
+            label: String::new(),
+            description: String::new(),
+            icon: String::new(),
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: String::new(),
+            lifecycle: "task".to_string(),
+            command: String::new(),
+            args: String::new(),
+            working_directory_policy: "package_root".to_string(),
+            working_directory_path: String::new(),
+            environment: String::new(),
+            allowed_environment_overrides: String::new(),
+            context_keys: String::new(),
+            seeded_traits: None,
+            seeded_args: None,
+            seeded_context: None,
+            seeded_allowed_environment_overrides: None,
+            seeded_environment: None,
+            definition_target_id: String::new(),
+            error: None,
+        }
+    }
+
+    fn from_authoring(editable: DaemonSessionTypeEditableDefinition) -> Self {
+        let working_directory_policy;
+        let working_directory_path;
+        match &editable.definition.working_directory {
+            DaemonSessionTypeWorkingDirectory::PackageRoot => {
+                working_directory_policy = "package_root".to_string();
+                working_directory_path = String::new();
+            }
+            DaemonSessionTypeWorkingDirectory::Relative { path } => {
+                working_directory_policy = "relative".to_string();
+                working_directory_path = path.clone();
+            }
+        }
+        let (source, source_target_id) = match &editable.source {
+            DaemonSessionTypeMutationSource::Device => ("device".to_string(), String::new()),
+            DaemonSessionTypeMutationSource::Repo { target_id } => {
+                ("repo".to_string(), target_id.clone())
+            }
+            DaemonSessionTypeMutationSource::Package { package_name } => {
+                ("package".to_string(), package_name.clone())
+            }
+        };
+        let seeded_traits = editable.definition.traits.clone();
+        let seeded_args = editable.definition.args.clone();
+        let seeded_context = editable.definition.context.clone();
+        let seeded_allowed = editable.definition.allowed_environment_overrides.clone();
+        let seeded_environment = editable.definition.environment.clone();
+        Self {
+            mode: SessionTypeFormMode::Edit,
+            source,
+            source_target_id,
+            session_type_id: Some(editable.session_type_id),
+            seed_definition: Some(editable.definition.clone()),
+            seed_source: Some(editable.source),
+            id: editable.definition.id.clone(),
+            label: editable.definition.label.clone(),
+            description: editable.definition.description.clone().unwrap_or_default(),
+            icon: editable.definition.icon.clone().unwrap_or_default(),
+            role: editable.definition.role.clone(),
+            interaction: editable.definition.interaction.clone(),
+            traits: join_tokens(&seeded_traits),
+            lifecycle: editable.definition.lifecycle.clone(),
+            command: editable.definition.command.clone(),
+            args: join_tokens(&seeded_args),
+            working_directory_policy,
+            working_directory_path,
+            environment: format_environment(&seeded_environment),
+            allowed_environment_overrides: join_tokens(&seeded_allowed),
+            context_keys: join_tokens(&seeded_context),
+            seeded_traits: Some(seeded_traits),
+            seeded_args: Some(seeded_args),
+            seeded_context: Some(seeded_context),
+            seeded_allowed_environment_overrides: Some(seeded_allowed),
+            seeded_environment: Some(seeded_environment),
+            definition_target_id: editable.definition.target_id.clone().unwrap_or_default(),
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TargetFirstSpawnStep {
+    PickTarget,
+    PickSessionType {
+        target_id: String,
+        target_label: String,
+    },
+    Prompt {
+        target_id: String,
+        target_label: String,
+        session_type_id: String,
+        prompt: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetFirstSpawnFlow {
+    step: TargetFirstSpawnStep,
+}
+
+/// One pickable launch target: admitted spawn targets plus synthetic ids that
+/// Hub publishes on session types (device:local, package:<name>).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaunchTargetOption {
+    target_id: String,
+    label: String,
+}
+
+fn join_tokens(values: &[String]) -> String {
+    values.join(", ")
+}
+
+fn parse_token_list(input: &str, seeded: Option<&Vec<String>>) -> Vec<String> {
+    let trimmed = input.trim();
+    // Empty means the user cleared the field. Untouched fields keep the seeded
+    // rendering (join_tokens(seed) == trimmed) so wholesale update stays lossless.
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Some(seeded) = seeded
+        && join_tokens(seeded) == trimmed
+    {
+        return seeded.clone();
+    }
+    trimmed
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_environment(environment: &BTreeMap<String, String>) -> String {
+    environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_environment(
+    input: &str,
+    seeded: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return BTreeMap::new();
+    }
+    if let Some(seeded) = seeded
+        && format_environment(seeded) == trimmed
+    {
+        return seeded.clone();
+    }
+    let mut map = BTreeMap::new();
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.trim().to_string(), value.to_string());
+        }
+    }
+    map
+}
+
+fn definition_from_session_type_form(form: &SessionTypeFormDraft) -> DaemonSessionTypeDefinition {
+    let working_directory = if form.working_directory_policy == "relative" {
+        DaemonSessionTypeWorkingDirectory::Relative {
+            path: form.working_directory_path.trim().to_string(),
+        }
+    } else {
+        DaemonSessionTypeWorkingDirectory::PackageRoot
+    };
+    let description = form.description.trim();
+    let icon = form.icon.trim();
+    let definition_target_id = form.definition_target_id.trim();
+    DaemonSessionTypeDefinition {
+        id: form.id.trim().to_string(),
+        label: form.label.trim().to_string(),
+        description: if description.is_empty() {
+            None
+        } else {
+            Some(description.to_string())
+        },
+        icon: if icon.is_empty() {
+            None
+        } else {
+            Some(icon.to_string())
+        },
+        role: form.role.trim().to_string(),
+        interaction: form.interaction.trim().to_string(),
+        traits: parse_token_list(&form.traits, form.seeded_traits.as_ref()),
+        lifecycle: form.lifecycle.trim().to_string(),
+        command: form.command.trim().to_string(),
+        args: parse_token_list(&form.args, form.seeded_args.as_ref()),
+        working_directory,
+        environment: parse_environment(&form.environment, form.seeded_environment.as_ref()),
+        allowed_environment_overrides: parse_token_list(
+            &form.allowed_environment_overrides,
+            form.seeded_allowed_environment_overrides.as_ref(),
+        ),
+        context: parse_token_list(&form.context_keys, form.seeded_context.as_ref()),
+        target_id: if definition_target_id.is_empty() {
+            None
+        } else {
+            Some(definition_target_id.to_string())
+        },
+    }
+}
+
+fn mutation_source_from_form(
+    form: &SessionTypeFormDraft,
+) -> Result<DaemonSessionTypeMutationSource, String> {
+    match form.source.as_str() {
+        "device" => Ok(DaemonSessionTypeMutationSource::Device),
+        "repo" => {
+            let target_id = form.source_target_id.trim();
+            if target_id.is_empty() {
+                return Err("repo session types require a spawn target".to_string());
+            }
+            Ok(DaemonSessionTypeMutationSource::Repo {
+                target_id: target_id.to_string(),
+            })
+        }
+        other => Err(format!(
+            "unsupported session type source for mutation: {other}"
+        )),
     }
 }
 
@@ -804,6 +1256,14 @@ struct TuiApp {
     session_entities: SessionEntityState,
     pending_sessions: BTreeMap<String, SessionRow>,
     session_subscription: Option<SessionSubscriptionPump>,
+    session_type_entities: SessionTypeEntityState,
+    session_type_subscription: Option<SessionSubscriptionPump>,
+    session_type_subscription_error: Option<String>,
+    session_types_supported: bool,
+    spawn_targets: Vec<DaemonSpawnTarget>,
+    selected_session_type_id: Option<String>,
+    session_type_form: Option<SessionTypeFormDraft>,
+    target_first_spawn: Option<TargetFirstSpawnFlow>,
     sessions: Vec<SessionRow>,
     selected_session: Option<String>,
     attached_session: Option<String>,
@@ -818,7 +1278,6 @@ struct TuiApp {
     terminal_mouse_mode_attachment: Option<(String, String)>,
     terminal_mouse_mode_refresh_due: bool,
     last_terminal_mouse_mode_probe: Option<Instant>,
-    command: String,
     drafts: BTreeMap<String, Value>,
     system_details_visible: bool,
     package_storage_context_configured: bool,
@@ -874,6 +1333,14 @@ impl TuiApp {
             session_entities: SessionEntityState::default(),
             pending_sessions: BTreeMap::new(),
             session_subscription: None,
+            session_type_entities: SessionTypeEntityState::default(),
+            session_type_subscription: None,
+            session_type_subscription_error: None,
+            session_types_supported: true,
+            spawn_targets: Vec::new(),
+            selected_session_type_id: None,
+            session_type_form: None,
+            target_first_spawn: None,
             sessions: Vec::new(),
             selected_session: None,
             attached_session: None,
@@ -888,7 +1355,6 @@ impl TuiApp {
             terminal_mouse_mode_attachment: None,
             terminal_mouse_mode_refresh_due: false,
             last_terminal_mouse_mode_probe: None,
-            command: DEFAULT_COMMAND.to_string(),
             drafts: BTreeMap::new(),
             system_details_visible: false,
             package_storage_context_configured,
@@ -923,6 +1389,9 @@ impl TuiApp {
 
     fn poll_hub(&mut self) {
         if self.drain_session_subscription() {
+            return;
+        }
+        if self.drain_session_type_subscription() {
             return;
         }
         if self.client.is_none() {
@@ -1105,15 +1574,14 @@ impl TuiApp {
         values: Option<UiFormValues>,
         payload: Option<Value>,
     ) {
-        if let Some(values) = values.as_ref()
-            && let Some(value) = values.0.get("command").and_then(Value::as_str)
-        {
-            self.command = value.to_string();
+        if let Some(values) = values.as_ref() {
+            self.apply_session_type_form_values(values);
+            self.apply_spawn_flow_values(values);
         }
 
         match action_id.as_str() {
             "botster.tui.connect" => self.force_reconnect(),
-            "botster.tui.spawn" => self.spawn_session(),
+            "botster.tui.spawn" => self.begin_target_first_spawn(),
             "botster.tui.attach" => {
                 if let Some(session_id) = payload
                     .as_ref()
@@ -1277,6 +1745,66 @@ impl TuiApp {
                 }
             }
             // The input router already focuses the terminal. Attachment is an
+            "botster.tui.session_type.select" => {
+                if let Some(session_type_id) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("session_type_id"))
+                    .and_then(Value::as_str)
+                {
+                    self.selected_session_type_id = Some(session_type_id.to_string());
+                }
+            }
+            "botster.tui.session_type.create" => {
+                self.session_type_form = Some(SessionTypeFormDraft::create_default());
+            }
+            "botster.tui.session_type.edit" => {
+                if let Some(session_type_id) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("session_type_id"))
+                    .and_then(Value::as_str)
+                {
+                    self.open_session_type_edit(session_type_id);
+                }
+            }
+            "botster.tui.session_type.delete" => {
+                if let Some(session_type_id) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("session_type_id"))
+                    .and_then(Value::as_str)
+                {
+                    self.delete_session_type(session_type_id);
+                }
+            }
+            "botster.tui.session_type.form.cancel" => {
+                self.session_type_form = None;
+            }
+            "botster.tui.session_type.form.submit" => {
+                self.submit_session_type_form();
+            }
+            "botster.tui.spawn.cancel" => {
+                self.target_first_spawn = None;
+            }
+            "botster.tui.spawn.pick_target" => {
+                if let Some(target_id) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("target_id"))
+                    .and_then(Value::as_str)
+                {
+                    self.spawn_pick_target(target_id);
+                }
+            }
+            "botster.tui.spawn.pick_session_type" => {
+                if let Some(session_type_id) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("session_type_id"))
+                    .and_then(Value::as_str)
+                {
+                    self.spawn_pick_session_type(session_type_id);
+                }
+            }
+            "botster.tui.spawn.submit" => {
+                self.submit_target_first_spawn();
+            }
             // explicit session activation and must not be a terminal side effect.
             "botster.terminal.focus" => {}
             _ => {}
@@ -1299,6 +1827,9 @@ impl TuiApp {
         self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
             self.error = Some("session subscription cleanup timed out".to_string());
+        }
+        if !self.invalidate_session_type_generation() {
+            self.error = Some("session type subscription cleanup timed out".to_string());
         }
         self.attached_session = None;
         self.attached_subscription_id = None;
@@ -1325,6 +1856,7 @@ impl TuiApp {
                 if let Err(error) = self.start_session_subscription() {
                     self.record_transport_error(error);
                 }
+                self.start_session_type_subscription_if_supported();
             }
             Err(error) => {
                 self.record_transport_error(error);
@@ -1337,6 +1869,11 @@ impl TuiApp {
         self.refresh_apps();
         self.refresh_package_navigation();
         self.refresh_packages();
+        self.refresh_spawn_targets();
+    }
+
+    fn refresh_spawn_targets(&mut self) {
+        self.request_and_apply(DaemonRequest::ListSpawnTargets);
     }
 
     fn refresh_status(&mut self) {
@@ -1505,23 +2042,185 @@ impl TuiApp {
         });
     }
 
-    fn spawn_session(&mut self) {
-        if self.command.trim().is_empty() {
-            self.error = Some("command is required".to_string());
+    fn launch_target_options(&self) -> Vec<LaunchTargetOption> {
+        let mut options: BTreeMap<String, LaunchTargetOption> = BTreeMap::new();
+        for target in &self.spawn_targets {
+            if !target.enabled {
+                continue;
+            }
+            options.insert(
+                target.target_id.clone(),
+                LaunchTargetOption {
+                    target_id: target.target_id.clone(),
+                    label: target.label.clone(),
+                },
+            );
+        }
+        for entity in self.session_type_entities.ordered() {
+            if entity.target_id.is_empty() {
+                continue;
+            }
+            options.entry(entity.target_id.clone()).or_insert_with(|| {
+                let label = if entity.target_id == "device:local"
+                    || entity.target_id.starts_with("device:")
+                {
+                    "This device".to_string()
+                } else if let Some(package_name) = entity.target_id.strip_prefix("package:") {
+                    format!("Package {package_name}")
+                } else {
+                    entity.target_id.clone()
+                };
+                LaunchTargetOption {
+                    target_id: entity.target_id.clone(),
+                    label,
+                }
+            });
+        }
+        options.into_values().collect()
+    }
+
+    fn begin_target_first_spawn(&mut self) {
+        self.error = None;
+        self.session_type_form = None;
+        if !self.session_types_supported {
+            self.error = Some(
+                "session types unavailable: hub does not provide session_type_entity_subscriptions"
+                    .to_string(),
+            );
             return;
         }
+        if self.launch_target_options().is_empty() {
+            self.error = Some(
+                "no launch targets available (no admitted spawn targets and no session types)"
+                    .to_string(),
+            );
+            return;
+        }
+        self.target_first_spawn = Some(TargetFirstSpawnFlow {
+            step: TargetFirstSpawnStep::PickTarget,
+        });
+        self.action_feedback = Some("select a launch target".to_string());
+    }
+
+    fn spawn_pick_target(&mut self, target_id: &str) {
+        let Some(target) = self
+            .launch_target_options()
+            .into_iter()
+            .find(|target| target.target_id == target_id)
+        else {
+            self.error = Some(format!("launch target not found: {target_id}"));
+            return;
+        };
+        self.target_first_spawn = Some(TargetFirstSpawnFlow {
+            step: TargetFirstSpawnStep::PickSessionType {
+                target_id: target.target_id.clone(),
+                target_label: target.label.clone(),
+            },
+        });
+        self.action_feedback = Some(format!("select a session type for {}", target.label));
+    }
+
+    fn spawn_pick_session_type(&mut self, session_type_id: &str) {
+        let Some(flow) = self.target_first_spawn.as_ref() else {
+            return;
+        };
+        let TargetFirstSpawnStep::PickSessionType {
+            target_id,
+            target_label,
+        } = &flow.step
+        else {
+            return;
+        };
+        let Some(session_type) = self
+            .session_type_entities
+            .entities
+            .get(session_type_id)
+            .cloned()
+        else {
+            self.error = Some(format!("session type not found: {session_type_id}"));
+            return;
+        };
+        if !session_type.available {
+            self.error = Some(format!(
+                "session type unavailable: {}{}",
+                session_type.session_type_id,
+                if session_type.diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", session_type.diagnostics.join("; "))
+                }
+            ));
+            return;
+        }
+        let needs_prompt = session_type.context_keys.iter().any(|key| key == "prompt");
+        if needs_prompt {
+            self.target_first_spawn = Some(TargetFirstSpawnFlow {
+                step: TargetFirstSpawnStep::Prompt {
+                    target_id: target_id.clone(),
+                    target_label: target_label.clone(),
+                    session_type_id: session_type_id.to_string(),
+                    prompt: String::new(),
+                },
+            });
+            self.action_feedback = Some("enter prompt context".to_string());
+            return;
+        }
+        self.execute_spawn_session_type(
+            session_type_id,
+            DaemonSessionTypeRequest {
+                target_id: Some(target_id.clone()),
+                ..DaemonSessionTypeRequest::default()
+            },
+        );
+    }
+
+    fn submit_target_first_spawn(&mut self) {
+        let Some(flow) = self.target_first_spawn.clone() else {
+            return;
+        };
+        match flow.step {
+            TargetFirstSpawnStep::Prompt {
+                target_id,
+                session_type_id,
+                prompt,
+                ..
+            } => {
+                let mut request = DaemonSessionTypeRequest {
+                    target_id: Some(target_id.clone()),
+                    ..DaemonSessionTypeRequest::default()
+                };
+                if !prompt.trim().is_empty() {
+                    request.context.prompt = Some(prompt.trim().to_string());
+                }
+                self.execute_spawn_session_type(&session_type_id, request);
+            }
+            _ => {
+                self.error = Some("spawn form is incomplete".to_string());
+            }
+        }
+    }
+
+    fn execute_spawn_session_type(
+        &mut self,
+        session_type_id: &str,
+        request: DaemonSessionTypeRequest,
+    ) {
         self.error = None;
+        self.target_first_spawn = None;
         let session_id = format!("btui-{}", short_suffix());
-        let command = self.command.clone();
         self.pending_sessions
             .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
         self.selected_session = Some(session_id.clone());
         self.rebuild_session_rows();
-        self.action_feedback = Some(format!("spawn pending: {session_id}"));
-        match self.request(DaemonRequest::Spawn {
+        self.action_feedback = Some(format!("spawn pending: {session_id} via {session_type_id}"));
+        let spawn_request = DaemonRequest::SpawnSessionType {
+            session_type_id: session_type_id.to_string(),
             session_id: session_id.clone(),
-            command,
-        }) {
+            request,
+        };
+        #[cfg(test)]
+        self.record_request(&spawn_request);
+        match self.request(spawn_request) {
             Ok(response) => {
                 let failed = response.error.is_some();
                 self.apply_response(response);
@@ -1541,6 +2240,380 @@ impl TuiApp {
             self.action_feedback = Some(format!(
                 "spawn accepted: {session_id}; waiting for authoritative session"
             ));
+        }
+    }
+
+    /// Test/live-harness helper: write a device-root shell script and CreateSessionType.
+    ///
+    /// Not a product path — production headless-live-runtime uses freeform Spawn for
+    /// smoke only; product launch is SpawnSessionType via the toolbar dialog.
+    #[cfg(test)]
+    fn ensure_headless_shell_session_type(
+        &mut self,
+        hub_data_dir: &std::path::Path,
+        script_body: &str,
+    ) -> Result<String, String> {
+        let id = format!("btui-shell-{}", short_suffix() % 1_000_000);
+        let script_name = format!("{id}.sh");
+        let source_root = hub_data_dir.join("session-types");
+        std::fs::create_dir_all(&source_root).map_err(|error| error.to_string())?;
+        let script_path = source_root.join(&script_name);
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh
+{script_body}
+"
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script_path)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script_path, permissions)
+                .map_err(|error| error.to_string())?;
+        }
+        let definition = DaemonSessionTypeDefinition {
+            id: id.clone(),
+            label: "Botster TUI headless shell".to_string(),
+            description: None,
+            icon: None,
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: Vec::new(),
+            lifecycle: "task".to_string(),
+            command: script_name,
+            args: Vec::new(),
+            working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+            environment: BTreeMap::new(),
+            allowed_environment_overrides: Vec::new(),
+            context: Vec::new(),
+            target_id: None,
+        };
+        match self.request(DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition,
+        }) {
+            Ok(response) => {
+                let failed = response.error.clone();
+                self.apply_response(response);
+                if let Some(error) = failed {
+                    return Err(error.message);
+                }
+            }
+            Err(error) => {
+                self.record_transport_error(error);
+                return Err("create session type transport failed".to_string());
+            }
+        }
+        Ok(format!("device/{id}"))
+    }
+
+    fn session_types_supported_from_compatibility(
+        compatibility: Option<&DaemonCompatibility>,
+    ) -> bool {
+        // Permissive only before Hub status arrives (web parity).
+        let Some(compatibility) = compatibility else {
+            return true;
+        };
+        compatibility.supports_feature(FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
+    }
+
+    fn start_session_type_subscription_if_supported(&mut self) {
+        self.session_types_supported =
+            Self::session_types_supported_from_compatibility(self.compatibility.as_ref());
+        if !self.session_types_supported {
+            let _ = self.invalidate_session_type_generation();
+            self.session_type_subscription_error = None;
+            return;
+        }
+        if let Err(error) = self.start_session_type_subscription() {
+            self.session_type_subscription_error = Some(error.to_string());
+            self.error = Some(format!("session type subscription failed: {error}"));
+        }
+    }
+
+    fn start_session_type_subscription(&mut self) -> DaemonTransportResult<()> {
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or(DaemonTransportError::NotRunning)?;
+        let subscription_id = format!("btui-session-types-{}", short_suffix());
+        let mut subscription =
+            subscribe_entities(endpoint, "session_type", subscription_id.clone())?;
+        subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
+        let (sender, receiver) = mpsc::channel();
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        let reader_subscription_id = subscription_id.clone();
+
+        thread::Builder::new()
+            .name("botster-tui-session-type-entities".to_string())
+            .spawn(move || {
+                loop {
+                    if cancel_receiver.try_recv().is_ok() {
+                        let _ = subscription.unsubscribe();
+                        break;
+                    }
+                    match subscription.next_frame() {
+                        Ok(frame) => {
+                            if sender
+                                .send(SessionSubscriptionMessage::Frame(frame))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(DaemonTransportError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => {
+                            let _ = sender.send(SessionSubscriptionMessage::Disconnected {
+                                subscription_id: reader_subscription_id,
+                                error: error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                let _ = stopped_sender.send(());
+            })
+            .map_err(DaemonTransportError::Io)?;
+        self.session_type_entities.begin_generation(subscription_id);
+        self.session_type_subscription = Some(SessionSubscriptionPump {
+            messages: receiver,
+            cancel: Some(cancel_sender),
+            stopped: stopped_receiver,
+            stop_attempted: false,
+            stopped_confirmed: false,
+        });
+        self.session_type_subscription_error = None;
+        Ok(())
+    }
+
+    fn drain_session_type_subscription(&mut self) -> bool {
+        let messages = self
+            .session_type_subscription
+            .as_ref()
+            .map(|pump| pump.messages.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                SessionSubscriptionMessage::Frame(frame) => {
+                    match self.session_type_entities.apply(frame) {
+                        Ok(true) => {
+                            if self.selected_session_type_id.as_ref().is_some_and(|id| {
+                                !self.session_type_entities.entities.contains_key(id)
+                            }) {
+                                self.selected_session_type_id = None;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.session_type_subscription_error = Some(error.clone());
+                            self.error = Some(format!("session type sync: {error}"));
+                        }
+                    }
+                }
+                SessionSubscriptionMessage::Disconnected {
+                    subscription_id,
+                    error,
+                } if self.session_type_entities.subscription_id.as_deref()
+                    == Some(subscription_id.as_str()) =>
+                {
+                    if !self.invalidate_session_type_generation() {
+                        self.error =
+                            Some("session type subscription cleanup timed out".to_string());
+                    }
+                    self.session_type_subscription_error = Some(error);
+                    return true;
+                }
+                SessionSubscriptionMessage::Disconnected { .. } => {}
+            }
+        }
+        false
+    }
+
+    fn invalidate_session_type_generation(&mut self) -> bool {
+        let stopped = self
+            .session_type_subscription
+            .take()
+            .is_none_or(|mut pump| pump.stop());
+        self.session_type_entities = SessionTypeEntityState::default();
+        self.session_type_subscription_error = None;
+        stopped
+    }
+
+    fn open_session_type_edit(&mut self, session_type_id: &str) {
+        self.error = None;
+        self.action_feedback = Some(format!("loading authoring definition: {session_type_id}"));
+        match self.request(DaemonRequest::ShowSessionTypeDefinition {
+            session_type_id: session_type_id.to_string(),
+        }) {
+            Ok(response) => {
+                if let Some(error) = response.error.clone() {
+                    self.apply_response(response);
+                    self.error = Some(format!("{}: {}", error.code, error.message));
+                    return;
+                }
+                let definition = response.session_type_definition.clone();
+                self.apply_response(response);
+                match definition {
+                    Some(editable) => {
+                        self.session_type_form =
+                            Some(SessionTypeFormDraft::from_authoring(editable));
+                        self.action_feedback = Some(format!("edit ready: {session_type_id}"));
+                    }
+                    None => {
+                        self.error =
+                            Some("show_session_type_definition returned no definition".to_string());
+                    }
+                }
+            }
+            Err(error) => self.record_transport_error(error),
+        }
+    }
+
+    fn delete_session_type(&mut self, session_type_id: &str) {
+        let Some(entity) = self
+            .session_type_entities
+            .entities
+            .get(session_type_id)
+            .cloned()
+        else {
+            self.error = Some(format!("session type not found: {session_type_id}"));
+            return;
+        };
+        if !entity.editable {
+            self.error = Some(format!("session type is not editable: {session_type_id}"));
+            return;
+        }
+        // Prefer source_name (owning source) over target_id (eligibility stamp),
+        // matching Hub show_session_type_definition mutation source construction.
+        let source = match entity.source.as_str() {
+            "device" => DaemonSessionTypeMutationSource::Device,
+            "repo" => DaemonSessionTypeMutationSource::Repo {
+                target_id: if !entity.source_name.is_empty() {
+                    entity.source_name.clone()
+                } else {
+                    entity.target_id.clone()
+                },
+            },
+            other => {
+                self.error = Some(format!("cannot delete session type source: {other}"));
+                return;
+            }
+        };
+        self.action_feedback = Some(format!("delete requested: {session_type_id}"));
+        self.request_and_apply(DaemonRequest::DeleteSessionType {
+            source,
+            session_type_id: entity.id.clone(),
+        });
+    }
+
+    fn submit_session_type_form(&mut self) {
+        let Some(form) = self.session_type_form.clone() else {
+            return;
+        };
+        if form.id.trim().is_empty()
+            || form.label.trim().is_empty()
+            || form.role.trim().is_empty()
+            || form.interaction.trim().is_empty()
+            || form.lifecycle.trim().is_empty()
+            || form.command.trim().is_empty()
+        {
+            if let Some(form) = self.session_type_form.as_mut() {
+                form.error = Some(
+                    "id, label, role, interaction, lifecycle, and command are required".to_string(),
+                );
+            }
+            return;
+        }
+        let source = match mutation_source_from_form(&form) {
+            Ok(source) => source,
+            Err(error) => {
+                if let Some(form) = self.session_type_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return;
+            }
+        };
+        let definition = definition_from_session_type_form(&form);
+        let request = match form.mode {
+            SessionTypeFormMode::Create => DaemonRequest::CreateSessionType { source, definition },
+            SessionTypeFormMode::Edit => DaemonRequest::UpdateSessionType { source, definition },
+        };
+        self.action_feedback = Some(match form.mode {
+            SessionTypeFormMode::Create => "create session type requested".to_string(),
+            SessionTypeFormMode::Edit => "update session type requested".to_string(),
+        });
+        match self.request(request) {
+            Ok(response) => {
+                if let Some(error) = response.error.clone() {
+                    self.apply_response(response);
+                    if let Some(form) = self.session_type_form.as_mut() {
+                        form.error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                } else {
+                    self.apply_response(response);
+                    self.session_type_form = None;
+                }
+            }
+            Err(error) => self.record_transport_error(error),
+        }
+    }
+
+    fn apply_session_type_form_values(&mut self, values: &UiFormValues) {
+        let Some(form) = self.session_type_form.as_mut() else {
+            return;
+        };
+        let set = |key: &str, target: &mut String| {
+            if let Some(value) = values.0.get(key).and_then(Value::as_str) {
+                *target = value.to_string();
+            }
+        };
+        set("session_type_source", &mut form.source);
+        set("session_type_source_target_id", &mut form.source_target_id);
+        set("session_type_id", &mut form.id);
+        set("session_type_label", &mut form.label);
+        set("session_type_description", &mut form.description);
+        set("session_type_icon", &mut form.icon);
+        set("session_type_role", &mut form.role);
+        set("session_type_interaction", &mut form.interaction);
+        set("session_type_traits", &mut form.traits);
+        set("session_type_lifecycle", &mut form.lifecycle);
+        set("session_type_command", &mut form.command);
+        set("session_type_args", &mut form.args);
+        set(
+            "session_type_working_directory_policy",
+            &mut form.working_directory_policy,
+        );
+        set(
+            "session_type_working_directory_path",
+            &mut form.working_directory_path,
+        );
+        set("session_type_environment", &mut form.environment);
+        set(
+            "session_type_allowed_environment_overrides",
+            &mut form.allowed_environment_overrides,
+        );
+        set("session_type_context_keys", &mut form.context_keys);
+    }
+
+    fn apply_spawn_flow_values(&mut self, values: &UiFormValues) {
+        let Some(flow) = self.target_first_spawn.as_mut() else {
+            return;
+        };
+        if let TargetFirstSpawnStep::Prompt { prompt, .. } = &mut flow.step
+            && let Some(value) = values.0.get("spawn_prompt").and_then(Value::as_str)
+        {
+            *prompt = value.to_string();
         }
     }
 
@@ -1828,6 +2901,46 @@ impl TuiApp {
                     data: data.clone(),
                 })
             }
+            DaemonRequest::ListSpawnTargets => self
+                .observed_requests
+                .push(ObservedRequest::ListSpawnTargets),
+            DaemonRequest::ShowSessionTypeDefinition { session_type_id } => self
+                .observed_requests
+                .push(ObservedRequest::ShowSessionTypeDefinition(
+                    session_type_id.clone(),
+                )),
+            DaemonRequest::CreateSessionType { .. } => self
+                .observed_requests
+                .push(ObservedRequest::CreateSessionType),
+            DaemonRequest::UpdateSessionType { .. } => self
+                .observed_requests
+                .push(ObservedRequest::UpdateSessionType),
+            DaemonRequest::DeleteSessionType {
+                source,
+                session_type_id,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::DeleteSessionType {
+                    source: source.clone(),
+                    session_type_id: session_type_id.clone(),
+                }),
+            DaemonRequest::SpawnSessionType {
+                session_type_id,
+                session_id,
+                ..
+            } => self
+                .observed_requests
+                .push(ObservedRequest::SpawnSessionType {
+                    session_type_id: session_type_id.clone(),
+                    session_id: session_id.clone(),
+                }),
+            DaemonRequest::Spawn {
+                session_id,
+                command,
+            } => self.observed_requests.push(ObservedRequest::Spawn {
+                session_id: session_id.clone(),
+                command: command.clone(),
+            }),
             _ => {}
         }
     }
@@ -1837,6 +2950,9 @@ impl TuiApp {
         self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
             self.error = Some("session subscription cleanup timed out".to_string());
+        }
+        if !self.invalidate_session_type_generation() {
+            self.error = Some("session type subscription cleanup timed out".to_string());
         }
         self.attached_session = None;
         self.attached_subscription_id = None;
@@ -1917,6 +3033,18 @@ impl TuiApp {
             self.status = format!("connected ({})", status.lifecycle_state);
             self.package_count = status.package_count;
             self.enabled_package_count = status.enabled_package_count;
+            let supported =
+                Self::session_types_supported_from_compatibility(self.compatibility.as_ref());
+            if supported != self.session_types_supported {
+                self.session_types_supported = supported;
+                if supported {
+                    if self.session_type_subscription.is_none() {
+                        self.start_session_type_subscription_if_supported();
+                    }
+                } else {
+                    let _ = self.invalidate_session_type_generation();
+                }
+            }
         }
 
         if matches!(
@@ -1930,6 +3058,9 @@ impl TuiApp {
         }
         if matches!(response.kind, DaemonResponseKind::PackageNavigation) {
             self.package_navigation = response.package_navigation;
+        }
+        if matches!(response.kind, DaemonResponseKind::SpawnTargets) {
+            self.spawn_targets = response.spawn_targets;
         }
         if matches!(response.kind, DaemonResponseKind::AvailablePackages) {
             self.available_packages = response.available_packages;
@@ -2282,6 +3413,16 @@ impl TuiApp {
             return root;
         }
 
+        if self.target_first_spawn.is_some() {
+            let root = self.target_first_spawn_dialog();
+            root.validate()
+                .expect("target-first spawn UiNode should satisfy the core UI contract");
+            renderer::tui_capabilities()
+                .validate_node(&root)
+                .expect("target-first spawn UiNode should fit TUI renderer capabilities");
+            return root;
+        }
+
         if self.plugin_surface.is_some() {
             let root = self.plugin_shell_surface();
             root.validate()
@@ -2329,6 +3470,7 @@ impl TuiApp {
 
     fn uses_workspace_shell(&self) -> bool {
         if self.confirmation.is_some()
+            || self.target_first_spawn.is_some()
             || self.plugin_surface.is_some()
             || self.system_details_visible
         {
@@ -2609,6 +3751,24 @@ impl TuiApp {
             session.lifecycle.as_str()
         };
         let mut label = format!("{} · {state}", session.session_id);
+        if let Some(session_type_id) = &session.session_type_id {
+            label.push_str(&format!(" · type={session_type_id}"));
+        }
+        if let Some(source) = &session.session_type_source {
+            label.push_str(&format!(" · source={source}"));
+        }
+        if let Some(role) = &session.role {
+            label.push_str(&format!(" · role={role}"));
+        }
+        if let Some(interaction) = &session.interaction {
+            label.push_str(&format!(" · interaction={interaction}"));
+        }
+        if !session.traits.is_empty() {
+            label.push_str(&format!(" · traits={}", session.traits.join(",")));
+        }
+        if let Some(lifecycle) = &session.session_type_lifecycle {
+            label.push_str(&format!(" · type_lifecycle={lifecycle}"));
+        }
         if let Some(reason) = &session.failure_reason {
             label.push_str(&format!(" · {reason}"));
         }
@@ -2758,7 +3918,7 @@ impl TuiApp {
                 json!({}),
             )),
         ];
-        children.push(child(self.command_form()));
+        children.extend(self.session_types_section_nodes().into_iter().map(child));
         if let Some(error) = &self.connection_error {
             children.push(child(node(
                 UiNodeKind::Text,
@@ -3238,31 +4398,417 @@ impl TuiApp {
         }
     }
 
-    fn command_form(&self) -> UiNode {
-        let command = self
-            .drafts
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.command);
-        let mut form = node(UiNodeKind::Inline, "tui-command-panel", json!({}));
-        form.children = vec![
-            child(node(
-                UiNodeKind::TextInput,
-                "tui-command",
+    fn session_types_section_nodes(&self) -> Vec<UiNode> {
+        let mut nodes = vec![node(
+            UiNodeKind::Text,
+            "tui-session-types-heading",
+            json!({ "text": "Session types" }),
+        )];
+        if !self.session_types_supported {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "tui-session-types-unsupported",
                 json!({
-                    "name": "command",
-                    "label": "command",
-                    "value": command
+                    "text": "This hub does not provide session_type_entity_subscriptions."
                 }),
-            )),
-            child(button(
-                "workspace-command-spawn",
-                "Spawn",
-                "botster.tui.spawn",
-                json!({}),
-            )),
+            ));
+            return nodes;
+        }
+        if let Some(error) = &self.session_type_subscription_error {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "tui-session-types-subscription-error",
+                json!({ "text": format!("session type subscription: {error}") }),
+            ));
+        }
+        nodes.push(button(
+            "tui-session-type-create",
+            "Add session type",
+            "botster.tui.session_type.create",
+            json!({}),
+        ));
+        if let Some(form) = &self.session_type_form {
+            nodes.extend(self.session_type_form_nodes(form));
+        }
+        let mut by_source: BTreeMap<String, Vec<&DaemonSessionType>> = BTreeMap::new();
+        for entity in self.session_type_entities.ordered() {
+            by_source
+                .entry(entity.source.clone())
+                .or_default()
+                .push(entity);
+        }
+        if by_source.is_empty() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "tui-session-types-empty",
+                json!({ "text": "session types: none reported" }),
+            ));
+        } else {
+            for (source, rows) in by_source {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    &format!("tui-session-type-source-{source}"),
+                    json!({ "text": format!("source: {source}") }),
+                ));
+                for entity in rows {
+                    nodes.extend(self.session_type_row_nodes(entity));
+                }
+            }
+        }
+        if let Some(selected_id) = &self.selected_session_type_id
+            && let Some(entity) = self.session_type_entities.entities.get(selected_id)
+        {
+            nodes.push(self.session_type_detail_node(entity));
+        }
+        nodes
+    }
+
+    fn session_type_row_nodes(&self, entity: &DaemonSessionType) -> Vec<UiNode> {
+        let selected =
+            self.selected_session_type_id.as_deref() == Some(entity.session_type_id.as_str());
+        let availability = if entity.available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        let editable = if entity.editable {
+            "editable"
+        } else {
+            "read-only"
+        };
+        let mut label = format!(
+            "{} · {} · {} · {} · {availability} · {editable}",
+            entity.label, entity.role, entity.interaction, entity.lifecycle
+        );
+        if !entity.traits.is_empty() {
+            label.push_str(&format!(" · traits={}", entity.traits.join(",")));
+        }
+        if !entity.diagnostics.is_empty() {
+            label.push_str(&format!(" · {}", entity.diagnostics.join("; ")));
+        }
+        let mut nodes = vec![
+            node(
+                UiNodeKind::Text,
+                &format!("tui-session-type-{}-label", entity.session_type_id),
+                json!({ "text": label }),
+            ),
+            button(
+                &format!("tui-session-type-{}", entity.session_type_id),
+                "Select",
+                "botster.tui.session_type.select",
+                json!({ "session_type_id": entity.session_type_id, "selected": selected }),
+            ),
         ];
-        form
+        if entity.editable {
+            nodes.push(button(
+                &format!("tui-session-type-{}-edit", entity.session_type_id),
+                "Edit",
+                "botster.tui.session_type.edit",
+                json!({ "session_type_id": entity.session_type_id }),
+            ));
+            nodes.push(button(
+                &format!("tui-session-type-{}-delete", entity.session_type_id),
+                "Delete",
+                "botster.tui.session_type.delete",
+                json!({ "session_type_id": entity.session_type_id }),
+            ));
+        }
+        nodes
+    }
+
+    fn session_type_detail_node(&self, entity: &DaemonSessionType) -> UiNode {
+        let mut detail = node(
+            UiNodeKind::Stack,
+            "tui-session-type-detail",
+            json!({ "direction": "vertical" }),
+        );
+        let override_chain = entity
+            .overridden_sources
+            .iter()
+            .map(|source| format!("{}:{}", source.kind, source.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let lines = [
+            format!("session_type_id: {}", entity.session_type_id),
+            format!("id: {}", entity.id),
+            format!("source: {} ({})", entity.source, entity.source_name),
+            format!("command: {} {:?}", entity.command, entity.args),
+            format!(
+                "working_directory_policy: {}",
+                entity.working_directory_policy
+            ),
+            format!(
+                "allowed_environment_overrides: {}",
+                entity.allowed_environment_overrides.join(", ")
+            ),
+            format!("context_keys: {}", entity.context_keys.join(", ")),
+            format!("target_id: {}", entity.target_id),
+            format!("override_chain: {override_chain}"),
+            format!("role: {}", entity.role),
+            format!("interaction: {}", entity.interaction),
+            format!("traits: {}", entity.traits.join(", ")),
+            format!("lifecycle: {}", entity.lifecycle),
+        ];
+        detail.children = lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                child(node(
+                    UiNodeKind::Text,
+                    &format!("tui-session-type-detail-{index}"),
+                    json!({ "text": text }),
+                ))
+            })
+            .collect();
+        detail
+    }
+
+    fn session_type_form_nodes(&self, form: &SessionTypeFormDraft) -> Vec<UiNode> {
+        let title = match form.mode {
+            SessionTypeFormMode::Create => "Create session type",
+            SessionTypeFormMode::Edit => "Edit session type",
+        };
+        let mut nodes = vec![node(
+            UiNodeKind::Text,
+            "tui-session-type-form-title",
+            json!({ "text": title }),
+        )];
+        if let Some(error) = &form.error {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "tui-session-type-form-error",
+                json!({ "text": format!("form error: {error}") }),
+            ));
+        }
+        let fields = [
+            ("session_type_source", "source", form.source.as_str()),
+            (
+                "session_type_source_target_id",
+                "source target id",
+                form.source_target_id.as_str(),
+            ),
+            ("session_type_id", "id", form.id.as_str()),
+            ("session_type_label", "label", form.label.as_str()),
+            (
+                "session_type_description",
+                "description",
+                form.description.as_str(),
+            ),
+            ("session_type_role", "role", form.role.as_str()),
+            (
+                "session_type_interaction",
+                "interaction",
+                form.interaction.as_str(),
+            ),
+            ("session_type_traits", "traits", form.traits.as_str()),
+            (
+                "session_type_lifecycle",
+                "lifecycle",
+                form.lifecycle.as_str(),
+            ),
+            ("session_type_command", "command", form.command.as_str()),
+            ("session_type_args", "args", form.args.as_str()),
+            (
+                "session_type_working_directory_policy",
+                "working directory policy",
+                form.working_directory_policy.as_str(),
+            ),
+            (
+                "session_type_working_directory_path",
+                "working directory path",
+                form.working_directory_path.as_str(),
+            ),
+            (
+                "session_type_environment",
+                "environment",
+                form.environment.as_str(),
+            ),
+            (
+                "session_type_allowed_environment_overrides",
+                "allowed environment overrides",
+                form.allowed_environment_overrides.as_str(),
+            ),
+            (
+                "session_type_context_keys",
+                "context keys",
+                form.context_keys.as_str(),
+            ),
+        ];
+        for (name, label, value) in fields {
+            let displayed = self
+                .drafts
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or(value);
+            // Render label+value as text so System details always shows the draft,
+            // plus a TextInput for keyboard editing.
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("tui-session-type-field-text-{name}"),
+                json!({ "text": format!("{label}: {displayed}") }),
+            ));
+            nodes.push(node(
+                UiNodeKind::TextInput,
+                &format!("tui-session-type-field-{name}"),
+                json!({
+                    "name": name,
+                    "label": label,
+                    "value": displayed
+                }),
+            ));
+        }
+        nodes.push(button(
+            "tui-session-type-form-cancel",
+            "Cancel",
+            "botster.tui.session_type.form.cancel",
+            json!({}),
+        ));
+        nodes.push(button(
+            "tui-session-type-form-submit",
+            "Save",
+            "botster.tui.session_type.form.submit",
+            json!({}),
+        ));
+        nodes
+    }
+
+    fn target_first_spawn_nodes(&self, flow: &TargetFirstSpawnFlow) -> Vec<UiNode> {
+        let mut nodes = vec![node(
+            UiNodeKind::Text,
+            "tui-target-first-spawn-title",
+            json!({ "text": "Target-first spawn" }),
+        )];
+        match &flow.step {
+            TargetFirstSpawnStep::PickTarget => {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    "tui-target-first-spawn-help",
+                    json!({ "text": "Select a launch target first" }),
+                ));
+                for target in self.launch_target_options() {
+                    nodes.push(button(
+                        &format!("tui-spawn-target-{}", target.target_id),
+                        &format!("{} ({})", target.label, target.target_id),
+                        "botster.tui.spawn.pick_target",
+                        json!({ "target_id": target.target_id }),
+                    ));
+                }
+            }
+            TargetFirstSpawnStep::PickSessionType {
+                target_id,
+                target_label,
+            } => {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    "tui-target-first-spawn-target",
+                    json!({ "text": format!("Target: {target_label} ({target_id})") }),
+                ));
+                let mut matched = false;
+                for entity in self.session_type_entities.ordered() {
+                    if entity.target_id != *target_id {
+                        continue;
+                    }
+                    matched = true;
+                    let label = if entity.available {
+                        format!("{} · {}", entity.label, entity.session_type_id)
+                    } else {
+                        format!(
+                            "{} · {} · unavailable · {}",
+                            entity.label,
+                            entity.session_type_id,
+                            entity.diagnostics.join("; ")
+                        )
+                    };
+                    if entity.available {
+                        nodes.push(button(
+                            &format!("tui-spawn-session-type-{}", entity.session_type_id),
+                            &label,
+                            "botster.tui.spawn.pick_session_type",
+                            json!({ "session_type_id": entity.session_type_id }),
+                        ));
+                    } else {
+                        // Keep unavailable types visible without inventing a disabled Button prop.
+                        nodes.push(node(
+                            UiNodeKind::Text,
+                            &format!("tui-spawn-session-type-{}", entity.session_type_id),
+                            json!({ "text": label }),
+                        ));
+                    }
+                }
+                if !matched {
+                    nodes.push(node(
+                        UiNodeKind::Text,
+                        "tui-target-first-spawn-empty",
+                        json!({ "text": "No session types for this target" }),
+                    ));
+                }
+            }
+            TargetFirstSpawnStep::Prompt {
+                target_label,
+                session_type_id,
+                prompt,
+                ..
+            } => {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    "tui-target-first-spawn-prompt-meta",
+                    json!({
+                        "text": format!("Target {target_label} · type {session_type_id}")
+                    }),
+                ));
+                let displayed_prompt = self
+                    .drafts
+                    .get("spawn_prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or(prompt);
+                nodes.push(node(
+                    UiNodeKind::TextInput,
+                    "tui-spawn-prompt",
+                    json!({
+                        "name": "spawn_prompt",
+                        "label": "prompt",
+                        "value": displayed_prompt
+                    }),
+                ));
+                nodes.push(button(
+                    "tui-spawn-submit",
+                    "Start session",
+                    "botster.tui.spawn.submit",
+                    json!({}),
+                ));
+            }
+        }
+        nodes.push(button(
+            "tui-spawn-cancel",
+            "Cancel spawn",
+            "botster.tui.spawn.cancel",
+            json!({}),
+        ));
+        nodes
+    }
+
+    fn target_first_spawn_dialog(&self) -> UiNode {
+        let flow = self
+            .target_first_spawn
+            .as_ref()
+            .expect("target-first spawn dialog requires active flow");
+        let mut body = node(
+            UiNodeKind::Stack,
+            "tui-target-first-spawn-body",
+            json!({ "direction": "vertical" }),
+        );
+        body.children = self
+            .target_first_spawn_nodes(flow)
+            .into_iter()
+            .map(child)
+            .collect();
+        let mut dialog = node(
+            UiNodeKind::Dialog,
+            "tui-target-first-spawn",
+            json!({ "title": "Target-first spawn", "presentation": "auto" }),
+        );
+        dialog.slots.insert("body".to_string(), vec![child(body)]);
+        dialog
     }
 
     fn terminal_panel(&self) -> UiNode {
@@ -3388,6 +4934,22 @@ enum ObservedRequest {
     SendInput {
         session_id: String,
         data: String,
+    },
+    ListSpawnTargets,
+    ShowSessionTypeDefinition(String),
+    CreateSessionType,
+    UpdateSessionType,
+    DeleteSessionType {
+        source: DaemonSessionTypeMutationSource,
+        session_type_id: String,
+    },
+    SpawnSessionType {
+        session_type_id: String,
+        session_id: String,
+    },
+    Spawn {
+        session_id: String,
+        command: String,
     },
 }
 
@@ -4571,8 +6133,33 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     {
         app.workspace_test_mode = true;
     }
-    app.command = DEFAULT_COMMAND.to_string();
-    app.spawn_session();
+    // Harness smoke only: freeform Spawn seeds a shell session so contract-matrix /
+    // attach paths can run without writing into Hub's device session-types root.
+    // Product launch remains target-first SpawnSessionType (toolbar dialog).
+    let session_id = format!("btui-{}", short_suffix());
+    app.pending_sessions
+        .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
+    app.selected_session = Some(session_id.clone());
+    app.rebuild_session_rows();
+    app.action_feedback = Some(format!("spawn pending: {session_id}"));
+    match app.request(DaemonRequest::Spawn {
+        session_id: session_id.clone(),
+        command: DEFAULT_COMMAND.to_string(),
+    }) {
+        Ok(response) => {
+            let failed = response.error.is_some();
+            app.apply_response(response);
+            if failed {
+                app.pending_sessions.remove(&session_id);
+                app.rebuild_session_rows();
+            }
+        }
+        Err(error) => {
+            app.pending_sessions.remove(&session_id);
+            app.rebuild_session_rows();
+            app.record_transport_error(error);
+        }
+    }
     if let Some(error) = &app.error {
         eprintln!("headless-live-runtime-error: {error}");
         return Err(DaemonTransportError::Protocol(
@@ -7510,27 +9097,42 @@ mod tests {
     }
 
     #[test]
-    fn command_draft_is_rendered_before_submit() {
+    fn session_type_form_fields_render_in_system_details() {
         let mut app = TuiApp::new(None);
-        app.set_drafts(BTreeMap::from([(
-            "command".to_string(),
-            Value::String("printf draft\\n".to_string()),
-        )]));
+        app.system_details_visible = true;
+        app.session_types_supported = true;
+        let mut form = SessionTypeFormDraft::create_default();
+        form.id = "shell".to_string();
+        form.label = "Shell".to_string();
+        form.command = "printf draft".to_string();
+        app.session_type_form = Some(form);
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
-        assert!(lines.join("\n").contains("printf draft"));
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Create session type"), "{rendered}");
+        assert!(rendered.contains("printf draft"), "{rendered}");
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-session-type-form-submit")
+        );
     }
 
     #[test]
-    fn blank_command_validation_renders_visible_error_state() {
+    fn blank_target_first_spawn_validation_renders_visible_error_state() {
         let mut app = TuiApp::new(None);
-        app.command = " \t\n".to_string();
+        app.session_types_supported = true;
+        app.begin_target_first_spawn();
 
-        app.spawn_session();
-
-        assert_eq!(app.error.as_deref(), Some("command is required"));
+        assert_eq!(
+            app.error.as_deref(),
+            Some("no launch targets available (no admitted spawn targets and no session types)")
+        );
         let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
-        assert!(lines.join("\n").contains("error: command is required"));
+        assert!(lines.join("\n").contains(
+            "error: no launch targets available (no admitted spawn targets and no session types)"
+        ));
     }
 
     #[test]
@@ -8085,7 +9687,7 @@ mod tests {
     #[test]
     fn canonical_session_bindings_follow_published_oracle_through_frames_and_reconnect() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
-        assert_eq!(scenario.conformance_fixture_revision, 31);
+        assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
         let body =
             serde_json::from_value(scenario.surface.clone()).expect("published surface is typed");
         let mut app = TuiApp::new(None);
@@ -11620,17 +13222,33 @@ mod tests {
     #[test]
     fn corrected_user_action_clears_stale_validation_error() {
         let mut app = TuiApp::new(None);
-        app.command = " \t\n".to_string();
-        app.spawn_session();
-        assert_eq!(app.error.as_deref(), Some("command is required"));
+        app.session_types_supported = true;
+        app.system_details_visible = true;
+        app.begin_target_first_spawn();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("no launch targets available (no admitted spawn targets and no session types)")
+        );
 
-        app.command = "printf fixed\\n".to_string();
-        app.spawn_session();
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        app.error = None;
+        app.begin_target_first_spawn();
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 160, 70);
         let rendered = lines.join("\n");
-        assert!(!rendered.contains("error: command is required"));
-        assert!(rendered.contains("hub unavailable; reconnecting"));
+        assert!(!rendered.contains(
+            "error: no launch targets available (no admitted spawn targets and no session types)"
+        ));
+        assert!(rendered.contains("Target-first spawn"));
+        assert!(app.target_first_spawn.is_some());
     }
 
     #[test]
@@ -12799,6 +14417,12 @@ mod tests {
                 lifecycle: "failed".to_string(),
                 failure_reason: Some("worker exited".to_string()),
                 pending: false,
+                session_type_id: None,
+                session_type_source: None,
+                role: None,
+                traits: Vec::new(),
+                interaction: None,
+                session_type_lifecycle: None,
             }]
         );
         let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
@@ -12843,6 +14467,12 @@ mod tests {
             lifecycle: "exited".to_string(),
             failure_reason: None,
             pending: false,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         }];
         app.selected_session = Some("session-beta".to_string());
         let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
@@ -12904,6 +14534,12 @@ mod tests {
             lifecycle: "stopped".to_string(),
             failure_reason: None,
             pending: false,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         }];
         app.selected_session = Some("session-beta".to_string());
         app.observed_requests.clear();
@@ -12936,6 +14572,12 @@ mod tests {
             lifecycle: "exited".to_string(),
             failure_reason: None,
             pending: false,
+            session_type_id: None,
+            session_type_source: None,
+            role: None,
+            traits: Vec::new(),
+            interaction: None,
+            session_type_lifecycle: None,
         }];
         app.selected_session = Some("session-beta".to_string());
         app.observed_requests.clear();
@@ -12958,6 +14600,7 @@ mod tests {
                 ObservedRequest::ListApps,
                 ObservedRequest::ListPackageNavigation,
                 ObservedRequest::ListPackages,
+                ObservedRequest::ListSpawnTargets,
             ]
         );
     }
@@ -15525,6 +17168,12 @@ mod tests {
                 lifecycle: lifecycle.to_string(),
                 failure_reason: None,
                 pending: false,
+                session_type_id: None,
+                session_type_source: None,
+                role: None,
+                traits: Vec::new(),
+                interaction: None,
+                session_type_lifecycle: None,
             })
             .collect()
     }
@@ -16626,12 +18275,869 @@ mod tests {
         response
     }
 
+    fn sample_session_type(
+        session_type_id: &str,
+        source: &str,
+        editable: bool,
+    ) -> DaemonSessionType {
+        DaemonSessionType {
+            session_type_id: session_type_id.to_string(),
+            source_name: source.to_string(),
+            id: session_type_id
+                .rsplit_once('/')
+                .map(|(_, id)| id.to_string())
+                .unwrap_or_else(|| session_type_id.to_string()),
+            source: source.to_string(),
+            editable,
+            overridden_sources: Vec::new(),
+            diagnostics: Vec::new(),
+            label: format!("label-{session_type_id}"),
+            description: None,
+            icon: None,
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: vec!["namespaced.trait".to_string()],
+            lifecycle: "task".to_string(),
+            command: "/bin/echo".to_string(),
+            args: vec!["hello".to_string()],
+            working_directory_policy: "package_root".to_string(),
+            allowed_environment_overrides: Vec::new(),
+            context_keys: Vec::new(),
+            target_id: "repo-a".to_string(),
+            available: true,
+        }
+    }
+
+    #[test]
+    fn session_type_entity_reducer_snapshot_upsert_remove_and_rejects_patch() {
+        let mut state = SessionTypeEntityState::default();
+        state.begin_generation("st-gen".to_string());
+        let entity = sample_session_type("device/shell", "device", true);
+        assert!(
+            state
+                .apply(DaemonEntityFrame::Snapshot {
+                    subscription_id: "st-gen".to_string(),
+                    entity_type: "session_type".to_string(),
+                    snapshot_seq: 1,
+                    items: vec![serde_json::to_value(&entity).expect("serialize")],
+                    resync_reason: None,
+                })
+                .expect("snapshot applies")
+        );
+        assert!(state.entities.contains_key("device/shell"));
+
+        let mut updated = entity.clone();
+        updated.label = "updated".to_string();
+        assert!(
+            state
+                .apply(DaemonEntityFrame::Upsert {
+                    subscription_id: "st-gen".to_string(),
+                    entity_type: "session_type".to_string(),
+                    snapshot_seq: 2,
+                    id: "device/shell".to_string(),
+                    entity: serde_json::to_value(&updated).expect("serialize"),
+                })
+                .expect("upsert applies")
+        );
+        assert_eq!(state.entities["device/shell"].label, "updated");
+
+        let err = state
+            .apply(DaemonEntityFrame::Patch {
+                subscription_id: "st-gen".to_string(),
+                entity_type: "session_type".to_string(),
+                snapshot_seq: 3,
+                id: "device/shell".to_string(),
+                patch: json!({ "label": "nope" }),
+            })
+            .expect_err("patch must fail");
+        assert!(err.contains("patch is unsupported"));
+
+        assert!(
+            state
+                .apply(DaemonEntityFrame::Remove {
+                    subscription_id: "st-gen".to_string(),
+                    entity_type: "session_type".to_string(),
+                    snapshot_seq: 4,
+                    id: "device/shell".to_string(),
+                })
+                .expect("remove applies")
+        );
+        assert!(state.entities.is_empty());
+    }
+
+    #[test]
+    fn session_types_render_package_read_only_and_unknown_literals() {
+        let mut app = TuiApp::new(None);
+        app.system_details_visible = true;
+        app.session_types_supported = true;
+        app.session_type_entities.begin_generation("st".to_string());
+        let mut package = sample_session_type("package.demo/init", "package", false);
+        package.role = "custom.role.token".to_string();
+        package.traits = vec!["unknown.trait.token".to_string()];
+        package.interaction = "service".to_string();
+        app.session_type_entities
+            .entities
+            .insert(package.session_type_id.clone(), package.clone());
+        app.session_type_entities
+            .entity_order
+            .push(package.session_type_id.clone());
+        app.selected_session_type_id = Some(package.session_type_id.clone());
+
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 220, 70);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("custom.role.token"), "{rendered}");
+        assert!(rendered.contains("unknown.trait.token"), "{rendered}");
+        assert!(rendered.contains("read-only"), "{rendered}");
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id.contains("-edit")),
+            "package rows must not expose edit"
+        );
+    }
+
+    #[test]
+    fn authoring_seed_and_wholesale_definition_preserve_path_and_environment() {
+        let editable = DaemonSessionTypeEditableDefinition {
+            session_type_id: "device/shell".to_string(),
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: DaemonSessionTypeDefinition {
+                id: "shell".to_string(),
+                label: "Shell".to_string(),
+                description: None,
+                icon: None,
+                role: "botster.agent".to_string(),
+                interaction: "interactive".to_string(),
+                traits: vec!["keep.trait".to_string()],
+                lifecycle: "task".to_string(),
+                command: "shell.sh".to_string(),
+                args: Vec::new(),
+                working_directory: DaemonSessionTypeWorkingDirectory::Relative {
+                    path: "nested/path".to_string(),
+                },
+                environment: BTreeMap::from([("KEEP".to_string(), "yes".to_string())]),
+                allowed_environment_overrides: Vec::new(),
+                context: Vec::new(),
+                target_id: None,
+            },
+        };
+        let form = SessionTypeFormDraft::from_authoring(editable);
+        assert_eq!(form.working_directory_path, "nested/path");
+        assert!(form.environment.contains("KEEP=yes"));
+        let mut form = form;
+        form.label = "Shell 2".to_string();
+        let definition = definition_from_session_type_form(&form);
+        assert_eq!(
+            definition.working_directory,
+            DaemonSessionTypeWorkingDirectory::Relative {
+                path: "nested/path".to_string()
+            }
+        );
+        assert_eq!(
+            definition.environment.get("KEEP").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(definition.label, "Shell 2");
+        assert_eq!(definition.traits, vec!["keep.trait".to_string()]);
+    }
+
+    #[test]
+    fn clearing_token_list_fields_emits_empty_collections_on_update() {
+        let editable = DaemonSessionTypeEditableDefinition {
+            session_type_id: "device/shell".to_string(),
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: DaemonSessionTypeDefinition {
+                id: "shell".to_string(),
+                label: "Shell".to_string(),
+                description: None,
+                icon: None,
+                role: "botster.agent".to_string(),
+                interaction: "interactive".to_string(),
+                traits: vec!["a.trait".to_string()],
+                lifecycle: "task".to_string(),
+                command: "shell.sh".to_string(),
+                args: vec!["--flag".to_string()],
+                working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+                environment: BTreeMap::from([("KEEP".to_string(), "yes".to_string())]),
+                allowed_environment_overrides: vec!["KEEP".to_string()],
+                context: vec!["prompt".to_string()],
+                target_id: None,
+            },
+        };
+        let mut form = SessionTypeFormDraft::from_authoring(editable);
+        form.traits.clear();
+        form.args.clear();
+        form.environment.clear();
+        form.allowed_environment_overrides.clear();
+        form.context_keys.clear();
+        let definition = definition_from_session_type_form(&form);
+        assert!(definition.traits.is_empty());
+        assert!(definition.args.is_empty());
+        assert!(definition.environment.is_empty());
+        assert!(definition.allowed_environment_overrides.is_empty());
+        assert!(definition.context.is_empty());
+    }
+
+    #[test]
+    fn launch_targets_include_device_local_from_session_type_entities() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.spawn_targets.clear();
+        let mut device = sample_session_type("device/shell", "device", true);
+        device.target_id = "device:local".to_string();
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entities
+            .insert(device.session_type_id.clone(), device.clone());
+        app.session_type_entities
+            .entity_order
+            .push(device.session_type_id.clone());
+        let options = app.launch_target_options();
+        assert!(
+            options
+                .iter()
+                .any(|option| option.target_id == "device:local"),
+            "{options:?}"
+        );
+        app.begin_target_first_spawn();
+        assert!(app.target_first_spawn.is_some());
+        assert_eq!(app.error, None);
+        app.spawn_pick_target("device:local");
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Target-first spawn"), "{rendered}");
+        assert!(
+            hit_map.regions().iter().any(|region| region
+                .node_id
+                .contains("tui-spawn-session-type-device/shell")),
+            "{:?}",
+            hit_map
+                .regions()
+                .iter()
+                .map(|r| &r.node_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn toolbar_spawn_dialog_is_reachable_without_system_details() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.system_details_visible = false;
+        let mut device = sample_session_type("device/shell", "device", true);
+        device.target_id = "device:local".to_string();
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entities
+            .insert(device.session_type_id.clone(), device.clone());
+        app.session_type_entities
+            .entity_order
+            .push(device.session_type_id);
+        app.handle_action("botster.tui.spawn".to_string(), None, None);
+        assert!(app.target_first_spawn.is_some());
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Target-first spawn"), "{rendered}");
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-spawn-cancel")
+        );
+        app.handle_action("botster.tui.spawn.cancel".to_string(), None, None);
+        assert!(app.target_first_spawn.is_none());
+    }
+
+    #[test]
+    fn session_type_form_draft_keystrokes_render_before_submit() {
+        let mut app = TuiApp::new(None);
+        app.system_details_visible = true;
+        app.session_types_supported = true;
+        let mut form = SessionTypeFormDraft::create_default();
+        form.command = String::new();
+        app.session_type_form = Some(form);
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 80, &RenderState::default());
+        let field = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "tui-session-type-field-session_type_command")
+            .expect("command field hit region");
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let column = field.rect.x;
+        let row = field.rect.y;
+        app.handle_dispatch(router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        ));
+        app.handle_dispatch(router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        ));
+        for ch in ['z', 's', 'h'] {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            let dispatch = router.dispatch_event(Event::Key(key), &hit_map);
+            app.handle_dispatch(dispatch);
+            app.set_drafts(router.draft_values());
+        }
+        assert_eq!(
+            app.drafts
+                .get("session_type_command")
+                .and_then(Value::as_str),
+            Some("zsh")
+        );
+        let (lines, _) = render_app_to_lines(&app, 220, 80, &RenderState::default());
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("zsh"), "{rendered}");
+    }
+
+    #[test]
+    fn product_toolbar_spawn_emits_spawn_session_type_request() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.system_details_visible = false;
+        let mut device = sample_session_type("device/shell", "device", true);
+        device.target_id = "device:local".to_string();
+        device.available = true;
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entities
+            .insert(device.session_type_id.clone(), device.clone());
+        app.session_type_entities
+            .entity_order
+            .push(device.session_type_id.clone());
+        app.observed_requests.clear();
+        app.handle_action("botster.tui.spawn".to_string(), None, None);
+        app.handle_action(
+            "botster.tui.spawn.pick_target".to_string(),
+            None,
+            Some(json!({ "target_id": "device:local" })),
+        );
+        app.handle_action(
+            "botster.tui.spawn.pick_session_type".to_string(),
+            None,
+            Some(json!({ "session_type_id": "device/shell" })),
+        );
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::SpawnSessionType {
+                    session_type_id,
+                    ..
+                } if session_type_id == "device/shell"
+            )),
+            "{:?}",
+            app.observed_requests
+        );
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::Spawn { .. }))
+        );
+    }
+
+    #[test]
+    fn delete_session_type_uses_source_name_for_repo_mutation_source() {
+        let mut app = TuiApp::new(None);
+        let mut entity = sample_session_type("shared-git/type-a", "repo", true);
+        entity.source_name = "shared-git".to_string();
+        entity.target_id = "authored-other-target".to_string();
+        entity.id = "type-a".to_string();
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entities
+            .insert(entity.session_type_id.clone(), entity);
+        app.session_type_entities
+            .entity_order
+            .push("shared-git/type-a".to_string());
+        app.observed_requests.clear();
+        app.delete_session_type("shared-git/type-a");
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::DeleteSessionType {
+                    source: DaemonSessionTypeMutationSource::Repo { target_id },
+                    session_type_id,
+                } if target_id == "shared-git" && session_type_id == "type-a"
+            )),
+            "{:?}",
+            app.observed_requests
+        );
+    }
+
+    #[test]
+    fn pinned_session_plugin_binding_fixture_is_conformance_32() {
+        let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
+        assert_eq!(
+            scenario.conformance_fixture_revision, 32,
+            "hub-test-support pin must publish fixture revision 32"
+        );
+        assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
+    }
+
+    #[test]
+    fn product_toolbar_spawn_opens_target_first_flow_not_freeform_spawn() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.system_details_visible = true;
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        app.observed_requests.clear();
+        app.handle_action("botster.tui.spawn".to_string(), None, None);
+        assert!(app.target_first_spawn.is_some());
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::Spawn { .. })),
+            "toolbar spawn must not emit freeform Spawn"
+        );
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Select a launch target first"),
+            "{rendered}"
+        );
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-spawn-target-repo-a")
+        );
+    }
+
+    #[test]
+    fn session_types_unsupported_surface_when_feature_missing() {
+        let mut app = TuiApp::new(None);
+        app.system_details_visible = true;
+        app.session_types_supported = false;
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("does not provide session_type_entity_subscriptions"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn feature_session_type_entity_subscriptions_is_not_a_required_handshake_feature() {
+        let requirement = tui_compatibility_requirement();
+        assert!(
+            !requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
+        );
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 31);
+    }
+
+    #[test]
+    fn target_first_spawn_lists_unavailable_session_types_without_dropping_them() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        let mut unavailable = sample_session_type("repo-a/svc", "repo", true);
+        unavailable.target_id = "repo-a".to_string();
+        unavailable.available = false;
+        unavailable.diagnostics = vec!["missing binary".to_string()];
+        unavailable.interaction = "service".to_string();
+        app.session_type_entities.begin_generation("st".to_string());
+        app.session_type_entities
+            .entities
+            .insert(unavailable.session_type_id.clone(), unavailable.clone());
+        app.session_type_entities
+            .entity_order
+            .push(unavailable.session_type_id.clone());
+        app.target_first_spawn = Some(TargetFirstSpawnFlow {
+            step: TargetFirstSpawnStep::PickSessionType {
+                target_id: "repo-a".to_string(),
+                target_label: "Repo A".to_string(),
+            },
+        });
+        let nodes = app.target_first_spawn_nodes(app.target_first_spawn.as_ref().unwrap());
+        let text = nodes
+            .iter()
+            .filter_map(|node| node.props.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("unavailable"), "{text}");
+        assert!(text.contains("missing binary"), "{text}");
+        assert!(text.contains("repo-a/svc"), "{text}");
+    }
+
+    #[test]
+    fn session_type_real_input_create_button_dispatches_through_input_router() {
+        let mut app = TuiApp::new(None);
+        app.system_details_visible = true;
+        app.session_types_supported = true;
+        let (lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
+        let _ = lines;
+        let region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "tui-session-type-create")
+            .expect("create button hit region");
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let column = region.rect.x;
+        let row = region.rect.y;
+        let down = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        app.handle_dispatch(down);
+        let up = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        );
+        app.handle_dispatch(up);
+        assert!(app.session_type_form.is_some());
+    }
+
+    #[test]
+    fn session_types_live_profile_runs_against_isolated_hub_when_binaries_are_available() {
+        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
+            skip_or_panic("BOTSTER_HUB_BIN");
+            return;
+        };
+        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
+            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
+            return;
+        };
+        let root = PathBuf::from(format!("/tmp/btst{}", short_suffix() % 1_000_000));
+        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(&hub_bin)
+            .session_worker_bin(session_worker_bin)
+            .root(&root)
+            .name("botster-tui-session-types-live")
+            .start()
+            .expect("isolated hub starts");
+
+        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
+        // Fail closed on provenance before product cases.
+        let compatibility = app
+            .compatibility
+            .clone()
+            .or_else(|| {
+                for _ in 0..40 {
+                    app.poll_hub();
+                    if app.compatibility.is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                app.compatibility.clone()
+            })
+            .expect("live hub must publish compatibility");
+        assert!(
+            compatibility.conformance_fixture_revision >= 32,
+            "session-types live profile requires hub conformance >= 32, observed {}",
+            compatibility.conformance_fixture_revision
+        );
+        assert!(
+            compatibility.supports_feature(FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS),
+            "session-types live profile requires session_type_entity_subscriptions; features={:?}",
+            compatibility.features
+        );
+        assert_eq!(
+            compatibility.protocol_version,
+            botster_hub_client::PROTOCOL_VERSION
+        );
+
+        // Wait for session type subscription snapshot (may be empty).
+        for _ in 0..80 {
+            app.poll_hub();
+            if app.session_type_entities.has_snapshot {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.session_type_entities.has_snapshot,
+            "session_type entity snapshot required"
+        );
+
+        // Create interactive agent type with relative path + environment.
+        let create_id = format!("live-agent-{}", short_suffix() % 1_000_000);
+        let definition = DaemonSessionTypeDefinition {
+            id: create_id.clone(),
+            label: "Live Agent".to_string(),
+            description: Some("live proof".to_string()),
+            icon: None,
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: vec!["proof.trait".to_string()],
+            lifecycle: "task".to_string(),
+            command: "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
+            args: Vec::new(),
+            working_directory: DaemonSessionTypeWorkingDirectory::Relative {
+                path: "proof/nested".to_string(),
+            },
+            environment: BTreeMap::from([("LIVE_PROOF".to_string(), "1".to_string())]),
+            allowed_environment_overrides: Vec::new(),
+            context: Vec::new(),
+            target_id: None,
+        };
+        app.request_and_apply(DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: definition.clone(),
+        });
+        if let Some(error) = &app.error {
+            panic!("create agent session type failed: {error}");
+        }
+        let agent_type_id = format!("device/{create_id}");
+        for _ in 0..80 {
+            app.poll_hub();
+            if app
+                .session_type_entities
+                .entities
+                .contains_key(&agent_type_id)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.session_type_entities
+                .entities
+                .contains_key(&agent_type_id),
+            "created agent type missing from entity store"
+        );
+
+        // Accessory interactive + service types.
+        for (suffix, interaction, role) in [
+            ("acc", "interactive", "botster.accessory"),
+            ("svc", "service", "botster.accessory"),
+        ] {
+            let id = format!("live-{suffix}-{}", short_suffix() % 1_000_000);
+            let accessory_script = format!("{id}.sh");
+            let accessory_dir = hub.data_dir().join("session-types");
+            std::fs::create_dir_all(&accessory_dir).expect("device session-types dir");
+            let accessory_path = accessory_dir.join(&accessory_script);
+            std::fs::write(
+                &accessory_path,
+                "#!/bin/sh
+exit 0
+",
+            )
+            .expect("accessory script");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&accessory_path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&accessory_path, permissions).unwrap();
+            }
+            app.request_and_apply(DaemonRequest::CreateSessionType {
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: DaemonSessionTypeDefinition {
+                    id: id.clone(),
+                    label: format!("Live {suffix}"),
+                    description: None,
+                    icon: None,
+                    role: role.to_string(),
+                    interaction: interaction.to_string(),
+                    traits: vec!["unknown.namespaced.token".to_string()],
+                    lifecycle: "task".to_string(),
+                    command: accessory_script,
+                    args: Vec::new(),
+                    working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+                    environment: BTreeMap::new(),
+                    allowed_environment_overrides: Vec::new(),
+                    context: Vec::new(),
+                    target_id: None,
+                },
+            });
+            let effective = format!("device/{id}");
+            for _ in 0..80 {
+                app.poll_hub();
+                if app.session_type_entities.entities.contains_key(&effective) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            let entity = app
+                .session_type_entities
+                .entities
+                .get(&effective)
+                .unwrap_or_else(|| panic!("missing {effective}"));
+            assert_eq!(entity.interaction, interaction);
+            assert_eq!(entity.role, role);
+            assert!(
+                entity
+                    .traits
+                    .iter()
+                    .any(|t| t == "unknown.namespaced.token")
+            );
+        }
+
+        // Lossless authoring round-trip: edit label only; path+env preserved.
+        app.open_session_type_edit(&agent_type_id);
+        let mut form = app
+            .session_type_form
+            .clone()
+            .expect("edit form after authoring read");
+        form.label = "Live Agent Edited".to_string();
+        app.session_type_form = Some(form);
+        app.submit_session_type_form();
+        if let Some(error) = &app.error {
+            panic!("update session type failed: {error}");
+        }
+        // Re-read authoring definition to prove path/env retained.
+        match app.request(DaemonRequest::ShowSessionTypeDefinition {
+            session_type_id: agent_type_id.clone(),
+        }) {
+            Ok(response) => {
+                let definition = response
+                    .session_type_definition
+                    .as_ref()
+                    .expect("authoring definition after update")
+                    .definition
+                    .clone();
+                assert_eq!(definition.label, "Live Agent Edited");
+                assert_eq!(
+                    definition.working_directory,
+                    DaemonSessionTypeWorkingDirectory::Relative {
+                        path: "proof/nested".to_string()
+                    }
+                );
+                assert_eq!(
+                    definition.environment.get("LIVE_PROOF").map(String::as_str),
+                    Some("1")
+                );
+                app.apply_response(response);
+            }
+            Err(error) => panic!("show definition after update failed: {error}"),
+        }
+
+        // Package read-only: if any package type exists, ensure editable=false.
+        for entity in app.session_type_entities.ordered() {
+            if entity.source == "package" {
+                assert!(!entity.editable);
+            }
+        }
+
+        // Launch metadata via SpawnSessionType using a PackageRoot shell type (matches
+        // headless product path). Authoring path/env were already proven above.
+        let launch_type_id = app
+            .ensure_headless_shell_session_type(hub.data_dir(), DEFAULT_COMMAND)
+            .expect("launch session type");
+        for _ in 0..80 {
+            app.poll_hub();
+            if app
+                .session_type_entities
+                .entities
+                .contains_key(&launch_type_id)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        app.error = None;
+        app.execute_spawn_session_type(
+            &launch_type_id,
+            DaemonSessionTypeRequest {
+                target_id: Some("device:local".to_string()),
+                ..DaemonSessionTypeRequest::default()
+            },
+        );
+        if let Some(error) = &app.error {
+            panic!("spawn session type failed: {error}");
+        }
+        let session_id = app.selected_session.clone().expect("spawn selects session");
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("session becomes authoritative");
+        let session = app
+            .session_entities
+            .entities
+            .get(&session_id)
+            .expect("session entity");
+        assert_eq!(
+            session.session_type_id.as_deref(),
+            Some(launch_type_id.as_str())
+        );
+
+        // Delete device type and observe remove.
+        app.delete_session_type(&agent_type_id);
+        for _ in 0..80 {
+            app.poll_hub();
+            if !app
+                .session_type_entities
+                .entities
+                .contains_key(&agent_type_id)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !app.session_type_entities
+                .entities
+                .contains_key(&agent_type_id),
+            "deleted session type should leave entity store"
+        );
+
+        // Reconnect projection: force reconnect and wait for exact id for remaining accessory.
+        let remaining: Vec<String> = app.session_type_entities.entity_order.to_vec();
+        assert!(!remaining.is_empty());
+        let expected = remaining[0].clone();
+        app.force_reconnect();
+        for _ in 0..100 {
+            app.poll_hub();
+            if app.session_type_entities.has_snapshot
+                && app.session_type_entities.entities.contains_key(&expected)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.session_type_entities.entities.contains_key(&expected),
+            "reconnect must restore exact session_type_id {expected}"
+        );
+
+        println!(
+            "session-types-live: complete conformance={} features_has_session_type=true cases=agent,accessory,service,authoring,launch,delete,reconnect",
+            compatibility.conformance_fixture_revision
+        );
+    }
+
     fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
         DaemonResponse {
             kind,
             status: None,
             sessions: Vec::new(),
             session_types: Vec::new(),
+            session_type_definition: None,
             resolved_session_type: None,
             hub_update: None,
             session_context: None,
