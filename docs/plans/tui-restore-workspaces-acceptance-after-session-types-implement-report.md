@@ -39,7 +39,7 @@
 
 - Closed deps: `ticket_1785984128_479155` (Workspaces session types), `ticket_1785976581_841608` (protocol-6 TUI pin).
 - Open sibling `ticket_1786038825_352271` owns contract-matrix live failure (not this proof path).
-- No new cross-repo tickets required for this restore; residual hub strictness around incomplete session-type fixtures is documented below as fixture correction in-TUI.
+- **Registered Hub ticket** `ticket_1786066158_557371` (target `tgt_7e208a0c76a44980a83b63af976b1f22`): CreateSpawnTarget must return a typed operator frame for invalid repo-local session-types instead of `ClientDisconnected`. Discovered here; not blocking this TUI run.
 
 ## Deviations from plan
 
@@ -65,7 +65,7 @@ No lanes weakened or re-skipped.
 | Hub binary | `/tmp/botster-hub-pin-8a60bd58-target/debug/botster-hub` |
 | Session-worker commit | `33ebcd98d19031d23e91b03d8da0ee3f8d1410d4` (botster-core lock of hub pin) |
 | Session-worker binary | `/tmp/botster-hub-pin-8a60bd58-target/debug/botster-session-worker` (co-located) |
-| Workspaces package | `/Users/jasonconigliari/Projects/botster-workspaces` @ `3ec366abd1fd86dcade81b7a14470dcacfcbd504` |
+| Workspaces package | clean `botster-workspaces` checkout at `3ec366abd1fd86dcade81b7a14470dcacfcbd504`, supplied via `BOTSTER_WORKSPACES_PACKAGE_PATH` |
 | Pre-flight | protocol 6, conformance fixture revision 31 |
 
 ### Live lanes (all exit 0)
@@ -81,8 +81,8 @@ Runtime path: installed Workspaces package â†’ `botster_workspaces.open_spawn` â
 ## Unverified behavior or residual risk
 
 - Contract-matrix live lane remains owned by open `ticket_1786038825_352271`; not re-proven here.
-- Hub still fails closed harshly (client disconnect) on invalid repo-local session-type files rather than always returning a structured CreateSpawnTarget error; fixture now satisfies the pin schema.
-- Ambient `Projects/botster-hub` main tip binaries were not used for scoring.
+- Hub still fails closed harshly (`ClientDisconnected`) on invalid repo-local session-type files rather than always returning a structured CreateSpawnTarget error; fixture now satisfies the pin schema. Registered as a separate Hub-owned ticket (see Cross-repo).
+- Ambient Hub main-tip binaries were not used for scoring.
 
 ## Missing vault guidance discovered
 

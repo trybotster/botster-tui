@@ -202,7 +202,7 @@ Expected edit set (smallest surgical change):
 
 | Path | Change |
 | --- | --- |
-| `crates/botster-tui/src/app.rs` | `"template_id"` → `"session_type_id"` at spawn-form selection; stage string "template" → "session type"; split/preserve contract-matrix hermetic assertion; delete waiver loop only; **add** field-key source-scan unit test; clean live-test doc comments |
+| `crates/botster-tui/src/app.rs` | `"template_id"` → `"session_type_id"` at spawn-form selection; stage string "template" → "session type"; split/preserve contract-matrix hermetic assertion; delete waiver loop only; **add** field-key source-scan unit test; clean live-test doc comments; **complete** installed-driver repo-local `session-types.json` with protocol-6 `PackageSessionType` fields (`label`, namespaced `role`, `interaction`, `lifecycle`) so CreateSpawnTarget does not `ClientDisconnected` on Hub `8a60bd58` |
 | `script/test-live-hub` | Delete the workspaces hard-block (comments + `exit 1`) so `resolve_workspaces_package` and the retained profile body run |
 | `crates/botster-tui/fixtures/workspaces-spawn-driver-v1.evidence.jsonl` | Example payload keys `template_id` → `session_type_id` |
 | `README.md` | Replace known-gap block; drop closed-ticket lifecycle deferral; drop false "lacks lifecycle tree"; stop pointing operators solely at broken contract-matrix as live evidence |
@@ -253,7 +253,7 @@ No Cargo pin changes expected.
 | Stale / main-tip Hub binary misread as lane failure | Build from pin `8a60bd58…`; pre-flight protocol/conformance; record provenance |
 | Wrong Workspaces checkout (pre-migration) | Fail at EnablePackage; validate package path is post-`3ec366a` / equivalent |
 | Live binaries missing | Fail closed via `BOTSTER_TUI_REQUIRE_HUB_TEST=1`; do not soft-skip |
-| Over-broad cleanup while editing `app.rs` | Touch only rename, split test, source-scan, comments |
+| Over-broad cleanup while editing `app.rs` | Touch only rename, split test, source-scan, comments, and the protocol-6 session-types fixture field completion required for CreateSpawnTarget |
 | Plan file lost from worktree | Commit on run branch in Implement |
 
 ## Acceptance checks / tests
@@ -265,6 +265,7 @@ No Cargo pin changes expected.
 - Waiver loop of `blocked_workspaces_lanes_report_a_known_gap_for_every_profile` **gone**.
 - **Preserved** contract-matrix fixture-env assertion green as its own hermetic test (`contract_matrix_mode_requires_its_fixture_env_var` or equivalent name).
 - Acceptance module still validates evidence fixture against schema.
+- Installed-driver repo-local `.botster/session-types.json` carries full protocol-6 `PackageSessionType` fields (`id`, `label`, `role`, `interaction`, `lifecycle`, `command`, `working_directory`) so CreateSpawnTarget succeeds on Hub pin `8a60bd58`.
 
 ### Mandatory live (runtime path proof)
 
