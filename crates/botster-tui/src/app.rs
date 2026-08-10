@@ -19081,13 +19081,14 @@ mod tests {
         listed.target_id = "repo-a".to_string();
         app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![listed]));
         app.handle_action("botster.tui.spawn".to_string(), None, None);
+        let mut router = InputRouter::new(renderer::action_request_context());
+        // Mouse path (hit-map click activation).
         let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
         let target_region = hit_map
             .regions()
             .iter()
             .find(|region| region.node_id == "tui-spawn-target-repo-a")
             .expect("launch target hit region");
-        let mut router = InputRouter::new(renderer::action_request_context());
         let column = target_region.rect.x;
         let row = target_region.rect.y;
         app.handle_dispatch(router.dispatch_event(
@@ -19151,6 +19152,104 @@ mod tests {
             "{:?}",
             app.observed_requests
         );
+    }
+
+    #[test]
+    fn product_spawn_list_and_pick_are_reachable_through_keyboard_input_router() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.system_details_visible = false;
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        let mut listed = sample_session_type("device/shell", "device", true);
+        listed.target_id = "repo-a".to_string();
+        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![listed]));
+        app.observed_requests.clear();
+        app.handle_action("botster.tui.spawn".to_string(), None, None);
+        let mut router = InputRouter::new(renderer::action_request_context());
+
+        // Keyboard path: Tab focus admitted T, Enter → ListSessionTypesForTarget.
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &hit_map, "tui-spawn-target-repo-a");
+        activate_focused_action_with_enter(&mut app, &mut router, &hit_map);
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::ListSessionTypesForTarget { target_id }
+                    if target_id == "repo-a"
+            )),
+            "keyboard pick target must observe ListSessionTypesForTarget: {:?}",
+            app.observed_requests
+        );
+        assert_eq!(app.error, None, "keyboard list-for-target should succeed");
+
+        // Keyboard path: Tab focus Hub-listed Global, Enter → SpawnSessionType target_id=T.
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &hit_map, "tui-spawn-session-type-device/shell");
+        activate_focused_action_with_enter(&mut app, &mut router, &hit_map);
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::SpawnSessionType {
+                    session_type_id,
+                    target_id: Some(target_id),
+                    ..
+                } if session_type_id == "device/shell" && target_id == "repo-a"
+            )),
+            "keyboard spawn must carry target_id=T: {:?}",
+            app.observed_requests
+        );
+    }
+
+    fn focus_hit_map_node_by_tab(router: &mut InputRouter, hit_map: &HitMap, node_id: &str) {
+        router.reconcile(hit_map);
+        let attempts = hit_map.focusable_regions().count().saturating_add(2);
+        for _ in 0..attempts {
+            if router.focused_node_id() == Some(node_id) {
+                return;
+            }
+            router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                hit_map,
+            );
+        }
+        panic!(
+            "Tab traversal could not focus {node_id}; focused={:?}; focusable={:?}",
+            router.focused_node_id(),
+            hit_map
+                .focusable_regions()
+                .map(|region| region.node_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn activate_focused_action_with_enter(
+        app: &mut TuiApp,
+        router: &mut InputRouter,
+        hit_map: &HitMap,
+    ) {
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            hit_map,
+        );
+        match &dispatch {
+            InputDispatch::Action(request) => {
+                assert!(
+                    request.action_id.0.starts_with("botster.tui.spawn"),
+                    "expected product spawn action, got {:?}",
+                    request.action_id
+                );
+            }
+            other => panic!("Enter on focused spawn control must dispatch Action, got {other:?}"),
+        }
+        app.handle_dispatch(dispatch);
     }
 
     #[test]
@@ -19501,9 +19600,15 @@ exit 0
             app.target_first_spawn.is_some(),
             "product spawn dialog open"
         );
-        app.spawn_pick_target(&admitted_target_id);
+        // Production keyboard path through InputRouter (Tab focus + Enter), not
+        // direct spawn_pick_* helpers — required consumer proof for admitted T.
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let target_node_id = format!("tui-spawn-target-{admitted_target_id}");
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &hit_map, &target_node_id);
+        activate_focused_action_with_enter(&mut app, &mut router, &hit_map);
         if let Some(error) = &app.error {
-            panic!("list-for-target through product path failed: {error}");
+            panic!("list-for-target through keyboard product path failed: {error}");
         }
         let listed_ids = match &app.target_first_spawn.as_ref().unwrap().step {
             TargetFirstSpawnStep::PickSessionType { session_types, .. } => session_types
@@ -19516,9 +19621,12 @@ exit 0
             listed_ids.iter().any(|id| id == &launch_type_id),
             "device Global {launch_type_id} must appear via list-for-target for T={admitted_target_id}; listed={listed_ids:?}"
         );
-        app.spawn_pick_session_type(&launch_type_id);
+        let type_node_id = format!("tui-spawn-session-type-{launch_type_id}");
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &hit_map, &type_node_id);
+        activate_focused_action_with_enter(&mut app, &mut router, &hit_map);
         if let Some(error) = &app.error {
-            panic!("product spawn pick failed: {error}");
+            panic!("product keyboard spawn pick failed: {error}");
         }
         assert!(
             app.observed_requests.iter().any(|request| matches!(
@@ -19526,7 +19634,7 @@ exit 0
                 ObservedRequest::ListSessionTypesForTarget { target_id }
                     if target_id == &admitted_target_id
             )),
-            "live product path must observe ListSessionTypesForTarget: {:?}",
+            "live keyboard product path must observe ListSessionTypesForTarget: {:?}",
             app.observed_requests
         );
         assert!(
@@ -19538,7 +19646,7 @@ exit 0
                     ..
                 } if session_type_id == &launch_type_id && target_id == &admitted_target_id
             )),
-            "spawn must carry target_id=T not device:local: {:?}",
+            "keyboard spawn must carry target_id=T not device:local: {:?}",
             app.observed_requests
         );
         let session_id = app.selected_session.clone().expect("spawn selects session");
