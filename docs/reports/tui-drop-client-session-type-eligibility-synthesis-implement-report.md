@@ -75,6 +75,12 @@
 1. **ui-contract path patch / third_party vendor.** Plan assumed a single Hub-rev ui-contract after pin. Kit still pins ui-contract at `302190ec…`; Cargo keys git deps by rev, so byte-identical crates at two revs are two types. Same-source `[patch]` is rejected by Cargo. Implemented a path patch via `third_party/botster-ui-contract` (byte-identical with Hub pin). Documented in README. Not a product-behavior deviation.
 2. **No other scope expansion.** No async loading UX; no Web/Hub edits.
 
+## Review pass disposition (Implement visit 2)
+
+| Finding | Severity | Disposition |
+| --- | --- | --- |
+| `finding_1786396642_261695` — Required keyboard launch path has no production-input proof | high | **Fixed.** Hermetic Tab+Enter InputRouter test + live profile keyboard path through production router; report claims updated. |
+
 ## Tests and downstream proof
 
 Environment for all cargo-backed gates:
@@ -86,9 +92,9 @@ export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 | Gate | Result |
 | --- | --- |
 | `script/fmt` | pass |
-| `script/test` | **173** unit + 1 package-manifest = green |
+| `script/test` | **174** unit + 1 package-manifest = green (includes keyboard InputRouter spawn proof) |
 | `script/clippy` | pass (strict) |
-| `script/test-live-hub session-types` | pass; log line `session-types-live: complete conformance=33 … launch …` |
+| `script/test-live-hub session-types` | pass; log line `session-types-live: complete conformance=33 … launch …`; launch step uses production **Tab+Enter** InputRouter path |
 
 ### Live binary provenance
 
@@ -99,7 +105,12 @@ export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 
 ### Production path proven
 
-Toolbar `botster.tui.spawn` → `begin_target_first_spawn` → pick admitted `T` → sync `ListSessionTypesForTarget` → pick listed Global → `SpawnSessionType` with `target_id = T` (live profile + hermetic InputRouter path).
+Toolbar `botster.tui.spawn` → `begin_target_first_spawn` → pick admitted `T` → sync `ListSessionTypesForTarget` → pick listed Global → `SpawnSessionType` with `target_id = T`.
+
+Keyboard proof (Review finding `finding_1786396642_261695`):
+
+1. Hermetic: `product_spawn_list_and_pick_are_reachable_through_keyboard_input_router` — real-frame `InputRouter` **Tab** focus + **Enter** activate for both picker steps; asserts list + spawn requests.
+2. Live pin-matched profile: same Tab/Enter helpers through production router for admitted `T` and Hub-listed Global (no direct `spawn_pick_*` for the launch step).
 
 ### Dual core lock
 
