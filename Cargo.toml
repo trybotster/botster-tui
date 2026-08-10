@@ -7,3 +7,10 @@ edition = "2024"
 rust-version = "1.88.0"
 license = "MIT"
 publish = false
+
+# botster-tui-kit still pins ui-contract at an older Hub rev. Cargo keys git deps
+# by revision, so a byte-identical contract at two revs is two incompatible types.
+# Path-patch every hub-git ui-contract consumer onto this vendored pin copy
+# (byte-identical with Hub cb93df53 / kit-era content).
+[patch."https://github.com/trybotster/botster-hub.git"]
+botster-ui-contract = { path = "third_party/botster-ui-contract" }

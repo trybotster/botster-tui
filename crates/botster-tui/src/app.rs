@@ -61,7 +61,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 31;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 33;
 const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -690,6 +690,9 @@ enum TargetFirstSpawnStep {
     PickSessionType {
         target_id: String,
         target_label: String,
+        /// Available winners from Hub `ListSessionTypesForTarget` for `target_id`.
+        /// Flow-local only — never written into the session-type entity store.
+        session_types: Vec<DaemonSessionType>,
     },
     Prompt {
         target_id: String,
@@ -704,12 +707,34 @@ struct TargetFirstSpawnFlow {
     step: TargetFirstSpawnStep,
 }
 
-/// One pickable launch target: admitted spawn targets plus synthetic ids that
-/// Hub publishes on session types (device:local, package:<name>).
+/// One pickable launch target: an enabled admitted Hub spawn target only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LaunchTargetOption {
     target_id: String,
     label: String,
+}
+
+/// Test-only stub for list-for-target responses so hermetic handlers can prove
+/// success and operator/transport failure without a live Hub client.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum ListForTargetStub {
+    Ok(Vec<DaemonSessionType>),
+    OperatorError {
+        code: String,
+        operation: String,
+        message: String,
+    },
+    TransportError,
+}
+
+enum ListForTargetLoadError {
+    Operator {
+        code: String,
+        operation: String,
+        message: String,
+    },
+    Transport(DaemonTransportError),
 }
 
 fn join_tokens(values: &[String]) -> String {
@@ -1288,6 +1313,8 @@ struct TuiApp {
     acceptance_audit: Option<AcceptanceRequestAudit>,
     #[cfg(test)]
     observed_requests: Vec<ObservedRequest>,
+    #[cfg(test)]
+    list_for_target_stub: Option<ListForTargetStub>,
 }
 
 impl TuiApp {
@@ -1365,6 +1392,8 @@ impl TuiApp {
             acceptance_audit: None,
             #[cfg(test)]
             observed_requests: Vec::new(),
+            #[cfg(test)]
+            list_for_target_stub: None,
         };
         app.try_connect();
         app
@@ -2056,26 +2085,6 @@ impl TuiApp {
                 },
             );
         }
-        for entity in self.session_type_entities.ordered() {
-            if entity.target_id.is_empty() {
-                continue;
-            }
-            options.entry(entity.target_id.clone()).or_insert_with(|| {
-                let label = if entity.target_id == "device:local"
-                    || entity.target_id.starts_with("device:")
-                {
-                    "This device".to_string()
-                } else if let Some(package_name) = entity.target_id.strip_prefix("package:") {
-                    format!("Package {package_name}")
-                } else {
-                    entity.target_id.clone()
-                };
-                LaunchTargetOption {
-                    target_id: entity.target_id.clone(),
-                    label,
-                }
-            });
-        }
         options.into_values().collect()
     }
 
@@ -2090,10 +2099,8 @@ impl TuiApp {
             return;
         }
         if self.launch_target_options().is_empty() {
-            self.error = Some(
-                "no launch targets available (no admitted spawn targets and no session types)"
-                    .to_string(),
-            );
+            self.error =
+                Some("no launch targets available (no enabled admitted spawn targets)".to_string());
             return;
         }
         self.target_first_spawn = Some(TargetFirstSpawnFlow {
@@ -2111,13 +2118,91 @@ impl TuiApp {
             self.error = Some(format!("launch target not found: {target_id}"));
             return;
         };
+        // Clear any prior picker rows before the sync list request so a failed
+        // load cannot leave selectable stale rows from a previous target.
+        self.error = None;
         self.target_first_spawn = Some(TargetFirstSpawnFlow {
-            step: TargetFirstSpawnStep::PickSessionType {
-                target_id: target.target_id.clone(),
-                target_label: target.label.clone(),
-            },
+            step: TargetFirstSpawnStep::PickTarget,
         });
-        self.action_feedback = Some(format!("select a session type for {}", target.label));
+
+        let list_request = DaemonRequest::ListSessionTypesForTarget {
+            target_id: target.target_id.clone(),
+        };
+        #[cfg(test)]
+        self.record_request(&list_request);
+
+        let list_result = self.load_session_types_for_target(&list_request);
+        match list_result {
+            Ok(session_types) => {
+                self.target_first_spawn = Some(TargetFirstSpawnFlow {
+                    step: TargetFirstSpawnStep::PickSessionType {
+                        target_id: target.target_id.clone(),
+                        target_label: target.label.clone(),
+                        session_types,
+                    },
+                });
+                self.action_feedback = Some(format!("select a session type for {}", target.label));
+            }
+            Err(ListForTargetLoadError::Operator {
+                code,
+                operation,
+                message,
+            }) => {
+                self.error = Some(format!("{message} (code={code} operation={operation})"));
+                self.action_feedback = Some(format!(
+                    "session types for {} unavailable; pick another target or cancel",
+                    target.label
+                ));
+            }
+            Err(ListForTargetLoadError::Transport(error)) => {
+                self.record_transport_error(error);
+                self.action_feedback = Some(format!(
+                    "session types for {} failed to load; pick another target or cancel",
+                    target.label
+                ));
+            }
+        }
+    }
+
+    fn load_session_types_for_target(
+        &mut self,
+        list_request: &DaemonRequest,
+    ) -> Result<Vec<DaemonSessionType>, ListForTargetLoadError> {
+        #[cfg(test)]
+        if let Some(stub) = self.list_for_target_stub.take() {
+            return match stub {
+                ListForTargetStub::Ok(session_types) => Ok(session_types),
+                ListForTargetStub::OperatorError {
+                    code,
+                    operation,
+                    message,
+                } => Err(ListForTargetLoadError::Operator {
+                    code,
+                    operation,
+                    message,
+                }),
+                ListForTargetStub::TransportError => Err(ListForTargetLoadError::Transport(
+                    DaemonTransportError::NotRunning,
+                )),
+            };
+        }
+
+        match self.request(list_request.clone()) {
+            Ok(response) => {
+                if let Some(error) = response.error {
+                    self.record_diagnostics(error.diagnostics.clone());
+                    Err(ListForTargetLoadError::Operator {
+                        code: error.code,
+                        operation: error.operation,
+                        message: error.message,
+                    })
+                } else {
+                    // Flow-local only: do not apply_response / entity store.
+                    Ok(response.session_types)
+                }
+            }
+            Err(error) => Err(ListForTargetLoadError::Transport(error)),
+        }
     }
 
     fn spawn_pick_session_type(&mut self, session_type_id: &str) {
@@ -2127,14 +2212,14 @@ impl TuiApp {
         let TargetFirstSpawnStep::PickSessionType {
             target_id,
             target_label,
+            session_types,
         } = &flow.step
         else {
             return;
         };
-        let Some(session_type) = self
-            .session_type_entities
-            .entities
-            .get(session_type_id)
+        let Some(session_type) = session_types
+            .iter()
+            .find(|session_type| session_type.session_type_id == session_type_id)
             .cloned()
         else {
             self.error = Some(format!("session type not found: {session_type_id}"));
@@ -2904,6 +2989,12 @@ impl TuiApp {
             DaemonRequest::ListSpawnTargets => self
                 .observed_requests
                 .push(ObservedRequest::ListSpawnTargets),
+            DaemonRequest::ListSessionTypesForTarget { target_id } => {
+                self.observed_requests
+                    .push(ObservedRequest::ListSessionTypesForTarget {
+                        target_id: target_id.clone(),
+                    })
+            }
             DaemonRequest::ShowSessionTypeDefinition { session_type_id } => self
                 .observed_requests
                 .push(ObservedRequest::ShowSessionTypeDefinition(
@@ -2927,12 +3018,13 @@ impl TuiApp {
             DaemonRequest::SpawnSessionType {
                 session_type_id,
                 session_id,
-                ..
+                request,
             } => self
                 .observed_requests
                 .push(ObservedRequest::SpawnSessionType {
                     session_type_id: session_type_id.clone(),
                     session_id: session_id.clone(),
+                    target_id: request.target_id.clone(),
                 }),
             DaemonRequest::Spawn {
                 session_id,
@@ -4697,50 +4789,48 @@ impl TuiApp {
             TargetFirstSpawnStep::PickSessionType {
                 target_id,
                 target_label,
+                session_types,
             } => {
                 nodes.push(node(
                     UiNodeKind::Text,
                     "tui-target-first-spawn-target",
                     json!({ "text": format!("Target: {target_label} ({target_id})") }),
                 ));
-                let mut matched = false;
-                for entity in self.session_type_entities.ordered() {
-                    if entity.target_id != *target_id {
-                        continue;
-                    }
-                    matched = true;
-                    let label = if entity.available {
-                        format!("{} · {}", entity.label, entity.session_type_id)
-                    } else {
-                        format!(
-                            "{} · {} · unavailable · {}",
-                            entity.label,
-                            entity.session_type_id,
-                            entity.diagnostics.join("; ")
-                        )
-                    };
-                    if entity.available {
-                        nodes.push(button(
-                            &format!("tui-spawn-session-type-{}", entity.session_type_id),
-                            &label,
-                            "botster.tui.spawn.pick_session_type",
-                            json!({ "session_type_id": entity.session_type_id }),
-                        ));
-                    } else {
-                        // Keep unavailable types visible without inventing a disabled Button prop.
-                        nodes.push(node(
-                            UiNodeKind::Text,
-                            &format!("tui-spawn-session-type-{}", entity.session_type_id),
-                            json!({ "text": label }),
-                        ));
-                    }
-                }
-                if !matched {
+                // Membership comes only from Hub list-for-target rows stored on
+                // the flow — never from entity.target_id equality filtering.
+                if session_types.is_empty() {
                     nodes.push(node(
                         UiNodeKind::Text,
                         "tui-target-first-spawn-empty",
                         json!({ "text": "No session types for this target" }),
                     ));
+                } else {
+                    for session_type in session_types {
+                        let label = if session_type.available {
+                            format!("{} · {}", session_type.label, session_type.session_type_id)
+                        } else {
+                            format!(
+                                "{} · {} · unavailable · {}",
+                                session_type.label,
+                                session_type.session_type_id,
+                                session_type.diagnostics.join("; ")
+                            )
+                        };
+                        if session_type.available {
+                            nodes.push(button(
+                                &format!("tui-spawn-session-type-{}", session_type.session_type_id),
+                                &label,
+                                "botster.tui.spawn.pick_session_type",
+                                json!({ "session_type_id": session_type.session_type_id }),
+                            ));
+                        } else {
+                            nodes.push(node(
+                                UiNodeKind::Text,
+                                &format!("tui-spawn-session-type-{}", session_type.session_type_id),
+                                json!({ "text": label }),
+                            ));
+                        }
+                    }
                 }
             }
             TargetFirstSpawnStep::Prompt {
@@ -4936,6 +5026,9 @@ enum ObservedRequest {
         data: String,
     },
     ListSpawnTargets,
+    ListSessionTypesForTarget {
+        target_id: String,
+    },
     ShowSessionTypeDefinition(String),
     CreateSessionType,
     UpdateSessionType,
@@ -4946,6 +5039,7 @@ enum ObservedRequest {
     SpawnSessionType {
         session_type_id: String,
         session_id: String,
+        target_id: Option<String>,
     },
     Spawn {
         session_id: String,
@@ -9127,12 +9221,14 @@ mod tests {
 
         assert_eq!(
             app.error.as_deref(),
-            Some("no launch targets available (no admitted spawn targets and no session types)")
+            Some("no launch targets available (no enabled admitted spawn targets)")
         );
         let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
-        assert!(lines.join("\n").contains(
-            "error: no launch targets available (no admitted spawn targets and no session types)"
-        ));
+        assert!(
+            lines
+                .join("\n")
+                .contains("error: no launch targets available (no enabled admitted spawn targets)")
+        );
     }
 
     #[test]
@@ -9151,7 +9247,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_6_revision_31_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_6_revision_33_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
@@ -9163,7 +9259,7 @@ mod tests {
             botster_hub_client::PROTOCOL_VERSION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 6);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 31);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 33);
         assert!(
             requirement
                 .required_features
@@ -9177,13 +9273,13 @@ mod tests {
                 .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
         );
 
-        for revision in 16..31 {
+        for revision in 16..33 {
             let mut older_hub = DaemonCompatibility::current();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-                .expect_err("pre-session-type fixture revision must be rejected");
+                .expect_err("pre-list-for-target fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 31"));
+            assert!(error.diagnostic.contains("requires at least 33"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
@@ -9202,11 +9298,11 @@ mod tests {
             assert!(error.diagnostic.contains("client requires 6"));
         }
         botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 6 fixture revision 31 hub should connect");
+            .expect("protocol 6 fixture revision 33 hub should connect");
         let mut future_hub = DaemonCompatibility::current();
-        future_hub.conformance_fixture_revision = 32;
+        future_hub.conformance_fixture_revision = 34;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 32");
+            .expect("runtime compatibility must preserve minimum semantics for revision 34");
     }
 
     #[test]
@@ -13227,7 +13323,7 @@ mod tests {
         app.begin_target_first_spawn();
         assert_eq!(
             app.error.as_deref(),
-            Some("no launch targets available (no admitted spawn targets and no session types)")
+            Some("no launch targets available (no enabled admitted spawn targets)")
         );
 
         app.spawn_targets = vec![DaemonSpawnTarget {
@@ -13244,9 +13340,10 @@ mod tests {
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 160, 70);
         let rendered = lines.join("\n");
-        assert!(!rendered.contains(
-            "error: no launch targets available (no admitted spawn targets and no session types)"
-        ));
+        assert!(
+            !rendered
+                .contains("error: no launch targets available (no enabled admitted spawn targets)")
+        );
         assert!(rendered.contains("Target-first spawn"));
         assert!(app.target_first_spawn.is_some());
     }
@@ -18480,10 +18577,29 @@ mod tests {
     }
 
     #[test]
-    fn launch_targets_include_device_local_from_session_type_entities() {
+    fn launch_targets_are_enabled_admitted_spawn_targets_only() {
         let mut app = TuiApp::new(None);
         app.session_types_supported = true;
-        app.spawn_targets.clear();
+        app.spawn_targets = vec![
+            DaemonSpawnTarget {
+                target_id: "repo-a".to_string(),
+                label: "Repo A".to_string(),
+                root: std::path::PathBuf::from("/tmp/repo-a"),
+                enabled: true,
+                kind: "git".to_string(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            },
+            DaemonSpawnTarget {
+                target_id: "repo-disabled".to_string(),
+                label: "Disabled".to_string(),
+                root: std::path::PathBuf::from("/tmp/repo-disabled"),
+                enabled: false,
+                kind: "git".to_string(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            },
+        ];
         let mut device = sample_session_type("device/shell", "device", true);
         device.target_id = "device:local".to_string();
         app.session_type_entities.begin_generation("st".to_string());
@@ -18494,29 +18610,19 @@ mod tests {
             .entity_order
             .push(device.session_type_id.clone());
         let options = app.launch_target_options();
-        assert!(
+        assert_eq!(
             options
                 .iter()
-                .any(|option| option.target_id == "device:local"),
-            "{options:?}"
+                .map(|option| option.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["repo-a"]
         );
-        app.begin_target_first_spawn();
-        assert!(app.target_first_spawn.is_some());
-        assert_eq!(app.error, None);
-        app.spawn_pick_target("device:local");
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("Target-first spawn"), "{rendered}");
         assert!(
-            hit_map.regions().iter().any(|region| region
-                .node_id
-                .contains("tui-spawn-session-type-device/shell")),
-            "{:?}",
-            hit_map
-                .regions()
+            !options
                 .iter()
-                .map(|r| &r.node_id)
-                .collect::<Vec<_>>()
+                .any(|option| option.target_id == "device:local"
+                    || option.target_id.starts_with("package:")),
+            "must not synthesize device:local/package launch targets: {options:?}"
         );
     }
 
@@ -18525,15 +18631,15 @@ mod tests {
         let mut app = TuiApp::new(None);
         app.session_types_supported = true;
         app.system_details_visible = false;
-        let mut device = sample_session_type("device/shell", "device", true);
-        device.target_id = "device:local".to_string();
-        app.session_type_entities.begin_generation("st".to_string());
-        app.session_type_entities
-            .entities
-            .insert(device.session_type_id.clone(), device.clone());
-        app.session_type_entities
-            .entity_order
-            .push(device.session_type_id);
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
         app.handle_action("botster.tui.spawn".to_string(), None, None);
         assert!(app.target_first_spawn.is_some());
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
@@ -18604,22 +18710,34 @@ mod tests {
         let mut app = TuiApp::new(None);
         app.session_types_supported = true;
         app.system_details_visible = false;
-        let mut device = sample_session_type("device/shell", "device", true);
-        device.target_id = "device:local".to_string();
-        device.available = true;
-        app.session_type_entities.begin_generation("st".to_string());
-        app.session_type_entities
-            .entities
-            .insert(device.session_type_id.clone(), device.clone());
-        app.session_type_entities
-            .entity_order
-            .push(device.session_type_id.clone());
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        let mut global = sample_session_type("device/shell", "device", true);
+        global.target_id = "repo-a".to_string();
+        global.available = true;
+        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![global]));
         app.observed_requests.clear();
         app.handle_action("botster.tui.spawn".to_string(), None, None);
         app.handle_action(
             "botster.tui.spawn.pick_target".to_string(),
             None,
-            Some(json!({ "target_id": "device:local" })),
+            Some(json!({ "target_id": "repo-a" })),
+        );
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::ListSessionTypesForTarget { target_id }
+                    if target_id == "repo-a"
+            )),
+            "pick target must observe ListSessionTypesForTarget: {:?}",
+            app.observed_requests
         );
         app.handle_action(
             "botster.tui.spawn.pick_session_type".to_string(),
@@ -18631,8 +18749,9 @@ mod tests {
                 request,
                 ObservedRequest::SpawnSessionType {
                     session_type_id,
+                    target_id: Some(target_id),
                     ..
-                } if session_type_id == "device/shell"
+                } if session_type_id == "device/shell" && target_id == "repo-a"
             )),
             "{:?}",
             app.observed_requests
@@ -18674,11 +18793,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_32() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_33() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 32,
-            "hub-test-support pin must publish fixture revision 32"
+            scenario.conformance_fixture_revision, 33,
+            "hub-test-support pin must publish fixture revision 33"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -18742,11 +18861,11 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 31);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 33);
     }
 
     #[test]
-    fn target_first_spawn_lists_unavailable_session_types_without_dropping_them() {
+    fn target_first_spawn_picker_uses_list_rows_not_entity_target_equality() {
         let mut app = TuiApp::new(None);
         app.session_types_supported = true;
         app.spawn_targets = vec![DaemonSpawnTarget {
@@ -18758,33 +18877,301 @@ mod tests {
             base_ref: None,
             metadata: BTreeMap::new(),
         }];
-        let mut unavailable = sample_session_type("repo-a/svc", "repo", true);
-        unavailable.target_id = "repo-a".to_string();
-        unavailable.available = false;
-        unavailable.diagnostics = vec!["missing binary".to_string()];
-        unavailable.interaction = "service".to_string();
+        // Entity catalog has a type whose target_id equals repo-a, plus a Global
+        // that would never match entity equality for real admitted T.
+        let mut repo_entity = sample_session_type("repo-a/svc", "repo", true);
+        repo_entity.target_id = "repo-a".to_string();
+        let mut global_entity = sample_session_type("device/shell", "device", true);
+        global_entity.target_id = "device:local".to_string();
         app.session_type_entities.begin_generation("st".to_string());
-        app.session_type_entities
-            .entities
-            .insert(unavailable.session_type_id.clone(), unavailable.clone());
-        app.session_type_entities
-            .entity_order
-            .push(unavailable.session_type_id.clone());
+        for entity in [&repo_entity, &global_entity] {
+            app.session_type_entities
+                .entities
+                .insert(entity.session_type_id.clone(), entity.clone());
+            app.session_type_entities
+                .entity_order
+                .push(entity.session_type_id.clone());
+        }
+        // Hub list-for-target projects Global with list-context target_id = T.
+        let mut listed_global = sample_session_type("device/shell", "device", true);
+        listed_global.target_id = "repo-a".to_string();
+        listed_global.available = true;
         app.target_first_spawn = Some(TargetFirstSpawnFlow {
             step: TargetFirstSpawnStep::PickSessionType {
                 target_id: "repo-a".to_string(),
                 target_label: "Repo A".to_string(),
+                session_types: vec![listed_global],
             },
         });
         let nodes = app.target_first_spawn_nodes(app.target_first_spawn.as_ref().unwrap());
-        let text = nodes
+        let buttons: Vec<String> = nodes
             .iter()
-            .filter_map(|node| node.props.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("unavailable"), "{text}");
-        assert!(text.contains("missing binary"), "{text}");
-        assert!(text.contains("repo-a/svc"), "{text}");
+            .filter(|node| node.kind == UiNodeKind::Button)
+            .filter_map(|node| {
+                node.id
+                    .as_ref()
+                    .and_then(UiAuthoredNodeId::as_literal)
+                    .map(|id| id.0.clone())
+            })
+            .collect();
+        assert!(
+            buttons
+                .iter()
+                .any(|id| id.contains("tui-spawn-session-type-device/shell")),
+            "Global from Hub list must appear for admitted T: {buttons:?}"
+        );
+        assert!(
+            !buttons
+                .iter()
+                .any(|id| id.contains("tui-spawn-session-type-repo-a/svc")),
+            "entity-only rows must not appear when absent from Hub list: {buttons:?}"
+        );
+    }
+
+    #[test]
+    fn product_pick_target_list_failure_keeps_flow_recoverable_without_stale_rows() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        // Seed a prior successful list so a failed re-pick must not leave those rows.
+        let prior = sample_session_type("device/stale", "device", true);
+        app.target_first_spawn = Some(TargetFirstSpawnFlow {
+            step: TargetFirstSpawnStep::PickSessionType {
+                target_id: "repo-a".to_string(),
+                target_label: "Repo A".to_string(),
+                session_types: vec![prior],
+            },
+        });
+        app.list_for_target_stub = Some(ListForTargetStub::OperatorError {
+            code: "target_unavailable".to_string(),
+            operation: "list_session_types_for_target".to_string(),
+            message: "spawn target is not eligible".to_string(),
+        });
+        app.observed_requests.clear();
+        app.handle_action(
+            "botster.tui.spawn.pick_target".to_string(),
+            None,
+            Some(json!({ "target_id": "repo-a" })),
+        );
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::ListSessionTypesForTarget { target_id }
+                    if target_id == "repo-a"
+            )),
+            "{:?}",
+            app.observed_requests
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("spawn target is not eligible")),
+            "{:?}",
+            app.error
+        );
+        match app.target_first_spawn.as_ref().map(|flow| &flow.step) {
+            Some(TargetFirstSpawnStep::PickTarget) => {}
+            other => panic!("failed list must stay on PickTarget, got {other:?}"),
+        }
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let rendered = lines.join("\n");
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id.contains("tui-spawn-session-type-")),
+            "no selectable session-type rows after failed list: {:?}",
+            hit_map
+                .regions()
+                .iter()
+                .map(|r| &r.node_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "tui-spawn-cancel"),
+            "flow must remain cancellable: {rendered}"
+        );
+        // Recovery: re-pick after a successful list.
+        let mut recovered = sample_session_type("device/shell", "device", true);
+        recovered.target_id = "repo-a".to_string();
+        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![recovered]));
+        app.error = None;
+        app.handle_action(
+            "botster.tui.spawn.pick_target".to_string(),
+            None,
+            Some(json!({ "target_id": "repo-a" })),
+        );
+        assert_eq!(app.error, None);
+        match &app.target_first_spawn.as_ref().unwrap().step {
+            TargetFirstSpawnStep::PickSessionType { session_types, .. } => {
+                assert_eq!(session_types.len(), 1);
+                assert_eq!(session_types[0].session_type_id, "device/shell");
+            }
+            other => panic!("recovery should reach PickSessionType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn product_pick_target_transport_error_keeps_no_stale_selectable_rows() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        let prior = sample_session_type("device/stale", "device", true);
+        app.target_first_spawn = Some(TargetFirstSpawnFlow {
+            step: TargetFirstSpawnStep::PickSessionType {
+                target_id: "repo-a".to_string(),
+                target_label: "Repo A".to_string(),
+                session_types: vec![prior],
+            },
+        });
+        app.list_for_target_stub = Some(ListForTargetStub::TransportError);
+        app.handle_action(
+            "botster.tui.spawn.pick_target".to_string(),
+            None,
+            Some(json!({ "target_id": "repo-a" })),
+        );
+        match app.target_first_spawn.as_ref().map(|flow| &flow.step) {
+            Some(TargetFirstSpawnStep::PickTarget) => {}
+            other => panic!("transport failure must stay on PickTarget, got {other:?}"),
+        }
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        assert!(
+            !hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id.contains("tui-spawn-session-type-")),
+            "transport failure must not leave selectable session-type rows"
+        );
+    }
+
+    #[test]
+    fn product_spawn_list_and_pick_are_reachable_through_input_router() {
+        let mut app = TuiApp::new(None);
+        app.session_types_supported = true;
+        app.system_details_visible = false;
+        app.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        let mut listed = sample_session_type("device/shell", "device", true);
+        listed.target_id = "repo-a".to_string();
+        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![listed]));
+        app.handle_action("botster.tui.spawn".to_string(), None, None);
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
+        let target_region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "tui-spawn-target-repo-a")
+            .expect("launch target hit region");
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let column = target_region.rect.x;
+        let row = target_region.rect.y;
+        app.handle_dispatch(router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        ));
+        app.handle_dispatch(router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        ));
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::ListSessionTypesForTarget { target_id }
+                    if target_id == "repo-a"
+            )),
+            "{:?}",
+            app.observed_requests
+        );
+        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
+        let type_region = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "tui-spawn-session-type-device/shell")
+            .expect("session type hit region from Hub list");
+        let column = type_region.rect.x;
+        let row = type_region.rect.y;
+        app.handle_dispatch(router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        ));
+        app.handle_dispatch(router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column,
+                row,
+            ),
+            &hit_map,
+        ));
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::SpawnSessionType {
+                    session_type_id,
+                    target_id: Some(target_id),
+                    ..
+                } if session_type_id == "device/shell" && target_id == "repo-a"
+            )),
+            "{:?}",
+            app.observed_requests
+        );
+    }
+
+    #[test]
+    fn production_spawn_picker_source_does_not_filter_entities_by_target_id_equality() {
+        let source = source_without_line_comments();
+        // Build forbidden needles without embedding the production anti-patterns as
+        // contiguous literals (this test body is itself scanned).
+        let entity_eq_filter = format!("entity.target_id {} {}", "!=", "*target_id");
+        let device_local_synth = format!("entity.target_id {} \"{}\"", "==", "device:local");
+        assert!(
+            !source.contains(&entity_eq_filter),
+            "spawn picker must not re-filter entities by target_id equality"
+        );
+        assert!(
+            !source.contains(&device_local_synth),
+            "launch targets must not synthesize device:local from entities"
+        );
+        assert!(
+            source.contains("ListSessionTypesForTarget"),
+            "product path must call Hub ListSessionTypesForTarget"
+        );
     }
 
     #[test]
@@ -18859,8 +19246,8 @@ mod tests {
             })
             .expect("live hub must publish compatibility");
         assert!(
-            compatibility.conformance_fixture_revision >= 32,
-            "session-types live profile requires hub conformance >= 32, observed {}",
+            compatibility.conformance_fixture_revision >= 33,
+            "session-types live profile requires hub conformance >= 33, observed {}",
             compatibility.conformance_fixture_revision
         );
         assert!(
@@ -19046,8 +19433,8 @@ exit 0
             }
         }
 
-        // Launch metadata via SpawnSessionType using a PackageRoot shell type (matches
-        // headless product path). Authoring path/env were already proven above.
+        // Product launch path: admit a real spawn point T, list-for-target through
+        // the toolbar flow, pick Global device type, spawn with target_id = T.
         let launch_type_id = app
             .ensure_headless_shell_session_type(hub.data_dir(), DEFAULT_COMMAND)
             .expect("launch session type");
@@ -19062,17 +19449,98 @@ exit 0
             }
             thread::sleep(Duration::from_millis(50));
         }
-        app.error = None;
-        app.execute_spawn_session_type(
-            &launch_type_id,
-            DaemonSessionTypeRequest {
-                target_id: Some("device:local".to_string()),
-                ..DaemonSessionTypeRequest::default()
-            },
+        let repo_root = root.join("spawn-point-repo");
+        std::fs::create_dir_all(repo_root.join(".botster")).expect("spawn point repo");
+        std::fs::write(repo_root.join("README.md"), "live spawn point\n").expect("seed repo file");
+        run_fixture_command(&repo_root, "git", &["init", "-b", "main"]);
+        run_fixture_command(
+            &repo_root,
+            "git",
+            &["config", "user.email", "live@botster.dev"],
         );
+        run_fixture_command(&repo_root, "git", &["config", "user.name", "Botster Live"]);
+        run_fixture_command(&repo_root, "git", &["add", "."]);
+        run_fixture_command(&repo_root, "git", &["commit", "-m", "live spawn point"]);
+        let admitted_target_id = "live-spawn-point".to_string();
+        app.request_and_apply(DaemonRequest::CreateSpawnTarget {
+            target_id: Some(admitted_target_id.clone()),
+            label: Some("Live Spawn Point".to_string()),
+            root: repo_root.clone(),
+            enabled: true,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
+            metadata: BTreeMap::new(),
+        });
         if let Some(error) = &app.error {
-            panic!("spawn session type failed: {error}");
+            panic!("create spawn target failed: {error}");
         }
+        for _ in 0..80 {
+            app.poll_hub();
+            app.request_and_apply(DaemonRequest::ListSpawnTargets);
+            if app
+                .spawn_targets
+                .iter()
+                .any(|target| target.target_id == admitted_target_id && target.enabled)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.spawn_targets
+                .iter()
+                .any(|target| target.target_id == admitted_target_id && target.enabled),
+            "admitted spawn point T must be present: {:?}",
+            app.spawn_targets
+        );
+
+        app.error = None;
+        app.observed_requests.clear();
+        app.begin_target_first_spawn();
+        assert!(
+            app.target_first_spawn.is_some(),
+            "product spawn dialog open"
+        );
+        app.spawn_pick_target(&admitted_target_id);
+        if let Some(error) = &app.error {
+            panic!("list-for-target through product path failed: {error}");
+        }
+        let listed_ids = match &app.target_first_spawn.as_ref().unwrap().step {
+            TargetFirstSpawnStep::PickSessionType { session_types, .. } => session_types
+                .iter()
+                .map(|session_type| session_type.session_type_id.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("expected PickSessionType after list-for-target, got {other:?}"),
+        };
+        assert!(
+            listed_ids.iter().any(|id| id == &launch_type_id),
+            "device Global {launch_type_id} must appear via list-for-target for T={admitted_target_id}; listed={listed_ids:?}"
+        );
+        app.spawn_pick_session_type(&launch_type_id);
+        if let Some(error) = &app.error {
+            panic!("product spawn pick failed: {error}");
+        }
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::ListSessionTypesForTarget { target_id }
+                    if target_id == &admitted_target_id
+            )),
+            "live product path must observe ListSessionTypesForTarget: {:?}",
+            app.observed_requests
+        );
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::SpawnSessionType {
+                    session_type_id,
+                    target_id: Some(target_id),
+                    ..
+                } if session_type_id == &launch_type_id && target_id == &admitted_target_id
+            )),
+            "spawn must carry target_id=T not device:local: {:?}",
+            app.observed_requests
+        );
         let session_id = app.selected_session.clone().expect("spawn selects session");
         wait_for_authoritative_session(&mut app, &session_id)
             .expect("session becomes authoritative");
