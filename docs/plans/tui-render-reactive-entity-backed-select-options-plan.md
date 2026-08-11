@@ -6,10 +6,10 @@ Responds to `review_1786481460_700986` / findings:
 
 | Finding | Resolution in this revision |
 | --- | --- |
-| Kit prerequisite open but not registered | Hard dependency **re-registered** on `ticket_1786480740_176724` (kit target). Plan no longer claims soft-only tracking. Implement is blocked until kit closes and the merged kit commit pins Hub `891cc79…`. |
+| Kit prerequisite open but not registered | Hard dependency **registered** as `dependency_1786481683_121026` on `ticket_1786480740_176724`. **Closed and verified:** merged kit commit `9d4a566f309e9d848771b5448764a87f4721468e` pins Hub `891cc796faeab51ee4bee1a0e8494562b233036e` (on kit `origin/main`). |
 | Weak live proof residual | Soft residual **removed**. Isolated live Hub production-path proof is **required**. Missing producer/admission becomes an owner-repo dependency, not a waiver. |
 | Generation / ordered-gap recovery incomplete | Per-family subscription generation state machine specified (mirror existing `SessionEntityState`). Production-path tests required for stale generation, out-of-order deltas, gap recovery, surface replacement, reconnect. |
-| Plan document uncommitted | Plan committed on the run branch (this revision). |
+| Plan document uncommitted | Plan committed on the run branch (`7a3aa7d` + follow-up commit recording the verified kit pin). |
 
 ## Outcome
 
@@ -114,7 +114,7 @@ Hub boundary (locked by parent plan/report):
 | --- | --- | --- |
 | `ticket_1786474780_865627` Web: render reactive entity-backed select options | botster-web | Parallel consumer of the same fixture; do not implement Web here |
 | `ticket_1786474780_590414` Workspaces: available sessions picker | botster-workspaces | Product owner of an entity-options surface; not TUI product work |
-| `ticket_1786480740_176724` TUI Kit: pin ui-contract to Hub 891cc79 | botster-tui-kit | **Hard blocking pin prerequisite** (registered) |
+| `ticket_1786480740_176724` TUI Kit: pin ui-contract to Hub 891cc79 | botster-tui-kit | **Closed** pin prerequisite (`dependency_1786481683_121026`). Merged kit SHA `9d4a566f309e9d848771b5448764a87f4721468e` pins Hub `891cc79…` |
 
 ### Repository facts (current worktree)
 
@@ -195,12 +195,12 @@ Hub boundary (locked by parent plan/report):
 
 ### In scope (`botster-tui`)
 
-1. **Cold pin set** (only after kit prerequisite **closed** and verified):
+1. **Cold pin set** (kit prerequisite **closed and verified**):
    - `botster-hub-client`, direct `botster-ui-contract`, `botster-hub-test-support`
      → Hub `891cc796faeab51ee4bee1a0e8494562b233036e`
-   - `botster-tui-kit` → **merged** kit revision from
-     `ticket_1786480740_176724` whose own `botster-ui-contract` pin is the
-     **same** Hub Git source
+   - `botster-tui-kit` → **`9d4a566f309e9d848771b5448764a87f4721468e`**
+     (closed ticket `ticket_1786480740_176724`; `Cargo.toml` workspace pin is
+     Hub `891cc796faeab51ee4bee1a0e8494562b233036e`)
    - Regenerate `Cargo.lock`; prove a single `botster-ui-contract` source
      (`cargo tree -i botster-ui-contract` unambiguous — no dual Git revs)
    - Refresh `third_party/botster-ui-contract` + `PIN.md` only if patch identity
@@ -334,18 +334,20 @@ Hub boundary (locked by parent plan/report):
 ### Registered dependencies
 
 1. **Closed:** Hub contract `ticket_1786474779_865884`.
-2. **Hard open (product gate):** TUI Kit pin `ticket_1786480740_176724` on
-   target `tgt_3dfae49c02454037bf13554f552baf7f`.
-   - Edge **registered** via `project_pipelines_add_ticket_dependency`.
-   - This ticket's pipeline advance / Implement **must not** proceed while the
-     kit ticket is open.
-   - Before Implement activates: verify kit **merged** commit pins
-     `botster-ui-contract` to Hub `891cc796faeab51ee4bee1a0e8494562b233036e`
-     (or the exact same Git source the TUI will use). Record that kit SHA in
-     the implement report.
-   - Do **not** repin Hub on TUI while kit remains on `0ee42e9…` — that splits
-     `botster-ui-contract` type identity ([[botster rust consumers that share ui
-     contract must pin one hub revision]]).
+2. **Closed (product gate satisfied):** TUI Kit pin `ticket_1786480740_176724`
+   on target `tgt_3dfae49c02454037bf13554f552baf7f`.
+   - Edge **registered**: `dependency_1786481683_121026`
+     (`depends_on_status: closed` after kit delivery run
+     `run_1786481687_478122` closed).
+   - **Verified merged kit commit:** `9d4a566f309e9d848771b5448764a87f4721468e`
+     - Present on `origin/main` / local `main` of `trybotster/botster-tui-kit`
+     - Workspace `botster-ui-contract` rev =
+       `891cc796faeab51ee4bee1a0e8494562b233036e` (exact Hub entity-options pin)
+   - Implement must consume that kit SHA (or later main that keeps the same Hub
+     pin) together with Hub `891cc79…` on hub-client / ui-contract /
+     hub-test-support so Cargo resolves **one** `botster-ui-contract` source
+     ([[botster rust consumers that share ui contract must pin one hub
+     revision]]).
 3. **Conditional (only if live producer cannot be owned in TUI):** register an
    owner-repo dependency for an admitted entity-options surface fixture rather
    than waiving live proof.
@@ -355,9 +357,9 @@ Hub boundary (locked by parent plan/report):
 ### Assumptions
 
 1. Hub main `891cc796faeab51ee4bee1a0e8494562b233036e` is the consumer pin for
-   the closed dependency.
-2. Kit pin is mechanical (Cargo rev + lock + gates); kit Select already accepts
-   realized options.
+   the closed Hub dependency.
+2. Kit pin is mechanical; kit Select already accepts realized options. **Verified
+   kit SHA:** `9d4a566f309e9d848771b5448764a87f4721468e`.
 3. “Existing generic entity state path” means contract `EntityFamilyStore` +
    existing entity-frame / subscribe plumbing extended with generation
    discipline already proven on `SessionEntityState`.
@@ -370,7 +372,7 @@ Hub boundary (locked by parent plan/report):
 
 ### Unknowns (resolve in Implement; escalate only if blocking)
 
-1. Exact **merged kit** commit SHA after `ticket_1786480740_176724` closes.
+1. ~~Exact merged kit commit SHA~~ → **resolved:** `9d4a566f309e9d848771b5448764a87f4721468e`.
 2. Whether overlapping `session` family subscription can be shared with the
    options store without double-apply; if not, document single-owner generation
    choice in implement report.
@@ -393,10 +395,11 @@ Hub boundary (locked by parent plan/report):
 
 ## Implementation sequence (for Implement)
 
-1. Confirm kit ticket **closed**; record merged kit SHA; confirm its Hub pin is
-   `891cc79…`.
-2. Repin Hub trio + kit; prove single contract identity; green `./test.sh`
-   baseline (document unrelated pre-existing failures with exact filters only).
+1. ~~Confirm kit ticket closed / record kit SHA~~ → **done at Plan:** kit
+   `9d4a566f309e9d848771b5448764a87f4721468e` pins Hub `891cc79…`.
+2. Repin Hub trio + kit `9d4a566…`; prove single contract identity; green
+   `./test.sh` baseline (document unrelated pre-existing failures with exact
+   filters only).
 3. Implement multi-family store + generation/gap discipline; frame apply from
    `DaemonEntityFrame`.
 4. On plugin surface accept / reconnect / surface replace:
@@ -429,11 +432,13 @@ Hub boundary (locked by parent plan/report):
 
 ### Pin / identity
 
-- [ ] Kit `ticket_1786480740_176724` **closed** before Implement
-- [ ] Merged kit SHA pins Hub `891cc796faeab51ee4bee1a0e8494562b233036e`
-- [ ] TUI Hub pins = same Hub rev; kit pin = that merged kit SHA
-- [ ] Single `botster-ui-contract` source in lock/tree
-- [ ] README pin prose updated
+- [x] Kit `ticket_1786480740_176724` **closed** (Plan verified)
+- [x] Merged kit SHA `9d4a566f309e9d848771b5448764a87f4721468e` pins Hub
+      `891cc796faeab51ee4bee1a0e8494562b233036e` (Plan verified via
+      `git show …:Cargo.toml`)
+- [ ] TUI Hub pins = same Hub rev; kit pin = `9d4a566…` (Implement)
+- [ ] Single `botster-ui-contract` source in lock/tree (Implement)
+- [ ] README pin prose updated (Implement)
 
 ### Contract consumption
 
