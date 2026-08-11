@@ -1339,6 +1339,13 @@ struct TuiApp {
     observed_requests: Vec<ObservedRequest>,
     #[cfg(test)]
     list_for_target_stub: Option<ListForTargetStub>,
+    /// When true, entity-options SubscribeEntities uses local pumps (no network).
+    /// Production path tests inject frames through drain without a live Hub.
+    #[cfg(test)]
+    entity_options_local_pumps: bool,
+    /// Senders for local entity-options pumps (test injection only).
+    #[cfg(test)]
+    entity_options_frame_injectors: BTreeMap<String, mpsc::Sender<SessionSubscriptionMessage>>,
 }
 
 impl TuiApp {
@@ -1421,6 +1428,10 @@ impl TuiApp {
             observed_requests: Vec::new(),
             #[cfg(test)]
             list_for_target_stub: None,
+            #[cfg(test)]
+            entity_options_local_pumps: false,
+            #[cfg(test)]
+            entity_options_frame_injectors: BTreeMap::new(),
         };
         app.try_connect();
         app
@@ -1591,13 +1602,23 @@ impl TuiApp {
 
         match renderer::apply_action_result(&mut self.plugin_presentation, &result) {
             Ok(transition) => {
-                let body_replaced = transition.replacement.is_some();
+                let mut body_replaced = false;
                 if let Some(replacement) = transition.replacement {
-                    surface.body = replacement;
-                    // The snapshot validates the Hub-delivered tree at ingestion. An accepted
-                    // action replacement is app-owned active state and must not leave a second,
-                    // stale structural tree that looks current.
-                    surface.ui_tree_snapshot = None;
+                    let prior_families = demanded_entity_option_families(&surface.body);
+                    let next_families = demanded_entity_option_families(&replacement);
+                    // Hosts sometimes re-emit a realized select without options_source after
+                    // submit. Dropping every producer would leave entity frames unable to
+                    // re-materialize options — keep the prior producer body in that case.
+                    if !prior_families.is_empty() && next_families.is_empty() {
+                        surface.ui_tree_snapshot = None;
+                    } else {
+                        surface.body = replacement;
+                        // The snapshot validates the Hub-delivered tree at ingestion. An
+                        // accepted action replacement is app-owned active state and must not
+                        // leave a second, stale structural tree that looks current.
+                        surface.ui_tree_snapshot = None;
+                        body_replaced = true;
+                    }
                 }
                 self.pending_plugin_request = None;
                 self.action_feedback = Some(plugin_action_result_text(&result));
@@ -2616,6 +2637,8 @@ impl TuiApp {
             let _ = pump.stop();
         }
         self.entity_options = EntityOptionsStore::default();
+        #[cfg(test)]
+        self.entity_options_frame_injectors.clear();
     }
 
     /// Collect options_source families from the active plugin surface and ensure
@@ -2665,11 +2688,15 @@ impl TuiApp {
         &mut self,
         entity_type: &str,
     ) -> DaemonTransportResult<()> {
+        let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
+        #[cfg(test)]
+        if self.entity_options_local_pumps {
+            return self.install_local_entity_options_pump(entity_type, subscription_id);
+        }
         let endpoint = self
             .endpoint
             .as_ref()
             .ok_or(DaemonTransportError::NotRunning)?;
-        let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
         let mut subscription = subscribe_entities(endpoint, entity_type, subscription_id.clone())?;
         subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
         let (sender, receiver) = mpsc::channel();
@@ -2728,6 +2755,51 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Install a local (non-network) entity-options pump and begin a generation.
+    /// Used by production-path unit tests and offline start stubs.
+    #[cfg(test)]
+    fn install_local_entity_options_pump(
+        &mut self,
+        entity_type: &str,
+        subscription_id: String,
+    ) -> DaemonTransportResult<()> {
+        let (sender, receiver) = mpsc::channel();
+        let (cancel_sender, _cancel_receiver) = mpsc::channel();
+        let (_stopped_sender, stopped_receiver) = mpsc::channel();
+        self.entity_options
+            .begin_generation(entity_type, subscription_id);
+        self.entity_options_frame_injectors
+            .insert(entity_type.to_string(), sender);
+        self.entity_options_subscriptions.insert(
+            entity_type.to_string(),
+            SessionSubscriptionPump {
+                messages: receiver,
+                cancel: Some(cancel_sender),
+                stopped: stopped_receiver,
+                stop_attempted: false,
+                stopped_confirmed: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Re-open demanded entity-options pumps that are missing after a failed recovery.
+    fn heal_entity_options_subscriptions(&mut self) {
+        let Some(surface) = self.plugin_surface.as_ref() else {
+            return;
+        };
+        let demanded: Vec<String> = demanded_entity_option_families(&surface.body)
+            .into_iter()
+            .filter(|family| !is_process_wide_entity_family(family))
+            .filter(|family| !self.entity_options_subscriptions.contains_key(family))
+            .collect();
+        for family in demanded {
+            if let Err(error) = self.start_entity_options_subscription(&family) {
+                self.error = Some(format!("entity options heal failed for {family}: {error}"));
+            }
+        }
+    }
+
     /// Drain entity-options family pumps. Returns true when a disconnect forces reconnect.
     fn drain_entity_options_subscriptions(&mut self) -> bool {
         let families: Vec<String> = self.entity_options_subscriptions.keys().cloned().collect();
@@ -2747,19 +2819,33 @@ impl TuiApp {
                             Ok(false) => {}
                             Err(error) => {
                                 self.error = Some(format!("entity options sync: {error}"));
-                                // Gap recovery: re-subscribe this family for a fresh snapshot.
+                                // Gap recovery: drop the generation and open a fresh SubscribeEntities.
                                 if let Some(mut pump) =
                                     self.entity_options_subscriptions.remove(&family)
                                 {
                                     let _ = pump.stop();
                                 }
+                                #[cfg(test)]
+                                self.entity_options_frame_injectors.remove(&family);
                                 self.entity_options.drop_family(&family);
-                                if let Err(start_error) =
-                                    self.start_entity_options_subscription(&family)
+                                let still_demanded =
+                                    self.plugin_surface.as_ref().is_some_and(|surface| {
+                                        demanded_entity_option_families(&surface.body)
+                                            .contains(&family)
+                                    });
+                                if still_demanded
+                                    && let Err(start_error) =
+                                        self.start_entity_options_subscription(&family)
                                 {
                                     self.error = Some(format!(
                                         "entity options recovery failed for {family}: {start_error}"
                                     ));
+                                    // Leave the family unsubscribed only transiently —
+                                    // heal below retries demanded pumps; force reconnect
+                                    // if the endpoint itself is gone.
+                                    if self.endpoint.is_none() || self.client.is_none() {
+                                        force_reconnect = true;
+                                    }
                                 }
                             }
                         }
@@ -2802,6 +2888,8 @@ impl TuiApp {
         if mutated {
             self.reconcile_entity_option_drafts();
         }
+        // Retry any demanded family left without a pump after gap recovery failure.
+        self.heal_entity_options_subscriptions();
         force_reconnect
     }
 
@@ -15852,6 +15940,302 @@ mod tests {
     }
 
     #[test]
+    fn plugin_action_result_keeps_prior_body_when_replacement_drops_options_source() {
+        let initial = ui_node(json!({
+            "type": "select",
+            "id": "entity-options-select",
+            "props": {
+                "name": "option",
+                "label": "Option",
+                "options_source": {
+                    "$kind": "entity_options",
+                    "source": "/entity-options-reactive.item",
+                    "value_field": "value",
+                    "display_fields": ["label"],
+                    "order": ["value"]
+                }
+            }
+        }));
+        let stripped = ui_node(json!({
+            "type": "select",
+            "id": "entity-options-select",
+            "props": {
+                "name": "option",
+                "label": "Option"
+            }
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "entity-options-reactive",
+            "entity-options-reactive.picker",
+            initial.clone(),
+        )));
+        app.error = None;
+        let request = plugin_request(
+            "req-strip-options",
+            "entity-options-reactive.picker",
+            "entity-options.submit",
+            "entity-options-select",
+        );
+        app.pending_plugin_request = Some(request.clone());
+        app.apply_plugin_action_result(UiActionResult {
+            request_id: request.request_id.clone(),
+            surface_id: request.surface_id.clone(),
+            action_id: request.action_id.clone(),
+            node_id: request.node_id.clone(),
+            state: botster_ui_contract::UiActionResultState::Accepted,
+            field_errors: BTreeMap::new(),
+            form_errors: Vec::new(),
+            warnings: Vec::new(),
+            normalized_values: None,
+            presentation: None,
+            replacement: Some(Box::new(stripped)),
+            payload: None,
+            error: None,
+        });
+        assert!(
+            app.plugin_surface
+                .as_ref()
+                .is_some_and(|surface| surface_has_options_source(&surface.body)),
+            "producer body must be preserved when replacement drops options_source"
+        );
+        assert_eq!(
+            app.plugin_surface.as_ref().map(|surface| &surface.body),
+            Some(&initial)
+        );
+    }
+
+    #[test]
+    fn entity_options_drain_gap_recovery_replaces_pump_and_requires_new_snapshot() {
+        let body = ui_node(json!({
+            "type": "form",
+            "id": "entity-options-form",
+            "props": {
+                "action": { "id": "entity-options.submit" },
+                "submit_label": "Submit"
+            },
+            "children": [{
+                "type": "select",
+                "id": "entity-options-select",
+                "props": {
+                    "name": "option",
+                    "label": "Option",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/entity-options-reactive.item",
+                        "value_field": "value",
+                        "display_fields": ["label"],
+                        "order": ["value"]
+                    }
+                }
+            }]
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.entity_options_local_pumps = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "entity-options-reactive",
+            "entity-options-reactive.picker",
+            body,
+        )));
+        app.error = None;
+        app.drop_entity_options_subscriptions();
+        app.start_entity_options_subscription("entity-options-reactive.item")
+            .expect("local pump starts");
+        let old_sub = app
+            .entity_options
+            .family("entity-options-reactive.item")
+            .and_then(|family| family.subscription_id.clone())
+            .expect("generation subscription id");
+        let injector = app
+            .entity_options_frame_injectors
+            .get("entity-options-reactive.item")
+            .expect("local injector")
+            .clone();
+        injector
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Snapshot {
+                    subscription_id: old_sub.clone(),
+                    entity_type: "entity-options-reactive.item".to_string(),
+                    snapshot_seq: 1,
+                    items: vec![json!({
+                        "id": "opt-alpha",
+                        "label": "Alpha",
+                        "value": "opt-alpha"
+                    })],
+                    resync_reason: None,
+                },
+            ))
+            .expect("inject snapshot");
+        assert!(!app.drain_entity_options_subscriptions());
+        assert!(
+            app.entity_options
+                .family("entity-options-reactive.item")
+                .is_some_and(|family| family.has_snapshot)
+        );
+
+        // Sequence hole on the active generation must resubscribe with a new id.
+        injector
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Upsert {
+                    subscription_id: old_sub.clone(),
+                    entity_type: "entity-options-reactive.item".to_string(),
+                    snapshot_seq: 3,
+                    id: "opt-gap".to_string(),
+                    entity: json!({
+                        "id": "opt-gap",
+                        "label": "Gap",
+                        "value": "opt-gap"
+                    }),
+                },
+            ))
+            .expect("inject gap");
+        assert!(!app.drain_entity_options_subscriptions());
+        let new_sub = app
+            .entity_options
+            .family("entity-options-reactive.item")
+            .and_then(|family| family.subscription_id.clone())
+            .expect("recovered generation");
+        assert_ne!(
+            old_sub, new_sub,
+            "gap recovery must begin a new subscription id"
+        );
+        assert!(
+            app.entity_options
+                .family("entity-options-reactive.item")
+                .is_some_and(|family| !family.has_snapshot),
+            "recovery generation must wait for an authoritative snapshot"
+        );
+        assert!(
+            app.entity_options_subscriptions
+                .contains_key("entity-options-reactive.item"),
+            "recovered family must keep a live pump"
+        );
+
+        let recovery_injector = app
+            .entity_options_frame_injectors
+            .get("entity-options-reactive.item")
+            .expect("recovery injector")
+            .clone();
+        recovery_injector
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Snapshot {
+                    subscription_id: new_sub.clone(),
+                    entity_type: "entity-options-reactive.item".to_string(),
+                    snapshot_seq: 1,
+                    items: vec![json!({
+                        "id": "opt-recovered",
+                        "label": "Recovered",
+                        "value": "opt-recovered"
+                    })],
+                    resync_reason: None,
+                },
+            ))
+            .expect("inject recovery snapshot");
+        assert!(!app.drain_entity_options_subscriptions());
+        assert!(
+            app.entity_options
+                .family("entity-options-reactive.item")
+                .is_some_and(|family| {
+                    family.has_snapshot && family.records.contains_key("opt-recovered")
+                }),
+            "authoritative recovery snapshot must populate the new generation"
+        );
+    }
+
+    #[test]
+    fn entity_options_drain_gap_recovery_start_failure_forces_reconnect_signal() {
+        let body = ui_node(json!({
+            "type": "select",
+            "id": "entity-options-select",
+            "props": {
+                "name": "option",
+                "label": "Option",
+                "options_source": {
+                    "$kind": "entity_options",
+                    "source": "/entity-options-reactive.item",
+                    "value_field": "value",
+                    "display_fields": ["label"],
+                    "order": ["value"]
+                }
+            }
+        }));
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.entity_options_local_pumps = false;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "entity-options-reactive",
+            "entity-options-reactive.picker",
+            body,
+        )));
+        app.error = None;
+        app.drop_entity_options_subscriptions();
+        let (sender, receiver) = mpsc::channel();
+        let (cancel_sender, _cancel_receiver) = mpsc::channel();
+        let (_stopped_sender, stopped_receiver) = mpsc::channel();
+        app.entity_options
+            .begin_generation("entity-options-reactive.item", "gap-old".to_string());
+        app.entity_options_subscriptions.insert(
+            "entity-options-reactive.item".to_string(),
+            SessionSubscriptionPump {
+                messages: receiver,
+                cancel: Some(cancel_sender),
+                stopped: stopped_receiver,
+                stop_attempted: false,
+                stopped_confirmed: false,
+            },
+        );
+        assert!(
+            app.entity_options
+                .apply_daemon_frame(DaemonEntityFrame::Snapshot {
+                    subscription_id: "gap-old".to_string(),
+                    entity_type: "entity-options-reactive.item".to_string(),
+                    snapshot_seq: 1,
+                    items: vec![json!({
+                        "id": "opt-alpha",
+                        "label": "Alpha",
+                        "value": "opt-alpha"
+                    })],
+                    resync_reason: None,
+                })
+                .expect("seed snapshot")
+        );
+        sender
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Upsert {
+                    subscription_id: "gap-old".to_string(),
+                    entity_type: "entity-options-reactive.item".to_string(),
+                    snapshot_seq: 3,
+                    id: "opt-gap".to_string(),
+                    entity: json!({
+                        "id": "opt-gap",
+                        "label": "Gap",
+                        "value": "opt-gap"
+                    }),
+                },
+            ))
+            .expect("inject gap");
+        let force_reconnect = app.drain_entity_options_subscriptions();
+        assert!(
+            force_reconnect,
+            "failed recovery without an endpoint must signal reconnect"
+        );
+        assert!(
+            !app.entity_options_subscriptions
+                .contains_key("entity-options-reactive.item"),
+            "failed recovery must not leave a half-open pump"
+        );
+        assert!(
+            app.error.as_ref().is_some_and(
+                |error| error.contains("recovery failed") || error.contains("heal failed")
+            ),
+            "failed recovery must record an error: {:?}",
+            app.error
+        );
+    }
+
+    #[test]
     fn entity_options_live_hub_proof_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -16139,56 +16523,23 @@ mod tests {
             "live submit must travel PluginSurfaceAction with exact value: {:?}",
             app.observed_requests
         );
-        // Drain the action result without allowing a replacement that strips
-        // options_source (some hosts re-emit a realized select without options).
-        // Keep the authored producer body so later entity frames re-materialize.
-        let authored_picker = ui_node(json!({
-            "type": "form",
-            "id": "entity-options-form",
-            "props": {
-                "action": { "id": "entity-options.submit" },
-                "submit_label": "Submit selection"
-            },
-            "children": [{
-                "type": "select",
-                "id": "entity-options-select",
-                "props": {
-                    "name": "option",
-                    "label": "Option",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/session",
-                        "value_field": "session_uuid",
-                        "display_fields": ["lifecycle_class", "session_type_id", "registry_state"],
-                        "order": ["session_uuid"],
-                        "where": { "lifecycle_class": "current" }
-                    }
-                }
-            }]
-        }));
-        // Host action results may replace the body with a realized select that omitted
-        // the options slot. Always restore the authored producer body after submit so
-        // subsequent entity frames re-materialize through the production path.
-        if let Some(surface) = app.plugin_surface.as_mut() {
-            surface.body = authored_picker;
-            surface.ui_tree_snapshot = None;
-        }
-        app.plugin_action_result = None;
-        app.sync_entity_options_subscriptions();
+        // Production path must keep the Hub-delivered surface after submit (no
+        // test-authored body rewrite). Host replacements that drop every
+        // options_source producer are refused in apply_plugin_action_result.
         assert!(
             app.plugin_surface
                 .as_ref()
                 .is_some_and(|surface| surface_has_options_source(&surface.body)),
-            "authored options_source must be present after submit restore"
+            "Hub-delivered surface must retain options_source after keyboard submit; body={:?}",
+            app.plugin_surface.as_ref().map(|surface| &surface.body)
         );
-        // Sanity: materialize succeeds before ordered entity updates.
         let (_, baseline_map) = renderer::render_to_lines(&app.surface(), 140, 50);
         assert!(
             baseline_map
                 .regions()
                 .iter()
                 .any(|region| region.node_id == "entity-options-select"),
-            "restored authored body must materialize the select before ordered change"
+            "Hub-delivered surface must materialize the select before ordered change"
         );
 
         // Post-baseline ordered change on the active session subscription: shutdown
