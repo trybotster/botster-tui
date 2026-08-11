@@ -36,7 +36,7 @@ decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
 `Cargo.lock` pins that dev-only source at
-`ff115694caf61e435bfb3d7ffcc5a6459689c8d9`. The kit supplies semantic
+`9d41ad4c614add7d15ff7e0f88b310a55627cd82`. The kit supplies semantic
 viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
 focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
 occlusion barriers. The kit owns reusable
@@ -186,7 +186,7 @@ Session types are authoritative Hub descriptors consumed through the
 - Pins: Hub crates `891cc796faeab51ee4bee1a0e8494562b233036e`, kit
   `9d4a566f309e9d848771b5448764a87f4721468e`. Cargo.lock must keep a single
   `botster-ui-contract` at that Hub rev and dual `botster-core` sources
-  (direct `16bf08f2…` plus `branch=main` at `ff115694…` via hub-test-support).
+  (direct `16bf08f2…` plus `branch=main` at `9d41ad4…` via hub-test-support).
 
 Live proof (independent of contract-matrix):
 

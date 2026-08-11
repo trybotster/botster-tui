@@ -16523,8 +16523,10 @@ mod tests {
             app.observed_requests
         );
         // Production path must keep the Hub-delivered surface after submit (no
-        // test-authored body rewrite). Host replacements that drop every
-        // options_source producer are refused in apply_plugin_action_result.
+        // test-authored body rewrite). Owner-authored replacements that drop
+        // every options_source producer are applied when present (see
+        // plugin_action_result_applies_static_success_replacement…); this live
+        // fixture does not return such a replacement, so options_source stays.
         assert!(
             app.plugin_surface
                 .as_ref()
