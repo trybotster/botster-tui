@@ -1,5 +1,6 @@
 mod acceptance;
 mod app;
+mod entity_options;
 mod renderer;
 
 fn main() -> std::io::Result<()> {

@@ -171,7 +171,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core?branch=main#ff115694caf61e435bfb3d7ffcc5a6459689c8d9"
+source = "git+https://github.com/trybotster/botster-core?branch=main#9d41ad4c614add7d15ff7e0f88b310a55627cd82"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -212,7 +212,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=0ee42e9b84a0b0e9b0ab89834675535c8b831993#0ee42e9b84a0b0e9b0ab89834675535c8b831993"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=891cc796faeab51ee4bee1a0e8494562b233036e#891cc796faeab51ee4bee1a0e8494562b233036e"
 dependencies = [
  "base64",
  "botster-ui-contract",
@@ -223,7 +223,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=0ee42e9b84a0b0e9b0ab89834675535c8b831993#0ee42e9b84a0b0e9b0ab89834675535c8b831993"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=891cc796faeab51ee4bee1a0e8494562b233036e#891cc796faeab51ee4bee1a0e8494562b233036e"
 dependencies = [
  "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core?branch=main)",
  "botster-hub-client",
@@ -253,7 +253,7 @@ dependencies = [
 [[package]]
 name = "botster-tui-kit"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=571523d93a62945208ebb2bb75262dcdd78001a2#571523d93a62945208ebb2bb75262dcdd78001a2"
+source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=9d4a566f309e9d848771b5448764a87f4721468e#9d4a566f309e9d848771b5448764a87f4721468e"
 dependencies = [
  "botster-ui-contract",
  "crossterm",
@@ -263,8 +263,8 @@ dependencies = [
 
 [[package]]
 name = "botster-ui-contract"
-version = "0.3.1"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=0ee42e9b84a0b0e9b0ab89834675535c8b831993#0ee42e9b84a0b0e9b0ab89834675535c8b831993"
+version = "0.3.2"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=891cc796faeab51ee4bee1a0e8494562b233036e#891cc796faeab51ee4bee1a0e8494562b233036e"
 dependencies = [
  "serde",
  "serde_json",

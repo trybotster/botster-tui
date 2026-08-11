@@ -1,0 +1,28 @@
+{
+  "name": "entity-options-reactive",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "description": "Owner package surface for TUI reactive entity-backed select options live proof.",
+  "capabilities": [{ "surface": "surfaces" }],
+  "entrypoints": [
+    {
+      "runtime": "lua",
+      "path": "plugin.lua",
+      "bootstrap": false
+    }
+  ],
+  "surfaces": [
+    {
+      "id": "entity-options-reactive.picker",
+      "kind": "app",
+      "title": "Entity Options Picker",
+      "description": "Reactive entity-backed select options live proof surface.",
+      "icon": "list",
+      "order": 10,
+      "category": "contract",
+      "supports": ["render", "action"]
+    }
+  ]
+}
