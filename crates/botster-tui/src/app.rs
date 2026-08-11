@@ -8845,6 +8845,35 @@ mod tests {
     }
 
     #[test]
+    fn never_connected_workspace_shows_connection_error_and_hub_unavailable_state() {
+        let app = TuiApp::new_with_connection(None, Some("daemon is not running".to_string()));
+
+        let surface = app.surface();
+        let alert = find_ui_node_by_id(&surface, "workspace-connection-alert")
+            .expect("never-connected workspace must include the connection alert");
+        assert!(
+            alert.props["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("daemon is not running")),
+            "connection alert must include the transport error: {:?}",
+            alert.props
+        );
+        let terminal_output = find_ui_node_by_id(&surface, "tui-terminal-output")
+            .expect("never-connected workspace must keep the terminal panel visible");
+        assert!(
+            terminal_output.props["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Hub unavailable")),
+            "terminal panel must include the Hub unavailable state: {:?}",
+            terminal_output.props
+        );
+        assert!(
+            find_ui_node_by_id(&surface, "tui-status-panel").is_none(),
+            "connection error must not replace the workspace with System details"
+        );
+    }
+
+    #[test]
     fn contextual_toolbar_shows_valid_actions_and_overflows_only_when_constrained() {
         let mut app = workspace_fixture();
         let (_wide, wide_hits) = render_app_to_lines(&app, 140, 42, &RenderState::default());
@@ -14992,10 +15021,28 @@ mod tests {
             unavailable_args.daemon_endpoint(),
             unavailable_args.connection_error,
         );
-        let (lines, _) = renderer::render_to_lines(&unavailable_app.surface(), 120, 48);
+        let surface = unavailable_app.surface();
+        let connection_error = unavailable_app
+            .connection_error
+            .as_deref()
+            .expect("unavailable live Hub must report a connection error");
+        let connection_alert = find_ui_node_by_id(&surface, "workspace-connection-alert")
+            .expect("never-connected live app must include the workspace connection alert");
+        assert!(
+            connection_alert.props["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(connection_error)),
+            "workspace connection alert must include the complete connection error: {:?}",
+            connection_alert.props
+        );
+        assert!(
+            find_ui_node_by_id(&surface, "tui-terminal-output").is_some(),
+            "never-connected live app must keep the terminal panel visible"
+        );
+        let (lines, _) = renderer::render_to_lines(&surface, 120, 48);
         let rendered = lines.join("\n");
         assert!(rendered.contains("Hub unavailable"));
-        assert!(rendered.contains("connection:"));
+        assert!(rendered.contains("Connection unavailable:"));
 
         hub.shutdown().expect("isolated hub shuts down cleanly");
     }
