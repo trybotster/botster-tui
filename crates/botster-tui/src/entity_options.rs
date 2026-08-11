@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use botster_hub_client::DaemonEntityFrame;
 use botster_ui_contract::{
     EntityFamilyStore, EntityOption, EntityOptionsFrame, EntityRecordItem, UiAuthoredNodeId,
-    UiChild, UiEntityOptionsSource, UiNode, UiNodeId, UiNodeKind, UiBindIf, UiBindList,
-    UiConditional, apply_entity_options_frame, collect_entity_option_families,
+    UiBindIf, UiBindList, UiChild, UiConditional, UiEntityOptionsSource, UiNode, UiNodeId,
+    UiNodeKind, apply_entity_options_frame, collect_entity_option_families,
     project_entity_options_from_store,
 };
 use serde_json::{Map, Value};
@@ -43,19 +43,45 @@ impl EntityOptionsFamilyState {
         entity_type == family && self.subscription_id.as_deref() == Some(subscription_id)
     }
 
-    pub fn accepts_delta(
+    /// Classify a delta against the current generation.
+    ///
+    /// - `Accept` — matching generation, snapshot held, strictly advancing seq
+    /// - `Ignore` — foreign generation / non-advancing seq (do not mutate)
+    /// - `NeedsRecovery` — matching generation but no snapshot yet, or a sequence
+    ///   hole after a snapshot. Production drain must resubscribe for a fresh
+    ///   authoritative snapshot.
+    pub fn classify_delta(
         &self,
         subscription_id: &str,
         entity_type: &str,
         family: &str,
         snapshot_seq: u64,
-    ) -> bool {
-        self.has_snapshot
-            && self.matches(subscription_id, entity_type, family)
-            && self
-                .snapshot_seq
-                .is_none_or(|current| snapshot_seq > current)
+    ) -> DeltaDisposition {
+        if !self.matches(subscription_id, entity_type, family) {
+            return DeltaDisposition::Ignore;
+        }
+        if !self.has_snapshot {
+            return DeltaDisposition::NeedsRecovery(
+                "delta before first authoritative snapshot".to_string(),
+            );
+        }
+        match self.snapshot_seq {
+            Some(current) if snapshot_seq == current + 1 => DeltaDisposition::Accept,
+            Some(current) if snapshot_seq > current + 1 => DeltaDisposition::NeedsRecovery(
+                format!("sequence gap: current={current} observed={snapshot_seq}"),
+            ),
+            // Non-advancing or older seq under the active generation: ignore.
+            Some(_) | None => DeltaDisposition::Ignore,
+        }
     }
+}
+
+/// Production delta disposition for entity-options generation discipline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaDisposition {
+    Accept,
+    Ignore,
+    NeedsRecovery(String),
 }
 
 /// Multi-family entity-options store with per-family generation discipline.
@@ -87,7 +113,11 @@ impl EntityOptionsStore {
     }
 
     /// Apply a production DaemonEntityFrame with generation/sequence gates.
-    /// Returns Ok(true) when the family map mutated.
+    ///
+    /// - `Ok(true)` — family map mutated
+    /// - `Ok(false)` — ignored (no generation, foreign subscription, non-advancing seq)
+    /// - `Err` — matching generation needs recovery (pre-snapshot delta, sequence gap,
+    ///   or subscription Error). Callers must `begin_generation` + resubscribe.
     pub fn apply_daemon_frame(&mut self, frame: DaemonEntityFrame) -> Result<bool, String> {
         let family_key = entity_type_of(&frame).to_string();
         let Some(family) = self.families.get_mut(&family_key) else {
@@ -129,9 +159,19 @@ impl EntityOptionsStore {
                 id,
                 entity,
             } => {
-                if !family.accepts_delta(&subscription_id, &entity_type, &family_key, snapshot_seq)
-                {
-                    return Ok(false);
+                match family.classify_delta(
+                    &subscription_id,
+                    &entity_type,
+                    &family_key,
+                    snapshot_seq,
+                ) {
+                    DeltaDisposition::Ignore => return Ok(false),
+                    DeltaDisposition::NeedsRecovery(reason) => {
+                        return Err(format!(
+                            "entity options gap recovery required for {family_key}: {reason}"
+                        ));
+                    }
+                    DeltaDisposition::Accept => {}
                 }
                 let fields = value_to_fields(entity, &id)?;
                 let options_frame = EntityOptionsFrame::Upsert {
@@ -154,9 +194,19 @@ impl EntityOptionsStore {
                 id,
                 patch,
             } => {
-                if !family.accepts_delta(&subscription_id, &entity_type, &family_key, snapshot_seq)
-                {
-                    return Ok(false);
+                match family.classify_delta(
+                    &subscription_id,
+                    &entity_type,
+                    &family_key,
+                    snapshot_seq,
+                ) {
+                    DeltaDisposition::Ignore => return Ok(false),
+                    DeltaDisposition::NeedsRecovery(reason) => {
+                        return Err(format!(
+                            "entity options gap recovery required for {family_key}: {reason}"
+                        ));
+                    }
+                    DeltaDisposition::Accept => {}
                 }
                 let fields = value_to_fields(patch, &id)?;
                 let options_frame = EntityOptionsFrame::Patch {
@@ -178,9 +228,19 @@ impl EntityOptionsStore {
                 snapshot_seq,
                 id,
             } => {
-                if !family.accepts_delta(&subscription_id, &entity_type, &family_key, snapshot_seq)
-                {
-                    return Ok(false);
+                match family.classify_delta(
+                    &subscription_id,
+                    &entity_type,
+                    &family_key,
+                    snapshot_seq,
+                ) {
+                    DeltaDisposition::Ignore => return Ok(false),
+                    DeltaDisposition::NeedsRecovery(reason) => {
+                        return Err(format!(
+                            "entity options gap recovery required for {family_key}: {reason}"
+                        ));
+                    }
+                    DeltaDisposition::Accept => {}
                 }
                 let options_frame = EntityOptionsFrame::Remove {
                     entity_type: family_key.clone(),
@@ -211,8 +271,7 @@ impl EntityOptionsStore {
     }
 
     /// Apply a pure contract timeline frame without generation gates (fixture path).
-    /// Still requires an active generation with matching entity_type for production
-    /// reducers; fixture helpers call [`Self::seed_family_for_fixture`] first.
+    #[cfg(test)]
     pub fn apply_contract_frame(&mut self, frame: &EntityOptionsFrame) -> bool {
         let entity_type = match frame {
             EntityOptionsFrame::Snapshot { entity_type, .. }
@@ -240,6 +299,7 @@ impl EntityOptionsStore {
     }
 
     /// Seed a family generation for pure fixture application without a live subscribe.
+    #[cfg(test)]
     pub fn seed_family_for_fixture(&mut self, entity_type: &str, subscription_id: &str) {
         self.begin_generation(entity_type, subscription_id.to_string());
         if let Some(family) = self.families.get_mut(entity_type) {
@@ -309,10 +369,10 @@ fn value_to_fields(value: Value, id: &str) -> Result<Map<String, Value>, String>
 pub fn compact_entity_option_label(option: &EntityOption, display_fields: &[String]) -> String {
     let mut parts = Vec::new();
     for field in display_fields {
-        if let Some(value) = option.metadata.get(field) {
-            if !value.is_empty() {
-                parts.push(value.as_str());
-            }
+        if let Some(value) = option.metadata.get(field)
+            && !value.is_empty()
+        {
+            parts.push(value.as_str());
         }
     }
     if parts.is_empty() {
@@ -343,10 +403,10 @@ fn materialize_entity_options_node(
     store: &EntityFamilyStore,
     drafts: &mut BTreeMap<String, Value>,
 ) -> Result<(), String> {
-    if node.kind == UiNodeKind::Select {
-        if let Some(source_value) = node.props.get("options_source").cloned() {
-            realize_entity_options_select(node, source_value, store, drafts)?;
-        }
+    if node.kind == UiNodeKind::Select
+        && let Some(source_value) = node.props.get("options_source").cloned()
+    {
+        realize_entity_options_select(node, source_value, store, drafts)?;
     }
     for child in &mut node.children {
         materialize_entity_options_child(child, store, drafts)?;
@@ -407,11 +467,26 @@ fn realize_entity_options_select(
         .and_then(Value::as_str)
         .or_else(|| node.props.get("selected").and_then(Value::as_str))
         .map(str::to_string);
-    let projection =
-        project_entity_options_from_store(&descriptor, store, selection.as_deref());
+    let projection = project_entity_options_from_store(&descriptor, store, selection.as_deref());
+
+    // Realized Select requires exactly one of: non-empty `options` slot, or
+    // `options_source`. Empty projections therefore keep the producer prop.
+    if projection.options.is_empty() {
+        node.slots.remove("options");
+        if !projection.selection_valid {
+            if !field_name.is_empty() {
+                drafts.remove(&field_name);
+            }
+            node.props.remove("selected");
+            node.props.insert(
+                "error".to_string(),
+                Value::String(SELECTION_INVALID_ERROR.to_string()),
+            );
+        }
+        return Ok(());
+    }
 
     node.props.remove("options_source");
-    // Realized selects must not keep unresolved producer props for kit validate.
     if !projection.selection_valid {
         if !field_name.is_empty() {
             drafts.remove(&field_name);
@@ -425,12 +500,7 @@ fn realize_entity_options_select(
         node.props
             .insert("selected".to_string(), Value::String(selected));
         // Clear stale invalidation error if present.
-        if node
-            .props
-            .get("error")
-            .and_then(Value::as_str)
-            == Some(SELECTION_INVALID_ERROR)
-        {
+        if node.props.get("error").and_then(Value::as_str) == Some(SELECTION_INVALID_ERROR) {
             node.props.remove("error");
         }
     }
@@ -570,23 +640,95 @@ mod tests {
                 })
                 .expect("old generation ignored after begin_generation")
         );
+        let pre_snapshot = store
+            .apply_daemon_frame(DaemonEntityFrame::Upsert {
+                subscription_id: "gen-2".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 1,
+                id: "sess-e".to_string(),
+                entity: json!({
+                    "id": "sess-e",
+                    "session_uuid": "sess-e",
+                    "label": "E",
+                    "lifecycle_class": "current"
+                }),
+            })
+            .expect_err("delta before snapshot requires recovery");
         assert!(
-            !store
-                .apply_daemon_frame(DaemonEntityFrame::Upsert {
+            pre_snapshot.contains("gap recovery") || pre_snapshot.contains("before first"),
+            "{pre_snapshot}"
+        );
+        assert!(store.family("session").unwrap().records.is_empty());
+
+        // Snapshot then sequence hole (1 → 3) requires recovery, not silent apply.
+        assert!(
+            store
+                .apply_daemon_frame(DaemonEntityFrame::Snapshot {
                     subscription_id: "gen-2".to_string(),
                     entity_type: "session".to_string(),
                     snapshot_seq: 1,
-                    id: "sess-e".to_string(),
-                    entity: json!({
-                        "id": "sess-e",
-                        "session_uuid": "sess-e",
-                        "label": "E",
+                    items: vec![json!({
+                        "id": "sess-a",
+                        "session_uuid": "sess-a",
+                        "label": "A",
                         "lifecycle_class": "current"
-                    }),
+                    })],
+                    resync_reason: None,
                 })
-                .expect("delta before snapshot rejected")
+                .expect("snapshot ok")
         );
-        assert!(store.family("session").unwrap().records.is_empty());
+        let gap = store
+            .apply_daemon_frame(DaemonEntityFrame::Upsert {
+                subscription_id: "gen-2".to_string(),
+                entity_type: "session".to_string(),
+                snapshot_seq: 3,
+                id: "sess-gap".to_string(),
+                entity: json!({
+                    "id": "sess-gap",
+                    "session_uuid": "sess-gap",
+                    "label": "Gap",
+                    "lifecycle_class": "current"
+                }),
+            })
+            .expect_err("sequence hole requires recovery");
+        assert!(gap.contains("sequence gap"), "{gap}");
+        assert!(
+            !store
+                .family("session")
+                .unwrap()
+                .records
+                .contains_key("sess-gap")
+        );
+
+        // Production recovery: begin_generation + authoritative snapshot replaces state.
+        store.begin_generation("session", "gen-3".to_string());
+        assert!(
+            store
+                .apply_daemon_frame(DaemonEntityFrame::Snapshot {
+                    subscription_id: "gen-3".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 1,
+                    items: vec![json!({
+                        "id": "sess-recovered",
+                        "session_uuid": "sess-recovered",
+                        "label": "Recovered",
+                        "lifecycle_class": "current"
+                    })],
+                    resync_reason: None,
+                })
+                .expect("recovery snapshot applies")
+        );
+        assert!(
+            store
+                .family("session")
+                .unwrap()
+                .records
+                .contains_key("sess-recovered")
+        );
+        assert_eq!(
+            store.family("session").unwrap().subscription_id.as_deref(),
+            Some("gen-3")
+        );
     }
 
     #[test]
@@ -620,8 +762,11 @@ mod tests {
             let expected: EntityOptionsProjection =
                 serde_json::from_value(step["expected_projection"].clone()).expect("expected");
             let pure = project_entity_options_from_store(&descriptor, &pure_store, selection);
-            let via_tui =
-                project_entity_options_from_store(&descriptor, &tui_store.as_family_store(), selection);
+            let via_tui = project_entity_options_from_store(
+                &descriptor,
+                &tui_store.as_family_store(),
+                selection,
+            );
             assert_eq!(pure, expected, "pure projector at {}", step["name"]);
             assert_eq!(via_tui, expected, "tui store at {}", step["name"]);
             assert_eq!(
@@ -724,5 +869,42 @@ mod tests {
             root.props.get("error").and_then(Value::as_str),
             Some(SELECTION_INVALID_ERROR)
         );
+    }
+
+    #[test]
+    fn materialize_session_source_empty_store_keeps_producer_prop() {
+        let mut root = UiNode {
+            kind: UiNodeKind::Select,
+            id: Some(UiAuthoredNodeId::Literal(UiNodeId(
+                "entity-options-select".into(),
+            ))),
+            props: [
+                ("name".into(), json!("option")),
+                ("label".into(), json!("Option")),
+                (
+                    "options_source".into(),
+                    json!({
+                        "$kind": "entity_options",
+                        "source": "/session",
+                        "value_field": "session_uuid",
+                        "display_fields": ["lifecycle_class"],
+                        "order": ["session_uuid"],
+                        "where": { "lifecycle_class": "current" }
+                    }),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            children: Vec::new(),
+            slots: BTreeMap::new(),
+        };
+        let mut drafts = BTreeMap::new();
+        materialize_entity_options_selects(&mut root, &EntityFamilyStore::new(), &mut drafts)
+            .expect("materialize empty store");
+        // Empty projection keeps options_source so realized xor validation passes.
+        assert!(root.props.contains_key("options_source"));
+        assert!(!root.slots.contains_key("options"));
+        root.validate_realized()
+            .expect("empty entity-options select keeps producer prop for realized xor");
     }
 }
