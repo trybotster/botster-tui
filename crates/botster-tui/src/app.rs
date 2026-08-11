@@ -1602,23 +1602,15 @@ impl TuiApp {
 
         match renderer::apply_action_result(&mut self.plugin_presentation, &result) {
             Ok(transition) => {
-                let mut body_replaced = false;
+                let body_replaced = transition.replacement.is_some();
                 if let Some(replacement) = transition.replacement {
-                    let prior_families = demanded_entity_option_families(&surface.body);
-                    let next_families = demanded_entity_option_families(&replacement);
-                    // Hosts sometimes re-emit a realized select without options_source after
-                    // submit. Dropping every producer would leave entity frames unable to
-                    // re-materialize options — keep the prior producer body in that case.
-                    if !prior_families.is_empty() && next_families.is_empty() {
-                        surface.ui_tree_snapshot = None;
-                    } else {
-                        surface.body = replacement;
-                        // The snapshot validates the Hub-delivered tree at ingestion. An
-                        // accepted action replacement is app-owned active state and must not
-                        // leave a second, stale structural tree that looks current.
-                        surface.ui_tree_snapshot = None;
-                        body_replaced = true;
-                    }
+                    // Owner-authored replacement is authoritative, including success /
+                    // confirmation trees that drop entity-options producers.
+                    surface.body = replacement;
+                    // The snapshot validates the Hub-delivered tree at ingestion. An accepted
+                    // action replacement is app-owned active state and must not leave a second,
+                    // stale structural tree that looks current.
+                    surface.ui_tree_snapshot = None;
                 }
                 self.pending_plugin_request = None;
                 self.action_feedback = Some(plugin_action_result_text(&result));
@@ -15940,7 +15932,8 @@ mod tests {
     }
 
     #[test]
-    fn plugin_action_result_keeps_prior_body_when_replacement_drops_options_source() {
+    fn plugin_action_result_applies_static_success_replacement_and_drops_options_families() {
+        // Owner-authored success trees may drop every options_source producer.
         let initial = ui_node(json!({
             "type": "select",
             "id": "entity-options-select",
@@ -15956,24 +15949,23 @@ mod tests {
                 }
             }
         }));
-        let stripped = ui_node(json!({
-            "type": "select",
-            "id": "entity-options-select",
-            "props": {
-                "name": "option",
-                "label": "Option"
-            }
+        let success = ui_node(json!({
+            "type": "text",
+            "id": "entity-options-success",
+            "props": { "text": "Selection accepted" }
         }));
         let mut app = TuiApp::new(None);
         app.workspace_test_mode = true;
         app.apply_response(plugin_surface_response(canonical_surface(
             "entity-options-reactive",
             "entity-options-reactive.picker",
-            initial.clone(),
+            initial,
         )));
         app.error = None;
+        app.entity_options
+            .begin_generation("entity-options-reactive.item", "opts-item".to_string());
         let request = plugin_request(
-            "req-strip-options",
+            "req-success-replacement",
             "entity-options-reactive.picker",
             "entity-options.submit",
             "entity-options-select",
@@ -15990,19 +15982,26 @@ mod tests {
             warnings: Vec::new(),
             normalized_values: None,
             presentation: None,
-            replacement: Some(Box::new(stripped)),
+            replacement: Some(Box::new(success.clone())),
             payload: None,
             error: None,
         });
-        assert!(
-            app.plugin_surface
-                .as_ref()
-                .is_some_and(|surface| surface_has_options_source(&surface.body)),
-            "producer body must be preserved when replacement drops options_source"
-        );
         assert_eq!(
             app.plugin_surface.as_ref().map(|surface| &surface.body),
-            Some(&initial)
+            Some(&success),
+            "accepted owner replacement must replace the active surface body"
+        );
+        assert!(
+            !app.plugin_surface
+                .as_ref()
+                .is_some_and(|surface| surface_has_options_source(&surface.body)),
+            "success replacement may drop options_source producers"
+        );
+        assert!(
+            app.entity_options
+                .family("entity-options-reactive.item")
+                .is_none(),
+            "resync must drop options families no longer demanded by the replacement"
         );
     }
 
