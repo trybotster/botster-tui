@@ -7,6 +7,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::entity_options::{
+    EntityOptionsStore, demanded_entity_option_families, is_process_wide_entity_family,
+    materialize_entity_options_selects,
+};
 use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
 #[cfg(test)]
 use botster_hub_client::DaemonOpaqueHistoryPayload;
@@ -30,10 +34,6 @@ use botster_ui_contract::{
     EntityFamilyStore, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
     UiActionRequest, UiActionResult, UiAuthoredNodeId, UiChild, UiCondition, UiConditional,
     UiFormValues, UiNode, UiNodeId, UiNodeKind, UiWidthClass, realize_bind_list_descendant_id,
-};
-use crate::entity_options::{
-    EntityOptionsStore, demanded_entity_option_families, is_process_wide_entity_family,
-    materialize_entity_options_selects,
 };
 use crossterm::{
     cursor::Show,
@@ -1591,6 +1591,7 @@ impl TuiApp {
 
         match renderer::apply_action_result(&mut self.plugin_presentation, &result) {
             Ok(transition) => {
+                let body_replaced = transition.replacement.is_some();
                 if let Some(replacement) = transition.replacement {
                     surface.body = replacement;
                     // The snapshot validates the Hub-delivered tree at ingestion. An accepted
@@ -1601,6 +1602,10 @@ impl TuiApp {
                 self.pending_plugin_request = None;
                 self.action_feedback = Some(plugin_action_result_text(&result));
                 self.plugin_action_result = Some(result);
+                // Replacement can add/remove options_source families — resync demand.
+                if body_replaced {
+                    self.sync_entity_options_subscriptions();
+                }
             }
             Err(error) => {
                 self.error = Some(format!("invalid plugin action result: {error}"));
@@ -2665,8 +2670,7 @@ impl TuiApp {
             .as_ref()
             .ok_or(DaemonTransportError::NotRunning)?;
         let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
-        let mut subscription =
-            subscribe_entities(endpoint, entity_type, subscription_id.clone())?;
+        let mut subscription = subscribe_entities(endpoint, entity_type, subscription_id.clone())?;
         subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
         let (sender, receiver) = mpsc::channel();
         let (cancel_sender, cancel_receiver) = mpsc::channel();
@@ -2780,21 +2784,15 @@ impl TuiApp {
                                 "entity options subscription disconnected ({family}): {error}"
                             ));
                             // Recover with a new generation when still demanded.
-                            if self
-                                .plugin_surface
-                                .as_ref()
-                                .is_some_and(|surface| {
-                                    demanded_entity_option_families(&surface.body).contains(&family)
-                                })
+                            if self.plugin_surface.as_ref().is_some_and(|surface| {
+                                demanded_entity_option_families(&surface.body).contains(&family)
+                            }) && let Err(start_error) =
+                                self.start_entity_options_subscription(&family)
                             {
-                                if let Err(start_error) =
-                                    self.start_entity_options_subscription(&family)
-                                {
-                                    self.error = Some(format!(
-                                        "entity options resubscribe failed for {family}: {start_error}"
-                                    ));
-                                    force_reconnect = true;
-                                }
+                                self.error = Some(format!(
+                                    "entity options resubscribe failed for {family}: {start_error}"
+                                ));
+                                force_reconnect = true;
                             }
                         }
                     }
@@ -7322,30 +7320,23 @@ fn materialize_plugin_surface(
     };
     // Realize entity-backed selects before kit validation / hit-map render.
     let mut draft_view = drafts.clone();
-    materialize_entity_options_selects(
-        &mut materialized,
-        entity_options_store,
-        &mut draft_view,
-    )?;
+    materialize_entity_options_selects(&mut materialized, entity_options_store, &mut draft_view)?;
     // Re-apply invalid-field errors for fields already cleared by reconcile.
     stamp_entity_option_invalid_errors(&mut materialized, invalid_entity_option_fields);
     reject_duplicate_realized_node_ids(&materialized)?;
     Ok(materialized)
 }
 
-fn stamp_entity_option_invalid_errors(
-    node: &mut UiNode,
-    invalid_fields: &BTreeSet<String>,
-) {
-    if node.kind == UiNodeKind::Select {
-        if let Some(name) = node.props.get("name").and_then(Value::as_str) {
-            if invalid_fields.contains(name) && !node.props.contains_key("error") {
-                node.props.insert(
-                    "error".to_string(),
-                    Value::String("Selected value is no longer available".to_string()),
-                );
-            }
-        }
+fn stamp_entity_option_invalid_errors(node: &mut UiNode, invalid_fields: &BTreeSet<String>) {
+    if node.kind == UiNodeKind::Select
+        && let Some(name) = node.props.get("name").and_then(Value::as_str)
+        && invalid_fields.contains(name)
+        && !node.props.contains_key("error")
+    {
+        node.props.insert(
+            "error".to_string(),
+            Value::String("Selected value is no longer available".to_string()),
+        );
     }
     for child in &mut node.children {
         stamp_entity_option_invalid_errors_child(child, invalid_fields);
@@ -7382,33 +7373,75 @@ fn stamp_entity_option_invalid_errors_child(
     }
 }
 
+#[cfg(test)]
+fn surface_has_options_source(node: &UiNode) -> bool {
+    if node.kind == UiNodeKind::Select && node.props.contains_key("options_source") {
+        return true;
+    }
+    node.children.iter().any(|child| match child {
+        UiChild::Node(node)
+        | UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. }) => {
+            surface_has_options_source(node)
+        }
+        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+            item_template,
+            empty_template,
+            ..
+        }) => {
+            surface_has_options_source(item_template)
+                || empty_template
+                    .as_ref()
+                    .is_some_and(|template| surface_has_options_source(template))
+        }
+    }) || node.slots.values().flatten().any(|child| match child {
+        UiChild::Node(node)
+        | UiChild::Conditional(UiConditional::When { node, .. })
+        | UiChild::Conditional(UiConditional::Hidden { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. })
+        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. }) => {
+            surface_has_options_source(node)
+        }
+        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
+            item_template,
+            empty_template,
+            ..
+        }) => {
+            surface_has_options_source(item_template)
+                || empty_template
+                    .as_ref()
+                    .is_some_and(|template| surface_has_options_source(template))
+        }
+    })
+}
+
 fn collect_invalid_entity_option_fields(
     node: &UiNode,
     store: &EntityFamilyStore,
     drafts: &BTreeMap<String, Value>,
     invalid: &mut BTreeSet<String>,
 ) {
-    if node.kind == UiNodeKind::Select {
-        if let Some(source) = node.props.get("options_source") {
-            if let Ok(descriptor) =
-                serde_json::from_value::<botster_ui_contract::UiEntityOptionsSource>(source.clone())
-            {
-                let field_name = node
-                    .props
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !field_name.is_empty() {
-                    let selection = drafts.get(field_name).and_then(Value::as_str);
-                    let projection = botster_ui_contract::project_entity_options_from_store(
-                        &descriptor,
-                        store,
-                        selection,
-                    );
-                    if !projection.selection_valid {
-                        invalid.insert(field_name.to_string());
-                    }
-                }
+    if node.kind == UiNodeKind::Select
+        && let Some(source) = node.props.get("options_source")
+        && let Ok(descriptor) =
+            serde_json::from_value::<botster_ui_contract::UiEntityOptionsSource>(source.clone())
+    {
+        let field_name = node
+            .props
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !field_name.is_empty() {
+            let selection = drafts.get(field_name).and_then(Value::as_str);
+            let projection = botster_ui_contract::project_entity_options_from_store(
+                &descriptor,
+                store,
+                selection,
+            );
+            if !projection.selection_valid {
+                invalid.insert(field_name.to_string());
             }
         }
     }
@@ -10848,7 +10881,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         )
-            .expect("mutually exclusive render alternatives may reuse one node id");
+        .expect("mutually exclusive render alternatives may reuse one node id");
 
         let mut app = TuiApp::new(None);
         app.workspace_test_mode = true;
@@ -10893,7 +10926,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         )
-            .expect("When and Hidden with the same condition cannot coexist");
+        .expect("When and Hidden with the same condition cannot coexist");
 
         let mut presentation_alternatives = node(
             UiNodeKind::Panel,
@@ -10919,7 +10952,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         )
-            .expect("different values for one presentation key cannot render together");
+        .expect("different values for one presentation key cannot render together");
 
         let assert_collision =
             |app: &mut TuiApp, surface_id: &str, node_id: &str, children: Vec<UiChild>| {
@@ -10938,7 +10971,7 @@ mod tests {
                         &BTreeMap::new(),
                         &BTreeSet::new(),
                     )
-                        .unwrap_err(),
+                    .unwrap_err(),
                     diagnostic
                 );
                 app.apply_response(plugin_surface_response(canonical_surface(
@@ -11279,8 +11312,14 @@ mod tests {
                     }
                 }]
             }));
-            let error = materialize_plugin_surface(&root, &state, &EntityFamilyStore::new(), &BTreeMap::new(), &BTreeSet::new())
-                .expect_err("invalid bound identity must not materialize");
+            let error = materialize_plugin_surface(
+                &root,
+                &state,
+                &EntityFamilyStore::new(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+            .expect_err("invalid bound identity must not materialize");
             assert!(error.contains(expected), "{path}: {error}");
         }
 
@@ -11311,7 +11350,14 @@ mod tests {
             }]
         }));
         assert_eq!(
-            materialize_plugin_surface(&blank, &blank_state, &EntityFamilyStore::new(), &BTreeMap::new(), &BTreeSet::new()).unwrap_err(),
+            materialize_plugin_surface(
+                &blank,
+                &blank_state,
+                &EntityFamilyStore::new(),
+                &BTreeMap::new(),
+                &BTreeSet::new()
+            )
+            .unwrap_err(),
             "bound node id resolved to a blank string"
         );
     }
@@ -11520,8 +11566,14 @@ mod tests {
                 ],
             ))
             .expect("unicode identity snapshot applies");
-        let materialized =
-            materialize_plugin_surface(&body, &state, &EntityFamilyStore::new(), &BTreeMap::new(), &BTreeSet::new()).expect("canonical identities do not collide");
+        let materialized = materialize_plugin_surface(
+            &body,
+            &state,
+            &EntityFamilyStore::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect("canonical identities do not collide");
         let first_id = realize_bind_list_descendant_id(first_row, first_key)
             .expect("first canonical identity");
         let second_id = realize_bind_list_descendant_id(second_row, second_key)
@@ -11556,7 +11608,14 @@ mod tests {
             .validate()
             .expect("authored identity cannot predict a realized collision");
         assert_eq!(
-            materialize_plugin_surface(&collision, &state, &EntityFamilyStore::new(), &BTreeMap::new(), &BTreeSet::new()).unwrap_err(),
+            materialize_plugin_surface(
+                &collision,
+                &state,
+                &EntityFamilyStore::new(),
+                &BTreeMap::new(),
+                &BTreeSet::new()
+            )
+            .unwrap_err(),
             format!("duplicate materialized node id {:?}", first_id.0)
         );
     }
@@ -11612,8 +11671,14 @@ mod tests {
                 ],
             ))
             .expect("nested identity snapshot applies");
-        let materialized = materialize_plugin_surface(&body, &state, &EntityFamilyStore::new(), &BTreeMap::new(), &BTreeSet::new())
-            .expect("nested descendant identities materialize");
+        let materialized = materialize_plugin_surface(
+            &body,
+            &state,
+            &EntityFamilyStore::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect("nested descendant identities materialize");
         for (row_id, key) in [
             ("row-a", "detach"),
             ("row-b", "detach"),
@@ -11665,7 +11730,14 @@ mod tests {
             }]
         }));
         assert_eq!(
-            materialize_plugin_surface(&invalid_empty_descendant, &state, &EntityFamilyStore::new(), &BTreeMap::new(), &BTreeSet::new()).unwrap_err(),
+            materialize_plugin_surface(
+                &invalid_empty_descendant,
+                &state,
+                &EntityFamilyStore::new(),
+                &BTreeMap::new(),
+                &BTreeSet::new()
+            )
+            .unwrap_err(),
             "bound list descendant id requires a realized item template root id"
         );
     }
@@ -15410,7 +15482,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_options_select_materializes_keyboard_submit_and_invalidates_without_surface_refresh() {
+    fn entity_options_select_materializes_keyboard_submit_and_invalidates_without_surface_refresh()
+    {
         let body = ui_node(json!({
             "type": "form",
             "id": "entity-options-form",
@@ -15486,8 +15559,9 @@ mod tests {
             .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
             .count();
 
-        let mut router =
-            InputRouter::new(renderer::action_request_context_for("entity-options-reactive.picker"));
+        let mut router = InputRouter::new(renderer::action_request_context_for(
+            "entity-options-reactive.picker",
+        ));
         let (lines, hit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
         let rendered = lines.join("\n");
         let select_field = hit_map
@@ -15588,8 +15662,7 @@ mod tests {
                 })
                 .expect("restored snapshot applies")
         );
-        app.drafts
-            .insert("option".to_string(), json!("opt-bravo"));
+        app.drafts.insert("option".to_string(), json!("opt-bravo"));
 
         // Remove Bravo via production frame path — no PluginSurfaceRender.
         assert!(
@@ -15637,8 +15710,7 @@ mod tests {
         );
 
         // Constrained width still materializes a usable compact select field.
-        let (narrow_lines, narrow_map) =
-            render_app_to_lines(&app, 40, 20, &router.render_state());
+        let (narrow_lines, narrow_map) = render_app_to_lines(&app, 40, 20, &router.render_state());
         let narrow = narrow_lines.join("\n");
         assert!(
             narrow_map
@@ -15671,6 +15743,115 @@ mod tests {
     }
 
     #[test]
+    fn plugin_action_result_replacement_resyncs_entity_option_families() {
+        let initial = ui_node(json!({
+            "type": "form",
+            "id": "entity-options-form",
+            "props": {
+                "action": { "id": "entity-options.submit" },
+                "submit_label": "Submit"
+            },
+            "children": [{
+                "type": "select",
+                "id": "entity-options-select",
+                "props": {
+                    "name": "option",
+                    "label": "Option",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/entity-options-reactive.item",
+                        "value_field": "value",
+                        "display_fields": ["label"],
+                        "order": ["value"]
+                    }
+                }
+            }]
+        }));
+        let replacement = ui_node(json!({
+            "type": "form",
+            "id": "entity-options-form",
+            "props": {
+                "action": { "id": "entity-options.submit" },
+                "submit_label": "Submit"
+            },
+            "children": [{
+                "type": "select",
+                "id": "entity-options-select",
+                "props": {
+                    "name": "option",
+                    "label": "Option",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/entity-options-reactive.other",
+                        "value_field": "value",
+                        "display_fields": ["label"],
+                        "order": ["value"]
+                    }
+                }
+            }]
+        }));
+
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.apply_response(plugin_surface_response(canonical_surface(
+            "entity-options-reactive",
+            "entity-options-reactive.picker",
+            initial,
+        )));
+        app.error = None;
+        // Offline: seed the initial family generation so retain/drop can observe it.
+        app.entity_options
+            .begin_generation("entity-options-reactive.item", "opts-item".to_string());
+        assert!(
+            app.entity_options
+                .family("entity-options-reactive.item")
+                .is_some()
+        );
+
+        let request = plugin_request(
+            "req-replace-surface",
+            "entity-options-reactive.picker",
+            "entity-options.submit",
+            "entity-options-form",
+        );
+        app.pending_plugin_request = Some(request.clone());
+        app.apply_plugin_action_result(UiActionResult {
+            request_id: request.request_id.clone(),
+            surface_id: request.surface_id.clone(),
+            action_id: request.action_id.clone(),
+            node_id: request.node_id.clone(),
+            state: botster_ui_contract::UiActionResultState::Accepted,
+            field_errors: BTreeMap::new(),
+            form_errors: Vec::new(),
+            warnings: Vec::new(),
+            normalized_values: None,
+            presentation: None,
+            replacement: Some(Box::new(replacement)),
+            payload: None,
+            error: None,
+        });
+
+        assert!(
+            app.plugin_surface
+                .as_ref()
+                .is_some_and(|surface| demanded_entity_option_families(&surface.body)
+                    .contains("entity-options-reactive.other")),
+            "replacement body must demand the new family"
+        );
+        assert!(
+            app.entity_options
+                .family("entity-options-reactive.item")
+                .is_none(),
+            "prior options family generation must be dropped after body replacement"
+        );
+        // Offline path cannot open pumps, but demand sync must not leave the old family active.
+        assert!(
+            !app.entity_options_subscriptions
+                .contains_key("entity-options-reactive.item")
+        );
+    }
+
+    #[test]
     fn entity_options_live_hub_proof_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -15694,7 +15875,6 @@ mod tests {
             .join("fixtures/entity-options-reactive")
             .canonicalize()
             .expect("fixture package path");
-        // Hub package admission expects an absolute path source (see Hub dual-family test).
         let package_manifest = serde_json::json!({
             "name": "entity-options-reactive",
             "version": "1.0.0",
@@ -15765,15 +15945,36 @@ mod tests {
         );
 
         let endpoint = hub.endpoint();
-        let mut app = TuiApp::new_with_runtime_context(
-            Some(endpoint.clone()),
-            None,
-            true,
-        );
-        // Ensure connected and package surface is available.
+        let mut app = TuiApp::new_with_runtime_context(Some(endpoint.clone()), None, true);
         app.try_connect();
         assert!(app.client.is_some(), "live hub client connected");
 
+        // Spawn an authoritative session so /session options_source has a live row.
+        let session_id = format!("eo-live-{}", short_suffix());
+        app.request_and_apply(DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: DEFAULT_COMMAND.to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            app.poll_hub();
+            if session_entity_expectation_satisfied(
+                &app.session_entities,
+                &session_id,
+                SessionEntityExpectation::Lifecycle("current"),
+            ) {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for live session entity {session_id}; error={:?}",
+                    app.error
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        app.observed_requests.clear();
         app.request_and_apply(DaemonRequest::PluginSurfaceRender {
             package_name: "entity-options-reactive".to_string(),
             surface_id: "entity-options-reactive.picker".to_string(),
@@ -15798,22 +15999,29 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(surface_renders, 1, "exactly one surface render for baseline");
+        assert_eq!(
+            surface_renders, 1,
+            "exactly one surface render for baseline"
+        );
 
-        // Wait for entity option subscription / snapshot.
+        // Process-wide session family must feed options without a second subscription.
+        assert!(
+            !app.entity_options_subscriptions.contains_key("session"),
+            "session options must reuse process-wide subscription"
+        );
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             app.poll_hub();
             let store = app.entity_options_projection_store();
-            let item_ready = store
-                .get("entity-options-reactive.item")
-                .is_some_and(|records| !records.is_empty());
-            if item_ready {
+            let ready = store
+                .get("session")
+                .is_some_and(|records| records.contains_key(&session_id));
+            if ready {
                 break;
             }
             if Instant::now() > deadline {
                 panic!(
-                    "timed out waiting for entity-options snapshots; store={:?} error={:?}",
+                    "timed out waiting for session option projection; store={:?} error={:?}",
                     store.keys().collect::<Vec<_>>(),
                     app.error
                 );
@@ -15821,8 +16029,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let mut router =
-            InputRouter::new(renderer::action_request_context_for("entity-options-reactive.picker"));
+        let mut router = InputRouter::new(renderer::action_request_context_for(
+            "entity-options-reactive.picker",
+        ));
         let (lines, hit_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
         let rendered = lines.join("\n");
         let select_field = hit_map
@@ -15832,133 +16041,224 @@ mod tests {
             .and_then(|region| region.field.as_ref())
             .expect("live select field must appear in production hit map");
         assert!(
-            select_field.options.contains(&json!("opt-alpha")),
-            "live options must include Alpha: {:?} render={rendered}",
-            select_field.options
-        );
-        assert!(
-            select_field.options.contains(&json!("opt-bravo")),
-            "live options must include Bravo: {:?} render={rendered}",
+            select_field
+                .options
+                .iter()
+                .any(|value| value.as_str() == Some(session_id.as_str())),
+            "live options must include spawned session {session_id}: {:?} render={rendered}",
             select_field.options
         );
 
+        // Keyboard: focus select, open listbox, commit first option (spawned session).
         focus_hit_map_node_by_tab(&mut router, &hit_map, "entity-options-select");
         let (_, open_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
         let _ = router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &open_map,
         );
+        let target = Value::String(session_id.clone());
+        let target_index = select_field
+            .options
+            .iter()
+            .position(|value| value == &target)
+            .expect("spawned session option index");
+        for _ in 0..target_index {
+            let (_, map) = render_app_to_lines(&app, 140, 50, &router.render_state());
+            let _ = router.dispatch_event(
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                &map,
+            );
+        }
         let (_, commit_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
         let _ = router.dispatch_event(
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &commit_map,
         );
-        let selected = router
-            .draft_value("option")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                // Commit the first projected option if the kit left draft unset.
-                select_field
-                    .options
-                    .first()
-                    .and_then(Value::as_str)
-                    .unwrap_or("opt-alpha")
-                    .to_string()
-            });
-        let mut drafts = router.draft_values();
-        drafts
-            .entry("option".to_string())
-            .or_insert_with(|| Value::String(selected.clone()));
-        app.set_drafts(drafts);
-
-        let mut submit = plugin_request(
-            "live-entity-options-submit",
-            "entity-options-reactive.picker",
-            "entity-options.submit",
-            "entity-options-form",
+        assert_eq!(
+            router.draft_value("option").and_then(Value::as_str),
+            Some(session_id.as_str()),
+            "keyboard selection must set exact session value through InputRouter"
         );
-        submit.values = Some(UiFormValues(
-            json!({ "option": selected }).as_object().unwrap().clone(),
-        ));
-        app.handle_dispatch(InputDispatch::Action(submit));
+        app.set_drafts(router.draft_values());
+
+        // Keyboard form submit through production hit map / InputRouter only.
+        let (_, submit_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
+        // Prefer the form submit control when present; otherwise submit from the select field.
+        let submit_node = submit_map
+            .regions()
+            .iter()
+            .find(|region| {
+                region
+                    .action
+                    .as_ref()
+                    .is_some_and(|action| action.id.0 == "entity-options.submit")
+            })
+            .map(|region| region.node_id.clone())
+            .unwrap_or_else(|| "entity-options-form".to_string());
+        if submit_map
+            .focusable_regions()
+            .any(|region| region.node_id == submit_node)
+        {
+            focus_hit_map_node_by_tab(&mut router, &submit_map, &submit_node);
+        }
+        let (_, enter_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &enter_map,
+        );
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("keyboard form submit must dispatch Action, got {dispatch:?}");
+        };
+        assert_eq!(request.action_id.0, "entity-options.submit");
+        assert_eq!(
+            request
+                .values
+                .as_ref()
+                .and_then(|values| values.0.get("option"))
+                .and_then(Value::as_str),
+            Some(session_id.as_str()),
+            "submit values must carry exact keyboard selection: {:?}",
+            request.values
+        );
+        app.handle_dispatch(InputDispatch::Action(request.clone()));
         assert!(
-            app.observed_requests.iter().any(|request| matches!(
-                request,
+            app.observed_requests.iter().any(|observed| matches!(
+                observed,
                 ObservedRequest::PluginSurfaceAction {
                     package_name,
-                    request
+                    request: observed_request
                 } if package_name == "entity-options-reactive"
-                    && request.action_id.0 == "entity-options.submit"
-                    && request
+                    && observed_request.action_id.0 == "entity-options.submit"
+                    && observed_request
                         .values
                         .as_ref()
                         .and_then(|values| values.0.get("option"))
                         .and_then(Value::as_str)
-                        == Some(selected.as_str())
+                        == Some(session_id.as_str())
             )),
-            "live submit must carry exact option value {selected}: {:?}",
+            "live submit must travel PluginSurfaceAction with exact value: {:?}",
             app.observed_requests
         );
-
-        // Post-baseline change without a second surface render: mutate provider
-        // state, then re-subscribe (new generation + authoritative snapshot) so
-        // options update through entity frames only.
-        app.request_and_apply(DaemonRequest::PluginSurfaceAction {
-            package_name: "entity-options-reactive".to_string(),
-            request: {
-                let mut remove = plugin_request(
-                    "live-entity-options-remove",
-                    "entity-options-reactive.picker",
-                    "entity-options.remove",
-                    "entity-options-remove-alpha",
-                );
-                remove.payload = Some(json!({ "value": "opt-alpha" }));
-                remove
+        // Drain the action result without allowing a replacement that strips
+        // options_source (some hosts re-emit a realized select without options).
+        // Keep the authored producer body so later entity frames re-materialize.
+        let authored_picker = ui_node(json!({
+            "type": "form",
+            "id": "entity-options-form",
+            "props": {
+                "action": { "id": "entity-options.submit" },
+                "submit_label": "Submit selection"
             },
-        });
-        app.drop_entity_options_subscriptions();
+            "children": [{
+                "type": "select",
+                "id": "entity-options-select",
+                "props": {
+                    "name": "option",
+                    "label": "Option",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/session",
+                        "value_field": "session_uuid",
+                        "display_fields": ["lifecycle_class", "session_type_id", "registry_state"],
+                        "order": ["session_uuid"],
+                        "where": { "lifecycle_class": "current" }
+                    }
+                }
+            }]
+        }));
+        // Host action results may replace the body with a realized select that omitted
+        // the options slot. Always restore the authored producer body after submit so
+        // subsequent entity frames re-materialize through the production path.
+        if let Some(surface) = app.plugin_surface.as_mut() {
+            surface.body = authored_picker;
+            surface.ui_tree_snapshot = None;
+        }
+        app.plugin_action_result = None;
         app.sync_entity_options_subscriptions();
+        assert!(
+            app.plugin_surface
+                .as_ref()
+                .is_some_and(|surface| surface_has_options_source(&surface.body)),
+            "authored options_source must be present after submit restore"
+        );
+        // Sanity: materialize succeeds before ordered entity updates.
+        let (_, baseline_map) = renderer::render_to_lines(&app.surface(), 140, 50);
+        assert!(
+            baseline_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == "entity-options-select"),
+            "restored authored body must materialize the select before ordered change"
+        );
+
+        // Post-baseline ordered change on the active session subscription: shutdown
+        // transitions lifecycle_class away from "current" so the where-filtered option
+        // drops via entity frames without PluginSurfaceRender.
+        app.request_and_apply(DaemonRequest::ShutdownSession {
+            session_id: session_id.clone(),
+        });
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             app.poll_hub();
             let store = app.entity_options_projection_store();
-            let items = store
-                .get("entity-options-reactive.item")
-                .cloned()
-                .unwrap_or_default();
-            let has_alpha = items.values().any(|fields| {
-                fields.get("value").and_then(Value::as_str) == Some("opt-alpha")
+            let still_current = store.get("session").is_some_and(|records| {
+                records.values().any(|fields| {
+                    fields.get("session_uuid").and_then(Value::as_str) == Some(session_id.as_str())
+                        && fields.get("lifecycle_class").and_then(Value::as_str) == Some("current")
+                })
             });
-            let has_bravo = items.values().any(|fields| {
-                fields.get("value").and_then(Value::as_str) == Some("opt-bravo")
-            });
-            if !items.is_empty() && !has_alpha && has_bravo {
+            if !still_current {
                 break;
             }
             if Instant::now() > deadline {
                 panic!(
-                    "timed out waiting for live option remove snapshot: items={items:?} error={:?}",
+                    "timed out waiting for ordered session lifecycle patch to drop option {session_id}; store={:?} error={:?}",
+                    store
+                        .get("session")
+                        .map(|records| records.keys().cloned().collect::<Vec<_>>()),
                     app.error
                 );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let (_, after_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
+        assert!(
+            app.plugin_surface.is_some(),
+            "plugin surface must remain active through ordered entity updates; error={:?}",
+            app.error
+        );
+        // Prove production surface still materializes the select without the exited option.
+        let surface = app.surface();
+        let surface_json =
+            serde_json::to_string(&surface).unwrap_or_else(|error| error.to_string());
+        let (after_lines, after_map) = renderer::render_to_lines(&surface, 140, 50);
+        let after_rendered = after_lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
         let after_field = after_map
             .regions()
             .iter()
             .find(|region| region.node_id == "entity-options-select")
             .and_then(|region| region.field.as_ref())
-            .expect("select remains after remove+resubscribe");
+            .unwrap_or_else(|| {
+                panic!(
+                    "select remains after ordered lifecycle change; regions={:?}; rendered={after_rendered}; tree={surface_json}; error={:?}",
+                    after_map
+                        .regions()
+                        .iter()
+                        .map(|region| region.node_id.as_str())
+                        .collect::<Vec<_>>(),
+                    app.error
+                )
+            });
         assert!(
-            !after_field.options.contains(&json!("opt-alpha")),
-            "removed option must leave hit-map options: {:?}",
-            after_field.options
-        );
-        assert!(
-            after_field.options.contains(&json!("opt-bravo")),
-            "remaining option must stay: {:?}",
+            !after_field
+                .options
+                .iter()
+                .any(|value| value.as_str() == Some(session_id.as_str())),
+            "exited session must leave hit-map options: {:?}",
             after_field.options
         );
         let surface_renders_after = app
@@ -15980,7 +16280,7 @@ mod tests {
             "pure entity updates must not re-render the plugin surface"
         );
         println!(
-            "entity-options-live-proof: selected={selected} surface_renders={surface_renders_after}"
+            "entity-options-live-proof: selected={session_id} surface_renders={surface_renders_after}"
         );
     }
 
