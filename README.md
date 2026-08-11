@@ -28,15 +28,15 @@ control-key input passthrough across attach and reattach paths.
 ## Foundation
 
 The workspace uses `botster-tui-kit` pinned to revision
-`551feb151f531d59d362efdae0cc7d3a34d8e311` and the kit, Hub client, and this
+`571523d93a62945208ebb2bb75262dcdd78001a2` and the kit, Hub client, and this
 crate share `botster-ui-contract`
 from botster-hub revision
-`302190ec2acc5ecee744432a6c9ffd1f040ebe01`. Runnable-entrypoint connection
+`0ee42e9b84a0b0e9b0ab89834675535c8b831993`. Runnable-entrypoint connection
 decoding and validation consume `botster-core` revision
 `16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
 receives a branch-tracked `botster-core` through `botster-hub-test-support`;
 `Cargo.lock` pins that dev-only source at
-`e36435f2cb583c344d6f6ba2d62c39da324c7a64`. The kit supplies semantic
+`ff115694caf61e435bfb3d7ffcc5a6459689c8d9`. The kit supplies semantic
 viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
 focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
 occlusion barriers. The kit owns reusable
@@ -129,7 +129,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`302190ec2acc5ecee744432a6c9ffd1f040ebe01`. The protocol source is
+`0ee42e9b84a0b0e9b0ab89834675535c8b831993`. The protocol source is
 `crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
 handshake, request/response frames, session spawn/attach, input, resize, and
 drain events. `botster-tui` does not implement a private socket protocol.
@@ -168,6 +168,9 @@ Session types are authoritative Hub descriptors consumed through the
   `ShowSessionTypeDefinition` and submits wholesale `UpdateSessionType`
   definitions. Entity rows are never used as edit seeds (they omit relative
   working-directory path and environment).
+- The authoring form provides an explicit `execution` select with
+  `relative_executable` and `shell_command`. It keeps `command` and `args`
+  separate and never infers execution from command text.
 - Product launch is **target-first** `SpawnSessionType` only, opened as a
   dialog from the toolbar (not buried under System details). The first step
   lists **enabled admitted** Hub spawn targets only (no client synthesis of
@@ -180,17 +183,15 @@ Session types are authoritative Hub descriptors consumed through the
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 33` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `cb93df53d66fead323973b5233d4589562cf57b1`, kit
-  `902650dfbd56a5bdc99c1e88c04ba2e62442f703`. Cargo.lock must keep a single
-  `botster-ui-contract` (workspace `[patch]` path-unifies kit’s older Hub rev
-  onto the Hub pin’s byte-identical contract under
-  `third_party/botster-ui-contract`) and dual `botster-core` sources
+- Pins: Hub crates `0ee42e9b84a0b0e9b0ab89834675535c8b831993`, kit
+  `571523d93a62945208ebb2bb75262dcdd78001a2`. Cargo.lock must keep a single
+  `botster-ui-contract` at that Hub rev and dual `botster-core` sources
   (direct `16bf08f2…` plus `branch=main` at `ff115694…` via hub-test-support).
 
 Live proof (independent of contract-matrix):
 
 ```sh
-# Prefer Hub + session-worker binaries built from >= cb93df5 (exact pin preferred).
+# Prefer Hub + session-worker binaries built from 0ee42e9 (exact pin preferred).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -208,7 +209,7 @@ list-for-target for a real admitted spawn point `T` (not `device:local`).
 are the repository-owned runtime proof that the installed Workspaces package,
 including the spawn-form `session_type_id` field and lifecycle bindings, works
 against a protocol-6 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `cb93df53d66fead323973b5233d4589562cf57b1`) and an
+this crate pins, currently `0ee42e9b84a0b0e9b0ab89834675535c8b831993`) and an
 explicit clean post-migration `botster-workspaces` package path via
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
 also pins the acceptance driver field key so a silent `template_id` revert
