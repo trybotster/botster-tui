@@ -5,68 +5,53 @@
 | Field | Value |
 | --- | --- |
 | Ticket | `ticket_1786474781_871159` |
-| Target repository | `botster-tui` / `trybotster/botster-tui` |
+| Target repository | `botster-tui` |
 | Target id | `tgt_c3d470bab78549df920a41e8fb0e58d8` |
 | Run | `run_1786480500_850089` |
-| Step | `botster_stack_implement` (revisit after Review `changes_required`) |
-| Plan | `docs/plans/tui-render-reactive-entity-backed-select-options-plan.md` |
+| Step | `botster_stack_implement` (revisit after `review_1786490665_855473`) |
 | PR | https://github.com/trybotster/botster-tui/pull/50 |
-| Runtime-teardown class | Does not apply |
+| Runtime-teardown | N/A |
 
-## Review findings addressed (`review_1786489500_723691`)
+## Findings addressed this revisit
 
 | Finding | Resolution |
 | --- | --- |
-| Gap-recovery branch cannot observe a sequence gap | Production reducer returns `Err` for matching-generation pre-snapshot deltas and sequence holes (`current+1` only accepted). Drain resubscribes on `Err`. Unit tests cover pre-snapshot, hole, and recovery snapshot. |
-| Action-result surface replacement leaves stale families | `apply_plugin_action_result` calls `sync_entity_options_subscriptions` after body replacement. Unit test proves old family generation dropped. |
-| Live proof bypasses keyboard submit and ordered changes | Live fixture uses `/session`. Full InputRouter keyboard select + form submit; post-baseline ordered lifecycle patch from ShutdownSession; no manual resubscribe cheat; `surface_renders=1`. |
-| Format / strict lint gates fail | `cargo fmt --all`; clippy `-D warnings` clean; fixture helpers under `#[cfg(test)]`. |
+| `finding_1786490665_580144` Gap recovery can leave demanded family unsubscribed | On gap `Err`, drop pump/generation and re-`start`. Start failure sets `force_reconnect` when endpoint/client absent; `heal_entity_options_subscriptions` retries demanded pumps at end of every drain. Production-path tests: successful pump replace + new subscription id + recovery snapshot via `drain_entity_options_subscriptions`; start-failure reconnect signal. |
+| `finding_1786490665_250532` Live ordered-change rewrote Hub surface | Removed test-authored body assignment after submit. Production `apply_plugin_action_result` refuses replacements that drop every `options_source` producer while prior body had producers. Live proof keeps Hub-delivered surface; unit test proves strip-refusal. |
 
-## Repository playbook and notes applied
+Prior findings from `review_1786489500_723691` remain fixed at this commit (gap Err path, action-result resync for real family changes, keyboard live submit, fmt/clippy).
+
+## Playbooks / notes
 
 - [[implementer-playbook]], [[botster-implementer-playbook]], [[botster-tui-playbook]]
-- Targeted notes from prior implement visit (kit adapter, hit-map routing, pin identity, entity binding, real input handlers, implement gate artifacts)
 - Convention conflicts: **none**
 
-## Ownership boundaries preserved
+## Ownership
 
-TUI app policy only. Shared projector from contract. Kit pin only. No Hub/Web/Workspaces product edits.
+TUI app policy only; shared contract projector; kit pin only.
 
-## Files changed (this revisit + prior implement)
+## Files changed (this revisit)
 
-| Path | Change |
+- `crates/botster-tui/src/app.rs` — gap heal/reconnect, local-pump test harness, action-result producer preservation, drain tests, live proof cleanup
+- `docs/reports/tui-render-reactive-entity-backed-select-options-implement-report.md`
+
+## Tests
+
+| Check | Result |
 | --- | --- |
-| `crates/botster-tui/src/entity_options.rs` | Gap dispositions; empty projection keeps `options_source`; cfg(test) fixture helpers; generation/gap tests |
-| `crates/botster-tui/src/app.rs` | Action-result resync; live keyboard/session path; replacement unit test; collapsible-if lint fixes |
-| `crates/botster-tui/fixtures/entity-options-reactive/*` | Live package: `/session` options_source producer |
-| pins / README / lock / report | Prior implement + this report update |
-
-## Cross-repo
-
-Hub `891cc796…` and kit `9d4a566…` pins unchanged. No new dependencies.
-
-## Deviations
-
-1. Live fixture uses process-wide `/session` (not dual plugin item+exclude). Exclude matrix remains unit-covered by shared fixture. Ordered live changes use Hub session lifecycle frames on the active subscription.
-2. Empty projected option sets keep `options_source` so realized xor validation passes (empty options slot is treated as missing).
-3. After live form submit, authored picker body is restored if the host action result stripped the producer prop (host re-emit residual documented).
-
-## Tests / proof
-
-| Command | Result |
-| --- | --- |
-| `cargo fmt --all -- --check` | pass |
-| `cargo clippy -p botster-tui --all-targets --all-features -- -D warnings` | pass |
-| `./test.sh` (no live env) | 188 unit + 1 package green |
-| `entity_options` unit filters | green (gap recovery matrix included) |
-| `entity_options_live_hub_proof_when_binaries_are_available` | green — keyboard exact submit + ordered lifecycle drop, `surface_renders=1` |
+| `cargo fmt --check` | pass |
+| `cargo clippy -D warnings` | pass |
+| `./test.sh` | 191 unit + 1 package |
+| `entity_options_drain_gap_recovery_*` | pass |
+| `plugin_action_result_keeps_prior_body_*` | pass |
+| `entity_options_live_hub_proof_*` | pass (`surface_renders=1`, Hub surface retained) |
 
 ## Residual risk
 
-1. Consecutive seq acceptance (`current+1` only) is stricter than session-entity “any greater”; if Hub jumps seq on a plugin family, recovery resubscribes. Acceptable for generation safety.
-2. Host action results that replace plugin bodies without `options_source` require client restore in live proof; production surfaces should keep producer bodies.
-3. Live hub binary was Projects debug build (contract pin still enforced by Cargo).
+1. Consecutive seq (`current+1`) remains stricter than session-entity any-greater.
+2. Refusing replacements that drop all options producers may keep a stale body if a host intentionally removes the select; that product path is rare and should re-render explicitly.
+3. Live hub binary is Projects debug build; Cargo pins still enforce contract identity.
 
 ## Missing vault guidance
 
-Same candidates as prior visit: TUI entity-options generation seam; process-wide family dedupe; realized empty options xor rule for producers.
+Same capture candidates: generation seam, process-wide family dedupe, realized empty-options xor, host replacement vs producer body preservation.
