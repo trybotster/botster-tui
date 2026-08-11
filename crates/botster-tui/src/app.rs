@@ -17,7 +17,7 @@ use botster_hub_client::{
     DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
-    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
+    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
     FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
@@ -573,6 +573,7 @@ struct SessionTypeFormDraft {
     interaction: String,
     traits: String,
     lifecycle: String,
+    execution: String,
     command: String,
     args: String,
     working_directory_policy: String,
@@ -607,6 +608,7 @@ impl SessionTypeFormDraft {
             interaction: "interactive".to_string(),
             traits: String::new(),
             lifecycle: "task".to_string(),
+            execution: "relative_executable".to_string(),
             command: String::new(),
             args: String::new(),
             working_directory_policy: "package_root".to_string(),
@@ -666,6 +668,10 @@ impl SessionTypeFormDraft {
             interaction: editable.definition.interaction.clone(),
             traits: join_tokens(&seeded_traits),
             lifecycle: editable.definition.lifecycle.clone(),
+            execution: match &editable.definition.execution {
+                DaemonSessionTypeExecution::RelativeExecutable => "relative_executable".to_string(),
+                DaemonSessionTypeExecution::ShellCommand => "shell_command".to_string(),
+            },
             command: editable.definition.command.clone(),
             args: join_tokens(&seeded_args),
             working_directory_policy,
@@ -795,7 +801,9 @@ fn parse_environment(
     map
 }
 
-fn definition_from_session_type_form(form: &SessionTypeFormDraft) -> DaemonSessionTypeDefinition {
+fn definition_from_session_type_form(
+    form: &SessionTypeFormDraft,
+) -> Result<DaemonSessionTypeDefinition, String> {
     let working_directory = if form.working_directory_policy == "relative" {
         DaemonSessionTypeWorkingDirectory::Relative {
             path: form.working_directory_path.trim().to_string(),
@@ -806,7 +814,12 @@ fn definition_from_session_type_form(form: &SessionTypeFormDraft) -> DaemonSessi
     let description = form.description.trim();
     let icon = form.icon.trim();
     let definition_target_id = form.definition_target_id.trim();
-    DaemonSessionTypeDefinition {
+    let execution = match form.execution.as_str() {
+        "relative_executable" => DaemonSessionTypeExecution::RelativeExecutable,
+        "shell_command" => DaemonSessionTypeExecution::ShellCommand,
+        other => return Err(format!("unsupported session type execution mode: {other}")),
+    };
+    Ok(DaemonSessionTypeDefinition {
         id: form.id.trim().to_string(),
         label: form.label.trim().to_string(),
         description: if description.is_empty() {
@@ -823,6 +836,7 @@ fn definition_from_session_type_form(form: &SessionTypeFormDraft) -> DaemonSessi
         interaction: form.interaction.trim().to_string(),
         traits: parse_token_list(&form.traits, form.seeded_traits.as_ref()),
         lifecycle: form.lifecycle.trim().to_string(),
+        execution,
         command: form.command.trim().to_string(),
         args: parse_token_list(&form.args, form.seeded_args.as_ref()),
         working_directory,
@@ -837,7 +851,7 @@ fn definition_from_session_type_form(form: &SessionTypeFormDraft) -> DaemonSessi
         } else {
             Some(definition_target_id.to_string())
         },
-    }
+    })
 }
 
 fn mutation_source_from_form(
@@ -2371,6 +2385,7 @@ impl TuiApp {
             interaction: "interactive".to_string(),
             traits: Vec::new(),
             lifecycle: "task".to_string(),
+            execution: DaemonSessionTypeExecution::RelativeExecutable,
             command: script_name,
             args: Vec::new(),
             working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
@@ -2629,7 +2644,15 @@ impl TuiApp {
                 return;
             }
         };
-        let definition = definition_from_session_type_form(&form);
+        let definition = match definition_from_session_type_form(&form) {
+            Ok(definition) => definition,
+            Err(error) => {
+                if let Some(form) = self.session_type_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return;
+            }
+        };
         let request = match form.mode {
             SessionTypeFormMode::Create => DaemonRequest::CreateSessionType { source, definition },
             SessionTypeFormMode::Edit => DaemonRequest::UpdateSessionType { source, definition },
@@ -2673,6 +2696,7 @@ impl TuiApp {
         set("session_type_interaction", &mut form.interaction);
         set("session_type_traits", &mut form.traits);
         set("session_type_lifecycle", &mut form.lifecycle);
+        set("session_type_execution", &mut form.execution);
         set("session_type_command", &mut form.command);
         set("session_type_args", &mut form.args);
         set(
@@ -4624,6 +4648,13 @@ impl TuiApp {
             format!("session_type_id: {}", entity.session_type_id),
             format!("id: {}", entity.id),
             format!("source: {} ({})", entity.source, entity.source_name),
+            format!(
+                "execution: {}",
+                match &entity.execution {
+                    DaemonSessionTypeExecution::RelativeExecutable => "relative_executable",
+                    DaemonSessionTypeExecution::ShellCommand => "shell_command",
+                }
+            ),
             format!("command: {} {:?}", entity.command, entity.args),
             format!(
                 "working_directory_policy: {}",
@@ -4749,6 +4780,43 @@ impl TuiApp {
                 }),
             ));
         }
+        let execution = self
+            .drafts
+            .get("session_type_execution")
+            .and_then(Value::as_str)
+            .unwrap_or(&form.execution);
+        nodes.push(node(
+            UiNodeKind::Text,
+            "tui-session-type-field-text-session_type_execution",
+            json!({ "text": format!("execution: {execution}") }),
+        ));
+        let mut execution_select = node(
+            UiNodeKind::Select,
+            "tui-session-type-field-session_type_execution",
+            json!({
+                "name": "session_type_execution",
+                "label": "execution",
+                "selected": execution
+            }),
+        );
+        execution_select.slots.insert(
+            "options".to_string(),
+            [
+                ("relative_executable", "Relative executable"),
+                ("shell_command", "Shell command"),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (value, label))| {
+                child(node(
+                    UiNodeKind::SelectOption,
+                    &format!("tui-session-type-execution-option-{index}"),
+                    json!({ "value": value, "label": label }),
+                ))
+            })
+            .collect(),
+        );
+        nodes.push(execution_select);
         nodes.push(button(
             "tui-session-type-form-cancel",
             "Cancel",
@@ -9235,11 +9303,47 @@ mod tests {
         assert!(rendered.contains("Create session type"), "{rendered}");
         assert!(rendered.contains("printf draft"), "{rendered}");
         assert!(
+            rendered.contains("execution: relative_executable"),
+            "{rendered}"
+        );
+        assert!(
             hit_map
                 .regions()
                 .iter()
                 .any(|region| region.node_id == "tui-session-type-form-submit")
         );
+    }
+
+    #[test]
+    fn session_type_form_renders_explicit_execution_control() {
+        let app = TuiApp::new(None);
+        let form = SessionTypeFormDraft::create_default();
+        let nodes = app.session_type_form_nodes(&form);
+        let execution = nodes
+            .iter()
+            .find(|node| {
+                node.kind == UiNodeKind::Select
+                    && node.props.get("name") == Some(&json!("session_type_execution"))
+            })
+            .expect("execution select renders");
+
+        assert_eq!(
+            execution.props.get("selected"),
+            Some(&json!("relative_executable"))
+        );
+        let options = execution.slots.get("options").expect("options render");
+        assert_eq!(options.len(), 2);
+        let UiChild::Node(relative) = &options[0] else {
+            panic!("relative executable option renders as a node");
+        };
+        let UiChild::Node(shell) = &options[1] else {
+            panic!("shell command option renders as a node");
+        };
+        assert_eq!(
+            relative.props.get("value"),
+            Some(&json!("relative_executable"))
+        );
+        assert_eq!(shell.props.get("value"), Some(&json!("shell_command")));
     }
 
     #[test]
@@ -18442,6 +18546,7 @@ mod tests {
             interaction: "interactive".to_string(),
             traits: vec!["namespaced.trait".to_string()],
             lifecycle: "task".to_string(),
+            execution: DaemonSessionTypeExecution::RelativeExecutable,
             command: "/bin/echo".to_string(),
             args: vec!["hello".to_string()],
             working_directory_policy: "package_root".to_string(),
@@ -18555,6 +18660,7 @@ mod tests {
                 interaction: "interactive".to_string(),
                 traits: vec!["keep.trait".to_string()],
                 lifecycle: "task".to_string(),
+                execution: DaemonSessionTypeExecution::ShellCommand,
                 command: "shell.sh".to_string(),
                 args: Vec::new(),
                 working_directory: DaemonSessionTypeWorkingDirectory::Relative {
@@ -18571,7 +18677,7 @@ mod tests {
         assert!(form.environment.contains("KEEP=yes"));
         let mut form = form;
         form.label = "Shell 2".to_string();
-        let definition = definition_from_session_type_form(&form);
+        let definition = definition_from_session_type_form(&form).expect("form reconstructs");
         assert_eq!(
             definition.working_directory,
             DaemonSessionTypeWorkingDirectory::Relative {
@@ -18584,6 +18690,146 @@ mod tests {
         );
         assert_eq!(definition.label, "Shell 2");
         assert_eq!(definition.traits, vec!["keep.trait".to_string()]);
+        assert_eq!(
+            definition.execution,
+            DaemonSessionTypeExecution::ShellCommand
+        );
+    }
+
+    #[test]
+    fn session_type_create_form_defaults_to_relative_executable() {
+        let mut form = SessionTypeFormDraft::create_default();
+        form.label = "Shell".to_string();
+        form.command = "printf ready && exec agent".to_string();
+        form.args = "first, second".to_string();
+
+        let definition = definition_from_session_type_form(&form).expect("form reconstructs");
+
+        assert_eq!(form.execution, "relative_executable");
+        assert_eq!(
+            definition.execution,
+            DaemonSessionTypeExecution::RelativeExecutable
+        );
+        assert_eq!(definition.command, "printf ready && exec agent");
+        assert_eq!(definition.args, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn session_type_create_form_preserves_selected_execution_and_separate_args() {
+        let mut app = TuiApp::new(None);
+        app.session_type_form = Some(SessionTypeFormDraft::create_default());
+        app.apply_session_type_form_values(&UiFormValues(serde_json::Map::from_iter([
+            ("session_type_execution".to_string(), json!("shell_command")),
+            (
+                "session_type_command".to_string(),
+                json!("printf '%s' \"$1\""),
+            ),
+            ("session_type_args".to_string(), json!("first, second")),
+        ])));
+        let form = app.session_type_form.expect("form remains open");
+
+        let definition = definition_from_session_type_form(&form).expect("form reconstructs");
+
+        assert_eq!(
+            definition.execution,
+            DaemonSessionTypeExecution::ShellCommand
+        );
+        assert_eq!(definition.command, "printf '%s' \"$1\"");
+        assert_eq!(definition.args, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn session_type_edit_form_preserves_shell_command_and_args() {
+        let editable = DaemonSessionTypeEditableDefinition {
+            session_type_id: "device/shell".to_string(),
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: DaemonSessionTypeDefinition {
+                id: "shell".to_string(),
+                label: "Shell".to_string(),
+                description: None,
+                icon: None,
+                role: "botster.agent".to_string(),
+                interaction: "interactive".to_string(),
+                traits: Vec::new(),
+                lifecycle: "task".to_string(),
+                execution: DaemonSessionTypeExecution::ShellCommand,
+                command: "printf '%s' \"$1\"".to_string(),
+                args: vec!["first value".to_string(), "second".to_string()],
+                working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+                environment: BTreeMap::new(),
+                allowed_environment_overrides: Vec::new(),
+                context: Vec::new(),
+                target_id: None,
+            },
+        };
+
+        let form = SessionTypeFormDraft::from_authoring(editable);
+        let definition = definition_from_session_type_form(&form).expect("form reconstructs");
+
+        assert_eq!(form.execution, "shell_command");
+        assert_eq!(
+            definition.execution,
+            DaemonSessionTypeExecution::ShellCommand
+        );
+        assert_eq!(definition.command, "printf '%s' \"$1\"");
+        assert_eq!(definition.args, vec!["first value", "second"]);
+    }
+
+    #[test]
+    fn session_type_execution_modes_round_trip_through_form_reconstruction() {
+        for execution in [
+            DaemonSessionTypeExecution::RelativeExecutable,
+            DaemonSessionTypeExecution::ShellCommand,
+        ] {
+            let editable = DaemonSessionTypeEditableDefinition {
+                session_type_id: "device/round-trip".to_string(),
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: DaemonSessionTypeDefinition {
+                    id: "round-trip".to_string(),
+                    label: "Round trip".to_string(),
+                    description: None,
+                    icon: None,
+                    role: "botster.agent".to_string(),
+                    interaction: "interactive".to_string(),
+                    traits: Vec::new(),
+                    lifecycle: "task".to_string(),
+                    execution: execution.clone(),
+                    command: "bin/agent --literal-text".to_string(),
+                    args: vec!["one value".to_string()],
+                    working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+                    environment: BTreeMap::new(),
+                    allowed_environment_overrides: Vec::new(),
+                    context: Vec::new(),
+                    target_id: None,
+                },
+            };
+
+            let form = SessionTypeFormDraft::from_authoring(editable);
+            let reconstructed =
+                definition_from_session_type_form(&form).expect("form reconstructs");
+
+            assert_eq!(reconstructed.execution, execution);
+            assert_eq!(reconstructed.command, "bin/agent --literal-text");
+            assert_eq!(reconstructed.args, vec!["one value"]);
+        }
+    }
+
+    #[test]
+    fn omitted_session_type_execution_defaults_to_relative_executable() {
+        let definition: DaemonSessionTypeDefinition = serde_json::from_value(json!({
+            "id": "defaulted",
+            "label": "Defaulted",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "lifecycle": "task",
+            "command": "bin/defaulted"
+        }))
+        .expect("definition decodes");
+
+        assert_eq!(
+            definition.execution,
+            DaemonSessionTypeExecution::RelativeExecutable
+        );
     }
 
     #[test]
@@ -18600,6 +18846,7 @@ mod tests {
                 interaction: "interactive".to_string(),
                 traits: vec!["a.trait".to_string()],
                 lifecycle: "task".to_string(),
+                execution: DaemonSessionTypeExecution::RelativeExecutable,
                 command: "shell.sh".to_string(),
                 args: vec!["--flag".to_string()],
                 working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
@@ -18615,7 +18862,7 @@ mod tests {
         form.environment.clear();
         form.allowed_environment_overrides.clear();
         form.context_keys.clear();
-        let definition = definition_from_session_type_form(&form);
+        let definition = definition_from_session_type_form(&form).expect("form reconstructs");
         assert!(definition.traits.is_empty());
         assert!(definition.args.is_empty());
         assert!(definition.environment.is_empty());
@@ -19430,6 +19677,7 @@ mod tests {
             interaction: "interactive".to_string(),
             traits: vec!["proof.trait".to_string()],
             lifecycle: "task".to_string(),
+            execution: DaemonSessionTypeExecution::ShellCommand,
             command: "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
             args: Vec::new(),
             working_directory: DaemonSessionTypeWorkingDirectory::Relative {
@@ -19501,6 +19749,7 @@ exit 0
                     interaction: interaction.to_string(),
                     traits: vec!["unknown.namespaced.token".to_string()],
                     lifecycle: "task".to_string(),
+                    execution: DaemonSessionTypeExecution::RelativeExecutable,
                     command: accessory_script,
                     args: Vec::new(),
                     working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
