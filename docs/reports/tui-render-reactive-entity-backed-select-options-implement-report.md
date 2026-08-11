@@ -8,50 +8,42 @@
 | Target repository | `botster-tui` |
 | Target id | `tgt_c3d470bab78549df920a41e8fb0e58d8` |
 | Run | `run_1786480500_850089` |
-| Step | `botster_stack_implement` (revisit after `review_1786490665_855473`) |
+| Step | `botster_stack_implement` (revisit after `review_1786491226_172233`) |
 | PR | https://github.com/trybotster/botster-tui/pull/50 |
-| Runtime-teardown | N/A |
 
-## Findings addressed this revisit
+## Finding addressed
 
 | Finding | Resolution |
 | --- | --- |
-| `finding_1786490665_580144` Gap recovery can leave demanded family unsubscribed | On gap `Err`, drop pump/generation and re-`start`. Start failure sets `force_reconnect` when endpoint/client absent; `heal_entity_options_subscriptions` retries demanded pumps at end of every drain. Production-path tests: successful pump replace + new subscription id + recovery snapshot via `drain_entity_options_subscriptions`; start-failure reconnect signal. |
-| `finding_1786490665_250532` Live ordered-change rewrote Hub surface | Removed test-authored body assignment after submit. Production `apply_plugin_action_result` refuses replacements that drop every `options_source` producer while prior body had producers. Live proof keeps Hub-delivered surface; unit test proves strip-refusal. |
+| `finding_1786491226_232190` TUI rejects valid owner-authored replacement trees | Removed content-based refusal. Accepted `UiActionResult.replacement` is always applied; `sync_entity_options_subscriptions` runs so families drop when the owner replaces the picker with a static success tree. Unit test updated to require application of a success replacement. Live proof remains on Hub-delivered surface (no test body rewrite). |
 
-Prior findings from `review_1786489500_723691` remain fixed at this commit (gap Err path, action-result resync for real family changes, keyboard live submit, fmt/clippy).
-
-## Playbooks / notes
+## Playbooks
 
 - [[implementer-playbook]], [[botster-implementer-playbook]], [[botster-tui-playbook]]
 - Convention conflicts: **none**
 
 ## Ownership
 
-TUI app policy only; shared contract projector; kit pin only.
+TUI app policy only.
 
-## Files changed (this revisit)
+## Files changed
 
-- `crates/botster-tui/src/app.rs` — gap heal/reconnect, local-pump test harness, action-result producer preservation, drain tests, live proof cleanup
+- `crates/botster-tui/src/app.rs`
 - `docs/reports/tui-render-reactive-entity-backed-select-options-implement-report.md`
 
 ## Tests
 
 | Check | Result |
 | --- | --- |
-| `cargo fmt --check` | pass |
-| `cargo clippy -D warnings` | pass |
-| `./test.sh` | 191 unit + 1 package |
-| `entity_options_drain_gap_recovery_*` | pass |
-| `plugin_action_result_keeps_prior_body_*` | pass |
-| `entity_options_live_hub_proof_*` | pass (`surface_renders=1`, Hub surface retained) |
+| `cargo fmt` / `clippy -D warnings` | pass |
+| `./test.sh` | unit suite green |
+| `plugin_action_result_applies_static_success_replacement_and_drops_options_families` | pass |
+| `entity_options_live_hub_proof_when_binaries_are_available` | pass (`surface_renders=1`) |
 
 ## Residual risk
 
-1. Consecutive seq (`current+1`) remains stricter than session-entity any-greater.
-2. Refusing replacements that drop all options producers may keep a stale body if a host intentionally removes the select; that product path is rare and should re-render explicitly.
-3. Live hub binary is Projects debug build; Cargo pins still enforce contract identity.
+None new. Owner success replacements intentionally drop options demand via resync.
 
 ## Missing vault guidance
 
-Same capture candidates: generation seam, process-wide family dedupe, realized empty-options xor, host replacement vs producer body preservation.
+Owner replacement trees that drop options_source producers must resync family demand — candidate capture.
