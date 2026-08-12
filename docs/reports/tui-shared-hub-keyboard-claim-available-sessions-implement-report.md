@@ -19,8 +19,25 @@
 | `finding_1786548951_900036` UUID oracle can pass on draft | high | Driver requires `request.values.session_id` only (no draft fallback). Hermetic test submits via InputRouter Enter and asserts observed PluginSurfaceAction values; stripped-values negative proves oracle. |
 | `finding_1786548951_618201` surface refresh not failed | high | After claim submit, capture `surface_renders` baseline; membership join + exclusion fail if count increases (reopen is keyboard Action only). |
 | `finding_1786548951_322843` pin ledger caller-supplied revs | high | Revisions always derived from checkout HEAD; explicit rev must equal HEAD; Hub source path required. |
-| `finding_1786548951_886988` shared-Hub campaign missing | high | Live campaign green via `script/test-live-hub workspaces claim-driver`; evidence at `docs/reports/tui-shared-hub-keyboard-claim-live-evidence.jsonl`. |
+| `finding_1786548951_886988` shared-Hub campaign missing | high | Live campaign via `script/test-live-hub workspaces claim-driver`; evidence committed separately after a clean code commit. |
 | `finding_1786548951_395337` baseline not running | medium | Baseline requires `lifecycle_class == current`; evidence records lifecycle; ended-row negative unit test. |
+
+## Review revisit (`review_1786549581_936278`)
+
+| Finding | Severity | Resolution |
+| --- | --- | --- |
+| `finding_1786549581_181050` live evidence does not identify binaries | high | Pin ledger requires clean tracked sources; hub + session-worker **realpaths** under Hub source; Hub Cargo.lock **core_rev** as session-worker provenance; live re-run from clean code HEAD `a185b92` then evidence-only commit. |
+| `finding_1786549581_240211` silent tracked evidence write | medium | Live test never writes into `docs/` by default; optional absolute `BOTSTER_TUI_CLAIM_EVIDENCE_OUT` owned by wrapper; write failures panic. |
+
+### Live evidence (post-fix)
+
+| Field | Value |
+| --- | --- |
+| Code HEAD at run | `a185b926d323333abd1effb2aaa1f7a4eeac06df` (`tui_rev` in pin_ledger) |
+| Hub rev | `de6b09982e72fd5efd04a5258f5fc645f611adbc` |
+| Workspaces rev | `7ab4d1334214b3ea3c8b02e9ea665a27e70c0916` |
+| core_rev (session-worker) | from Hub Cargo.lock botster-core pin |
+| Evidence | `docs/reports/tui-shared-hub-keyboard-claim-live-evidence.jsonl` |
 
 ## Repository playbook and other playbooks/notes applied
 
