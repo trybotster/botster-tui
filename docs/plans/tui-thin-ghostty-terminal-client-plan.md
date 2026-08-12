@@ -1,8 +1,8 @@
 # Plan: Make TUI a thin Ghostty terminal client
 
-Ticket: `ticket_1786471490_592122`  
-Run: `run_1786508115_389280`  
-Step: `botster_stack_plan` (visit 7 after Plan Review `review_1786514388_224203`)  
+Ticket: `ticket_1786471490_592122`
+Run: `run_1786508115_389280`
+Step: `botster_stack_plan` (visit 7 after Plan Review `review_1786514388_224203`)
 Plan **revision 7**
 
 ## Target repository and target_id
@@ -233,19 +233,19 @@ Compatibility: require `FEATURE_MODE_GATED_INPUT`, conf floor **34**, protocol 6
 
 ## Scope
 
-1. Exact Cargo pins above + lock + README pin narrative  
-2. Attachment-scoped `GhosttyClientProjection`; H0–H5 hydration  
-3. **Locked paint seam** after kit TerminalView chrome  
-4. ModeGatedInput + full ModeFlags freshness; Kitty when `kitty_enabled`  
-5. Scroll → `ScrollOp`; no OSC color answers; no Scrollback install  
-6. Tests + gates in Acceptance  
+1. Exact Cargo pins above + lock + README pin narrative
+2. Attachment-scoped `GhosttyClientProjection`; H0–H5 hydration
+3. **Locked paint seam** after kit TerminalView chrome
+4. ModeGatedInput + full ModeFlags freshness; Kitty when `kitty_enabled`
+5. Scroll → `ScrollOp`; no OSC color answers; no Scrollback install
+6. Tests + gates in Acceptance
 
 ## Non-scope
 
-- Kit/core/hub product reimplementation  
-- Moving GHOSTSNP decode into kit  
-- Pushed mode events; control-path GHOSTSNP  
-- Expanding TerminalView props with Ghostty cell arrays (kit truth leak)  
+- Kit/core/hub product reimplementation
+- Moving GHOSTSNP decode into kit
+- Pushed mode events; control-path GHOSTSNP
+- Expanding TerminalView props with Ghostty cell arrays (kit truth leak)
 
 ## Ownership
 
@@ -258,26 +258,26 @@ Compatibility: require `FEATURE_MODE_GATED_INPUT`, conf floor **34**, protocol 6
 
 ## Assumptions and unknowns
 
-- Human product: install+render GHOSTSNP; ReadScreen diagnostic only  
-- Default `GhosttyAdapterConfig` (max_scrollback 0) honors snapshot producer policy  
-- Kit TerminalView remains monochrome Paragraph for Text children — paint overlay is required, not optional  
-- Unknown residual: exact scroll keybinding mapping (reuse existing terminal focus wheel/key paths if already forwarded; otherwise map focused-terminal wheel/page keys to `ScrollOp` without stealing outer UI)  
+- Human product: install+render GHOSTSNP; ReadScreen diagnostic only
+- Default `GhosttyAdapterConfig` (max_scrollback 0) honors snapshot producer policy
+- Kit TerminalView remains monochrome Paragraph for Text children — paint overlay is required, not optional
+- Unknown residual: exact scroll keybinding mapping (reuse existing terminal focus wheel/key paths if already forwarded; otherwise map focused-terminal wheel/page keys to `ScrollOp` without stealing outer UI)
 
 ## Affected surfaces
 
-- `crates/botster-tui/Cargo.toml`, `Cargo.lock`  
-- `crates/botster-tui/src/app.rs` — projection, H0–H5, ModeGatedInput, paint helper, tests  
-- `crates/botster-tui/src/renderer.rs` — only if paint helper lives there as TUI-local code  
-- `README.md` — pins, Zig/submodule, live binary pin `89dae7e`  
-- `script/*` — only if new filter env needed; prefer existing `script/test` / `script/test-live-hub`  
+- `crates/botster-tui/Cargo.toml`, `Cargo.lock`
+- `crates/botster-tui/src/app.rs` — projection, H0–H5, ModeGatedInput, paint helper, tests
+- `crates/botster-tui/src/renderer.rs` — only if paint helper lives there as TUI-local code
+- `README.md` — pins, Zig/submodule, live binary pin `89dae7e`
+- `script/*` — only if new filter env needed; prefer existing `script/test` / `script/test-live-hub`
 
 ### Production entry points
 
-1. Handshake: conf ≥ 34 + `mode_gated_input`  
-2. Attach: Snapshot → `install_ghostsnp` before live apply  
-3. `draw_workspace_shell` / `draw`: kit render → **HitMap `tui-terminal` region** → `frame.render_widget(ProjectionWidget, terminal_inner_rect(region))`  
-4. Input: ModeGatedInput for Kitty/mouse; `set_terminal_mouse_mode("tui-terminal", …)`  
-5. Resize: hub Resize + `projection.resize`  
+1. Handshake: conf ≥ 34 + `mode_gated_input`
+2. Attach: Snapshot → `install_ghostsnp` before live apply
+3. `draw_workspace_shell` / `draw`: kit render → **HitMap `tui-terminal` region** → `frame.render_widget(ProjectionWidget, terminal_inner_rect(region))`
+4. Input: ModeGatedInput for Kitty/mouse; `set_terminal_mouse_mode("tui-terminal", …)`
+5. Resize: hub Resize + `projection.resize`
 
 ## Risks
 
@@ -354,35 +354,35 @@ script/test -- --exact app::tests::headless_live_runtime_ghostty_install_scrollb
 
 That live test **must**:
 
-1. Use `BOTSTER_HUB_BIN` / `BOTSTER_SESSION_WORKER_BIN` (or hub-test-support spawn of those exact bins) — abort if unset  
-2. Spawn session, produce pre-attach history including a marker that ends **outside** the default viewport  
-3. Late attach: observe Snapshot install via production path; assert marker reachable after scroll through **painted** frame  
-4. OSC palette/special mutation then assert painted colors / `color_profile` agreement  
-5. Mode-gated mouse or kitty path admitted after ReadModeFlags  
-6. Later live output appears in projection paint  
+1. Use `BOTSTER_HUB_BIN` / `BOTSTER_SESSION_WORKER_BIN` (or hub-test-support spawn of those exact bins) — abort if unset
+2. Spawn session, produce pre-attach history including a marker that ends **outside** the default viewport
+3. Late attach: observe Snapshot install via production path; assert marker reachable after scroll through **painted** frame
+4. OSC palette/special mutation then assert painted colors / `color_profile` agreement
+5. Mode-gated mouse or kitty path admitted after ReadModeFlags
+6. Later live output appears in projection paint
 7. Soft residual / skip without bins = **failure**
 
 Optional: wrap the new live test in `script/test-live-hub` only if existing modes cannot host it; default is exact `cargo test` filter via `script/test -- --exact …` with bins exported.
 
 ### Summary gate set for Review/Verify
 
-1. `script/fmt`  
-2. `script/test`  
-3. `script/clippy`  
-4. cargo-tree identity checks  
-5. Exact unit tests listed above  
-6. Live with pin-matched hub + session-worker bins  
+1. `script/fmt`
+2. `script/test`
+3. `script/clippy`
+4. cargo-tree identity checks
+5. Exact unit tests listed above
+6. Live with pin-matched hub + session-worker bins
 
 ## Implementation sequence
 
-1. Apply exact Cargo.toml pins; source-qualified `cargo update` (ui-contract@0.3.2); `cargo build -p botster-tui`; cargo-tree checks  
+1. Apply exact Cargo.toml pins; source-qualified `cargo update` (ui-contract@0.3.2); `cargo build -p botster-tui`; cargo-tree checks
 
-2. Submodule/Zig for `libghostty-vt` until `cargo build -p botster-tui` succeeds  
-3. Projection state + H0–H5  
-4. `ProjectionWidget` via `frame.render_widget` on HitMap `tui-terminal` inner rect after kit render  
+2. Submodule/Zig for `libghostty-vt` until `cargo build -p botster-tui` succeeds
+3. Projection state + H0–H5
+4. `ProjectionWidget` via `frame.render_widget` on HitMap `tui-terminal` inner rect after kit render
 
-5. ModeGatedInput + ModeFlags  
-6. Exact tests + live; README pins  
+5. ModeGatedInput + ModeFlags
+6. Exact tests + live; README pins
 
 ## Finding disposition
 

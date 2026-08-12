@@ -184,7 +184,6 @@ struct AttachHydration {
     session_id: String,
     subscription_id: String,
     deadline: Instant,
-    read_screen_requested: bool,
     buffered_live_output: String,
     /// True after a verified Snapshot GHOSTSNP was installed into the projection.
     snapshot_installed: bool,
@@ -1070,7 +1069,10 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
             let event = event::read()?;
             match event {
                 Event::Key(key)
-                    if key.kind == KeyEventKind::Press && app.handle_tui_owned_key(key) => {}
+                    if key.kind == KeyEventKind::Press
+                        && app.handle_tui_owned_key(key, router.focused_node_id()) => {}
+                Event::Key(key)
+                    if app.handle_focused_terminal_key(key, router.focused_node_id()) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
                 _ => {
                     let dispatch = router.dispatch_event(event, &hit_map);
@@ -1607,50 +1609,41 @@ impl TuiApp {
         true
     }
 
-    fn handle_tui_owned_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers == KeyModifiers::NONE
-            && self.ghostty_projection.is_some()
-            && self.attached_session.is_some()
+    fn handle_tui_owned_key(&mut self, key: KeyEvent, focused_node_id: Option<&str>) -> bool {
+        // Terminal scroll shortcuts only when the production terminal owns focus.
+        let terminal_focused = focused_node_id == Some("tui-terminal")
+            || focused_node_id == Some("tui-terminal-output");
+        if terminal_focused && self.ghostty_projection.is_some() && self.attached_session.is_some()
         {
-            match key.code {
-                KeyCode::PageUp => {
-                    self.scroll_projection(ScrollOp::Delta(
-                        -(i32::from(self.terminal_viewport_size.rows)),
-                    ));
-                    return true;
+            if key.modifiers == KeyModifiers::NONE {
+                match key.code {
+                    KeyCode::PageUp => {
+                        self.scroll_projection(ScrollOp::Delta(
+                            -(i32::from(self.terminal_viewport_size.rows)),
+                        ));
+                        return true;
+                    }
+                    KeyCode::PageDown => {
+                        self.scroll_projection(ScrollOp::Delta(i32::from(
+                            self.terminal_viewport_size.rows,
+                        )));
+                        return true;
+                    }
+                    _ => {}
                 }
-                KeyCode::PageDown => {
-                    self.scroll_projection(ScrollOp::Delta(
-                        self.terminal_viewport_size.rows as i32,
-                    ));
-                    return true;
-                }
-                KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_projection(ScrollOp::Top);
-                    return true;
-                }
-                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_projection(ScrollOp::Bottom);
-                    return true;
-                }
-                _ => {}
             }
-        }
-        // Ctrl+Home / Ctrl+End: modifiers already checked above only for NONE branch.
-        if self.ghostty_projection.is_some()
-            && self.attached_session.is_some()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            match key.code {
-                KeyCode::Home => {
-                    self.scroll_projection(ScrollOp::Top);
-                    return true;
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Home => {
+                        self.scroll_projection(ScrollOp::Top);
+                        return true;
+                    }
+                    KeyCode::End => {
+                        self.scroll_projection(ScrollOp::Bottom);
+                        return true;
+                    }
+                    _ => {}
                 }
-                KeyCode::End => {
-                    self.scroll_projection(ScrollOp::Bottom);
-                    return true;
-                }
-                _ => {}
             }
         }
         if key.code != KeyCode::Esc || key.modifiers != KeyModifiers::NONE {
@@ -1661,6 +1654,52 @@ impl TuiApp {
             return true;
         }
         self.clear_active_plugin_surface()
+    }
+
+    /// Encode focused-terminal keys with Kitty CSI-u when mode flags say so.
+    ///
+    /// Kit's InputRouter always classic-encodes. When `kitty_enabled`, the TUI
+    /// owns the real KeyEvent path and re-encodes before ModeGatedInput.
+    fn handle_focused_terminal_key(
+        &mut self,
+        key: KeyEvent,
+        focused_node_id: Option<&str>,
+    ) -> bool {
+        let terminal_focused = focused_node_id == Some("tui-terminal")
+            || focused_node_id == Some("tui-terminal-output");
+        if !terminal_focused {
+            return false;
+        }
+        let Some(session_id) = self.attached_session.clone() else {
+            return false;
+        };
+        if self.attached_subscription_id.as_deref() != Some(self.subscription_id.as_str()) {
+            return false;
+        }
+        let Some(shadow) = self.current_mode_shadow() else {
+            // Modes unknown: leave classic router path for non-mode-dependent
+            // keys. Mode-dependent mouse reports fail closed in dispatch.
+            return false;
+        };
+        if !shadow.kitty_enabled {
+            return false;
+        }
+        let Some(bytes) =
+            renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
+        else {
+            // Consumed unencodable/release edge for Kitty path.
+            return true;
+        };
+        match String::from_utf8(bytes) {
+            Ok(data) => {
+                self.error = None;
+                self.forward_mode_gated_input(session_id, data, true);
+            }
+            Err(error) => {
+                self.error = Some(format!("kitty terminal input was not UTF-8: {error}"));
+            }
+        }
+        true
     }
 
     fn reset_active_plugin_surface(&mut self) {
@@ -3203,7 +3242,6 @@ impl TuiApp {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
             deadline: Instant::now() + ATTACH_HYDRATION_TIMEOUT,
-            read_screen_requested: false,
             buffered_live_output: String::new(),
             snapshot_installed: false,
         });
@@ -3708,8 +3746,12 @@ impl TuiApp {
                     history,
                 } => {
                     // H2: install verified Snapshot GHOSTSNP only. Never Scrollback.
-                    if self.hydration_matches(&session_id, &subscription_id) {
-                        hydration_evidence.opaque_state_received = true;
+                    let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
+                    let attached_matches = self.attached_matches(&session_id, &subscription_id);
+                    if hydration_matches || attached_matches {
+                        if hydration_matches {
+                            hydration_evidence.opaque_state_received = true;
+                        }
                         match history.decoded_bytes() {
                             Ok(bytes) => self.install_ghostsnp_from_snapshot(&session_id, &bytes),
                             Err(error) => {
@@ -3762,8 +3804,9 @@ impl TuiApp {
                     if state == "attached" && hydration_matches {
                         self.attached_session = Some(session_id.clone());
                         self.attached_subscription_id = Some(subscription_id);
-                        // H4b: ModeFlags freshness after attach for ModeGatedInput.
-                        self.probe_terminal_mouse_mode(&session_id);
+                        // H3/H5: open live path immediately (blank projection when
+                        // no Snapshot). Do not wait on ReadScreen or the 5s deadline.
+                        self.open_attach_live_path(&session_id);
                     } else if state == "detached" {
                         self.attached_session = None;
                         self.attached_subscription_id = None;
@@ -3798,48 +3841,33 @@ impl TuiApp {
         }
     }
 
-    fn complete_attach_hydration(&mut self, _deadline_expired: bool) {
-        let Some(hydration) = self.attach_hydration.as_mut() else {
+    fn complete_attach_hydration(&mut self, deadline_expired: bool) {
+        let Some(session_id) = self
+            .attach_hydration
+            .as_ref()
+            .map(|hydration| hydration.session_id.clone())
+        else {
             return;
         };
-        if hydration.read_screen_requested {
-            return;
+        // Deadline or opaque ordering signal: open live path without ReadScreen
+        // authority. Prefer Attached-driven open_attach_live_path when possible.
+        if deadline_expired || self.attached_session.as_deref() == Some(session_id.as_str()) {
+            self.open_attach_live_path(&session_id);
         }
-        hydration.read_screen_requested = true;
-        let session_id = hydration.session_id.clone();
-        self.request_optional_readback(DaemonRequest::ReadScreen { session_id }, "read_screen");
     }
 
     fn finish_attach_hydration(&mut self, session_id: &str, restored_text: &str) {
-        let Some(hydration) = self.attach_hydration.take() else {
-            return;
-        };
-        if hydration.session_id != session_id || hydration.subscription_id != self.subscription_id {
-            self.attach_hydration = Some(hydration);
-            return;
+        // Diagnostic-only ReadScreen path. Never promotes text into projection
+        // authority or terminal_content primary paint.
+        let _ = restored_text;
+        if self.attach_hydration.is_some() {
+            self.open_attach_live_path(session_id);
         }
-
-        // H5: apply buffered live after install (or onto a blank projection when
-        // no Snapshot arrived). ReadScreen text is diagnostic/compat only.
-        if hydration.snapshot_installed {
-            self.apply_live_terminal_output(&hydration.buffered_live_output);
-        } else if !hydration.buffered_live_output.is_empty() {
-            self.ensure_ghostty_projection(session_id);
-            self.apply_live_terminal_output(&hydration.buffered_live_output);
-        }
-
-        // H4c: ReadScreen remains optional diagnostic text, not authority.
-        self.terminal_output.clear();
-        self.terminal_output.push_str(restored_text);
-        append_non_overlapping(&mut self.terminal_output, &hydration.buffered_live_output);
-        self.request_optional_readback(
-            DaemonRequest::CaptureSnapshot {
-                session_id: session_id.to_string(),
-            },
-            "capture_snapshot",
-        );
-        if self.attached_session.as_deref() == Some(session_id) {
-            self.probe_terminal_mouse_mode(session_id);
+        // Keep restored text only as a detached/diagnostic fallback when there
+        // is still no Ghostty projection (non-GHOSTSNP / install-closed cases).
+        if self.ghostty_projection.is_none() && !restored_text.is_empty() {
+            self.terminal_output.clear();
+            self.terminal_output.push_str(restored_text);
         }
     }
 
@@ -3935,6 +3963,10 @@ impl TuiApp {
                 // Dimensions come from decoded Ghostty after install.
                 self.terminal_viewport_size = dimensions;
                 self.refresh_ghostty_viewport_cache();
+                // If already attached, open live path immediately after install.
+                if self.attached_session.as_deref() == Some(session_id) {
+                    self.open_attach_live_path(session_id);
+                }
             }
             (Err(error), _) => {
                 // Fail closed: do not keep a partially installed projection.
@@ -3950,9 +3982,54 @@ impl TuiApp {
         }
         if let Some(projection) = self.ghostty_projection.as_mut() {
             projection.apply_terminal_output(data.as_bytes());
+            self.refresh_ghostty_viewport_cache();
+            // Projection paint is authoritative; do not mirror into text path.
+            return;
         }
+        // No projection yet: keep a diagnostic/compat text buffer only.
         self.append_terminal_output(data);
-        self.refresh_ghostty_viewport_cache();
+    }
+
+    /// Open the post-attach live path: blank or installed projection, flush
+    /// buffered live bytes, drop ReadScreen as readiness gate.
+    fn open_attach_live_path(&mut self, session_id: &str) {
+        let Some(hydration) = self.attach_hydration.take() else {
+            if self.ghostty_projection.is_none() {
+                self.ensure_ghostty_projection(session_id);
+            }
+            return;
+        };
+        if hydration.session_id != session_id || hydration.subscription_id != self.subscription_id {
+            self.attach_hydration = Some(hydration);
+            return;
+        }
+        if !hydration.snapshot_installed {
+            self.ensure_ghostty_projection(session_id);
+        }
+        if !hydration.buffered_live_output.is_empty() {
+            if let Some(projection) = self.ghostty_projection.as_mut() {
+                projection.apply_terminal_output(hydration.buffered_live_output.as_bytes());
+                self.refresh_ghostty_viewport_cache();
+            } else {
+                self.append_terminal_output(&hydration.buffered_live_output);
+            }
+        }
+        // Optional diagnostic ReadScreen only — never terminal content authority.
+        self.request_optional_readback(
+            DaemonRequest::ReadScreen {
+                session_id: session_id.to_string(),
+            },
+            "read_screen_diagnostic",
+        );
+        self.request_optional_readback(
+            DaemonRequest::CaptureSnapshot {
+                session_id: session_id.to_string(),
+            },
+            "capture_snapshot",
+        );
+        if self.attached_session.as_deref() == Some(session_id) {
+            self.probe_terminal_mouse_mode(session_id);
+        }
     }
 
     fn scroll_projection(&mut self, op: ScrollOp) {
@@ -4014,21 +4091,23 @@ impl TuiApp {
         }
     }
 
-    fn mode_gated_input_required(&self, data: &str) -> bool {
-        // ModeGatedInput requires attachment-scoped ModeFlags freshness. Until
-        // ReadModeFlags lands, keep plain SendInput so attach/input unit paths
-        // remain available; production probes modes immediately after attach.
-        let Some(shadow) = self.current_mode_shadow() else {
-            return false;
-        };
+    fn looks_like_mouse_report(data: &str) -> bool {
         let bytes = data.as_bytes();
-        let looks_like_mouse_report = bytes.starts_with(b"\x1b[<") || bytes.starts_with(b"\x1b[M");
+        bytes.starts_with(b"\x1b[<") || bytes.starts_with(b"\x1b[M")
+    }
+
+    fn mode_gated_input_required(&self, data: &str) -> bool {
+        let looks_like_mouse = Self::looks_like_mouse_report(data);
+        let Some(shadow) = self.current_mode_shadow() else {
+            // Mouse reports without ModeFlags freshness must not plain-SendInput.
+            return looks_like_mouse;
+        };
         // Kitty keyboard: all nested terminal input uses ModeGatedInput.
         if shadow.kitty_enabled {
             return true;
         }
         // Mouse tracking: only mouse reports need the gate; keys stay plain.
-        if shadow.mouse_mode != 0 && looks_like_mouse_report {
+        if shadow.mouse_mode != 0 && looks_like_mouse {
             return true;
         }
         false
@@ -4168,7 +4247,10 @@ impl TuiApp {
         match response.kind {
             DaemonResponseKind::ReadScreen => {
                 if let Some(screen) = response.read_screen {
-                    self.finish_attach_hydration(&screen.session_id, &screen.text);
+                    // Diagnostic/compat only — never primary terminal authority.
+                    if operation == "read_screen_diagnostic" || operation == "read_screen" {
+                        self.finish_attach_hydration(&screen.session_id, &screen.text);
+                    }
                 }
             }
             DaemonResponseKind::CaptureSnapshot => {
@@ -5737,17 +5819,23 @@ impl TuiApp {
     }
 
     fn terminal_content(&self) -> String {
-        if !self.terminal_output.is_empty() {
-            if self.attached_session.is_none() {
-                return format!(
-                    "Detached · terminal history is read-only.\n{}",
-                    self.terminal_output
-                );
+        // When a Ghostty projection is installed, styled paint is authoritative.
+        // Kit Text child is chrome placeholder only — not ReadScreen authority.
+        if self.ghostty_projection.is_some() || self.ghostty_viewport_cache.is_some() {
+            if self.attached_session.is_some() {
+                return String::new();
             }
-            return self.terminal_output.clone();
+            return "Detached · Ghostty projection retained for scrollback.".to_string();
         }
         if self.attached_session.is_some() {
-            return "Waiting for terminal output.".to_string();
+            return "Waiting for terminal projection.".to_string();
+        }
+        if !self.terminal_output.is_empty() {
+            // Detached diagnostic/compat fallback only (no projection).
+            return format!(
+                "Detached · terminal history is read-only.\n{}",
+                self.terminal_output
+            );
         }
         match self.selected_session_row() {
             Some(session) if session.pending => {
@@ -6248,7 +6336,7 @@ fn drive_workspaces_acceptance(
                 "initial session subscription has no id",
             )
         })?;
-    if !app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)) {
+    if !app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None) {
         return invalid_acceptance(
             "Esc did not return the active plugin surface to System details",
         );
@@ -7206,19 +7294,6 @@ fn responsive_child(width: UiWidthClass, node: UiNode) -> UiChild {
         },
         node: Box::new(node),
     })
-}
-
-fn append_non_overlapping(output: &mut String, buffered: &str) {
-    let max_overlap = output.len().min(buffered.len());
-    let overlap = (0..=max_overlap)
-        .rev()
-        .find(|overlap| {
-            output.is_char_boundary(output.len() - overlap)
-                && buffered.is_char_boundary(*overlap)
-                && output.ends_with(&buffered[..*overlap])
-        })
-        .unwrap_or_default();
-    output.push_str(&buffered[overlap..]);
 }
 
 fn button(id: &str, label: &str, action_id: &str, payload: Value) -> UiNode {
@@ -12459,7 +12534,6 @@ mod tests {
             session_id: "session-alpha".to_string(),
             subscription_id: "terminal-generation".to_string(),
             deadline: Instant::now() + Duration::from_secs(1),
-            read_screen_requested: false,
             buffered_live_output: String::new(),
             snapshot_installed: false,
         });
@@ -13040,7 +13114,7 @@ mod tests {
             "contract-form",
         ));
 
-        assert!(app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None));
 
         assert!(app.plugin_surface.is_none());
         assert_eq!(
@@ -14576,14 +14650,13 @@ mod tests {
                 data: "current".to_string(),
             },
         ]));
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "restored-"),
-            "read_screen",
-        );
 
         assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
         assert_eq!(app.attached_subscription_id.as_deref(), Some("sub-current"));
-        assert_eq!(app.terminal_output, "restored-current");
+        // Projection is authority; stale subscription output must not apply.
+        assert!(app.ghostty_projection.is_some());
+        assert!(viewport_cache_contains(&app, "current"));
+        assert!(!viewport_cache_contains(&app, "stale"));
 
         app.apply_response(events_response(vec![DaemonEvent::AttachState {
             session_id: "session-alpha".to_string(),
@@ -14591,7 +14664,7 @@ mod tests {
             state: "detached".to_string(),
         }]));
         assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert_eq!(app.terminal_output, "restored-current");
+        assert!(viewport_cache_contains(&app, "current"));
     }
 
     #[test]
@@ -14646,27 +14719,21 @@ mod tests {
                 subscription_id: "sub-test".to_string(),
                 data: "live\n".to_string(),
             },
+            DaemonEvent::AttachState {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                state: "attached".to_string(),
+            },
         ]));
 
-        assert!(app.terminal_output.is_empty());
-        assert_eq!(
-            app.attach_hydration
-                .as_ref()
-                .map(|hydration| hydration.buffered_live_output.as_str()),
-            Some("live\n")
-        );
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "restored\n"),
-            "read_screen",
-        );
-        assert_eq!(app.terminal_output, "restored\nlive\n");
-
+        // Non-GHOSTSNP Snapshot never installs as text; live opens on a blank projection.
+        assert!(!viewport_cache_contains(&app, "snapshot"));
+        assert!(!viewport_cache_contains(&app, "scrollback"));
+        assert!(viewport_cache_contains(&app, "live"));
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
         assert!(!rendered.contains("snapshot"));
         assert!(!rendered.contains("scrollback"));
-        assert!(rendered.contains("restored"));
-        assert!(rendered.contains("live"));
         assert!(
             hit_map
                 .regions()
@@ -14742,6 +14809,7 @@ mod tests {
         };
         assert_eq!(decoded, vec![0, 255, 71, 84, 89, 1]);
         app.apply_response(events_response(vec![opaque_event]));
+        // Fixture opaque body is not GHOSTSNP; must never render as terminal text.
         assert!(app.terminal_output.is_empty());
         assert!(app.attach_hydration.is_some());
 
@@ -14752,6 +14820,8 @@ mod tests {
             app.attached_session.as_deref(),
             Some(scenario.session_id.as_str())
         );
+        assert!(app.attach_hydration.is_none());
+        assert!(app.ghostty_projection.is_some());
 
         app.apply_response(events_response(vec![
             scenario.history_then_live[live_index].clone(),
@@ -14760,29 +14830,17 @@ mod tests {
             DaemonEvent::TerminalOutput { data, .. } => data,
             other => panic!("expected shared live event, got {other:?}"),
         };
-        assert!(app.terminal_output.is_empty());
+        assert!(viewport_cache_contains(&app, live.trim()));
         app.apply_optional_readback_response(
             read_screen_response(&scenario.session_id, &scenario.read_screen_text),
-            "read_screen",
+            "read_screen_diagnostic",
         );
-        assert_eq!(
-            app.terminal_output,
-            format!("{}{live}", scenario.read_screen_text)
-        );
-        assert_eq!(
-            app.terminal_output
-                .matches(&scenario.read_screen_text)
-                .count(),
-            1
-        );
-        assert!(app.attach_hydration.is_none());
+        // ReadScreen text is not projection authority.
+        assert!(!viewport_cache_contains(
+            &app,
+            scenario.read_screen_text.trim()
+        ));
         assert!(app.observed_requests.is_empty());
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.find(scenario.read_screen_text.trim()).unwrap()
-                < rendered.find(live.trim()).unwrap()
-        );
     }
 
     #[test]
@@ -14831,30 +14889,18 @@ mod tests {
             app.attached_session.as_deref(),
             Some(scenario.no_history_session_id.as_str())
         );
-        assert!(app.attach_hydration.is_some());
+        // No-history attach opens live path immediately (blank projection).
+        assert!(app.attach_hydration.is_none());
+        assert!(app.ghostty_projection.is_some());
 
         app.apply_response(events_response(vec![
             scenario.no_history_then_live[live_index].clone(),
         ]));
-        assert!(app.terminal_output.is_empty());
-        assert!(app.attach_hydration.is_some());
-        assert!(app.observed_requests.is_empty());
-
-        app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
-        app.apply_response(events_response(Vec::new()));
-        app.apply_optional_readback_response(
-            read_screen_response(
-                &scenario.no_history_session_id,
-                &scenario.no_history_read_screen_text,
-            ),
-            "read_screen",
-        );
-        assert!(app.attach_hydration.is_none());
         let live = match &scenario.no_history_then_live[live_index] {
             DaemonEvent::TerminalOutput { data, .. } => data,
             other => panic!("expected shared live event, got {other:?}"),
         };
-        assert_eq!(app.terminal_output, *live);
+        assert!(viewport_cache_contains(&app, live.trim()));
         assert!(app.observed_requests.is_empty());
 
         let exit = scenario
@@ -14891,9 +14937,11 @@ mod tests {
             },
         ]));
 
+        // Non-GHOSTSNP Snapshot never becomes text content; attach opens blank projection.
         assert!(app.terminal_output.is_empty());
-        assert!(app.attach_hydration.is_some());
+        assert!(app.attach_hydration.is_none());
         assert_eq!(app.attached_session.as_deref(), Some("session-opaque"));
+        assert!(app.ghostty_projection.is_some());
     }
 
     #[test]
@@ -14902,85 +14950,113 @@ mod tests {
         app.subscription_id = "sub-captured".to_string();
         app.begin_attach_hydration("session-captured", "sub-captured");
         app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
-        app.attached_session = None;
+        // Attached before deadline so complete_attach_hydration can open live path.
+        app.attached_session = Some("session-captured".to_string());
+        app.attached_subscription_id = Some("sub-captured".to_string());
         app.observed_requests.clear();
 
         app.apply_response(events_response(Vec::new()));
-        assert!(app.attach_hydration.is_some());
-        assert!(app.observed_requests.is_empty());
-
+        assert!(app.attach_hydration.is_none());
+        assert!(app.ghostty_projection.is_some());
+        // ReadScreen diagnostic must not become primary terminal content.
         app.apply_optional_readback_response(
             read_screen_response("session-captured", "restored screen"),
-            "read_screen",
+            "read_screen_diagnostic",
         );
-        assert!(app.attach_hydration.is_none());
-        assert_eq!(app.terminal_output, "restored screen");
-        assert!(
-            renderer::render_to_lines(&app.surface(), 120, 48)
-                .0
-                .join("\n")
-                .contains("restored screen")
-        );
+        assert!(!app.terminal_content().contains("restored screen"));
     }
 
     #[test]
     fn late_screen_response_cannot_replace_restored_history() {
         let mut app = TuiApp::new(None);
         app.terminal_output_session_id = Some("session-alpha".to_string());
-        app.terminal_output = "ordered history".to_string();
+        app.ensure_ghostty_projection("session-alpha");
+        {
+            let projection = app.ghostty_projection.as_mut().unwrap();
+            projection.apply_terminal_output(b"ordered history");
+        }
+        app.refresh_ghostty_viewport_cache();
+        assert!(viewport_cache_contains(&app, "ordered history"));
 
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "stale screen"),
-            "read_screen",
+            "read_screen_diagnostic",
         );
 
-        assert_eq!(app.terminal_output, "ordered history");
+        assert!(viewport_cache_contains(&app, "ordered history"));
+        assert!(!viewport_cache_contains(&app, "stale screen"));
+        assert!(!app.terminal_content().contains("stale screen"));
     }
 
     #[test]
     fn read_screen_precedes_buffered_live_output_without_duplication() {
+        // Product path: Snapshot/live projection is authority; ReadScreen is diagnostic.
         let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-alpha");
 
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            data: "authoritative-live".to_string(),
-        }]));
-        assert!(app.terminal_output.is_empty());
-
+        app.apply_response(events_response(vec![
+            DaemonEvent::TerminalOutput {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-alpha".to_string(),
+                data: "authoritative-live".to_string(),
+            },
+            DaemonEvent::AttachState {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-alpha".to_string(),
+                state: "attached".to_string(),
+            },
+        ]));
+        assert!(viewport_cache_contains(&app, "authoritative-live"));
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "restored-first\n"),
-            "read_screen",
+            "read_screen_diagnostic",
         );
-
-        assert_eq!(app.terminal_output, "restored-first\nauthoritative-live");
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
-            .0
-            .join("\n");
-        assert!(
-            rendered.find("restored-first").unwrap() < rendered.find("authoritative-live").unwrap()
+        assert!(!viewport_cache_contains(&app, "restored-first"));
+        assert_eq!(
+            app.ghostty_viewport_cache.as_ref().map(|v| v
+                .cells
+                .iter()
+                .map(|c| c.grapheme.as_str())
+                .collect::<String>()
+                .matches("authoritative-live")
+                .count()),
+            Some(1)
         );
-        assert_eq!(rendered.matches("authoritative-live").count(), 1);
     }
 
     #[test]
     fn read_screen_overlap_is_not_duplicated_when_live_output_is_flushed() {
         let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-alpha");
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            data: "marker\r\n".to_string(),
-        }]));
-
+        app.apply_response(events_response(vec![
+            DaemonEvent::TerminalOutput {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-alpha".to_string(),
+                data: "marker\r\n".to_string(),
+            },
+            DaemonEvent::AttachState {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-alpha".to_string(),
+                state: "attached".to_string(),
+            },
+        ]));
+        assert!(viewport_cache_contains(&app, "marker"));
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "prompt marker"),
-            "read_screen",
+            "read_screen_diagnostic",
         );
-
-        assert_eq!(app.terminal_output, "prompt marker\r\n");
-        assert_eq!(app.terminal_output.matches("marker").count(), 1);
+        // Diagnostic ReadScreen must not inject a second marker into projection.
+        let text = app
+            .ghostty_viewport_cache
+            .as_ref()
+            .map(|v| {
+                v.cells
+                    .iter()
+                    .map(|c| c.grapheme.as_str())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        assert_eq!(text.matches("marker").count(), 1);
     }
 
     #[test]
@@ -15179,20 +15255,26 @@ mod tests {
     #[test]
     fn stale_opaque_history_cannot_replace_current_terminal_output() {
         let mut app = TuiApp::new(None);
-        app.terminal_output = "current output".to_string();
-        app.begin_attach_hydration("session-alpha", "sub-current");
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "current output"),
-            "read_screen",
-        );
+        app.ensure_ghostty_projection("session-alpha");
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some("sub-current".to_string());
+        app.subscription_id = "sub-current".to_string();
+        {
+            let projection = app.ghostty_projection.as_mut().unwrap();
+            projection.apply_terminal_output(b"current output");
+        }
+        app.refresh_ghostty_viewport_cache();
+        assert!(viewport_cache_contains(&app, "current output"));
 
+        // Stale subscription Snapshot must not replace current projection.
         app.apply_response(events_response(vec![DaemonEvent::Snapshot {
             session_id: "session-alpha".to_string(),
             subscription_id: "sub-stale".to_string(),
             history: DaemonOpaqueHistoryPayload::from_bytes(b"stale opaque state"),
         }]));
 
-        assert_eq!(app.terminal_output, "current output");
+        assert!(viewport_cache_contains(&app, "current output"));
+        assert!(!viewport_cache_contains(&app, "stale opaque state"));
     }
 
     #[test]
@@ -15416,6 +15498,10 @@ mod tests {
 
         app.attached_session = Some("session-alpha".to_string());
         app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 9, 1, 2),
+            "read_mode_flags",
+        );
 
         let up_dispatch = router.dispatch_event(
             mouse_event(
@@ -15442,17 +15528,24 @@ mod tests {
                 .count(),
             0
         );
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::SendInput { .. }))
-                .count(),
-            1
-        );
-        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
-            session_id: "session-alpha".to_string(),
-            data: String::from_utf8(sgr_release.to_vec()).expect("SGR release should be UTF-8"),
+        // Mouse reports use ModeGatedInput with ModeFlags freshness, not plain SendInput.
+        assert!(app.observed_requests.iter().any(|request| {
+            matches!(
+                request,
+                ObservedRequest::ModeGatedInput {
+                    session_id,
+                    data,
+                    mode_generation: 1,
+                    mode_revision: 2,
+                } if session_id == "session-alpha"
+                    && data.as_bytes() == sgr_release
+            )
         }));
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::SendInput { .. }))
+        );
     }
 
     #[test]
@@ -15612,26 +15705,21 @@ mod tests {
                 state: "attached".to_string(),
             },
         ]));
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|h| h.snapshot_installed),
-            "Snapshot GHOSTSNP must install before readiness"
-        );
+        // Attached opens live path immediately after Snapshot install.
+        assert!(app.attach_hydration.is_none());
         assert!(
             app.ghostty_projection.is_some(),
             "projection must exist after install"
         );
-        // Finish hydration applies buffered live after install (H5).
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "diagnostic-only"),
-            "read_screen",
-        );
-        assert!(app.attach_hydration.is_none());
         assert!(viewport_cache_contains(&app, "seed-install"));
         assert!(viewport_cache_contains(&app, "pre-install-live"));
-        // ReadScreen is diagnostic text, not projection authority.
-        assert!(app.terminal_output.contains("diagnostic-only"));
+        // ReadScreen is diagnostic only and must not become terminal content.
+        app.apply_optional_readback_response(
+            read_screen_response("session-alpha", "diagnostic-only"),
+            "read_screen_diagnostic",
+        );
+        assert!(!viewport_cache_contains(&app, "diagnostic-only"));
+        assert!(!app.terminal_content().contains("diagnostic-only"));
     }
 
     #[test]
@@ -15865,24 +15953,145 @@ mod tests {
         let mut app = TuiApp::new(None);
         app.terminal_viewport_size = size;
         app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
-        }]));
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|h| h.snapshot_installed)
-        );
+        app.apply_response(events_response(vec![
+            DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
+            },
+            DaemonEvent::AttachState {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                state: "attached".to_string(),
+            },
+        ]));
+        assert!(app.attach_hydration.is_none());
+        assert!(viewport_cache_contains(&app, "projection-authority"));
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "read-screen-text-only"),
-            "read_screen",
+            "read_screen_diagnostic",
         );
         assert!(viewport_cache_contains(&app, "projection-authority"));
-        assert!(app.terminal_output.contains("read-screen-text-only"));
-        // Projection must not be rebuilt from ReadScreen text.
         assert!(!viewport_cache_contains(&app, "read-screen-text-only"));
+        assert!(!app.terminal_content().contains("read-screen-text-only"));
+    }
+
+    #[test]
+    fn kitty_encoding_uses_real_key_path_and_mode_gated_input() {
+        let mut app = TuiApp::new(None);
+        app.sessions = vec![SessionRow::running("session-alpha")];
+        app.selected_session = Some("session-alpha".to_string());
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", true, 0, 5, 9),
+            "read_mode_flags",
+        );
+        app.observed_requests.clear();
+
+        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
+        let mut router = InputRouter::new(renderer::action_request_context());
+        // Focus the terminal region so the production key path can encode Kitty.
+        let terminal = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "tui-terminal")
+            .expect("terminal region");
+        let focus = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                terminal.rect.x.saturating_add(1),
+                terminal.rect.y.saturating_add(1),
+            ),
+            &hit_map,
+        );
+        app.handle_dispatch(focus);
+        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
+
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(app.handle_focused_terminal_key(key, router.focused_node_id()));
+        let expected = renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
+            .expect("kitty encodes char a");
+        let expected = String::from_utf8(expected).expect("utf8");
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::ModeGatedInput {
+                    session_id: "session-alpha".to_string(),
+                    data: expected,
+                    mode_generation: 5,
+                    mode_revision: 9,
+                })
+        );
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::SendInput { .. }))
+        );
+    }
+
+    #[test]
+    fn classic_encoding_remains_when_kitty_disabled() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 0, 1, 1),
+            "read_mode_flags",
+        );
+        app.observed_requests.clear();
+        // Without kitty, focused key path defers to classic router TerminalForward.
+        assert!(!app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: b"x".to_vec(),
+        });
+        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
+            session_id: "session-alpha".to_string(),
+            data: "x".to_string(),
+        }));
+    }
+
+    #[test]
+    fn mouse_report_without_mode_flags_fails_closed() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.observed_requests.clear();
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: b"\x1b[<0;1;1M".to_vec(),
+        });
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::SendInput { .. })),
+            "mouse reports must not plain-SendInput without ModeFlags freshness"
+        );
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn terminal_scroll_shortcuts_require_terminal_focus() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.ensure_ghostty_projection("session-alpha");
+        {
+            let projection = app.ghostty_projection.as_mut().unwrap();
+            projection.apply_terminal_output(b"line1\r\nline2\r\nline3\r\n");
+        }
+        app.refresh_ghostty_viewport_cache();
+        // Focused navigator must not steal PageUp into terminal scroll.
+        assert!(!app.handle_tui_owned_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            Some("tui-session-list"),
+        ));
+        assert!(app.handle_tui_owned_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
     }
 
     #[test]
@@ -17388,7 +17597,7 @@ mod tests {
         let root = PathBuf::from(format!("/tmp/bt-ghostty-{}", short_suffix() % 1_000_000));
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
             .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
+            .session_worker_bin(&session_worker_bin)
             .root(&root)
             .name("botster-tui-ghostty-live")
             .start()
@@ -17454,16 +17663,35 @@ mod tests {
                 "color_profile should reflect OSC palette mutations when present"
             );
         }
-        // ModeFlags freshness for ModeGatedInput.
+        // ModeFlags freshness for ModeGatedInput (required production path).
         app.probe_terminal_mouse_mode(&session_id);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && app.current_mode_shadow().is_none() {
             app.poll_hub();
             thread::sleep(Duration::from_millis(50));
         }
+        assert!(
+            app.current_mode_shadow().is_some(),
+            "live attach must obtain ModeFlags freshness for ModeGatedInput"
+        );
+
+        // Resize through production path.
+        app.handle_dispatch(InputDispatch::TerminalResize {
+            node_id: "tui-terminal".to_string(),
+            rows: 30,
+            cols: 100,
+        });
+        assert_eq!(app.terminal_viewport_size.rows, 30);
+        assert_eq!(app.terminal_viewport_size.cols, 100);
+
         // Later live output through production apply path.
         if let Some(session_id) = app.attached_session.clone() {
-            app.forward_terminal_input(session_id, "live-marker\n".to_string());
+            let shadow = app.current_mode_shadow().cloned();
+            if shadow.as_ref().is_some_and(|s| s.kitty_enabled) {
+                app.forward_mode_gated_input(session_id, "live-marker\n".to_string(), true);
+            } else {
+                app.forward_terminal_input(session_id, "live-marker\n".to_string());
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -17489,13 +17717,24 @@ mod tests {
             app.ghostty_viewport_cache.is_some(),
             "live frame must paint from projection cache; rendered={rendered}"
         );
+        // Reconnect: detach-style clear + re-attach cycle.
+        app.begin_attach_hydration(&session_id, &format!("reconnect-{}", short_suffix()));
+        assert!(app.ghostty_projection.is_none());
         println!(
-            "ghostty-live: projection={} attached={:?} mode_shadow={:?} rendered_has_bottom={}",
+            "ghostty-live: projection={} attached={:?} mode_shadow={:?} hub_bin={:?} worker_bin={:?} has_top={} has_live={}",
             app.ghostty_projection.is_some(),
             app.attached_session,
-            app.current_mode_shadow()
-                .map(|s| (s.mode_generation, s.mode_revision, s.mouse_mode)),
-            rendered.contains("BOTTOM") || viewport_cache_contains(&app, "BOTTOM_LIVE")
+            app.current_mode_shadow().map(|s| (
+                s.mode_generation,
+                s.mode_revision,
+                s.mouse_mode,
+                s.kitty_enabled
+            )),
+            hub_bin,
+            session_worker_bin,
+            viewport_cache_contains(&app, "TOP_MARKER"),
+            viewport_cache_contains(&app, "echo:live-marker")
+                || viewport_cache_contains(&app, "live-marker")
         );
     }
 

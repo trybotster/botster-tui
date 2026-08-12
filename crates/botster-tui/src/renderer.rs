@@ -6,7 +6,8 @@ pub const WORKSPACE_SURFACE_ID: &str = "botster-tui.workspace";
 
 pub use botster_tui_kit::{
     ActionRequestContext, HitMap, InputDispatch, InputRouter, PresentationState, RenderState,
-    apply_action_result, render_node_with_presentation_state, tui_capabilities, viewport_for_area,
+    TerminalKeyEncoding, apply_action_result, render_node_with_presentation_state,
+    terminal_key_bytes_with, tui_capabilities, viewport_for_area,
 };
 
 #[cfg(test)]
