@@ -98,8 +98,7 @@ Path(path).write_text(
     )
     + "\n"
 )
-print(path)
 PY
 
-export BOTSTER_TUI_CLAIM_BUILD_RECEIPT="$receipt_path"
-echo "$receipt_path"
+# Single path on stdout so `receipt="$(script/write-claim-build-receipt)"` is safe.
+printf '%s\n' "$receipt_path"

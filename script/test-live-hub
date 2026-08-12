@@ -143,8 +143,12 @@ if [ "$profile" = "claim-driver" ]; then
   export BOTSTER_HUB_BUILD_TARGET_DIR="$claim_hub_build_target"
   export BOTSTER_HUB_SOURCE_PATH="$hub_source"
   export BOTSTER_TUI_CLAIM_BUILD_RECEIPT="${claim_hub_build_target}/claim-build-receipt.json"
-  claim_build_receipt="$(script/write-claim-build-receipt)"
-  export BOTSTER_TUI_CLAIM_BUILD_RECEIPT="$claim_build_receipt"
+  script/write-claim-build-receipt >/dev/null
+  # Keep the explicit receipt path export (writer also validates/writes that file).
+  if [ ! -f "$BOTSTER_TUI_CLAIM_BUILD_RECEIPT" ]; then
+    echo "claim-driver: missing build receipt at $BOTSTER_TUI_CLAIM_BUILD_RECEIPT" >&2
+    exit 1
+  fi
 else
   hub_bin="$(resolve_binary BOTSTER_HUB_BIN botster-hub)"
   session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
