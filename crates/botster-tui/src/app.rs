@@ -15691,6 +15691,82 @@ mod tests {
         row.contains(needle)
     }
 
+    #[derive(Debug, Clone)]
+    struct PaintedCell {
+        x: u16,
+        y: u16,
+        symbol: char,
+        fg: Option<(u8, u8, u8)>,
+        bold: bool,
+    }
+
+    fn render_app_painted(
+        app: &TuiApp,
+        width: u16,
+        height: u16,
+    ) -> (String, HitMap, Vec<PaintedCell>) {
+        use ratatui::style::{Color, Modifier};
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend should initialize");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| draw(frame, &mut hit_map, app, &RenderState::default()))
+            .expect("application shell should render");
+        let buffer = terminal.backend().buffer();
+        let mut cells = Vec::new();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                let cell = &buffer[(x, y)];
+                let ch = cell.symbol().chars().next().unwrap_or(' ');
+                let style = cell.style();
+                let fg = match style.fg.unwrap_or(cell.fg) {
+                    Color::Rgb(r, g, b) => Some((r, g, b)),
+                    _ => None,
+                };
+                let bold = style.add_modifier.contains(Modifier::BOLD)
+                    || cell.modifier.contains(Modifier::BOLD);
+                cells.push(PaintedCell {
+                    x,
+                    y,
+                    symbol: ch,
+                    fg,
+                    bold,
+                });
+                line.push(ch);
+            }
+            lines.push(line);
+        }
+        (lines.join("\n"), hit_map, cells)
+    }
+
+    fn wait_for_mode_flags(
+        app: &mut TuiApp,
+        session_id: &str,
+        predicate: impl Fn(&TerminalModeShadow) -> bool,
+    ) -> TerminalModeShadow {
+        app.probe_terminal_mouse_mode(session_id);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            app.poll_hub();
+            if let Some(shadow) = app.current_mode_shadow().cloned()
+                && predicate(&shadow)
+            {
+                return shadow;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for ModeFlags predicate; current={:?} error={:?}",
+                    app.current_mode_shadow(),
+                    app.error
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+            app.probe_terminal_mouse_mode(session_id);
+        }
+    }
+
     #[test]
     fn ghostty_install_snapshot_before_live_applies_output() {
         let size = TerminalScreenSize::new(8, 40);
@@ -17704,8 +17780,10 @@ mod tests {
 
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
-        // Exact-bin live gate. With BOTSTER_TUI_REQUIRE_HUB_TEST=1, missing bins fail.
-        // Required provenance: Hub 89dae7e binary + hub-locked Core session-worker.
+        // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
+        // Build matching binaries from Hub 89dae7e and that Hub lock's Core worker tip
+        // (currently 2c5171a). Export BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
+        // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
             return;
@@ -17716,26 +17794,17 @@ mod tests {
         };
         let hub_path = PathBuf::from(&hub_bin);
         let worker_path = PathBuf::from(&session_worker_bin);
-        assert!(
-            hub_path.is_file(),
-            "BOTSTER_HUB_BIN must exist: {}",
-            hub_path.display()
-        );
+        assert!(hub_path.is_file(), "BOTSTER_HUB_BIN must exist");
         assert!(
             worker_path.is_file(),
-            "BOTSTER_SESSION_WORKER_BIN must exist: {}",
-            worker_path.display()
+            "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
             .unwrap_or_else(|_| "89dae7e15a844bcb7411b83b32581121720e23eb".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
             .unwrap_or_else(|_| "2c5171a6cb3b073c53620a9838d8b08480dd215c".to_string());
         println!(
-            "ghostty-live-provenance: hub_bin={} hub_rev={} worker_bin={} worker_rev={}",
-            hub_path.display(),
-            hub_rev,
-            worker_path.display(),
-            worker_rev
+            "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} hub_bin_set=true worker_bin_set=true"
         );
 
         let root = PathBuf::from(format!("/tmp/bt-ghostty-{}", short_suffix() % 1_000_000));
@@ -17747,19 +17816,26 @@ mod tests {
             .start()
             .expect("isolated hub starts");
 
-        // --- History attach path (Snapshot GHOSTSNP + scrollback + palette) ---
+        // --- History attach: GHOSTSNP, scrollback, palette, styles, modes, live, reconnect ---
         let mut app = TuiApp::new(Some(hub.endpoint().clone()));
         app.workspace_test_mode = true;
+        // Full OSC form matches Core projection tests; STYLED is bold truecolor green.
         let command = concat!(
             "printf 'TOP_MARKER\\n'; ",
             "i=0; while [ $i -lt 40 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
             "printf 'BOTTOM_LIVE\\n'; ",
-            // OSC palette index 1 + special foreground
-            "printf '\\033]4;1;rgb:ff/00/00\\007'; ",
-            "printf '\\033]10;rgb:00/ff/00\\007'; ",
+            "printf '\\033]4;1;rgb:ffff/0000/0000\\033\\\\'; ",
+            "printf '\\033]10;rgb:0000/ffff/0000\\033\\\\'; ",
             "printf '\\033[1;38;2;0;128;0mSTYLED\\033[0m\\n'; ",
             "printf 'palette-ready\\n'; ",
-            "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+            "while IFS= read -r line; do ",
+            "  if [ \"$line\" = enable-modes ]; then ",
+            "    printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
+            "    printf 'modes-enabled\\n'; ",
+            "  else ",
+            "    printf 'echo:%s\\n' \"$line\"; ",
+            "  fi; ",
+            "done"
         )
         .to_string();
         let session_id = format!("btui-ghostty-{}", short_suffix());
@@ -17788,71 +17864,142 @@ mod tests {
         }
         assert!(
             app.ghostty_projection.is_some(),
-            "production attach must install GHOSTSNP into GhosttyClientProjection; error={:?}",
+            "production attach must install GHOSTSNP; error={:?}",
             app.error
         );
         assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
 
-        // Full scrollback: marker outside default viewport, then ScrollOp::Top.
+        // Scrollback marker outside default viewport → ScrollOp::Top → painted frame.
         app.refresh_ghostty_viewport_cache();
-        let saw_top_before = viewport_cache_contains(&app, "TOP_MARKER");
-        app.scroll_projection(ScrollOp::Top);
         assert!(
-            viewport_cache_contains(&app, "TOP_MARKER"),
-            "ScrollOp must surface pre-attach history marker (saw_before={saw_top_before})"
+            !viewport_cache_contains(&app, "TOP_MARKER"),
+            "TOP_MARKER must start outside the default live viewport"
         );
-        // Painted frame must show the history marker after scroll.
-        let (lines_top, hit_map_top) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        let painted_top = lines_top.join("\n");
+        app.scroll_projection(ScrollOp::Top);
+        assert!(viewport_cache_contains(&app, "TOP_MARKER"));
+        let (painted_top, hit_map_top, _) = render_app_painted(&app, 140, 42);
         assert!(
             painted_top.contains("TOP_MARKER"),
             "Ratatui frame must paint scrollback marker; frame={painted_top}"
         );
         assert!(
-            hit_map_top
-                .regions()
-                .iter()
-                .any(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView)
+            hit_map_top.regions().iter().any(|r| {
+                r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView
+            })
         );
 
-        // Palette + special colors + styled cells from projection.
+        // Exact palette index 1 red + special foreground green.
         let profile = app
             .ghostty_projection
             .as_mut()
             .expect("projection")
             .color_profile()
             .expect("color_profile");
-        assert!(
-            profile.colors.contains_key(&1)
-                || profile
-                    .colors
-                    .contains_key(&botster_terminal_ghostty::COLOR_INDEX_FOREGROUND)
-                || !profile.colors.is_empty(),
-            "color_profile must capture OSC palette/special colors: {profile:?}"
+        let palette1 = profile
+            .colors
+            .get(&1)
+            .unwrap_or_else(|| panic!("palette index 1 missing: {profile:?}"));
+        assert_eq!(
+            (palette1.r, palette1.g, palette1.b),
+            (255, 0, 0),
+            "OSC 4;1 must resolve pure red"
         );
+        let special_fg = profile
+            .colors
+            .get(&botster_terminal_ghostty::COLOR_INDEX_FOREGROUND)
+            .unwrap_or_else(|| panic!("special foreground missing: {profile:?}"));
+        assert_eq!(
+            (special_fg.r, special_fg.g, special_fg.b),
+            (0, 255, 0),
+            "OSC 10 must resolve pure green"
+        );
+
+        // Styled cell required in projection and painted frame attributes.
         app.scroll_projection(ScrollOp::Bottom);
         app.refresh_ghostty_viewport_cache();
-        if let Some(viewport) = app.ghostty_viewport_cache.as_ref() {
-            let styled = viewport.cells.iter().find(|c| c.grapheme == "S");
-            if let Some(cell) = styled {
-                assert!(
-                    cell.bold || cell.fg.g > 0,
-                    "styled cell should carry bold/truecolor attributes: {cell:?}"
-                );
-            }
-        }
+        let viewport = app
+            .ghostty_viewport_cache
+            .as_ref()
+            .expect("viewport after scroll bottom");
+        let styled = viewport
+            .cells
+            .iter()
+            .find(|c| c.grapheme == "S")
+            .unwrap_or_else(|| panic!("STYLED head cell missing in projection"));
+        assert!(styled.bold, "STYLED S must be bold: {styled:?}");
+        assert_eq!(
+            (styled.fg.r, styled.fg.g, styled.fg.b),
+            (0, 128, 0),
+            "STYLED S must be truecolor green: {styled:?}"
+        );
+        let (painted_styled, hit_map_styled, painted_cells) = render_app_painted(&app, 140, 42);
+        assert!(
+            painted_styled.contains("STYLED"),
+            "painted frame must contain STYLED run: {painted_styled}"
+        );
+        let terminal_rect = hit_map_styled
+            .regions()
+            .iter()
+            .rev()
+            .find(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView)
+            .map(|r| r.rect)
+            .expect("tui-terminal region for styled paint");
+        let painted_s = painted_cells
+            .iter()
+            .find(|c| {
+                c.symbol == 'S'
+                    && c.fg == Some((0, 128, 0))
+                    && c.x >= terminal_rect.x
+                    && c.x < terminal_rect.x.saturating_add(terminal_rect.width)
+                    && c.y >= terminal_rect.y
+                    && c.y < terminal_rect.y.saturating_add(terminal_rect.height)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "painted truecolor-green S missing in terminal region; candidates={:?}",
+                    painted_cells
+                        .iter()
+                        .filter(|c| c.symbol == 'S')
+                        .take(12)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            painted_s.bold,
+            "painted STYLED head must be bold: {painted_s:?}"
+        );
 
-        // ModeFlags freshness required before ModeGatedInput.
-        app.probe_terminal_mouse_mode(&session_id);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && app.current_mode_shadow().is_none() {
+        // Enable Kitty + mouse tracking in-session; fail if either branch does not run.
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "enable-modes\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
             app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            if viewport_cache_contains(&app, "modes-enabled") {
+                break;
+            }
             thread::sleep(Duration::from_millis(50));
         }
-        let shadow = app
-            .current_mode_shadow()
-            .cloned()
-            .expect("live attach must obtain ModeFlags freshness");
+        let shadow = wait_for_mode_flags(&mut app, &session_id, |s| {
+            s.kitty_enabled && s.mouse_mode != 0
+        });
+        println!(
+            "ghostty-live-modes: kitty_enabled={} mouse_mode={} gen={} rev={}",
+            shadow.kitty_enabled, shadow.mouse_mode, shadow.mode_generation, shadow.mode_revision
+        );
+        assert!(
+            shadow.kitty_enabled,
+            "controlled session must enable Kitty keyboard"
+        );
+        assert!(
+            shadow.mouse_mode != 0,
+            "controlled session must enable mouse tracking; mouse_mode={}",
+            shadow.mouse_mode
+        );
 
         // Resize production path.
         app.handle_dispatch(InputDispatch::TerminalResize {
@@ -17863,81 +18010,73 @@ mod tests {
         assert_eq!(app.terminal_viewport_size.rows, 30);
         assert_eq!(app.terminal_viewport_size.cols, 100);
 
-        // Real focused key path: Kitty or classic based on ModeFlags.
+        // Required Kitty branch: real focused KeyEvent → ModeGatedInput CSI-u.
         app.observed_requests.clear();
         let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(app.handle_focused_terminal_key(key, Some("tui-terminal")));
+        let expected = renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
+            .expect("kitty encodes z");
         assert!(
-            app.handle_focused_terminal_key(key, Some("tui-terminal")),
-            "focused terminal key must be consumed after ModeFlags"
+            app.observed_requests.iter().any(|r| matches!(
+                r,
+                ObservedRequest::ModeGatedInput {
+                    data,
+                    mode_generation,
+                    mode_revision,
+                    ..
+                } if data.as_bytes() == expected.as_slice()
+                    && *mode_generation == shadow.mode_generation
+                    && *mode_revision == shadow.mode_revision
+            )),
+            "Kitty branch must ModeGatedInput CSI-u with freshness tokens: {:?}",
+            app.observed_requests
         );
-        if shadow.kitty_enabled {
-            let expected =
-                renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
-                    .expect("kitty encodes z");
-            assert!(
-                app.observed_requests.iter().any(|r| matches!(
-                    r,
-                    ObservedRequest::ModeGatedInput { data, .. }
-                        if data.as_bytes() == expected.as_slice()
-                )),
-                "Kitty ModeFlags require ModeGatedInput CSI-u bytes: {:?}",
-                app.observed_requests
-            );
-        } else {
-            assert!(
-                app.observed_requests.iter().any(|r| matches!(
-                    r,
-                    ObservedRequest::SendInput { data, .. } if data == "z"
-                )),
-                "classic ModeFlags send plain key: {:?}",
-                app.observed_requests
-            );
-        }
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::SendInput { .. })),
+            "Kitty branch must not plain-SendInput"
+        );
 
-        // Mouse SGR through dispatch with ModeFlags → ModeGatedInput when tracking.
+        // Required mouse branch: SGR → ModeGatedInput.
         app.observed_requests.clear();
         let sgr = "\x1b[<0;1;1M".to_string();
         app.handle_dispatch(InputDispatch::TerminalForward {
             node_id: "tui-terminal".to_string(),
             bytes: sgr.as_bytes().to_vec(),
         });
-        if shadow.mouse_mode != 0 {
-            assert!(
-                app.observed_requests
-                    .iter()
-                    .any(|r| matches!(r, ObservedRequest::ModeGatedInput { .. })),
-                "mouse tracking ModeFlags must ModeGatedInput SGR: {:?}",
-                app.observed_requests
-            );
-        }
+        assert!(
+            app.observed_requests.iter().any(|r| matches!(
+                r,
+                ObservedRequest::ModeGatedInput { data, .. } if data == &sgr
+            )),
+            "mouse branch must ModeGatedInput SGR: {:?}",
+            app.observed_requests
+        );
 
-        // Later live output appears in painted frame.
+        // Later live output required in painted Ratatui frame (not cache alone).
         app.request_and_apply(DaemonRequest::SendInput {
             session_id: session_id.clone(),
             data: "live-marker\n".to_string(),
         });
         let deadline = Instant::now() + Duration::from_secs(6);
+        let mut painted_live = String::new();
         while Instant::now() < deadline {
             app.poll_hub();
             app.refresh_ghostty_viewport_cache();
-            if viewport_cache_contains(&app, "echo:live-marker")
-                || viewport_cache_contains(&app, "live-marker")
-            {
+            let (frame, _, _) = render_app_painted(&app, 140, 42);
+            painted_live = frame;
+            if painted_live.contains("live-marker") || painted_live.contains("echo:live-marker") {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        app.refresh_ghostty_viewport_cache();
-        let (lines_live, _) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        let painted_live = lines_live.join("\n");
         assert!(
-            viewport_cache_contains(&app, "echo:live-marker")
-                || viewport_cache_contains(&app, "live-marker")
-                || painted_live.contains("live-marker"),
-            "later live output must appear in projection/paint; painted={painted_live}"
+            painted_live.contains("live-marker") || painted_live.contains("echo:live-marker"),
+            "later live output must appear in painted Ratatui frame; painted={painted_live}"
         );
 
-        // Reconnect: clear + full re-attach of same session.
+        // Reconnect must restore pre-attach history marker after reinstall.
         let reconnect_sub = format!("reconnect-{}", short_suffix());
         app.begin_attach_hydration(&session_id, &reconnect_sub);
         assert!(app.ghostty_projection.is_none());
@@ -17960,24 +18099,34 @@ mod tests {
             "reconnect attach must reinstall projection; error={:?}",
             app.error
         );
+        app.scroll_projection(ScrollOp::Top);
+        assert!(
+            viewport_cache_contains(&app, "TOP_MARKER"),
+            "reconnect must restore scrollback history marker"
+        );
+        let (painted_reconnect, _, _) = render_app_painted(&app, 140, 42);
+        assert!(
+            painted_reconnect.contains("TOP_MARKER"),
+            "reconnect painted frame must show history marker"
+        );
 
-        // --- No-history attach path on a second session ---
-        let no_hist_id = format!("btui-empty-{}", short_suffix());
+        // --- Truly silent no-history session: no pre-attach print, no Snapshot install ---
+        let no_hist_id = format!("btui-silent-{}", short_suffix());
         app.pending_sessions
             .insert(no_hist_id.clone(), SessionRow::pending(no_hist_id.clone()));
         app.selected_session = Some(no_hist_id.clone());
         app.rebuild_session_rows();
         match app.request(DaemonRequest::Spawn {
             session_id: no_hist_id.clone(),
-            command:
-                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
-                    .to_string(),
+            // No printf before the read loop — empty initial screen, no Snapshot body.
+            command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
         }) {
             Ok(response) => app.apply_response(response),
-            Err(error) => panic!("no-history spawn failed: {error}"),
+            Err(error) => panic!("silent spawn failed: {error}"),
         }
-        wait_for_authoritative_session(&mut app, &no_hist_id).expect("no-history session ready");
+        wait_for_authoritative_session(&mut app, &no_hist_id).expect("silent session ready");
         app.selected_session = Some(no_hist_id.clone());
+        // Attach immediately — no pre-attach producer output / no history Snapshot.
         app.attach_selected_or_first();
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
@@ -17992,31 +18141,42 @@ mod tests {
         assert_eq!(app.attached_session.as_deref(), Some(no_hist_id.as_str()));
         assert!(
             app.ghostty_projection.is_some(),
-            "no-history attach must open blank projection immediately"
+            "silent attach must open blank projection without Snapshot"
+        );
+        // Blank projection: no history markers from the other session.
+        app.refresh_ghostty_viewport_cache();
+        assert!(
+            !viewport_cache_contains(&app, "TOP_MARKER"),
+            "silent session must not inherit history Snapshot content"
+        );
+        assert!(
+            !viewport_cache_contains(&app, "ready"),
+            "silent session must not print a pre-attach readiness banner"
         );
         app.request_and_apply(DaemonRequest::SendInput {
             session_id: no_hist_id.clone(),
             data: "after-empty\n".to_string(),
         });
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut painted_empty = String::new();
         while Instant::now() < deadline {
             app.poll_hub();
             app.refresh_ghostty_viewport_cache();
-            if viewport_cache_contains(&app, "echo:after-empty")
-                || viewport_cache_contains(&app, "after-empty")
-            {
+            let (frame, _, _) = render_app_painted(&app, 140, 42);
+            painted_empty = frame;
+            if painted_empty.contains("after-empty") {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            viewport_cache_contains(&app, "echo:after-empty")
-                || viewport_cache_contains(&app, "after-empty"),
-            "no-history live output must apply without Snapshot wait"
+            painted_empty.contains("after-empty"),
+            "silent session live output must paint immediately; painted={painted_empty}"
         );
 
         println!(
-            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history_session={session_id} no_hist={no_hist_id}"
+            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} kitty={} mouse={}",
+            shadow.kitty_enabled, shadow.mouse_mode
         );
     }
 
