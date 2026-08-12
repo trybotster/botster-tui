@@ -176,12 +176,20 @@
               "payload": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["subscription_id", "snapshot_seq", "has_snapshot", "session_uuid"],
+                "required": [
+                  "subscription_id",
+                  "snapshot_seq",
+                  "has_snapshot",
+                  "session_uuid",
+                  "lifecycle_class"
+                ],
                 "properties": {
                   "subscription_id": { "$ref": "#/$defs/nonEmpty" },
                   "snapshot_seq": { "type": "integer", "minimum": 0 },
                   "has_snapshot": { "const": true },
-                  "session_uuid": { "$ref": "#/$defs/nonEmpty" }
+                  "session_uuid": { "$ref": "#/$defs/nonEmpty" },
+                  "lifecycle_class": { "const": "current" },
+                  "lifecycle": { "type": ["string", "null"] }
                 }
               }
             }

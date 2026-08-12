@@ -61,7 +61,7 @@ profile="${2:-}"
 case "$mode" in
   contract-matrix)
     if [ "$#" -gt 1 ]; then
-      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver> | session-types" >&2
+      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types" >&2
       exit 1
     fi
     contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
@@ -75,20 +75,30 @@ case "$mode" in
     test_filter="app::tests::session_types_live_profile_runs_against_isolated_hub_when_binaries_are_available"
     ;;
   workspaces)
-    if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ] && [ "$profile" != "installed-driver" ]; }; then
-      echo "usage: script/test-live-hub workspaces <plumbing|lifecycle|installed-driver>" >&2
+    if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ] && [ "$profile" != "installed-driver" ] && [ "$profile" != "claim-driver" ]; }; then
+      echo "usage: script/test-live-hub workspaces <plumbing|lifecycle|installed-driver|claim-driver>" >&2
       exit 1
     fi
     workspaces_package="$(resolve_workspaces_package)"
     if [ "$profile" = "installed-driver" ]; then
       test_filter="app::tests::installed_workspaces_spawn_driver_runs_through_apps_open"
+    elif [ "$profile" = "claim-driver" ]; then
+      test_filter="app::tests::installed_workspaces_claim_driver_runs_through_apps_open"
+      if [ -z "${BOTSTER_HUB_SOURCE_PATH:-}" ]; then
+        echo "BOTSTER_HUB_SOURCE_PATH is required for claim-driver pin ancestry" >&2
+        exit 1
+      fi
+      if [ ! -d "${BOTSTER_HUB_SOURCE_PATH}" ]; then
+        echo "BOTSTER_HUB_SOURCE_PATH is not a directory: ${BOTSTER_HUB_SOURCE_PATH}" >&2
+        exit 1
+      fi
     else
       test_filter="app::tests::workspaces_live_acceptance_runs_against_real_package"
     fi
     ;;
   *)
     echo "unknown live-Hub mode: $mode" >&2
-    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver> | session-types" >&2
+    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types" >&2
     exit 1
     ;;
 esac
@@ -103,7 +113,7 @@ else
 fi
 
 cargo build -p botster-tui --target-dir "$target_dir" --locked
-if [ "$mode" = "contract-matrix" ] || [ "$profile" = "installed-driver" ]; then
+if [ "$mode" = "contract-matrix" ] || [ "$profile" = "installed-driver" ] || [ "$profile" = "claim-driver" ]; then
   mkdir -p target/debug
   cp "$target_dir/debug/botster-tui" target/debug/botster-tui
 fi
@@ -115,6 +125,7 @@ if BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
   BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
   BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="${contract_matrix_fixture:-}" \
   BOTSTER_WORKSPACES_PACKAGE_PATH="${workspaces_package:-}" \
+  BOTSTER_HUB_SOURCE_PATH="${BOTSTER_HUB_SOURCE_PATH:-}" \
   BOTSTER_TUI_WORKSPACES_PROFILE="$profile" \
   CARGO_TARGET_DIR="$target_dir" \
   cargo test -p botster-tui "$test_filter" -- --exact --nocapture >"$test_output" 2>&1
@@ -144,6 +155,13 @@ if [ "$mode" = "workspaces" ]; then
     installed-driver)
       if ! grep -F "installed-workspaces-driver: complete cases=3" "$test_output" >/dev/null; then
         echo "Workspaces installed-driver acceptance did not complete" >&2
+        exit 1
+      fi
+      exit 0
+      ;;
+    claim-driver)
+      if ! grep -F "installed-workspaces-claim-driver: complete" "$test_output" >/dev/null; then
+        echo "Workspaces claim-driver acceptance did not complete" >&2
         exit 1
       fi
       exit 0

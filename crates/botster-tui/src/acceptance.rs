@@ -339,12 +339,29 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         Some(workspaces_path.as_path()),
         "Workspaces",
     )?;
-    let hub_path = scenario.hub_source_path.as_deref().map(PathBuf::from);
-    let hub_rev = resolve_rev(scenario.hub_rev.as_deref(), hub_path.as_deref(), "Hub")?;
+    let hub_path = scenario
+        .hub_source_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "claim pin ledger requires hub_source_path or {HUB_SOURCE_PATH_ENV} so Hub provenance is observed from a checkout"
+                ),
+            )
+        })?;
+    if !hub_path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Hub source path is not a directory: {}", hub_path.display()),
+        ));
+    }
+    let hub_rev = resolve_rev(scenario.hub_rev.as_deref(), Some(hub_path.as_path()), "Hub")?;
     let tui_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let tui_rev = resolve_rev(scenario.tui_rev.as_deref(), Some(tui_root.as_path()), "TUI")?;
 
-    let hub_ancestry_ok = is_ancestor_or_equal(MIN_HUB_REV, &hub_rev, hub_path.as_deref())?;
+    let hub_ancestry_ok = is_ancestor_or_equal(MIN_HUB_REV, &hub_rev, Some(&hub_path))?;
     let workspaces_ancestry_ok =
         is_ancestor_or_equal(MIN_WORKSPACES_REV, &workspaces_rev, Some(&workspaces_path))?;
     let tui_ancestry_ok = is_ancestor_or_equal(MIN_TUI_REV, &tui_rev, Some(&tui_root))?;
@@ -386,17 +403,28 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
     })
 }
 
+/// Derive the consumed revision from the actual checkout. When the scenario
+/// supplies an explicit rev, require exact equality with that checkout HEAD —
+/// never treat a caller-supplied string as consumed without observing it.
 fn resolve_rev(explicit: Option<&str>, git_root: Option<&Path>, label: &str) -> io::Result<String> {
-    if let Some(rev) = explicit {
-        return Ok(rev.to_string());
-    }
     let Some(root) = git_root else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{label} pin requires an explicit rev or a source path"),
+            format!(
+                "{label} pin requires a source checkout path so the consumed revision can be derived from HEAD"
+            ),
         ));
     };
-    git_rev_parse(root)
+    let derived = git_rev_parse(root)?;
+    if let Some(explicit) = explicit
+        && explicit != derived
+    {
+        return invalid(format!(
+            "{label} explicit rev {explicit} does not match checkout HEAD {derived} at {}",
+            root.display()
+        ));
+    }
+    Ok(derived)
 }
 
 fn git_rev_parse(root: &Path) -> io::Result<String> {
@@ -901,5 +929,59 @@ mod tests {
         )
         .unwrap();
         assert!(!workspaces_package_has_available_sessions_form(&root).unwrap());
+    }
+
+    #[test]
+    fn pin_resolve_requires_checkout_and_rejects_mismatched_explicit_rev() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-tui-claim-pin-{}",
+            crate::app::short_suffix()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            resolve_rev(Some(MIN_HUB_REV), None, "Hub").is_err(),
+            "explicit rev without checkout must fail closed"
+        );
+        // Initialize a git checkout so HEAD is observed.
+        let status = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        fs::write(root.join("README"), "pin").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["-C"])
+                .arg(&root)
+                .args(["add", "README"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["-C"])
+                .arg(&root)
+                .args([
+                    "-c",
+                    "user.email=claim@botster.dev",
+                    "-c",
+                    "user.name=Claim",
+                    "commit",
+                    "-m",
+                    "pin"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = git_rev_parse(&root).unwrap();
+        assert_eq!(resolve_rev(None, Some(&root), "TUI").unwrap(), head);
+        assert_eq!(resolve_rev(Some(&head), Some(&root), "TUI").unwrap(), head);
+        assert!(
+            resolve_rev(Some(MIN_HUB_REV), Some(&root), "TUI").is_err(),
+            "mismatched explicit rev must fail closed against checkout HEAD"
+        );
     }
 }
