@@ -15,8 +15,6 @@ use botster_core::{
     RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport,
     contract::terminal_screen::TerminalScreenSize,
 };
-#[cfg(test)]
-use botster_hub_client::DaemonOpaqueHistoryPayload;
 use botster_hub_client::{
     DaemonApp, DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
     DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
@@ -33,6 +31,8 @@ use botster_hub_client::{
     FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
     read_frame_from_reader, subscribe_entities, subscribe_session_entities, write_frame,
 };
+#[cfg(test)]
+use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
 use botster_terminal_ghostty::{GhosttyClientProjection, ScrollOp, ViewportProjection};
 use botster_ui_contract::{
     EntityFamilyStore, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
@@ -72,7 +72,7 @@ const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 34;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
 const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DEFAULT_TERMINAL_COLS: u16 = 80;
@@ -191,7 +191,7 @@ struct AttachHydration {
     session_id: String,
     subscription_id: String,
     deadline: Instant,
-    buffered_live_output: String,
+    buffered_live_output: Vec<u8>,
     /// True after a verified Snapshot GHOSTSNP was installed into the projection.
     snapshot_installed: bool,
 }
@@ -1391,6 +1391,9 @@ struct TuiApp {
     /// Senders for local entity-options pumps (test injection only).
     #[cfg(test)]
     entity_options_frame_injectors: BTreeMap<String, mpsc::Sender<SessionSubscriptionMessage>>,
+    /// Exact live payloads passed to the Ghostty apply path (test observer only).
+    #[cfg(test)]
+    applied_live_payloads: Vec<Vec<u8>>,
 }
 
 impl TuiApp {
@@ -1485,6 +1488,8 @@ impl TuiApp {
             entity_options_local_pumps: false,
             #[cfg(test)]
             entity_options_frame_injectors: BTreeMap::new(),
+            #[cfg(test)]
+            applied_live_payloads: Vec::new(),
         };
         app.try_connect();
         app
@@ -3263,7 +3268,7 @@ impl TuiApp {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
             deadline: Instant::now() + ATTACH_HYDRATION_TIMEOUT,
-            buffered_live_output: String::new(),
+            buffered_live_output: Vec::new(),
             snapshot_installed: false,
         });
     }
@@ -3630,9 +3635,8 @@ impl TuiApp {
     fn apply_response(&mut self, response: DaemonResponse) {
         let evidence = self.apply_response_state(response);
         if evidence.lifecycle_ended {
-            if let Some(hydration) = self.attach_hydration.take() {
-                self.append_terminal_output(&hydration.buffered_live_output);
-            }
+            // Live PTY bytes are not diagnostic text. Drop any unflushed buffer.
+            let _ = self.attach_hydration.take();
             return;
         }
         if evidence.opaque_state_received {
@@ -3748,12 +3752,20 @@ impl TuiApp {
                 DaemonEvent::TerminalOutput {
                     session_id,
                     subscription_id,
-                    data,
+                    payload,
                 } => {
+                    let data = match payload.decoded_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            self.error =
+                                Some(format!("terminal output decode failed (closed): {error}"));
+                            continue;
+                        }
+                    };
                     if self.hydration_matches(&session_id, &subscription_id) {
                         // H1: buffer live output until Snapshot install (H2) completes.
                         if let Some(hydration) = self.attach_hydration.as_mut() {
-                            hydration.buffered_live_output.push_str(&data);
+                            hydration.buffered_live_output.extend_from_slice(&data);
                         }
                     } else if self.attached_matches(&session_id, &subscription_id) {
                         // H5: apply live bytes into the installed projection.
@@ -3888,7 +3900,7 @@ impl TuiApp {
         // is still no Ghostty projection (non-GHOSTSNP / install-closed cases).
         if self.ghostty_projection.is_none() && !restored_text.is_empty() {
             self.terminal_output.clear();
-            self.terminal_output.push_str(restored_text);
+            self.append_terminal_output(restored_text);
         }
     }
 
@@ -3997,18 +4009,17 @@ impl TuiApp {
         }
     }
 
-    fn apply_live_terminal_output(&mut self, data: &str) {
+    fn apply_live_terminal_output(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
+        #[cfg(test)]
+        self.applied_live_payloads.push(data.to_vec());
         if let Some(projection) = self.ghostty_projection.as_mut() {
-            projection.apply_terminal_output(data.as_bytes());
+            projection.apply_terminal_output(data);
             self.refresh_ghostty_viewport_cache();
-            // Projection paint is authoritative; do not mirror into text path.
-            return;
         }
-        // No projection yet: keep a diagnostic/compat text buffer only.
-        self.append_terminal_output(data);
+        // Live PTY frames are never copied into the diagnostic String.
     }
 
     /// Open the post-attach live path: blank or installed projection, flush
@@ -4028,12 +4039,7 @@ impl TuiApp {
             self.ensure_ghostty_projection(session_id);
         }
         if !hydration.buffered_live_output.is_empty() {
-            if let Some(projection) = self.ghostty_projection.as_mut() {
-                projection.apply_terminal_output(hydration.buffered_live_output.as_bytes());
-                self.refresh_ghostty_viewport_cache();
-            } else {
-                self.append_terminal_output(&hydration.buffered_live_output);
-            }
+            self.apply_live_terminal_output(&hydration.buffered_live_output);
         }
         // Optional diagnostic ReadScreen only — never terminal content authority.
         self.request_optional_readback(
@@ -4341,6 +4347,7 @@ impl TuiApp {
                     | DaemonDiagnosticKind::UnsupportedFeature
                     | DaemonDiagnosticKind::Disconnected
                     | DaemonDiagnosticKind::DaemonStartupFailure
+                    | DaemonDiagnosticKind::WorkerCompatibility
             )
         });
     }
@@ -6949,19 +6956,21 @@ fn drive_workspaces_claim_acceptance(
         .expect("acceptance audit enabled")
         .surface_renders
         .len();
-    let lifecycle_before = claim_option_lifecycle(&app, &scenario.session_uuid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "option present without projected lifecycle metadata",
-        )
-    })?;
+    let lifecycle_before =
+        claim_option_lifecycle(&app, &scenario.session_uuid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "option present without projected lifecycle metadata",
+            )
+        })?;
     let label_before = claim_option_dedicated_label(&app, &scenario.session_uuid);
-    let projected_before = claim_option_compact_label(&app, &scenario.session_uuid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "option present without projected compact label",
-        )
-    })?;
+    let projected_before =
+        claim_option_compact_label(&app, &scenario.session_uuid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "option present without projected compact label",
+            )
+        })?;
     app.request_and_apply(DaemonRequest::ShutdownSession {
         session_id: scenario.session_uuid.clone(),
     });
@@ -6986,18 +6995,20 @@ fn drive_workspaces_claim_acceptance(
                 && lifecycle_token_terminal(&lifecycle_after)
         },
     )?;
-    let lifecycle_after = claim_option_lifecycle(&app, &scenario.session_uuid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "lifecycle wait completed without projected lifecycle",
-        )
-    })?;
-    let projected_after = claim_option_compact_label(&app, &scenario.session_uuid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "lifecycle wait completed without projected compact label",
-        )
-    })?;
+    let lifecycle_after =
+        claim_option_lifecycle(&app, &scenario.session_uuid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lifecycle wait completed without projected lifecycle",
+            )
+        })?;
+    let projected_after =
+        claim_option_compact_label(&app, &scenario.session_uuid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lifecycle wait completed without projected compact label",
+            )
+        })?;
     let label_after = claim_option_dedicated_label(&app, &scenario.session_uuid);
     if app
         .acceptance_audit
@@ -7443,19 +7454,23 @@ const CLAIM_SESSION_DISPLAY_FIELDS: &[&str] = &[
     "spawn_point",
 ];
 
-fn claim_session_option_fields(app: &TuiApp, session_uuid: &str) -> Option<serde_json::Map<String, Value>> {
+fn claim_session_option_fields(
+    app: &TuiApp,
+    session_uuid: &str,
+) -> Option<serde_json::Map<String, Value>> {
     // Session family is process-wide: projection injects session_entities, not entity_options.
     let store = app.entity_options_projection_store();
     store
         .get("session")
         .and_then(|records| records.get(session_uuid).cloned())
         .or_else(|| {
-            app.session_entities.entities.get(session_uuid).and_then(|entity| {
-                match serde_json::to_value(entity) {
+            app.session_entities
+                .entities
+                .get(session_uuid)
+                .and_then(|entity| match serde_json::to_value(entity) {
                     Ok(Value::Object(fields)) => Some(fields),
                     _ => None,
-                }
-            })
+                })
         })
 }
 
@@ -7532,10 +7547,9 @@ fn claim_add_form_open(
     let form_id = format!("botster-workspaces-add-form-{workspace_id}");
     acceptance_frame(app, router, diagnostics)
         .map(|(_, hit_map)| {
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == form_id || region.node_id == WORKSPACES_ADD_SESSION_NODE)
+            hit_map.regions().iter().any(|region| {
+                region.node_id == form_id || region.node_id == WORKSPACES_ADD_SESSION_NODE
+            })
         })
         .unwrap_or(false)
 }
@@ -8234,6 +8248,7 @@ fn diagnostic_text(diagnostic: &DaemonDiagnostic) -> String {
         DaemonDiagnosticKind::CompatibilityMismatch => "compatibility_mismatch",
         DaemonDiagnosticKind::UnsupportedFeature => "unsupported_feature",
         DaemonDiagnosticKind::TerminalStreamUnavailable => "terminal_stream_unavailable",
+        DaemonDiagnosticKind::WorkerCompatibility => "worker_compatibility",
         DaemonDiagnosticKind::ActionFailure => "action_failure",
         DaemonDiagnosticKind::DaemonStartupFailure => "daemon_startup_failure",
         DaemonDiagnosticKind::Backpressure => "backpressure",
@@ -11225,7 +11240,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_6_revision_34_mode_gated_input_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_7_revision_36_mode_gated_input_and_session_entity_subscriptions() {
         let requirement = tui_compatibility_requirement();
 
         assert_eq!(
@@ -11236,8 +11251,8 @@ mod tests {
             requirement.protocol_version,
             botster_hub_client::PROTOCOL_VERSION
         );
-        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 6);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 34);
+        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
         assert!(
             requirement
                 .required_features
@@ -11257,19 +11272,19 @@ mod tests {
                 .any(|feature| feature == FEATURE_MODE_GATED_INPUT)
         );
 
-        for revision in 16..34 {
+        for revision in 16..36 {
             let mut older_hub = DaemonCompatibility::current();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-                .expect_err("pre-Ghostty-contract fixture revision must be rejected");
+                .expect_err("pre-byte-faithful-contract fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 34"));
+            assert!(error.diagnostic.contains("requires at least 36"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
         // directions are covered deliberately: dropping the newer-protocol case
         // would silently restore the old minimum semantics this bump replaced.
-        for protocol_version in (2..6).chain(7..10) {
+        for protocol_version in (2..7).chain(8..10) {
             let mut mismatched_hub = DaemonCompatibility::current();
             mismatched_hub.protocol_version = protocol_version;
             let error = botster_hub_client::ensure_compatible(&requirement, &mismatched_hub)
@@ -11279,14 +11294,14 @@ mod tests {
                     .diagnostic
                     .contains(&format!("version {protocol_version}"))
             );
-            assert!(error.diagnostic.contains("client requires 6"));
+            assert!(error.diagnostic.contains("client requires 7"));
         }
         botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 6 fixture revision 34 hub should connect");
+            .expect("protocol 7 fixture revision 36 hub should connect");
         let mut future_hub = DaemonCompatibility::current();
-        future_hub.conformance_fixture_revision = 35;
+        future_hub.conformance_fixture_revision = 37;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 35");
+            .expect("runtime compatibility must preserve minimum semantics for revision 37");
     }
 
     #[test]
@@ -13380,7 +13395,7 @@ mod tests {
             session_id: "session-alpha".to_string(),
             subscription_id: "terminal-generation".to_string(),
             deadline: Instant::now() + Duration::from_secs(1),
-            buffered_live_output: String::new(),
+            buffered_live_output: Vec::new(),
             snapshot_installed: false,
         });
         let (sender, receiver) = mpsc::channel();
@@ -15488,12 +15503,12 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-stale".to_string(),
-                data: "stale".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"stale"),
             },
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-current".to_string(),
-                data: "current".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"current"),
             },
         ]));
 
@@ -15563,7 +15578,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-test".to_string(),
-                data: "live\n".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"live\n"),
             },
             DaemonEvent::AttachState {
                 session_id: "session-alpha".to_string(),
@@ -15653,11 +15668,20 @@ mod tests {
             }
             other => panic!("expected shared opaque history event, got {other:?}"),
         };
-        assert_eq!(decoded, vec![0, 255, 71, 84, 89, 1]);
+        assert!(
+            decoded.starts_with(b"GHOSTSNP"),
+            "shared history fixture ships a GHOSTSNP Snapshot, not dummy bytes"
+        );
         app.apply_response(events_response(vec![opaque_event]));
-        // Fixture opaque body is not GHOSTSNP; must never render as terminal text.
+        // Snapshot GHOSTSNP installs; diagnostic String stays unused.
         assert!(app.terminal_output.is_empty());
         assert!(app.attach_hydration.is_some());
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.snapshot_installed)
+        );
+        assert!(app.ghostty_projection.is_some());
 
         app.apply_response(events_response(vec![
             scenario.history_then_live[attached_index].clone(),
@@ -15673,19 +15697,51 @@ mod tests {
             scenario.history_then_live[live_index].clone(),
         ]));
         let live = match &scenario.history_then_live[live_index] {
-            DaemonEvent::TerminalOutput { data, .. } => data,
+            DaemonEvent::TerminalOutput { payload, .. } => String::from_utf8(
+                payload
+                    .decoded_bytes()
+                    .expect("shared fixture live payload decodes"),
+            )
+            .expect("shared fixture live payload is utf-8 text"),
             other => panic!("expected shared live event, got {other:?}"),
         };
         assert!(viewport_cache_contains(&app, live.trim()));
+        let history_hits_before = app
+            .ghostty_viewport_cache
+            .as_ref()
+            .map(|viewport| {
+                viewport
+                    .cells
+                    .iter()
+                    .map(|cell| cell.grapheme.as_str())
+                    .collect::<String>()
+                    .matches(scenario.read_screen_text.trim())
+                    .count()
+            })
+            .unwrap_or(0);
         app.apply_optional_readback_response(
             read_screen_response(&scenario.session_id, &scenario.read_screen_text),
             "read_screen_diagnostic",
         );
-        // ReadScreen text is not projection authority.
-        assert!(!viewport_cache_contains(
-            &app,
-            scenario.read_screen_text.trim()
-        ));
+        // ReadScreen is diagnostic only; it must not rewrite or duplicate GHOSTSNP text.
+        let history_hits_after = app
+            .ghostty_viewport_cache
+            .as_ref()
+            .map(|viewport| {
+                viewport
+                    .cells
+                    .iter()
+                    .map(|cell| cell.grapheme.as_str())
+                    .collect::<String>()
+                    .matches(scenario.read_screen_text.trim())
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            history_hits_after, history_hits_before,
+            "ReadScreen must not become projection authority"
+        );
+        assert!(viewport_cache_contains(&app, live.trim()));
         assert!(app.observed_requests.is_empty());
     }
 
@@ -15711,12 +15767,19 @@ mod tests {
             .iter()
             .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
             .expect("idle fixture includes live output");
-        assert!(attaching_index < attached_index);
+        let idle_snapshot_index = scenario
+            .no_history_then_live
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. }
+                )
+            })
+            .expect("idle fixture includes blank GHOSTSNP Snapshot");
+        assert!(attaching_index < idle_snapshot_index);
+        assert!(idle_snapshot_index < attached_index);
         assert!(attached_index < live_index);
-        assert!(scenario.no_history_then_live.iter().all(|event| !matches!(
-            event,
-            DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. }
-        )));
 
         let mut app = TuiApp::new(None);
         app.subscription_id = scenario.no_history_subscription_id.clone();
@@ -15728,6 +15791,7 @@ mod tests {
 
         app.apply_response(events_response(vec![
             scenario.no_history_then_live[attaching_index].clone(),
+            scenario.no_history_then_live[idle_snapshot_index].clone(),
             scenario.no_history_then_live[attached_index].clone(),
         ]));
 
@@ -15735,15 +15799,24 @@ mod tests {
             app.attached_session.as_deref(),
             Some(scenario.no_history_session_id.as_str())
         );
-        // No-history attach opens live path immediately (blank projection).
+        // Blank GHOSTSNP Snapshot still opens the live path.
         assert!(app.attach_hydration.is_none());
         assert!(app.ghostty_projection.is_some());
+        assert!(
+            !viewport_cache_contains(&app, "history-before-live"),
+            "idle GHOSTSNP must not carry the history golden"
+        );
 
         app.apply_response(events_response(vec![
             scenario.no_history_then_live[live_index].clone(),
         ]));
         let live = match &scenario.no_history_then_live[live_index] {
-            DaemonEvent::TerminalOutput { data, .. } => data,
+            DaemonEvent::TerminalOutput { payload, .. } => String::from_utf8(
+                payload
+                    .decoded_bytes()
+                    .expect("shared fixture live payload decodes"),
+            )
+            .expect("shared fixture live payload is utf-8 text"),
             other => panic!("expected shared live event, got {other:?}"),
         };
         assert!(viewport_cache_contains(&app, live.trim()));
@@ -15844,7 +15917,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-alpha".to_string(),
-                data: "authoritative-live".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"authoritative-live"),
             },
             DaemonEvent::AttachState {
                 session_id: "session-alpha".to_string(),
@@ -15878,7 +15951,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-alpha".to_string(),
-                data: "marker\r\n".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"marker\r\n"),
             },
             DaemonEvent::AttachState {
                 session_id: "session-alpha".to_string(),
@@ -16010,7 +16083,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-alpha".to_string(),
-                data: "final bytes".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"final bytes"),
             },
             DaemonEvent::ProcessExit {
                 session_id: "session-alpha".to_string(),
@@ -16019,7 +16092,11 @@ mod tests {
             },
         ]));
 
-        assert_eq!(app.terminal_output, "final bytes");
+        assert!(
+            app.terminal_output.is_empty(),
+            "hydration-end must not dump live PTY bytes into diagnostic text"
+        );
+        assert!(app.applied_live_payloads.is_empty());
         assert!(app.attach_hydration.is_none());
         assert!(app.snapshot_metadata.is_none());
         assert!(app.observed_requests.is_empty());
@@ -16458,7 +16535,7 @@ mod tests {
         app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
             session_id: "session-alpha".to_string(),
             subscription_id: "sub-alpha".to_string(),
-            data: "output".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"output"),
         }]));
         assert!(app.terminal_mouse_mode_refresh_due);
         app.refresh_terminal_mouse_mode_if_due();
@@ -16614,7 +16691,7 @@ mod tests {
             DaemonEvent::TerminalOutput {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-test".to_string(),
-                data: "pre-install-live".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"pre-install-live"),
             },
             DaemonEvent::Snapshot {
                 session_id: "session-alpha".to_string(),
@@ -16642,6 +16719,157 @@ mod tests {
         );
         assert!(!viewport_cache_contains(&app, "diagnostic-only"));
         assert!(!app.terminal_content().contains("diagnostic-only"));
+    }
+
+    fn live_output_event(session_id: &str, subscription_id: &str, bytes: &[u8]) -> DaemonEvent {
+        DaemonEvent::TerminalOutput {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(bytes),
+        }
+    }
+
+    fn attach_with_ghostsnp_seed(seed: &[u8]) -> TuiApp {
+        let size = TerminalScreenSize::new(8, 40);
+        let ghostsnp = producer_ghostsnp(size, seed);
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-test");
+        app.apply_response(events_response(vec![
+            DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
+            },
+            DaemonEvent::AttachState {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                state: "attached".to_string(),
+            },
+        ]));
+        assert!(app.attach_hydration.is_none());
+        assert!(app.ghostty_projection.is_some());
+        app.applied_live_payloads.clear();
+        app
+    }
+
+    #[test]
+    fn apply_response_preserves_split_utf8_live_bytes() {
+        let mut app = attach_with_ghostsnp_seed(b"byte-seed");
+        app.apply_response(events_response(vec![live_output_event(
+            "session-alpha",
+            "sub-test",
+            &[0xE2],
+        )]));
+        assert_eq!(app.applied_live_payloads, vec![vec![0xE2]]);
+        assert!(
+            !viewport_cache_contains(&app, "\u{FFFD}"),
+            "first split frame must not UTF-8-repair to U+FFFD"
+        );
+        assert!(
+            app.applied_live_payloads.iter().all(|payload| !payload
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD])),
+            "applied bytes must not contain the UTF-8 replacement sequence"
+        );
+
+        app.apply_response(events_response(vec![live_output_event(
+            "session-alpha",
+            "sub-test",
+            &[0x82, 0xAC],
+        )]));
+        assert_eq!(
+            app.applied_live_payloads.concat(),
+            vec![0xE2, 0x82, 0xAC],
+            "concatenated applied payloads must be the euro UTF-8 sequence"
+        );
+        assert!(
+            viewport_cache_contains(&app, "\u{20AC}"),
+            "euro must appear in the projection after both fragments"
+        );
+        let (painted, _, _) = render_app_painted(&app, 120, 24);
+        assert!(
+            painted.contains('\u{20AC}'),
+            "painted frame must show euro after both fragments; painted={painted}"
+        );
+    }
+
+    #[test]
+    fn apply_response_preserves_invalid_nul_and_escape_live_bytes() {
+        let mut app = attach_with_ghostsnp_seed(b"byte-seed");
+        app.apply_response(events_response(vec![live_output_event(
+            "session-alpha",
+            "sub-test",
+            &[0x00, 0x1b, 0xff, 0xc0],
+        )]));
+        assert_eq!(
+            app.applied_live_payloads,
+            vec![vec![0x00, 0x1b, 0xff, 0xc0]]
+        );
+        assert!(
+            !viewport_cache_contains(&app, "\u{FFFD}"),
+            "invalid 0xff must not become U+FFFD in the projection"
+        );
+        assert!(
+            app.applied_live_payloads.iter().all(|payload| !payload
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD])),
+            "0xff must reach apply_terminal_output unchanged"
+        );
+
+        app.apply_response(events_response(vec![live_output_event(
+            "session-alpha",
+            "sub-test",
+            b"\x1b[0mNUL-LATER",
+        )]));
+        assert!(
+            viewport_cache_contains(&app, "NUL-LATER"),
+            "NUL prefix must not drop later live bytes"
+        );
+        let (painted, _, _) = render_app_painted(&app, 120, 24);
+        assert!(
+            painted.contains("NUL-LATER"),
+            "later marker after NUL/ESC/invalid must paint; painted={painted}"
+        );
+    }
+
+    #[test]
+    fn apply_response_rejects_retired_terminal_output_data_field() {
+        let event = live_output_event("session-alpha", "sub-test", b"live-after-attach\r\n");
+        let mut value = serde_json::to_value(&event).expect("serialize current live envelope");
+        assert!(value.get("data").is_none());
+        value["data"] = serde_json::json!("live-after-attach\r\n");
+        let error = serde_json::from_value::<DaemonEvent>(value)
+            .expect_err("retired data key must fail even when the current envelope is valid");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy terminal_output data field is rejected"),
+            "expected retired-field rejection, got {error}"
+        );
+    }
+
+    #[test]
+    fn apply_response_fail_closes_on_live_output_decode_error() {
+        let mut app = attach_with_ghostsnp_seed(b"byte-seed");
+        let mut payload = DaemonLiveOutputPayload::from_bytes(b"ok");
+        payload.bytes = 99;
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            payload,
+        }]));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("terminal output decode failed (closed)")),
+            "decode failure must fail closed; error={:?}",
+            app.error
+        );
+        assert!(
+            app.applied_live_payloads.is_empty(),
+            "decode failure must not apply repaired bytes"
+        );
     }
 
     #[test]
@@ -18935,8 +19163,8 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub 89dae7e and that Hub lock's Core worker tip
-        // (currently 2c5171a). Export BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
+        // Build matching binaries from Hub 7499c161 and that Hub lock's Core worker tip
+        // (currently 5a993837). Export BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -18954,9 +19182,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "89dae7e15a844bcb7411b83b32581121720e23eb".to_string());
+            .unwrap_or_else(|_| "7499c1615078069ba391489b20c6f39c55c2d4c6".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "2c5171a6cb3b073c53620a9838d8b08480dd215c".to_string());
+            .unwrap_or_else(|_| "5a9938377b492ee1fa3acfb31365ebbebccc2a96".to_string());
         println!(
             "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} hub_bin_set=true worker_bin_set=true"
         );
@@ -18975,6 +19203,9 @@ mod tests {
         app.workspace_test_mode = true;
         // Full OSC form matches Core projection tests; STYLED is bold truecolor green.
         let command = concat!(
+            // Kernel echo would insert the command token between split UTF-8
+            // fragments. Disable it so barrier writes are exact payloads.
+            "stty -echo; ",
             "printf 'TOP_MARKER\\n'; ",
             "i=0; while [ $i -lt 40 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
             "printf 'BOTTOM_LIVE\\n'; ",
@@ -18986,6 +19217,12 @@ mod tests {
             "  if [ \"$line\" = enable-modes ]; then ",
             "    printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
             "    printf 'modes-enabled\\n'; ",
+            "  elif [ \"$line\" = emit-split-e2 ]; then ",
+            "    printf '\\342'; ",
+            "  elif [ \"$line\" = emit-split-rest ]; then ",
+            "    printf '\\202\\254'; ",
+            "  elif [ \"$line\" = emit-nul-esc-marker ]; then ",
+            "    printf '\\000\\033[0mBYTEFAITH'; ",
             "  else ",
             "    printf 'echo:%s\\n' \"$line\"; ",
             "  fi; ",
@@ -19245,6 +19482,119 @@ mod tests {
             "later live output must appear in painted Ratatui frame; painted={painted_live}"
         );
 
+        // Deterministic split-UTF-8 barrier: write [0xE2], observe that exact
+        // applied payload, then release [0x82, 0xAC] and prove euro without U+FFFD.
+        app.applied_live_payloads.clear();
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "emit-split-e2\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut saw_e2 = false;
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app
+                .applied_live_payloads
+                .iter()
+                .any(|payload| payload.as_slice() == [0xE2])
+            {
+                saw_e2 = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            saw_e2,
+            "producer barrier must apply exact first UTF-8 fragment [0xE2]; applied={:?}",
+            app.applied_live_payloads
+        );
+        assert!(
+            app.applied_live_payloads.iter().all(|payload| !payload
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD])),
+            "first fragment must not UTF-8-repair; applied={:?}",
+            app.applied_live_payloads
+        );
+        app.refresh_ghostty_viewport_cache();
+        assert!(
+            !viewport_cache_contains(&app, "\u{FFFD}"),
+            "split-first-frame must not paint U+FFFD"
+        );
+
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "emit-split-rest\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut painted_euro = String::new();
+        while Instant::now() < deadline {
+            app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            let (frame, _, _) = render_app_painted(&app, 140, 42);
+            painted_euro = frame;
+            if viewport_cache_contains(&app, "\u{20AC}") || painted_euro.contains('\u{20AC}') {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.applied_live_payloads
+                .concat()
+                .windows(3)
+                .any(|window| window == [0xE2, 0x82, 0xAC])
+                || (app
+                    .applied_live_payloads
+                    .iter()
+                    .any(|payload| payload.as_slice() == [0xE2])
+                    && app
+                        .applied_live_payloads
+                        .iter()
+                        .any(|payload| payload.as_slice() == [0x82, 0xAC])),
+            "concatenated applied bytes must include the euro sequence; applied={:?}",
+            app.applied_live_payloads
+        );
+        assert!(
+            viewport_cache_contains(&app, "\u{20AC}") || painted_euro.contains('\u{20AC}'),
+            "euro must appear after both fragments; painted={painted_euro}"
+        );
+        assert!(
+            !viewport_cache_contains(&app, "\u{FFFD}"),
+            "completed euro must not leave U+FFFD in the projection"
+        );
+
+        app.applied_live_payloads.clear();
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "emit-nul-esc-marker\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut painted_marker = String::new();
+        while Instant::now() < deadline {
+            app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            let (frame, _, _) = render_app_painted(&app, 140, 42);
+            painted_marker = frame;
+            if viewport_cache_contains(&app, "BYTEFAITH") || painted_marker.contains("BYTEFAITH") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.applied_live_payloads.iter().any(|payload| {
+                payload
+                    .windows(b"BYTEFAITH".len())
+                    .any(|window| window == b"BYTEFAITH")
+                    || payload.contains(&0x00)
+                    || payload.contains(&0x1b)
+            }),
+            "NUL/ESC/marker payload must reach apply_terminal_output; applied={:?}",
+            app.applied_live_payloads
+        );
+        assert!(
+            viewport_cache_contains(&app, "BYTEFAITH") || painted_marker.contains("BYTEFAITH"),
+            "later ASCII marker after NUL+ESC must paint; painted={painted_marker}"
+        );
+
         // Reconnect must restore pre-attach history marker after reinstall.
         let reconnect_sub = format!("reconnect-{}", short_suffix());
         app.begin_attach_hydration(&session_id, &reconnect_sub);
@@ -19307,6 +19657,30 @@ mod tests {
         assert!(
             painted_reconnect.contains("TOP_MARKER"),
             "reconnect painted frame must show history marker"
+        );
+
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "reconnect-live\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut painted_reconnect_live = String::new();
+        while Instant::now() < deadline {
+            app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            let (frame, _, _) = render_app_painted(&app, 140, 42);
+            painted_reconnect_live = frame;
+            if painted_reconnect_live.contains("reconnect-live")
+                || painted_reconnect_live.contains("echo:reconnect-live")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            painted_reconnect_live.contains("reconnect-live")
+                || painted_reconnect_live.contains("echo:reconnect-live"),
+            "later live marker after reconnect must paint; painted={painted_reconnect_live}"
         );
 
         // --- Truly silent no-history session: no pre-attach print, no Snapshot install ---
@@ -23892,11 +24266,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_34() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_36() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 34,
-            "hub-test-support pin must publish fixture revision 34"
+            scenario.conformance_fixture_revision, 36,
+            "hub-test-support pin must publish fixture revision 36"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -23960,7 +24334,7 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 34);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
     }
 
     #[test]

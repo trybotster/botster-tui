@@ -61,7 +61,7 @@ profile="${2:-}"
 case "$mode" in
   contract-matrix)
     if [ "$#" -gt 1 ]; then
-      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types" >&2
+      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty" >&2
       exit 1
     fi
     contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
@@ -73,6 +73,13 @@ case "$mode" in
       exit 1
     fi
     test_filter="app::tests::session_types_live_profile_runs_against_isolated_hub_when_binaries_are_available"
+    ;;
+  ghostty)
+    if [ "$#" -gt 1 ]; then
+      echo "usage: script/test-live-hub ghostty" >&2
+      exit 1
+    fi
+    test_filter="app::tests::headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input"
     ;;
   workspaces)
     if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ] && [ "$profile" != "installed-driver" ] && [ "$profile" != "claim-driver" ]; }; then
@@ -98,7 +105,7 @@ case "$mode" in
     ;;
   *)
     echo "unknown live-Hub mode: $mode" >&2
-    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types" >&2
+    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty" >&2
     exit 1
     ;;
 esac
@@ -190,6 +197,12 @@ fi
 if [ "$mode" = "session-types" ]; then
   if ! grep -F "session-types-live: complete" "$test_output" >/dev/null; then
     echo "session-types live profile did not complete" >&2
+    exit 1
+  fi
+fi
+if [ "$mode" = "ghostty" ]; then
+  if ! grep -F "ghostty-live-complete" "$test_output" >/dev/null; then
+    echo "ghostty live profile did not complete" >&2
     exit 1
   fi
 fi
