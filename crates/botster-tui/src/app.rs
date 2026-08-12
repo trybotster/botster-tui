@@ -20041,7 +20041,11 @@ mod tests {
                     cmd.contains("botster-hub")
                         && cmd.contains("--locked")
                         && cmd.contains(crate::acceptance::LABEL_HUB_SOURCE)
+                        && cmd.contains(crate::acceptance::LABEL_HUB_BUILD_TARGET)
                         && !cmd.contains("/Users/")
+                        && !cmd.contains("/var/folders/")
+                        && !cmd.contains("/private/var/")
+                        && !cmd.contains("/tmp/")
                 }),
             "pin ledger must record path-neutral locked Hub build command"
         );
@@ -20051,7 +20055,11 @@ mod tests {
                 .is_some_and(|cmd| {
                     cmd.contains("botster-session-worker")
                         && cmd.contains("--locked")
+                        && cmd.contains(crate::acceptance::LABEL_HUB_BUILD_TARGET)
                         && !cmd.contains("/Users/")
+                        && !cmd.contains("/var/folders/")
+                        && !cmd.contains("/private/var/")
+                        && !cmd.contains("/tmp/")
                 }),
             "pin ledger must record path-neutral locked session-worker build command"
         );
