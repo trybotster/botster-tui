@@ -139,10 +139,11 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`891cc796faeab51ee4bee1a0e8494562b233036e`. The protocol source is
-`crates/botster-hub-client/src/lib.rs` in that repository; it owns the daemon
-handshake, request/response frames, session spawn/attach, input, resize, and
-drain events. `botster-tui` does not implement a private socket protocol.
+`89dae7e15a844bcb7411b83b32581121720e23eb` (same Hub pin as Foundation above).
+The protocol source is `crates/botster-hub-client/src/lib.rs` in that
+repository; it owns the daemon handshake, request/response frames, session
+spawn/attach, ModeGatedInput, resize, and drain events. `botster-tui` does not
+implement a private socket protocol.
 
 Run against a separately started isolated hub:
 
