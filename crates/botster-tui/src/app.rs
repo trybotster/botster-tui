@@ -554,10 +554,49 @@ enum SessionTypeFormMode {
     Edit,
 }
 
+/// Client-side authoring presets. They only seed common role/interaction/lifecycle
+/// combinations for 80% cases; Hub still owns validation and vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTypeFormPreset {
+    Agent,
+    Shell,
+    Custom,
+}
+
+impl SessionTypeFormPreset {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Shell => "shell",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "agent" => Some(Self::Agent),
+            "shell" => Some(Self::Shell),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "Agent",
+            Self::Shell => "Shell",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
 /// Draft for create/edit. Edit is seeded only from ShowSessionTypeDefinition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionTypeFormDraft {
     mode: SessionTypeFormMode,
+    preset: SessionTypeFormPreset,
+    /// Progressive disclosure for cwd / environment / context keys.
+    show_advanced: bool,
     source: String,
     source_target_id: String,
     /// Effective Hub session_type_id while editing; unused for create.
@@ -593,8 +632,10 @@ struct SessionTypeFormDraft {
 
 impl SessionTypeFormDraft {
     fn create_default() -> Self {
-        Self {
+        let mut form = Self {
             mode: SessionTypeFormMode::Create,
+            preset: SessionTypeFormPreset::Agent,
+            show_advanced: false,
             source: "device".to_string(),
             source_target_id: String::new(),
             session_type_id: None,
@@ -604,8 +645,8 @@ impl SessionTypeFormDraft {
             label: String::new(),
             description: String::new(),
             icon: String::new(),
-            role: "botster.agent".to_string(),
-            interaction: "interactive".to_string(),
+            role: String::new(),
+            interaction: String::new(),
             traits: String::new(),
             lifecycle: "task".to_string(),
             execution: "relative_executable".to_string(),
@@ -623,6 +664,68 @@ impl SessionTypeFormDraft {
             seeded_environment: None,
             definition_target_id: String::new(),
             error: None,
+        };
+        form.apply_preset(SessionTypeFormPreset::Agent);
+        form
+    }
+
+    fn apply_preset(&mut self, preset: SessionTypeFormPreset) {
+        self.preset = preset;
+        match preset {
+            SessionTypeFormPreset::Agent => {
+                self.role = "botster.agent".to_string();
+                self.interaction = "interactive".to_string();
+                self.lifecycle = "task".to_string();
+            }
+            SessionTypeFormPreset::Shell => {
+                // First-party accessory role for interactive shell-style sessions.
+                // Operators can switch to Custom to author any namespaced descriptors.
+                self.role = "botster.accessory".to_string();
+                self.interaction = "interactive".to_string();
+                self.lifecycle = "task".to_string();
+            }
+            SessionTypeFormPreset::Custom => {
+                // Keep current descriptor fields so Custom is a disclosure choice,
+                // not a destructive wipe of an earlier Agent/Shell seed.
+            }
+        }
+    }
+
+    fn detect_preset(role: &str, interaction: &str, lifecycle: &str) -> SessionTypeFormPreset {
+        match (role, interaction, lifecycle) {
+            ("botster.agent", "interactive", "task") => SessionTypeFormPreset::Agent,
+            ("botster.accessory", "interactive", "task") => SessionTypeFormPreset::Shell,
+            _ => SessionTypeFormPreset::Custom,
+        }
+    }
+
+    fn has_advanced_values(&self) -> bool {
+        self.working_directory_policy == "relative"
+            || !self.working_directory_path.trim().is_empty()
+            || !self.environment.trim().is_empty()
+            || !self.allowed_environment_overrides.trim().is_empty()
+            || !self.context_keys.trim().is_empty()
+    }
+
+    fn source_choice_value(&self) -> String {
+        if self.source == "repo" {
+            format!("repo:{}", self.source_target_id)
+        } else {
+            self.source.clone()
+        }
+    }
+
+    fn apply_source_choice(&mut self, choice: &str) {
+        if let Some(target_id) = choice.strip_prefix("repo:") {
+            self.source = "repo".to_string();
+            self.source_target_id = target_id.to_string();
+        } else if choice == "device" || choice == "package" {
+            self.source = choice.to_string();
+            if choice == "device" {
+                self.source_target_id.clear();
+            }
+        } else if !choice.is_empty() {
+            self.source = choice.to_string();
         }
     }
 
@@ -653,8 +756,15 @@ impl SessionTypeFormDraft {
         let seeded_context = editable.definition.context.clone();
         let seeded_allowed = editable.definition.allowed_environment_overrides.clone();
         let seeded_environment = editable.definition.environment.clone();
-        Self {
+        let preset = Self::detect_preset(
+            &editable.definition.role,
+            &editable.definition.interaction,
+            &editable.definition.lifecycle,
+        );
+        let mut form = Self {
             mode: SessionTypeFormMode::Edit,
+            preset,
+            show_advanced: false,
             source,
             source_target_id,
             session_type_id: Some(editable.session_type_id),
@@ -686,7 +796,9 @@ impl SessionTypeFormDraft {
             seeded_environment: Some(seeded_environment),
             definition_target_id: editable.definition.target_id.clone().unwrap_or_default(),
             error: None,
-        }
+        };
+        form.show_advanced = form.has_advanced_values();
+        form
     }
 }
 
@@ -1798,6 +1910,7 @@ impl TuiApp {
                 }
             }
             "botster.tui.session_type.create" => {
+                self.clear_session_type_form_drafts();
                 self.session_type_form = Some(SessionTypeFormDraft::create_default());
             }
             "botster.tui.session_type.edit" => {
@@ -1820,9 +1933,45 @@ impl TuiApp {
             }
             "botster.tui.session_type.form.cancel" => {
                 self.session_type_form = None;
+                self.clear_session_type_form_drafts();
             }
             "botster.tui.session_type.form.submit" => {
                 self.submit_session_type_form();
+            }
+            "botster.tui.session_type.form.preset" => {
+                if let Some(preset) = payload
+                    .as_ref()
+                    .and_then(|value| value.get("preset"))
+                    .and_then(Value::as_str)
+                    .and_then(SessionTypeFormPreset::from_str)
+                {
+                    let synced = self.session_type_form.as_mut().map(|form| {
+                        form.apply_preset(preset);
+                        (
+                            form.role.clone(),
+                            form.interaction.clone(),
+                            form.lifecycle.clone(),
+                        )
+                    });
+                    if let Some((role, interaction, lifecycle)) = synced {
+                        // Keep text drafts in sync when preset rewrites descriptors.
+                        self.drafts
+                            .insert("session_type_role".to_string(), Value::String(role));
+                        self.drafts.insert(
+                            "session_type_interaction".to_string(),
+                            Value::String(interaction),
+                        );
+                        self.drafts.insert(
+                            "session_type_lifecycle".to_string(),
+                            Value::String(lifecycle),
+                        );
+                    }
+                }
+            }
+            "botster.tui.session_type.form.toggle_advanced" => {
+                if let Some(form) = self.session_type_form.as_mut() {
+                    form.show_advanced = !form.show_advanced;
+                }
             }
             "botster.tui.spawn.cancel" => {
                 self.target_first_spawn = None;
@@ -2550,6 +2699,11 @@ impl TuiApp {
         stopped
     }
 
+    fn clear_session_type_form_drafts(&mut self) {
+        self.drafts
+            .retain(|key, _| !key.starts_with("session_type_"));
+    }
+
     fn open_session_type_edit(&mut self, session_type_id: &str) {
         self.error = None;
         self.action_feedback = Some(format!("loading authoring definition: {session_type_id}"));
@@ -2566,6 +2720,7 @@ impl TuiApp {
                 self.apply_response(response);
                 match definition {
                     Some(editable) => {
+                        self.clear_session_type_form_drafts();
                         self.session_type_form =
                             Some(SessionTypeFormDraft::from_authoring(editable));
                         self.action_feedback = Some(format!("edit ready: {session_type_id}"));
@@ -2671,6 +2826,7 @@ impl TuiApp {
                 } else {
                     self.apply_response(response);
                     self.session_type_form = None;
+                    self.clear_session_type_form_drafts();
                 }
             }
             Err(error) => self.record_transport_error(error),
@@ -2686,6 +2842,14 @@ impl TuiApp {
                 *target = value.to_string();
             }
         };
+        if let Some(choice) = values
+            .0
+            .get("session_type_source_choice")
+            .and_then(Value::as_str)
+        {
+            form.apply_source_choice(choice);
+        }
+        // Free-text source fields remain for package provenance and power-user edits.
         set("session_type_source", &mut form.source);
         set("session_type_source_target_id", &mut form.source_target_id);
         set("session_type_id", &mut form.id);
@@ -2713,6 +2877,17 @@ impl TuiApp {
             &mut form.allowed_environment_overrides,
         );
         set("session_type_context_keys", &mut form.context_keys);
+        // When descriptors no longer match the active preset seed, treat as Custom.
+        if form.preset != SessionTypeFormPreset::Custom {
+            let expected = SessionTypeFormDraft::detect_preset(
+                form.role.trim(),
+                form.interaction.trim(),
+                form.lifecycle.trim(),
+            );
+            if expected != form.preset {
+                form.preset = SessionTypeFormPreset::Custom;
+            }
+        }
     }
 
     fn apply_spawn_flow_values(&mut self, values: &UiFormValues) {
@@ -4514,6 +4689,29 @@ impl TuiApp {
         }
     }
 
+    fn session_type_source_group_label(source: &str) -> String {
+        match source {
+            "device" => "This device".to_string(),
+            "repo" => "Repository".to_string(),
+            "package" => "Package".to_string(),
+            other => format!("Source · {other}"),
+        }
+    }
+
+    fn writable_session_type_source_options(&self) -> Vec<(String, String)> {
+        let mut options = vec![("device".to_string(), "This device".to_string())];
+        for target in &self.spawn_targets {
+            if !target.enabled {
+                continue;
+            }
+            options.push((
+                format!("repo:{}", target.target_id),
+                format!("Repo · {}", target.label),
+            ));
+        }
+        options
+    }
+
     fn session_types_section_nodes(&self) -> Vec<UiNode> {
         let mut nodes = vec![node(
             UiNodeKind::Text,
@@ -4557,14 +4755,16 @@ impl TuiApp {
             nodes.push(node(
                 UiNodeKind::Text,
                 "tui-session-types-empty",
-                json!({ "text": "session types: none reported" }),
+                json!({ "text": "No session types yet. Add one for this device or a repo." }),
             ));
         } else {
             for (source, rows) in by_source {
                 nodes.push(node(
                     UiNodeKind::Text,
                     &format!("tui-session-type-source-{source}"),
-                    json!({ "text": format!("source: {source}") }),
+                    json!({
+                        "text": Self::session_type_source_group_label(&source)
+                    }),
                 ));
                 for entity in rows {
                     nodes.extend(self.session_type_row_nodes(entity));
@@ -4592,6 +4792,7 @@ impl TuiApp {
         } else {
             "read-only"
         };
+        // Hub descriptors are rendered verbatim; never infer agent/shell from command.
         let mut label = format!(
             "{} · {} · {} · {} · {availability} · {editable}",
             entity.label, entity.role, entity.interaction, entity.lifecycle
@@ -4644,33 +4845,41 @@ impl TuiApp {
             .map(|source| format!("{}:{}", source.kind, source.name))
             .collect::<Vec<_>>()
             .join(", ");
+        let source_label = match entity.source.as_str() {
+            "device" => "This device".to_string(),
+            "repo" => format!("Repository ({})", entity.source_name),
+            "package" => format!("Package ({})", entity.source_name),
+            other => format!("{other} ({})", entity.source_name),
+        };
+        // Published rows omit relative path and full environment; detail stays honest.
         let lines = [
-            format!("session_type_id: {}", entity.session_type_id),
-            format!("id: {}", entity.id),
-            format!("source: {} ({})", entity.source, entity.source_name),
+            format!("Effective id: {}", entity.session_type_id),
+            format!("Identifier: {}", entity.id),
+            format!("Where it lives: {source_label}"),
             format!(
-                "execution: {}",
+                "Execution: {}",
                 match &entity.execution {
                     DaemonSessionTypeExecution::RelativeExecutable => "relative_executable",
                     DaemonSessionTypeExecution::ShellCommand => "shell_command",
                 }
             ),
-            format!("command: {} {:?}", entity.command, entity.args),
+            format!("Command: {} {:?}", entity.command, entity.args),
             format!(
-                "working_directory_policy: {}",
+                "Working directory policy: {}",
                 entity.working_directory_policy
             ),
             format!(
-                "allowed_environment_overrides: {}",
+                "Allowed environment overrides: {}",
                 entity.allowed_environment_overrides.join(", ")
             ),
-            format!("context_keys: {}", entity.context_keys.join(", ")),
-            format!("target_id: {}", entity.target_id),
-            format!("override_chain: {override_chain}"),
-            format!("role: {}", entity.role),
-            format!("interaction: {}", entity.interaction),
-            format!("traits: {}", entity.traits.join(", ")),
-            format!("lifecycle: {}", entity.lifecycle),
+            format!("Context keys: {}", entity.context_keys.join(", ")),
+            format!("Launch target: {}", entity.target_id),
+            format!("Override chain: {override_chain}"),
+            format!("Role: {}", entity.role),
+            format!("Interaction: {}", entity.interaction),
+            format!("Traits: {}", entity.traits.join(", ")),
+            format!("Lifecycle: {}", entity.lifecycle),
+            "Path and full environment require Edit (authoring read).".to_string(),
         ];
         detail.children = lines
             .into_iter()
@@ -4684,6 +4893,44 @@ impl TuiApp {
             })
             .collect();
         detail
+    }
+
+    fn session_type_form_field_nodes(
+        &self,
+        name: &str,
+        label: &str,
+        value: &str,
+        help: Option<&str>,
+    ) -> Vec<UiNode> {
+        let displayed = self
+            .drafts
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or(value);
+        let mut nodes = Vec::new();
+        if let Some(help) = help {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("tui-session-type-field-help-{name}"),
+                json!({ "text": help }),
+            ));
+        }
+        // Label+value text keeps drafts visible under System details scroll.
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("tui-session-type-field-text-{name}"),
+            json!({ "text": format!("{label}: {displayed}") }),
+        ));
+        nodes.push(node(
+            UiNodeKind::TextInput,
+            &format!("tui-session-type-field-{name}"),
+            json!({
+                "name": name,
+                "label": label,
+                "value": displayed
+            }),
+        ));
+        nodes
     }
 
     fn session_type_form_nodes(&self, form: &SessionTypeFormDraft) -> Vec<UiNode> {
@@ -4703,80 +4950,173 @@ impl TuiApp {
                 json!({ "text": format!("form error: {error}") }),
             ));
         }
-        let fields = [
-            ("session_type_source", "source", form.source.as_str()),
-            (
-                "session_type_source_target_id",
-                "source target id",
-                form.source_target_id.as_str(),
+
+        // Presets seed common descriptors only; Custom keeps free authoring.
+        nodes.push(node(
+            UiNodeKind::Text,
+            "tui-session-type-form-preset-heading",
+            json!({ "text": format!("Preset: {}", form.preset.label()) }),
+        ));
+        for preset in [
+            SessionTypeFormPreset::Agent,
+            SessionTypeFormPreset::Shell,
+            SessionTypeFormPreset::Custom,
+        ] {
+            let marker = if form.preset == preset { "● " } else { "" };
+            nodes.push(button(
+                &format!("tui-session-type-form-preset-{}", preset.as_str()),
+                &format!("{marker}{}", preset.label()),
+                "botster.tui.session_type.form.preset",
+                json!({ "preset": preset.as_str() }),
+            ));
+        }
+
+        // Where it lives: Select for create; read-only summary for edit.
+        let source_choice = form.source_choice_value();
+        let source_options = self.writable_session_type_source_options();
+        let source_label = source_options
+            .iter()
+            .find(|(value, _)| value == &source_choice)
+            .map(|(_, label)| label.as_str())
+            .unwrap_or_else(|| form.source.as_str());
+        match form.mode {
+            SessionTypeFormMode::Create => {
+                let selected = self
+                    .drafts
+                    .get("session_type_source_choice")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(source_choice.clone()));
+                let mut select = node(
+                    UiNodeKind::Select,
+                    "tui-session-type-field-session_type_source_choice",
+                    json!({
+                        "name": "session_type_source_choice",
+                        "label": "Where it lives",
+                        "selected": selected
+                    }),
+                );
+                select.slots.insert(
+                    "options".to_string(),
+                    source_options
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (value, label))| {
+                            child(node(
+                                UiNodeKind::SelectOption,
+                                &format!("tui-session-type-source-option-{index}"),
+                                json!({ "value": value, "label": label }),
+                            ))
+                        })
+                        .collect(),
+                );
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    "tui-session-type-field-text-session_type_source_choice",
+                    json!({
+                        "text": format!("Where it lives: {source_label}")
+                    }),
+                ));
+                nodes.push(select);
+            }
+            SessionTypeFormMode::Edit => {
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    "tui-session-type-field-text-session_type_source_choice",
+                    json!({
+                        "text": format!("Where it lives: {source_label} (fixed for edit)")
+                    }),
+                ));
+            }
+        }
+
+        // Primary fields for the 80% case.
+        nodes.extend(self.session_type_form_field_nodes(
+            "session_type_id",
+            "Identifier",
+            &form.id,
+            Some("Stable id under the source (for example my-agent)."),
+        ));
+        nodes.extend(self.session_type_form_field_nodes(
+            "session_type_label",
+            "Name",
+            &form.label,
+            None,
+        ));
+        nodes.extend(self.session_type_form_field_nodes(
+            "session_type_description",
+            "Description",
+            &form.description,
+            None,
+        ));
+        nodes.extend(self.session_type_form_field_nodes(
+            "session_type_command",
+            "Command",
+            &form.command,
+            Some(
+                "Relative path under the source root (device: hub session-types dir; repo: admitted root). Not a shell one-liner.",
             ),
-            ("session_type_id", "id", form.id.as_str()),
-            ("session_type_label", "label", form.label.as_str()),
-            (
-                "session_type_description",
-                "description",
-                form.description.as_str(),
-            ),
-            ("session_type_role", "role", form.role.as_str()),
-            (
-                "session_type_interaction",
-                "interaction",
-                form.interaction.as_str(),
-            ),
-            ("session_type_traits", "traits", form.traits.as_str()),
-            (
-                "session_type_lifecycle",
-                "lifecycle",
-                form.lifecycle.as_str(),
-            ),
-            ("session_type_command", "command", form.command.as_str()),
-            ("session_type_args", "args", form.args.as_str()),
-            (
-                "session_type_working_directory_policy",
-                "working directory policy",
-                form.working_directory_policy.as_str(),
-            ),
-            (
-                "session_type_working_directory_path",
-                "working directory path",
-                form.working_directory_path.as_str(),
-            ),
-            (
-                "session_type_environment",
-                "environment",
-                form.environment.as_str(),
-            ),
-            (
-                "session_type_allowed_environment_overrides",
-                "allowed environment overrides",
-                form.allowed_environment_overrides.as_str(),
-            ),
-            (
-                "session_type_context_keys",
-                "context keys",
-                form.context_keys.as_str(),
-            ),
-        ];
-        for (name, label, value) in fields {
-            let displayed = self
-                .drafts
-                .get(name)
-                .and_then(Value::as_str)
-                .unwrap_or(value);
-            // Render label+value as text so System details always shows the draft,
-            // plus a TextInput for keyboard editing.
+        ));
+        nodes.extend(self.session_type_form_field_nodes(
+            "session_type_args",
+            "Arguments",
+            &form.args,
+            Some("Space- or comma-separated argv tokens."),
+        ));
+
+        // Descriptor fields: primary for Custom; compact summary otherwise.
+        if form.preset == SessionTypeFormPreset::Custom {
             nodes.push(node(
                 UiNodeKind::Text,
-                &format!("tui-session-type-field-text-{name}"),
-                json!({ "text": format!("{label}: {displayed}") }),
+                "tui-session-type-form-semantics-heading",
+                json!({ "text": "Semantics (Hub descriptors; not inferred from command)" }),
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_role",
+                "Role",
+                &form.role,
+                Some("Namespaced role (for example botster.agent)."),
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_interaction",
+                "Interaction",
+                &form.interaction,
+                None,
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_lifecycle",
+                "Lifecycle",
+                &form.lifecycle,
+                None,
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_traits",
+                "Traits",
+                &form.traits,
+                Some("Optional capability tokens."),
+            ));
+        } else {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "tui-session-type-form-semantics-summary",
+                json!({
+                    "text": format!(
+                        "Semantics: {} · {} · {}{}",
+                        form.role,
+                        form.interaction,
+                        form.lifecycle,
+                        if form.traits.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · traits={}", form.traits)
+                        }
+                    )
+                }),
             ));
             nodes.push(node(
-                UiNodeKind::TextInput,
-                &format!("tui-session-type-field-{name}"),
+                UiNodeKind::Text,
+                "tui-session-type-form-semantics-hint",
                 json!({
-                    "name": name,
-                    "label": label,
-                    "value": displayed
+                    "text": "Choose Custom to edit role, interaction, lifecycle, and traits."
                 }),
             ));
         }
@@ -4817,6 +5157,64 @@ impl TuiApp {
             .collect(),
         );
         nodes.push(execution_select);
+
+        let advanced_label = if form.show_advanced {
+            "Hide advanced options"
+        } else {
+            "Show advanced options"
+        };
+        nodes.push(button(
+            "tui-session-type-form-toggle-advanced",
+            advanced_label,
+            "botster.tui.session_type.form.toggle_advanced",
+            json!({}),
+        ));
+        if form.show_advanced {
+            nodes.push(node(
+                UiNodeKind::Text,
+                "tui-session-type-form-advanced-heading",
+                json!({ "text": "Advanced options" }),
+            ));
+            if form.preset != SessionTypeFormPreset::Custom {
+                // Advanced still exposes traits for non-Custom presets without full Custom mode.
+                nodes.extend(self.session_type_form_field_nodes(
+                    "session_type_traits",
+                    "Traits",
+                    &form.traits,
+                    None,
+                ));
+            }
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_working_directory_policy",
+                "Working directory policy",
+                &form.working_directory_policy,
+                Some("package_root or relative."),
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_working_directory_path",
+                "Working directory path",
+                &form.working_directory_path,
+                Some("Used when policy is relative."),
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_environment",
+                "Environment",
+                &form.environment,
+                Some("One KEY=value per line."),
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_allowed_environment_overrides",
+                "Allowed environment overrides",
+                &form.allowed_environment_overrides,
+                None,
+            ));
+            nodes.extend(self.session_type_form_field_nodes(
+                "session_type_context_keys",
+                "Context keys",
+                &form.context_keys,
+                Some("Spawn-time context keys (for example prompt)."),
+            ));
+        }
         nodes.push(button(
             "tui-session-type-form-cancel",
             "Cancel",
@@ -4836,33 +5234,45 @@ impl TuiApp {
         let mut nodes = vec![node(
             UiNodeKind::Text,
             "tui-target-first-spawn-title",
-            json!({ "text": "Target-first spawn" }),
+            json!({ "text": "Start session" }),
         )];
         match &flow.step {
             TargetFirstSpawnStep::PickTarget => {
                 nodes.push(node(
                     UiNodeKind::Text,
                     "tui-target-first-spawn-help",
-                    json!({ "text": "Select a launch target first" }),
+                    json!({ "text": "1. Choose where the session should run" }),
                 ));
                 for target in self.launch_target_options() {
+                    let label = match target.target_id.as_str() {
+                        "device:local" => format!("{} · this device", target.label),
+                        id if id.starts_with("package:") => {
+                            format!("{} · package", target.label)
+                        }
+                        _ => format!("{} · repo", target.label),
+                    };
                     nodes.push(button(
                         &format!("tui-spawn-target-{}", target.target_id),
-                        &format!("{} ({})", target.label, target.target_id),
+                        &label,
                         "botster.tui.spawn.pick_target",
                         json!({ "target_id": target.target_id }),
                     ));
                 }
             }
             TargetFirstSpawnStep::PickSessionType {
-                target_id,
                 target_label,
                 session_types,
+                ..
             } => {
                 nodes.push(node(
                     UiNodeKind::Text,
                     "tui-target-first-spawn-target",
-                    json!({ "text": format!("Target: {target_label} ({target_id})") }),
+                    json!({ "text": format!("Where: {target_label}") }),
+                ));
+                nodes.push(node(
+                    UiNodeKind::Text,
+                    "tui-target-first-spawn-help",
+                    json!({ "text": "2. Choose a session type" }),
                 ));
                 // Membership comes only from Hub list-for-target rows stored on
                 // the flow — never from entity.target_id equality filtering.
@@ -4911,7 +5321,7 @@ impl TuiApp {
                     UiNodeKind::Text,
                     "tui-target-first-spawn-prompt-meta",
                     json!({
-                        "text": format!("Target {target_label} · type {session_type_id}")
+                        "text": format!("Where: {target_label} · type: {session_type_id}")
                     }),
                 ));
                 let displayed_prompt = self
@@ -4924,7 +5334,7 @@ impl TuiApp {
                     "tui-spawn-prompt",
                     json!({
                         "name": "spawn_prompt",
-                        "label": "prompt",
+                        "label": "Prompt",
                         "value": displayed_prompt
                     }),
                 ));
@@ -4938,7 +5348,7 @@ impl TuiApp {
         }
         nodes.push(button(
             "tui-spawn-cancel",
-            "Cancel spawn",
+            "Cancel",
             "botster.tui.spawn.cancel",
             json!({}),
         ));
@@ -4963,7 +5373,7 @@ impl TuiApp {
         let mut dialog = node(
             UiNodeKind::Dialog,
             "tui-target-first-spawn",
-            json!({ "title": "Target-first spawn", "presentation": "auto" }),
+            json!({ "title": "Start session", "presentation": "auto" }),
         );
         dialog.slots.insert("body".to_string(), vec![child(body)]);
         dialog
@@ -9298,10 +9708,19 @@ mod tests {
         form.command = "printf draft".to_string();
         app.session_type_form = Some(form);
 
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 80);
         let rendered = lines.join("\n");
         assert!(rendered.contains("Create session type"), "{rendered}");
         assert!(rendered.contains("printf draft"), "{rendered}");
+        assert!(rendered.contains("Preset:"), "{rendered}");
+        assert!(rendered.contains("Command"), "{rendered}");
+        assert!(
+            rendered.contains("Relative path under the source root")
+                || hit_map.regions().iter().any(|region| {
+                    region.node_id == "tui-session-type-field-help-session_type_command"
+                }),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("execution: relative_executable"),
             "{rendered}"
@@ -9311,6 +9730,25 @@ mod tests {
                 .regions()
                 .iter()
                 .any(|region| region.node_id == "tui-session-type-form-submit")
+        );
+        assert!(
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id.starts_with("tui-session-type-form-preset-")),
+            "{:?}",
+            hit_map
+                .regions()
+                .iter()
+                .map(|r| &r.node_id)
+                .collect::<Vec<_>>()
+        );
+        // Advanced cwd/env/context stay hidden by default on create.
+        assert!(
+            !hit_map.regions().iter().any(|region| {
+                region.node_id == "tui-session-type-field-session_type_environment"
+            }),
+            "environment should be under advanced disclosure"
         );
     }
 
@@ -13477,7 +13915,7 @@ mod tests {
             !rendered
                 .contains("error: no launch targets available (no enabled admitted spawn targets)")
         );
-        assert!(rendered.contains("Target-first spawn"));
+        assert!(rendered.contains("Start session"));
         assert!(app.target_first_spawn.is_some());
     }
 
@@ -18675,6 +19113,9 @@ mod tests {
         let form = SessionTypeFormDraft::from_authoring(editable);
         assert_eq!(form.working_directory_path, "nested/path");
         assert!(form.environment.contains("KEEP=yes"));
+        // Edit with authored advanced fields opens progressive disclosure.
+        assert!(form.show_advanced);
+        assert_eq!(form.preset, SessionTypeFormPreset::Agent);
         let mut form = form;
         form.label = "Shell 2".to_string();
         let definition = definition_from_session_type_form(&form).expect("form reconstructs");
@@ -18833,6 +19274,89 @@ mod tests {
     }
 
     #[test]
+    fn session_type_presets_seed_descriptors_without_client_validation() {
+        let mut form = SessionTypeFormDraft::create_default();
+        assert_eq!(form.preset, SessionTypeFormPreset::Agent);
+        assert_eq!(form.role, "botster.agent");
+        assert_eq!(form.interaction, "interactive");
+        assert_eq!(form.lifecycle, "task");
+
+        form.apply_preset(SessionTypeFormPreset::Shell);
+        assert_eq!(form.preset, SessionTypeFormPreset::Shell);
+        assert_eq!(form.role, "botster.accessory");
+        assert_eq!(form.interaction, "interactive");
+        assert_eq!(form.lifecycle, "task");
+
+        form.role = "vendor.custom".to_string();
+        form.apply_preset(SessionTypeFormPreset::Custom);
+        // Custom is a disclosure choice, not a wipe of existing descriptors.
+        assert_eq!(form.preset, SessionTypeFormPreset::Custom);
+        assert_eq!(form.role, "vendor.custom");
+
+        // Source choice encoding matches web Where-it-lives values.
+        form.apply_source_choice("repo:shared-git");
+        assert_eq!(form.source, "repo");
+        assert_eq!(form.source_target_id, "shared-git");
+        assert_eq!(form.source_choice_value(), "repo:shared-git");
+        form.apply_source_choice("device");
+        assert_eq!(form.source, "device");
+        assert!(form.source_target_id.is_empty());
+    }
+
+    #[test]
+    fn session_type_form_advanced_toggle_and_shell_preset_render() {
+        let mut app = TuiApp::new(None);
+        app.system_details_visible = true;
+        app.session_types_supported = true;
+        app.session_type_form = Some(SessionTypeFormDraft::create_default());
+        app.handle_action(
+            "botster.tui.session_type.form.preset".to_string(),
+            None,
+            Some(json!({ "preset": "shell" })),
+        );
+        assert_eq!(
+            app.session_type_form.as_ref().map(|form| form.preset),
+            Some(SessionTypeFormPreset::Shell)
+        );
+        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 220, 90);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Preset: Shell"), "{rendered}");
+        assert!(
+            rendered.contains("botster.accessory"),
+            "shell preset summary should show accessory role: {rendered}"
+        );
+        assert!(
+            !hit_map.regions().iter().any(|region| {
+                region.node_id == "tui-session-type-field-session_type_environment"
+            })
+        );
+        app.handle_action(
+            "botster.tui.session_type.form.toggle_advanced".to_string(),
+            None,
+            None,
+        );
+        assert_eq!(
+            app.session_type_form
+                .as_ref()
+                .map(|form| form.show_advanced),
+            Some(true)
+        );
+        let (_lines, hit_map) = renderer::render_to_lines(&app.surface(), 220, 100);
+        assert!(
+            hit_map.regions().iter().any(|region| {
+                region.node_id == "tui-session-type-field-session_type_environment"
+            }),
+            "advanced toggle should reveal environment"
+        );
+        assert!(hit_map.regions().iter().any(|region| {
+            region.node_id == "tui-session-type-field-session_type_working_directory_policy"
+        }));
+        assert!(hit_map.regions().iter().any(|region| {
+            region.node_id == "tui-session-type-field-session_type_context_keys"
+        }));
+    }
+
+    #[test]
     fn clearing_token_list_fields_emits_empty_collections_on_update() {
         let editable = DaemonSessionTypeEditableDefinition {
             session_type_id: "device/shell".to_string(),
@@ -18938,7 +19462,7 @@ mod tests {
         assert!(app.target_first_spawn.is_some());
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("Target-first spawn"), "{rendered}");
+        assert!(rendered.contains("Start session"), "{rendered}");
         assert!(
             hit_map
                 .regions()
@@ -19122,7 +19646,8 @@ mod tests {
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 200, 60);
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("Select a launch target first"),
+            rendered.contains("Start session")
+                && rendered.contains("Choose where the session should run"),
             "{rendered}"
         );
         assert!(

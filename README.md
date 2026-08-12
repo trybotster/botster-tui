@@ -162,8 +162,16 @@ diagnostics, not private hub probes.
 Session types are authoritative Hub descriptors consumed through the
 `session_type` entity subscription (`session_type_entity_subscriptions`).
 
-- Rows group by Hub `source` and render Hub labels/roles/traits/lifecycle as
-  delivered; package rows are read-only when `editable == false`.
+- Rows group by Hub `source` (This device / Repository / Package) and render
+  Hub labels/roles/traits/lifecycle as delivered; package rows are read-only
+  when `editable == false`.
+- Authoring uses **progressive disclosure**: Agent / Shell / Custom presets
+  seed common role/interaction/lifecycle combinations for 80% cases; Custom
+  exposes free descriptor fields. Advanced options hide cwd, environment, and
+  context keys until expanded. Labels match botster-web where shared
+  ("Where it lives", Identifier, Name, Command).
+- **Command** is a relative path under the source root (device session-types
+  dir or admitted repo root), not a shell one-liner. Full scripts live on disk.
 - Edit is **lossless**: the TUI opens the editor only after
   `ShowSessionTypeDefinition` and submits wholesale `UpdateSessionType`
   definitions. Entity rows are never used as edit seeds (they omit relative

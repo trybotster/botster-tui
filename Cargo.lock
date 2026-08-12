@@ -212,10 +212,9 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=0ee42e9b84a0b0e9b0ab89834675535c8b831993#0ee42e9b84a0b0e9b0ab89834675535c8b831993"
 dependencies = [
  "base64",
- "botster-ui-contract",
+ "botster-ui-contract 0.3.2",
  "serde",
  "serde_json",
 ]
@@ -223,11 +222,10 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=0ee42e9b84a0b0e9b0ab89834675535c8b831993#0ee42e9b84a0b0e9b0ab89834675535c8b831993"
 dependencies = [
  "botster-core 0.1.0 (git+https://github.com/trybotster/botster-core?branch=main)",
  "botster-hub-client",
- "botster-ui-contract",
+ "botster-ui-contract 0.3.2",
  "libc",
  "serde",
  "serde_json",
@@ -242,7 +240,7 @@ dependencies = [
  "botster-hub-client",
  "botster-hub-test-support",
  "botster-tui-kit",
- "botster-ui-contract",
+ "botster-ui-contract 0.3.1",
  "crossterm",
  "jsonschema",
  "ratatui",
@@ -255,7 +253,7 @@ name = "botster-tui-kit"
 version = "0.1.0"
 source = "git+https://github.com/trybotster/botster-tui-kit.git?rev=571523d93a62945208ebb2bb75262dcdd78001a2#571523d93a62945208ebb2bb75262dcdd78001a2"
 dependencies = [
- "botster-ui-contract",
+ "botster-ui-contract 0.3.1",
  "crossterm",
  "ratatui",
  "serde_json",
@@ -265,6 +263,15 @@ dependencies = [
 name = "botster-ui-contract"
 version = "0.3.1"
 source = "git+https://github.com/trybotster/botster-hub.git?rev=0ee42e9b84a0b0e9b0ab89834675535c8b831993#0ee42e9b84a0b0e9b0ab89834675535c8b831993"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "botster-ui-contract"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
