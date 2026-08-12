@@ -423,24 +423,9 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         )
     })?;
 
-    let hub_bin_under_source = path_is_under(&hub_bin_path, &hub_path);
-    let session_worker_bin_under_source = path_is_under(&session_worker_bin_path, &hub_path);
-    if !hub_bin_under_source {
-        return invalid(format!(
-            "Hub binary {} is not under Hub source checkout {}",
-            hub_bin_path.display(),
-            hub_path.display()
-        ));
-    }
-    if !session_worker_bin_under_source {
-        return invalid(format!(
-            "session-worker binary {} is not under Hub source checkout {} (expected build from the same Hub tree that locks Core)",
-            session_worker_bin_path.display(),
-            hub_path.display()
-        ));
-    }
-
-    // Fresh build target: reject stale shared target/release caches under the source tree.
+    // Fresh build target: reject stale shared target/release caches.
+    // Binaries may live outside the Hub source tree when built into an isolated
+    // target dir; provenance is then the locked build receipt + source SHAs.
     let build_target = std::env::var_os(HUB_BUILD_TARGET_DIR_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| {
@@ -477,6 +462,9 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
             build_target.display()
         ));
     }
+    // True when the fresh target itself is under the Hub source (optional layout).
+    let hub_bin_under_source = path_is_under(&hub_bin_path, &hub_path);
+    let session_worker_bin_under_source = path_is_under(&session_worker_bin_path, &hub_path);
 
     let (
         hub_build_command,
