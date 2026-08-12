@@ -115,7 +115,10 @@ claim_build_receipt=""
 if [ "$profile" = "claim-driver" ]; then
   # Fresh locked Hub + session-worker builds from the recorded Hub checkout.
   # Do not reuse a stale shared target/release under the Hub source tree.
+  # Canonicalize immediately so receipt commands match fs::canonicalize forms
+  # (avoids TMPDIR trailing-slash // and /var vs /private/var mismatches).
   claim_hub_build_target="$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-claim-build.XXXXXX")"
+  claim_hub_build_target="$(cd "$claim_hub_build_target" && pwd -P)"
   trap 'rm -rf "$target_dir" "$claim_hub_build_target"' EXIT
   hub_source="$(cd "${BOTSTER_HUB_SOURCE_PATH}" && pwd -P)"
   hub_rev="$(git -C "$hub_source" rev-parse HEAD)"

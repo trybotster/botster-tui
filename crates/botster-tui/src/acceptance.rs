@@ -560,12 +560,14 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
             &receipt.hub_build_command,
             &hub_path,
             &build_target,
-        ),
+            &receipt,
+        )?,
         session_worker_build_command: sanitize_build_command(
             &receipt.session_worker_build_command,
             &hub_path,
             &build_target,
-        ),
+            &receipt,
+        )?,
         build_receipt_path: format!("{LABEL_HUB_BUILD_TARGET}/claim-build-receipt.json"),
     })
 }
@@ -698,26 +700,114 @@ fn load_strict_build_receipt_from(
     Ok(receipt)
 }
 
-fn sanitize_build_command(command: &str, hub_path: &Path, build_target: &Path) -> String {
-    let mut out = command.to_string();
-    for root in [hub_path, build_target] {
-        let display = root.display().to_string();
-        out = out.replace(&display, path_label_for(root, hub_path, build_target));
-        if let Some(stripped) = display.strip_prefix("/private") {
-            out = out.replace(stripped, path_label_for(root, hub_path, build_target));
+/// Rewrite absolute machine paths in build commands to path-neutral labels.
+///
+/// Receipts often record mktemp/TMPDIR forms (`//`, `/var/folders` vs
+/// `/private/var/folders`) that differ from `fs::canonicalize`. Replace every
+/// known root variant, then fail closed if any machine-local absolute path remains.
+fn sanitize_build_command(
+    command: &str,
+    hub_path: &Path,
+    build_target: &Path,
+    receipt: &ClaimBuildReceipt,
+) -> io::Result<String> {
+    let mut replacements: Vec<(String, &'static str)> = Vec::new();
+    for variant in path_string_variants(&hub_path.display().to_string()) {
+        replacements.push((variant, LABEL_HUB_SOURCE));
+    }
+    for variant in path_string_variants(&build_target.display().to_string()) {
+        replacements.push((variant, LABEL_HUB_BUILD_TARGET));
+    }
+    for variant in path_string_variants(&receipt.hub_source) {
+        replacements.push((variant, LABEL_HUB_SOURCE));
+    }
+    for variant in path_string_variants(&receipt.target_dir) {
+        replacements.push((variant, LABEL_HUB_BUILD_TARGET));
+    }
+    if let Some(raw) = std::env::var_os(HUB_SOURCE_PATH_ENV) {
+        for variant in path_string_variants(&PathBuf::from(raw).display().to_string()) {
+            replacements.push((variant, LABEL_HUB_SOURCE));
+        }
+    }
+    if let Some(raw) = std::env::var_os(HUB_BUILD_TARGET_DIR_ENV) {
+        for variant in path_string_variants(&PathBuf::from(raw).display().to_string()) {
+            replacements.push((variant, LABEL_HUB_BUILD_TARGET));
+        }
+    }
+    // Longest match first so nested roots do not leave prefixes behind.
+    replacements.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    replacements.dedup_by(|left, right| left.0 == right.0);
+
+    // Collapse mktemp/TMPDIR `//` forms before replacement so canonical roots match.
+    let mut out = collapse_slashes(command);
+    for (from, label) in &replacements {
+        if !from.is_empty() {
+            out = out.replace(from, label);
+        }
+    }
+    require_path_neutral_command(&out)?;
+    Ok(out)
+}
+
+fn path_string_variants(raw: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![raw.to_string()];
+    while let Some(value) = stack.pop() {
+        if value.is_empty() || !seen.insert(value.clone()) {
+            continue;
+        }
+        let collapsed = collapse_slashes(&value);
+        if collapsed != value {
+            stack.push(collapsed);
+        }
+        if let Some(stripped) = value.strip_prefix("/private") {
+            stack.push(stripped.to_string());
+        } else if value.starts_with('/') {
+            stack.push(format!("/private{value}"));
+        }
+        if value.ends_with('/') && value.len() > 1 {
+            stack.push(value.trim_end_matches('/').to_string());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+fn collapse_slashes(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut prev_slash = false;
+    for ch in value.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                out.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+            out.push(ch);
         }
     }
     out
 }
 
-fn path_label_for(path: &Path, hub_path: &Path, build_target: &Path) -> &'static str {
-    if path == hub_path {
-        LABEL_HUB_SOURCE
-    } else {
-        // build_target and any other root map to the build-target label.
-        let _ = build_target;
-        LABEL_HUB_BUILD_TARGET
+fn require_path_neutral_command(command: &str) -> io::Result<()> {
+    for forbidden in [
+        "/Users/",
+        "/var/folders/",
+        "/private/var/",
+        "/home/",
+        "/tmp/",
+        "/private/tmp/",
+    ] {
+        if command.contains(forbidden) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "build command still contains machine-local path fragment {forbidden:?} after sanitization: {command}"
+                ),
+            ));
+        }
     }
+    Ok(())
 }
 
 fn require_executable_env(name: &str) -> io::Result<PathBuf> {
@@ -1460,6 +1550,7 @@ mod tests {
             "/var/folders/",
             "/private/var/",
             "/home/",
+            "/tmp/",
             "jasonconigliari",
         ] {
             assert!(
@@ -1470,6 +1561,37 @@ mod tests {
         // Labels and SHAs must remain.
         assert!(evidence.contains(LABEL_HUB_SOURCE) || evidence.contains("hub_rev"));
         assert!(evidence.contains("de6b099") || evidence.contains("hub_rev"));
+    }
+
+    #[test]
+    fn sanitize_build_command_rewrites_mktemp_and_private_variants() {
+        let hub = Path::new("/private/var/folders/xx/T/hub-src");
+        let target = Path::new("/private/var/folders/xx/T/build-tgt");
+        let receipt = ClaimBuildReceipt {
+            hub_source: hub.display().to_string(),
+            hub_rev: "abc".into(),
+            core_rev: "def".into(),
+            hub_bin: format!("{}/release/botster-hub", target.display()),
+            session_worker_bin: format!("{}/release/botster-session-worker", target.display()),
+            target_dir: target.display().to_string(),
+            hub_build_command: String::new(),
+            session_worker_build_command: String::new(),
+        };
+        // Double-slash TMPDIR form plus non-/private form must both rewrite.
+        let raw = "cargo build --locked --release -p botster-hub --manifest-path /var/folders/xx/T//hub-src/Cargo.toml --target-dir /var/folders/xx/T//build-tgt";
+        let sanitized = sanitize_build_command(raw, hub, target, &receipt).expect("sanitize");
+        assert_eq!(
+            sanitized,
+            format!(
+                "cargo build --locked --release -p botster-hub --manifest-path {LABEL_HUB_SOURCE}/Cargo.toml --target-dir {LABEL_HUB_BUILD_TARGET}"
+            )
+        );
+        require_path_neutral_command(&sanitized).expect("path-neutral");
+        let residual = "cargo build --target-dir /Users/someone/tgt";
+        assert!(
+            sanitize_build_command(residual, hub, target, &receipt).is_err(),
+            "unsanitizable absolute paths must fail closed"
+        );
     }
 
     #[test]
