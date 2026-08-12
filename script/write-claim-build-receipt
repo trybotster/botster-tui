@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Write a strict claim-mode build receipt from the parent entrypoint env vars.
+#
+# Required:
+#   BOTSTER_HUB_SOURCE_PATH
+#   BOTSTER_HUB_BUILD_TARGET_DIR
+#   BOTSTER_HUB_BIN
+#   BOTSTER_SESSION_WORKER_BIN
+# Optional:
+#   BOTSTER_TUI_CLAIM_BUILD_RECEIPT  (default: $BOTSTER_HUB_BUILD_TARGET_DIR/claim-build-receipt.json)
+#
+# core_rev is extracted from the Hub Cargo.lock botster-core pin (no manual edit).
+set -euo pipefail
+
+hub_source="${BOTSTER_HUB_SOURCE_PATH:?BOTSTER_HUB_SOURCE_PATH is required}"
+build_target="${BOTSTER_HUB_BUILD_TARGET_DIR:?BOTSTER_HUB_BUILD_TARGET_DIR is required}"
+hub_bin="${BOTSTER_HUB_BIN:?BOTSTER_HUB_BIN is required}"
+worker_bin="${BOTSTER_SESSION_WORKER_BIN:?BOTSTER_SESSION_WORKER_BIN is required}"
+
+hub_source="$(cd "$hub_source" && pwd -P)"
+build_target="$(cd "$build_target" && pwd -P)"
+hub_bin="$(cd "$(dirname "$hub_bin")" && pwd -P)/$(basename "$hub_bin")"
+worker_bin="$(cd "$(dirname "$worker_bin")" && pwd -P)/$(basename "$worker_bin")"
+
+if [ ! -x "$hub_bin" ] || [ ! -x "$worker_bin" ]; then
+  echo "write-claim-build-receipt: hub and session-worker binaries must be executable" >&2
+  exit 1
+fi
+
+receipt_path="${BOTSTER_TUI_CLAIM_BUILD_RECEIPT:-$build_target/claim-build-receipt.json}"
+hub_rev="$(git -C "$hub_source" rev-parse HEAD)"
+hub_build_cmd="cargo build --locked --release -p botster-hub --manifest-path ${hub_source}/Cargo.toml --target-dir ${build_target}"
+worker_build_cmd="cargo build --locked --release -p botster-core-daemon --bin botster-session-worker --manifest-path ${hub_source}/Cargo.toml --target-dir ${build_target}"
+
+core_rev="$(python3 - "$hub_source" <<'PY'
+import re, sys
+from pathlib import Path
+
+lock = Path(sys.argv[1], "Cargo.lock").read_text()
+for line in lock.splitlines():
+    line = line.strip()
+    if not line.startswith("source = \"") or "botster-core" not in line:
+        continue
+    if "rev=" in line:
+        rev = re.split(r'[&#"]', line.split("rev=", 1)[1])[0]
+        if len(rev) >= 7 and all(c in "0123456789abcdef" for c in rev.lower()):
+            print(rev)
+            raise SystemExit(0)
+    if "#" in line:
+        rev = line.rsplit("#", 1)[-1].rstrip('"')
+        if len(rev) >= 7 and all(c in "0123456789abcdef" for c in rev.lower()):
+            print(rev)
+            raise SystemExit(0)
+raise SystemExit("botster-core pin not found in Hub Cargo.lock")
+PY
+)"
+
+if [[ ! "$core_rev" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+  echo "write-claim-build-receipt: invalid core_rev extracted: ${core_rev}" >&2
+  exit 1
+fi
+
+python3 - "$receipt_path" "$hub_source" "$hub_rev" "$core_rev" "$hub_bin" "$worker_bin" "$build_target" "$hub_build_cmd" "$worker_build_cmd" <<'PY'
+import json, sys
+from pathlib import Path
+
+(
+    path,
+    hub_source,
+    hub_rev,
+    core_rev,
+    hub_bin,
+    worker_bin,
+    target_dir,
+    hub_cmd,
+    worker_cmd,
+) = sys.argv[1:10]
+
+# Reject placeholders — receipt must be ready for strict claim-mode validation.
+if any(token in core_rev for token in ("<", ">", "from Hub", "TODO", "FIXME")):
+    raise SystemExit(f"core_rev must be an exact Cargo.lock SHA, got {core_rev!r}")
+if len(core_rev) < 7 or any(c not in "0123456789abcdefABCDEF" for c in core_rev):
+    raise SystemExit(f"core_rev is not a git SHA: {core_rev!r}")
+
+Path(path).write_text(
+    json.dumps(
+        {
+            "hub_source": hub_source,
+            "hub_rev": hub_rev,
+            "core_rev": core_rev,
+            "hub_bin": str(Path(hub_bin).resolve()),
+            "session_worker_bin": str(Path(worker_bin).resolve()),
+            "target_dir": str(Path(target_dir).resolve()),
+            "hub_build_command": hub_cmd,
+            "session_worker_build_command": worker_cmd,
+        },
+        indent=2,
+    )
+    + "\n"
+)
+print(path)
+PY
+
+export BOTSTER_TUI_CLAIM_BUILD_RECEIPT="$receipt_path"
+echo "$receipt_path"
