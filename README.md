@@ -31,20 +31,21 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / `botster-ui-contract` / live hub | Hub `89dae7e15a844bcb7411b83b32581121720e23eb` |
-| `botster-tui-kit` | `32d804e3bbcb982e77113d5df12374baa8e9a2fa` (ui-contract → same Hub rev) |
+| `botster-hub-client` / `botster-ui-contract` / live hub | Hub `7499c1615078069ba391489b20c6f39c55c2d4c6` |
+| `botster-tui-kit` | `c07f793fb9ac46c24dcf1688881cd08be18ebc27` (ui-contract → same Hub rev) |
 | `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` | Core `4d0d1d8832d19352454a0789419a3e31e67d50df` with `libghostty-vt` |
 
 `botster-terminal-ghostty` owns GHOSTSNP install, live VT apply, viewport
 projection, scrollbar, and color profile. The TUI installs Hub
 `Snapshot.history.decoded_bytes()` before attached readiness, applies later
-`TerminalOutput`, and paints styled cells through a TUI-owned
-`ProjectionWidget` after kit `TerminalView` chrome (HitMap region
-`tui-terminal` + `terminal_inner_rect`). Kit does not gain Ghostty truth.
-Kitty keyboard and mouse encodings use Hub `ModeGatedInput` with
-`ReadModeFlags` freshness (`mode_generation` / `mode_revision`). ReadScreen
-remains optional diagnostic text only. Handshake requires protocol 6,
-conformance floor **34**, and feature `mode_gated_input`.
+`TerminalOutput.payload.decoded_bytes()` without UTF-8 repair, and paints
+styled cells through a TUI-owned `ProjectionWidget` after kit `TerminalView`
+chrome (HitMap region `tui-terminal` + `terminal_inner_rect`). Kit does not
+gain Ghostty truth. Kitty keyboard and mouse encodings use Hub
+`ModeGatedInput` with `ReadModeFlags` freshness (`mode_generation` /
+`mode_revision`). ReadScreen remains optional diagnostic text only.
+Handshake requires protocol **7**, conformance floor **36**, and feature
+`mode_gated_input`. Live Ghostty proof is `script/test-live-hub ghostty`.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -139,7 +140,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`89dae7e15a844bcb7411b83b32581121720e23eb` (same Hub pin as Foundation above).
+`7499c1615078069ba391489b20c6f39c55c2d4c6` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, ModeGatedInput, resize, and drain events. `botster-tui` does not
@@ -164,6 +165,22 @@ BOTSTER_HUB_CONNECTION="{\"transport\":{\"type\":\"unix_socket\",\"path\":\"$hub
 BOTSTER_HUB_DATA_DIR="$hub_dir" \
   cargo run -p botster-tui -- --headless-live-runtime
 ```
+
+Byte-faithful Ghostty live proof (protocol 7 / floor 36). Build Hub
+`7499c1615078069ba391489b20c6f39c55c2d4c6` and that checkout's locked Core
+worker `5a9938377b492ee1fa3acfb31365ebbebccc2a96` into a fresh target dir,
+then:
+
+```sh
+export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
+export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
+export BOTSTER_HUB_BIN_REV=7499c1615078069ba391489b20c6f39c55c2d4c6
+export BOTSTER_SESSION_WORKER_BIN_REV=5a9938377b492ee1fa3acfb31365ebbebccc2a96
+script/test-live-hub ghostty
+```
+
+`script/test` does not forward arguments and is not the live gate. Missing
+binaries fail `script/test-live-hub ghostty` closed.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
@@ -503,11 +520,12 @@ terminal readback, package navigation, resize, and plugin surface render/action.
 A running but incompatible hub is reported as a compatibility mismatch instead
 of being collapsed into the generic unavailable/reconnecting state.
 The daemon protocol version is matched **exactly**, not as a floor: the client
-requires protocol version 6 and refuses any other, so a newer Hub is rejected as
+requires protocol version 7 and refuses any other, so a newer Hub is rejected as
 firmly as an older one. The conformance fixture revision keeps minimum
-semantics with a floor of 31. Fixture revisions 16–30 and every protocol version
-other than 6 fail through the structured compatibility diagnostic; there is no
-fallback path.
+semantics with a floor of 36. Fixture revisions 16–35 and every protocol version
+other than 7 fail through the structured compatibility diagnostic; there is no
+fallback path. Live `TerminalOutput` is a validated base64 envelope
+(`payload_base64` / `payload_encoding` / `bytes`); retired `data` is rejected.
 
 When the Hub delivers a plugin surface, the TUI keeps a stable client-owned
 status/navigation shell and makes the plugin tree the interactive content
