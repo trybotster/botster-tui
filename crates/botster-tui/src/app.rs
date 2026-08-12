@@ -6936,6 +6936,109 @@ fn drive_workspaces_claim_acceptance(
         }),
     )?;
 
+    // Plan C2.5: held-open Available sessions must reflect a Hub lifecycle patch without
+    // reopening the dialog or using PluginSurfaceRender as synchronization.
+    diagnostics.stage(
+        "lifecycle_live_update",
+        None,
+        "held-open Available sessions option updates lifecycle without reopen or surface refresh",
+    );
+    let surface_renders_before_lifecycle = app
+        .acceptance_audit
+        .as_ref()
+        .expect("acceptance audit enabled")
+        .surface_renders
+        .len();
+    let lifecycle_before = claim_option_lifecycle(&app, &scenario.session_uuid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "option present without projected lifecycle metadata",
+        )
+    })?;
+    let label_before = claim_option_dedicated_label(&app, &scenario.session_uuid);
+    let projected_before = claim_option_compact_label(&app, &scenario.session_uuid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "option present without projected compact label",
+        )
+    })?;
+    app.request_and_apply(DaemonRequest::ShutdownSession {
+        session_id: scenario.session_uuid.clone(),
+    });
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "held-open Available sessions lifecycle change without reopen",
+        |app, diagnostics| {
+            // Form must remain open (no reopen path).
+            if !claim_add_form_open(app, &mut router, &scenario.workspace_id, diagnostics) {
+                return false;
+            }
+            let Some(lifecycle_after) = claim_option_lifecycle(app, &scenario.session_uuid) else {
+                return false;
+            };
+            let Some(projected_after) = claim_option_compact_label(app, &scenario.session_uuid)
+            else {
+                return false;
+            };
+            lifecycle_after != lifecycle_before
+                && projected_after != projected_before
+                && lifecycle_token_terminal(&lifecycle_after)
+        },
+    )?;
+    let lifecycle_after = claim_option_lifecycle(&app, &scenario.session_uuid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lifecycle wait completed without projected lifecycle",
+        )
+    })?;
+    let projected_after = claim_option_compact_label(&app, &scenario.session_uuid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lifecycle wait completed without projected compact label",
+        )
+    })?;
+    let label_after = claim_option_dedicated_label(&app, &scenario.session_uuid);
+    if app
+        .acceptance_audit
+        .as_ref()
+        .expect("acceptance audit enabled")
+        .surface_renders
+        .len()
+        != surface_renders_before_lifecycle
+    {
+        return invalid_acceptance(
+            "held-open lifecycle update issued PluginSurfaceRender as synchronization",
+        );
+    }
+    if !claim_add_form_open(&mut app, &mut router, &scenario.workspace_id, diagnostics) {
+        return invalid_acceptance("held-open lifecycle update reopened or closed the Add form");
+    }
+    let label_live_update = match (&label_before, &label_after) {
+        (Some(before), Some(after)) if before != after => true,
+        (Some(_), Some(_)) => false,
+        _ => false,
+    };
+    evidence.event(
+        "lifecycle_live_update",
+        None,
+        json!({
+            "field": WORKSPACES_ADD_SESSION_FIELD,
+            "node_id": WORKSPACES_ADD_SESSION_NODE,
+            "session_uuid": scenario.session_uuid,
+            "lifecycle_before": lifecycle_before,
+            "lifecycle_after": lifecycle_after,
+            "projected_label_before": projected_before,
+            "projected_label_after": projected_after,
+            "dedicated_label_before": label_before,
+            "dedicated_label_after": label_after,
+            "label_live_update": label_live_update,
+            "label_field_present": label_before.is_some() || label_after.is_some(),
+            "reopened": false,
+            "surface_render_delta": 0
+        }),
+    )?;
+
     diagnostics.stage(
         "keyboard_select",
         None,
@@ -7328,6 +7431,113 @@ fn session_option_projected(app: &TuiApp, session_uuid: &str) -> bool {
         }
     }
     true
+}
+
+/// Display fields authored on Workspaces Available sessions entity_options.
+const CLAIM_SESSION_DISPLAY_FIELDS: &[&str] = &[
+    "label",
+    "session_uuid",
+    "lifecycle",
+    "lifecycle_class",
+    "session_type_id",
+    "spawn_point",
+];
+
+fn claim_session_option_fields(app: &TuiApp, session_uuid: &str) -> Option<serde_json::Map<String, Value>> {
+    // Session family is process-wide: projection injects session_entities, not entity_options.
+    let store = app.entity_options_projection_store();
+    store
+        .get("session")
+        .and_then(|records| records.get(session_uuid).cloned())
+        .or_else(|| {
+            app.session_entities.entities.get(session_uuid).and_then(|entity| {
+                match serde_json::to_value(entity) {
+                    Ok(Value::Object(fields)) => Some(fields),
+                    _ => None,
+                }
+            })
+        })
+}
+
+fn json_field_string(fields: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    match fields.get(key)? {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn claim_option_lifecycle(app: &TuiApp, session_uuid: &str) -> Option<String> {
+    claim_session_option_fields(app, session_uuid)
+        .and_then(|fields| json_field_string(&fields, "lifecycle"))
+        .or_else(|| {
+            app.session_entities
+                .entities
+                .get(session_uuid)
+                .and_then(|entity| entity.lifecycle.clone())
+        })
+}
+
+fn claim_option_dedicated_label(app: &TuiApp, session_uuid: &str) -> Option<String> {
+    claim_session_option_fields(app, session_uuid)
+        .and_then(|fields| json_field_string(&fields, "label"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != session_uuid)
+}
+
+fn claim_option_compact_label(app: &TuiApp, session_uuid: &str) -> Option<String> {
+    let fields = claim_session_option_fields(app, session_uuid)?;
+    let mut metadata = std::collections::BTreeMap::new();
+    for field in CLAIM_SESSION_DISPLAY_FIELDS {
+        if let Some(value) = json_field_string(&fields, field) {
+            metadata.insert((*field).to_string(), value);
+        }
+    }
+    // Always include session_uuid so the compact label is non-empty when the option exists.
+    metadata
+        .entry("session_uuid".to_string())
+        .or_insert_with(|| session_uuid.to_string());
+    let option = botster_ui_contract::EntityOption {
+        value: session_uuid.to_string(),
+        label: metadata
+            .get("label")
+            .cloned()
+            .unwrap_or_else(|| session_uuid.to_string()),
+        metadata,
+    };
+    let display_fields: Vec<String> = CLAIM_SESSION_DISPLAY_FIELDS
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect();
+    Some(crate::entity_options::compact_entity_option_label(
+        &option,
+        &display_fields,
+    ))
+}
+
+fn lifecycle_token_terminal(lifecycle: &str) -> bool {
+    matches!(
+        lifecycle.to_ascii_lowercase().as_str(),
+        "exited" | "ended" | "failed" | "stopping" | "stale"
+    )
+}
+
+fn claim_add_form_open(
+    app: &mut TuiApp,
+    router: &mut InputRouter,
+    workspace_id: &str,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> bool {
+    let form_id = format!("botster-workspaces-add-form-{workspace_id}");
+    acceptance_frame(app, router, diagnostics)
+        .map(|(_, hit_map)| {
+            hit_map
+                .regions()
+                .iter()
+                .any(|region| region.node_id == form_id || region.node_id == WORKSPACES_ADD_SESSION_NODE)
+        })
+        .unwrap_or(false)
 }
 
 fn acceptance_frame(

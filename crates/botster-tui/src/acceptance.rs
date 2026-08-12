@@ -1349,6 +1349,7 @@ mod tests {
             "ready",
             "baseline",
             "option_present",
+            "lifecycle_live_update",
             "dispatched_action",
             "membership_join",
             "option_excluded",
@@ -1356,6 +1357,21 @@ mod tests {
         ] {
             assert!(kinds.contains(required), "missing evidence kind {required}");
         }
+        let lifecycle = records
+            .iter()
+            .find(|record| record["kind"] == "lifecycle_live_update")
+            .expect("lifecycle_live_update");
+        assert_eq!(lifecycle["payload"]["reopened"], false);
+        assert!(
+            lifecycle["payload"]["lifecycle_before"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            lifecycle["payload"]["lifecycle_after"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
         let join = records
             .iter()
             .find(|record| record["kind"] == "membership_join")
