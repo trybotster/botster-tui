@@ -3,70 +3,200 @@
   "$id": "https://botster.dev/contracts/tui/workspaces-claim-driver-v1.schema.json",
   "title": "Botster TUI Workspaces Claim driver v1",
   "$defs": {
-    "schema": { "const": "botster.tui.workspaces-claim-driver/v1" },
-    "nonEmpty": { "type": "string", "minLength": 1 },
+    "schema": {
+      "const": "botster.tui.workspaces-claim-driver/v1"
+    },
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1
+    },
     "scenario": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema", "workspace_id", "session_uuid"],
+      "required": [
+        "schema",
+        "workspace_id",
+        "session_uuid"
+      ],
       "properties": {
-        "schema": { "$ref": "#/$defs/schema" },
-        "workspace_id": { "$ref": "#/$defs/nonEmpty" },
-        "session_uuid": { "$ref": "#/$defs/nonEmpty" },
-        "hub_source_path": { "$ref": "#/$defs/nonEmpty" },
-        "workspaces_package_path": { "$ref": "#/$defs/nonEmpty" },
-        "hub_rev": { "$ref": "#/$defs/nonEmpty" },
-        "workspaces_rev": { "$ref": "#/$defs/nonEmpty" },
-        "tui_rev": { "$ref": "#/$defs/nonEmpty" },
-        "session_worker_rev": { "$ref": "#/$defs/nonEmpty" }
+        "schema": {
+          "$ref": "#/$defs/schema"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "session_uuid": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_source_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "workspaces_package_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "workspaces_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "tui_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "session_worker_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        }
       }
     },
     "focusedPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["node_id"],
+      "required": [
+        "node_id"
+      ],
       "properties": {
-        "node_id": { "$ref": "#/$defs/nonEmpty" },
-        "action_id": { "$ref": "#/$defs/nonEmpty" },
-        "field": { "$ref": "#/$defs/nonEmpty" }
+        "node_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "action_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "field": {
+          "$ref": "#/$defs/nonEmpty"
+        }
       },
       "oneOf": [
-        { "required": ["action_id"], "not": { "required": ["field"] } },
-        { "required": ["field"], "not": { "required": ["action_id"] } }
+        {
+          "required": [
+            "action_id"
+          ],
+          "not": {
+            "required": [
+              "field"
+            ]
+          }
+        },
+        {
+          "required": [
+            "field"
+          ],
+          "not": {
+            "required": [
+              "action_id"
+            ]
+          }
+        }
       ]
     },
     "actionRequestPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["request_id", "surface_id", "action_id", "node_id", "kind"],
+      "required": [
+        "request_id",
+        "surface_id",
+        "action_id",
+        "node_id",
+        "kind"
+      ],
       "properties": {
-        "request_id": { "$ref": "#/$defs/nonEmpty" },
-        "surface_id": { "$ref": "#/$defs/nonEmpty" },
-        "action_id": { "$ref": "#/$defs/nonEmpty" },
-        "node_id": { "$ref": "#/$defs/nonEmpty" },
-        "kind": { "enum": ["submit", "reset", "validate", "cancel"] },
-        "values": { "type": "object" },
-        "payload": { "type": ["object", "null"] }
+        "request_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "surface_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "action_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "node_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "kind": {
+          "enum": [
+            "submit",
+            "reset",
+            "validate",
+            "cancel"
+          ]
+        },
+        "values": {
+          "type": "object"
+        },
+        "payload": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
       }
     },
     "actionResultPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["request_id", "surface_id", "action_id", "node_id", "state"],
+      "required": [
+        "request_id",
+        "surface_id",
+        "action_id",
+        "node_id",
+        "state"
+      ],
       "properties": {
-        "request_id": { "$ref": "#/$defs/nonEmpty" },
-        "surface_id": { "$ref": "#/$defs/nonEmpty" },
-        "action_id": { "$ref": "#/$defs/nonEmpty" },
-        "node_id": { "$ref": "#/$defs/nonEmpty" },
-        "state": { "enum": ["accepted", "rejected", "deferred", "error"] },
-        "field_errors": { "type": "object" },
-        "form_errors": { "type": "array", "items": { "type": "string" } },
-        "warnings": { "type": "array", "items": { "type": "string" } },
-        "normalized_values": { "type": "object" },
-        "presentation": { "type": "array" },
-        "replacement": { "type": "object" },
-        "payload": { "type": ["object", "null"] },
-        "error": { "type": ["string", "null"] }
+        "request_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "surface_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "action_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "node_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "state": {
+          "enum": [
+            "accepted",
+            "rejected",
+            "deferred",
+            "error"
+          ]
+        },
+        "field_errors": {
+          "type": "object"
+        },
+        "form_errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "normalized_values": {
+          "type": "object"
+        },
+        "presentation": {
+          "type": "array"
+        },
+        "replacement": {
+          "type": "object"
+        },
+        "payload": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "pinLedgerPayload": {
@@ -100,64 +230,154 @@
         "session_worker_build_command"
       ],
       "properties": {
-        "hub_minimum": { "$ref": "#/$defs/nonEmpty" },
-        "workspaces_minimum": { "$ref": "#/$defs/nonEmpty" },
-        "tui_minimum": { "$ref": "#/$defs/nonEmpty" },
-        "hub_rev": { "$ref": "#/$defs/nonEmpty" },
-        "workspaces_rev": { "$ref": "#/$defs/nonEmpty" },
-        "tui_rev": { "$ref": "#/$defs/nonEmpty" },
-        "core_rev": { "$ref": "#/$defs/nonEmpty" },
-        "session_worker_rev": { "$ref": "#/$defs/nonEmpty" },
-        "hub_bin_path": { "$ref": "#/$defs/nonEmpty" },
-        "session_worker_bin_path": { "$ref": "#/$defs/nonEmpty" },
-        "hub_source_path": { "$ref": "#/$defs/nonEmpty" },
-        "workspaces_package_path": { "$ref": "#/$defs/nonEmpty" },
-        "tui_source_path": { "$ref": "#/$defs/nonEmpty" },
-        "hub_ancestry_ok": { "const": true },
-        "workspaces_ancestry_ok": { "const": true },
-        "tui_ancestry_ok": { "const": true },
-        "workspaces_available_sessions_form_ok": { "const": true },
-        "hub_bin_under_source": { "type": "boolean" },
-        "session_worker_bin_under_source": { "type": "boolean" },
-        "sources_clean": { "const": true },
-        "hub_build_target_dir": { "$ref": "#/$defs/nonEmpty" },
-        "hub_bin_under_build_target": { "const": true },
-        "session_worker_bin_under_build_target": { "const": true },
-        "hub_build_command": { "$ref": "#/$defs/nonEmpty" },
-        "session_worker_build_command": { "$ref": "#/$defs/nonEmpty" },
-        "build_receipt_path": { "$ref": "#/$defs/nonEmpty" }
+        "hub_minimum": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "workspaces_minimum": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "tui_minimum": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "workspaces_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "tui_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "core_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "session_worker_rev": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_bin_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "session_worker_bin_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_source_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "workspaces_package_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "tui_source_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_ancestry_ok": {
+          "const": true
+        },
+        "workspaces_ancestry_ok": {
+          "const": true
+        },
+        "tui_ancestry_ok": {
+          "const": true
+        },
+        "workspaces_available_sessions_form_ok": {
+          "const": true
+        },
+        "hub_bin_under_source": {
+          "type": "boolean"
+        },
+        "session_worker_bin_under_source": {
+          "type": "boolean"
+        },
+        "sources_clean": {
+          "const": true
+        },
+        "hub_build_target_dir": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "hub_bin_under_build_target": {
+          "const": true
+        },
+        "session_worker_bin_under_build_target": {
+          "const": true
+        },
+        "hub_build_command": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "session_worker_build_command": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "build_receipt_path": {
+          "$ref": "#/$defs/nonEmpty"
+        }
       }
     },
     "membershipJoinPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["family", "session_uuid", "workspace_id", "membership_id", "snapshot_seq"],
+      "required": [
+        "family",
+        "session_uuid",
+        "workspace_id",
+        "membership_id",
+        "snapshot_seq"
+      ],
       "properties": {
-        "family": { "const": "botster-workspaces.membership" },
-        "session_uuid": { "$ref": "#/$defs/nonEmpty" },
-        "workspace_id": { "$ref": "#/$defs/nonEmpty" },
-        "membership_id": { "$ref": "#/$defs/nonEmpty" },
-        "snapshot_seq": { "type": "integer", "minimum": 0 }
+        "family": {
+          "const": "botster-workspaces.membership"
+        },
+        "session_uuid": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "membership_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "snapshot_seq": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "optionStagePayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["field", "node_id", "session_uuid"],
+      "required": [
+        "field",
+        "node_id",
+        "session_uuid"
+      ],
       "properties": {
-        "field": { "const": "session_id" },
-        "node_id": { "const": "botster-workspaces-add-session-id" },
-        "session_uuid": { "$ref": "#/$defs/nonEmpty" },
-        "option_count": { "type": "integer", "minimum": 0 },
-        "reopened": { "type": "boolean" }
+        "field": {
+          "const": "session_id"
+        },
+        "node_id": {
+          "const": "botster-workspaces-add-session-id"
+        },
+        "session_uuid": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "option_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reopened": {
+          "type": "boolean"
+        }
       }
     },
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema", "kind", "payload"],
+      "required": [
+        "schema",
+        "kind",
+        "payload"
+      ],
       "properties": {
-        "schema": { "$ref": "#/$defs/schema" },
+        "schema": {
+          "$ref": "#/$defs/schema"
+        },
         "kind": {
           "enum": [
             "pin_ledger",
@@ -168,6 +388,7 @@
             "dispatched_action",
             "action_result",
             "option_present",
+            "lifecycle_live_update",
             "membership_join",
             "option_excluded",
             "request_summary",
@@ -175,32 +396,67 @@
             "failure"
           ]
         },
-        "case_id": { "$ref": "#/$defs/nonEmpty" },
-        "payload": { "type": "object" }
+        "case_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "payload": {
+          "type": "object"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "kind": { "const": "pin_ledger" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/pinLedgerPayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "pin_ledger"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/pinLedgerPayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "ready" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ready"
+              }
+            }
+          },
           "then": {
             "properties": {
               "payload": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["workspace_id", "session_uuid"],
+                "required": [
+                  "workspace_id",
+                  "session_uuid"
+                ],
                 "properties": {
-                  "workspace_id": { "$ref": "#/$defs/nonEmpty" },
-                  "session_uuid": { "$ref": "#/$defs/nonEmpty" }
+                  "workspace_id": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "session_uuid": {
+                    "$ref": "#/$defs/nonEmpty"
+                  }
                 }
               }
             }
           }
         },
         {
-          "if": { "properties": { "kind": { "const": "baseline" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "baseline"
+              }
+            }
+          },
           "then": {
             "properties": {
               "payload": {
@@ -214,59 +470,166 @@
                   "lifecycle_class"
                 ],
                 "properties": {
-                  "subscription_id": { "$ref": "#/$defs/nonEmpty" },
-                  "snapshot_seq": { "type": "integer", "minimum": 0 },
-                  "has_snapshot": { "const": true },
-                  "session_uuid": { "$ref": "#/$defs/nonEmpty" },
-                  "lifecycle_class": { "const": "current" },
-                  "lifecycle": { "type": ["string", "null"] }
+                  "subscription_id": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "snapshot_seq": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "has_snapshot": {
+                    "const": true
+                  },
+                  "session_uuid": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "lifecycle_class": {
+                    "const": "current"
+                  },
+                  "lifecycle": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
                 }
               }
             }
           }
         },
         {
-          "if": { "properties": { "kind": { "const": "surface_request" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "surface_request"
+              }
+            }
+          },
           "then": {
             "properties": {
               "payload": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["package_name", "surface_id"],
+                "required": [
+                  "package_name",
+                  "surface_id"
+                ],
                 "properties": {
-                  "package_name": { "$ref": "#/$defs/nonEmpty" },
-                  "surface_id": { "$ref": "#/$defs/nonEmpty" }
+                  "package_name": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "surface_id": {
+                    "$ref": "#/$defs/nonEmpty"
+                  }
                 }
               }
             }
           }
         },
         {
-          "if": { "properties": { "kind": { "const": "focused_control" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/focusedPayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "focused_control"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/focusedPayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "dispatched_action" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/actionRequestPayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "dispatched_action"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/actionRequestPayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "action_result" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/actionResultPayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "action_result"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/actionResultPayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "option_present" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/optionStagePayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "option_present"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/optionStagePayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "membership_join" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/membershipJoinPayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "membership_join"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/membershipJoinPayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "option_excluded" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/optionStagePayload" } } }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "option_excluded"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/optionStagePayload"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "request_summary" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "request_summary"
+              }
+            }
+          },
           "then": {
             "properties": {
               "payload": {
@@ -279,17 +642,29 @@
                   "surface_renders"
                 ],
                 "properties": {
-                  "surface_render_count": { "type": "integer", "minimum": 1 },
-                  "surface_action_count": { "type": "integer", "minimum": 1 },
-                  "list_sessions_count": { "const": 0 },
+                  "surface_render_count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "surface_action_count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "list_sessions_count": {
+                    "const": 0
+                  },
                   "surface_renders": {
                     "type": "array",
                     "minItems": 1,
                     "items": {
                       "type": "array",
                       "prefixItems": [
-                        { "$ref": "#/$defs/nonEmpty" },
-                        { "$ref": "#/$defs/nonEmpty" }
+                        {
+                          "$ref": "#/$defs/nonEmpty"
+                        },
+                        {
+                          "$ref": "#/$defs/nonEmpty"
+                        }
                       ],
                       "minItems": 2,
                       "maxItems": 2
@@ -301,24 +676,46 @@
           }
         },
         {
-          "if": { "properties": { "kind": { "const": "complete" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "complete"
+              }
+            }
+          },
           "then": {
             "properties": {
               "payload": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["workspace_id", "session_uuid", "action_id"],
+                "required": [
+                  "workspace_id",
+                  "session_uuid",
+                  "action_id"
+                ],
                 "properties": {
-                  "workspace_id": { "$ref": "#/$defs/nonEmpty" },
-                  "session_uuid": { "$ref": "#/$defs/nonEmpty" },
-                  "action_id": { "const": "botster_workspaces.add_session" }
+                  "workspace_id": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "session_uuid": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "action_id": {
+                    "const": "botster_workspaces.add_session"
+                  }
                 }
               }
             }
           }
         },
         {
-          "if": { "properties": { "kind": { "const": "failure" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "failure"
+              }
+            }
+          },
           "then": {
             "properties": {
               "payload": {
@@ -335,18 +732,124 @@
                   "last_observation"
                 ],
                 "properties": {
-                  "phase": { "$ref": "#/$defs/nonEmpty" },
-                  "message": { "type": "string", "maxLength": 512 },
-                  "expected_condition": { "$ref": "#/$defs/nonEmpty" },
-                  "subscription_id": { "type": ["string", "null"] },
-                  "snapshot_seq": { "type": ["integer", "null"], "minimum": 0 },
-                  "surface_render_count": { "type": "integer", "minimum": 0 },
+                  "phase": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "message": {
+                    "type": "string",
+                    "maxLength": 512
+                  },
+                  "expected_condition": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "subscription_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "snapshot_seq": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "surface_render_count": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
                   "focusable_ids": {
                     "type": "array",
                     "maxItems": 24,
-                    "items": { "$ref": "#/$defs/nonEmpty" }
+                    "items": {
+                      "$ref": "#/$defs/nonEmpty"
+                    }
                   },
-                  "last_observation": { "type": "object" }
+                  "last_observation": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "lifecycle_live_update"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "field",
+                  "node_id",
+                  "session_uuid",
+                  "lifecycle_before",
+                  "lifecycle_after",
+                  "reopened",
+                  "label_live_update",
+                  "label_field_present"
+                ],
+                "properties": {
+                  "field": {
+                    "const": "session_id"
+                  },
+                  "node_id": {
+                    "const": "botster-workspaces-add-session-id"
+                  },
+                  "session_uuid": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "lifecycle_before": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "lifecycle_after": {
+                    "$ref": "#/$defs/nonEmpty"
+                  },
+                  "projected_label_before": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "projected_label_after": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dedicated_label_before": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "dedicated_label_after": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "label_live_update": {
+                    "type": "boolean"
+                  },
+                  "label_field_present": {
+                    "type": "boolean"
+                  },
+                  "reopened": {
+                    "const": false
+                  },
+                  "surface_render_delta": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
                 }
               }
             }
@@ -355,5 +858,12 @@
       ]
     }
   },
-  "oneOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/evidence" }]
+  "oneOf": [
+    {
+      "$ref": "#/$defs/scenario"
+    },
+    {
+      "$ref": "#/$defs/evidence"
+    }
+  ]
 }
