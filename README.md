@@ -27,33 +27,43 @@ control-key input passthrough across attach and reattach paths.
 
 ## Foundation
 
-The workspace uses `botster-tui-kit` pinned to revision
-`9d4a566f309e9d848771b5448764a87f4721468e` and the kit, Hub client, and this
-crate share `botster-ui-contract`
-from botster-hub revision
-`891cc796faeab51ee4bee1a0e8494562b233036e`. Runnable-entrypoint connection
-decoding and validation consume `botster-core` revision
-`16bf08f29ec723c70c290cf995745ccbf79d4f05`. The live-Hub dev harness also
-receives a branch-tracked `botster-core` through `botster-hub-test-support`;
-`Cargo.lock` pins that dev-only source at
-`9d41ad4c614add7d15ff7e0f88b310a55627cd82`. The kit supplies semantic
-viewport layouts, state-aware rendering, scroll areas, toolbar overflow,
-focus reconciliation, complete terminal SGR mouse reports, and `HitMap`
-occlusion barriers. The kit owns reusable
-Ratatui/Crossterm `UiNode` rendering, hit maps, form/list routing, and terminal
-input forwarding. Semantic controls focus and capture on left Down, then
-activate only on matching-node left Up; `terminal_view` keeps left-Down focus
-behavior and forwards the trailing SGR release when mouse mode is focused.
+The workspace pins the Ghostty terminal client stack as one multipath set:
 
-The app does not yet display multi-click counts or drive the optional scroll
-normalizer poll/deadline clock, and it needs no app-specific occlusion helpers
-beyond the kit's `HitMap` behavior. Production mouse-mode ownership is split
-deliberately: core keeps the closed `terminal_view` contract (`session_id` plus
-optional `title`), the hub exposes authoritative emulator mode flags, this client
-keeps an attachment-scoped `u8` shadow and reapplies it after every render, and
-the kit converts tracking bits `1|2|4` into full-stream SGR routing. Bit `8` alone
-selects SGR encoding but does not enable tracking. Failed, malformed, stale, or
-detached readback clears the client shadow to safe-off.
+| Crate | Pin |
+| --- | --- |
+| `botster-hub-client` / `botster-ui-contract` / live hub | Hub `89dae7e15a844bcb7411b83b32581121720e23eb` |
+| `botster-tui-kit` | `32d804e3bbcb982e77113d5df12374baa8e9a2fa` (ui-contract → same Hub rev) |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` | Core `4d0d1d8832d19352454a0789419a3e31e67d50df` with `libghostty-vt` |
+
+`botster-terminal-ghostty` owns GHOSTSNP install, live VT apply, viewport
+projection, scrollbar, and color profile. The TUI installs Hub
+`Snapshot.history.decoded_bytes()` before attached readiness, applies later
+`TerminalOutput`, and paints styled cells through a TUI-owned
+`ProjectionWidget` after kit `TerminalView` chrome (HitMap region
+`tui-terminal` + `terminal_inner_rect`). Kit does not gain Ghostty truth.
+Kitty keyboard and mouse encodings use Hub `ModeGatedInput` with
+`ReadModeFlags` freshness (`mode_generation` / `mode_revision`). ReadScreen
+remains optional diagnostic text only. Handshake requires protocol 6,
+conformance floor **34**, and feature `mode_gated_input`.
+
+Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
+inside the resolved `botster-terminal-ghostty` package source (Cargo git
+checkout under `$CARGO_HOME/git/checkouts/botster-core-*/…`). Initialize with:
+
+```sh
+git -C "$(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="botster-terminal-ghostty") | .manifest_path' | xargs dirname)" \
+  submodule update --init vendor/ghostty
+```
+
+The kit supplies semantic viewport layouts, state-aware rendering, scroll
+areas, toolbar overflow, focus reconciliation, complete terminal SGR mouse
+reports, and `HitMap` occlusion barriers. Semantic controls focus and capture
+on left Down, then activate only on matching-node left Up; `terminal_view`
+keeps left-Down focus behavior and forwards the trailing SGR release when
+mouse mode is focused. Production mouse-mode ownership stays attachment-scoped
+in this client and is reapplied after every render. Bit `8` alone selects SGR
+encoding but does not enable tracking. Failed, malformed, stale, or detached
+readback clears the client shadow to safe-off.
 `botster-tui` owns the first-party hub client app, including workspace
 composition, hub connection setup, session presentation, packages, installed
 apps, marketplace diagnostics, and terminal attach/input/resize/drain behavior.

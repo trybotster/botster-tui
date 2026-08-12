@@ -9,6 +9,9 @@ pub use botster_tui_kit::{
     apply_action_result, render_node_with_presentation_state, tui_capabilities, viewport_for_area,
 };
 
+#[cfg(test)]
+pub use botster_tui_kit::HitRole;
+
 pub fn action_request_context() -> ActionRequestContext {
     action_request_context_for(WORKSPACE_SURFACE_ID)
 }
