@@ -385,6 +385,16 @@ Hermetic unit coverage:
 `app::tests::workspaces_claim_keyboard_select_submit_membership_and_exclusion`
 drives real InputRouter keys for select + submit + membership exclusion.
 
+Repository-owned live proof (isolated Hub, pin-matched sources):
+
+```sh
+BOTSTER_HUB_BIN=/path/to/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
+BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/botster-workspaces \  # ≥ 7ab4d133…
+BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub-source \         # ≥ de6b099…
+  script/test-live-hub workspaces claim-driver
+```
+
 The System details diagnostics distinguish:
 
 - missing, malformed, or invalid `BOTSTER_HUB_CONNECTION` configuration;

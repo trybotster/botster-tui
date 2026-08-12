@@ -6799,19 +6799,13 @@ fn drive_workspaces_claim_acceptance(
     diagnostics.stage(
         "baseline",
         None,
-        "authoritative /session baseline containing exact session_uuid",
+        "authoritative /session baseline with exact session_uuid and lifecycle_class=current",
     );
     wait_for_acceptance_state(
         &mut app,
         diagnostics,
-        "authoritative session baseline with exact session_uuid",
-        |app, _| {
-            app.session_entities.has_snapshot
-                && app
-                    .session_entities
-                    .entities
-                    .contains_key(&scenario.session_uuid)
-        },
+        "authoritative current session baseline with exact session_uuid",
+        |app, _| claim_session_is_current(app, &scenario.session_uuid),
     )?;
     wait_for_acceptance_state(
         &mut app,
@@ -6826,6 +6820,11 @@ fn drive_workspaces_claim_acceptance(
             })
         },
     )?;
+    let baseline_entity = app
+        .session_entities
+        .entities
+        .get(&scenario.session_uuid)
+        .expect("wait proved exact current session");
     evidence.event(
         "ready",
         None,
@@ -6841,7 +6840,9 @@ fn drive_workspaces_claim_acceptance(
             "subscription_id": app.session_entities.subscription_id,
             "snapshot_seq": app.session_entities.snapshot_seq,
             "has_snapshot": app.session_entities.has_snapshot,
-            "session_uuid": scenario.session_uuid
+            "session_uuid": scenario.session_uuid,
+            "lifecycle_class": baseline_entity.lifecycle_class,
+            "lifecycle": baseline_entity.lifecycle
         }),
     )?;
 
@@ -6969,17 +6970,22 @@ fn drive_workspaces_claim_acceptance(
         .as_ref()
         .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
         .and_then(Value::as_str);
-    let draft_uuid = router
-        .draft_value(WORKSPACES_ADD_SESSION_FIELD)
-        .and_then(Value::as_str);
-    if request_uuid != Some(scenario.session_uuid.as_str())
-        && draft_uuid != Some(scenario.session_uuid.as_str())
-    {
+    if request_uuid != Some(scenario.session_uuid.as_str()) {
         return invalid_acceptance(format!(
-            "add_session request did not carry exact session_uuid {:?}; values={:?} draft={:?}",
-            scenario.session_uuid, request.values, draft_uuid
+            "add_session request.values.session_id must equal exact session_uuid {:?}; values={:?}",
+            scenario.session_uuid, request.values
         ));
     }
+
+    // Surface-render budget for membership join + option exclusion: entity frames
+    // alone must update options. Add-dialog reopen is keyboard PluginSurfaceAction
+    // only and must not issue PluginSurfaceRender.
+    let surface_renders_before_reconciliation = app
+        .acceptance_audit
+        .as_ref()
+        .expect("acceptance audit enabled")
+        .surface_renders
+        .len();
 
     // Action accepted is supporting only — membership entity is the join oracle.
     // Owner replacement may close the dialog and drop the exclude-family demand;
@@ -7065,6 +7071,12 @@ fn drive_workspaces_claim_acceptance(
             audit.list_sessions
         ));
     }
+    if audit.surface_renders.len() != surface_renders_before_reconciliation {
+        return invalid_acceptance(format!(
+            "membership join / option exclusion issued PluginSurfaceRender as synchronization: before={surface_renders_before_reconciliation} after={}",
+            audit.surface_renders.len()
+        ));
+    }
     evidence.event(
         "request_summary",
         None,
@@ -7130,6 +7142,15 @@ fn ensure_membership_family_demanded(
         diagnostics,
     )?;
     Ok(())
+}
+
+fn claim_session_is_current(app: &TuiApp, session_uuid: &str) -> bool {
+    app.session_entities.has_snapshot
+        && app
+            .session_entities
+            .entities
+            .get(session_uuid)
+            .is_some_and(|entity| entity.lifecycle_class == "current")
 }
 
 fn membership_entity_contains(app: &TuiApp, workspace_id: &str, session_uuid: &str) -> bool {
@@ -17454,26 +17475,68 @@ mod tests {
         );
         app.set_drafts(router.draft_values());
 
-        let mut submit = plugin_request(
-            "req-claim-add-session",
-            WORKSPACES_SURFACE,
-            WORKSPACES_ADD_SESSION_ACTION,
-            "botster-workspaces-add-form-fixture",
+        // Keyboard form submit through production hit map / InputRouter only —
+        // never construct UiActionRequest.values by hand.
+        let (_, submit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
+        let submit_node = submit_map
+            .regions()
+            .iter()
+            .find(|region| {
+                region
+                    .action
+                    .as_ref()
+                    .is_some_and(|action| action.id.0 == WORKSPACES_ADD_SESSION_ACTION)
+            })
+            .map(|region| region.node_id.clone())
+            .expect("realized add_session form action must appear in hit map");
+        focus_hit_map_node_by_tab(&mut router, &submit_map, &submit_node);
+        let (_, enter_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
+        let dispatch = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &enter_map,
         );
-        submit.values = Some(UiFormValues(
-            json!({ "session_id": session_uuid })
-                .as_object()
-                .expect("values object")
-                .clone(),
-        ));
-        submit.payload = Some(json!({ "workspace_id": workspace_id }));
-        app.handle_dispatch(InputDispatch::Action(submit.clone()));
+        let InputDispatch::Action(request) = dispatch else {
+            panic!("keyboard form submit must dispatch Action, got {dispatch:?}");
+        };
+        assert_eq!(request.action_id.0, WORKSPACES_ADD_SESSION_ACTION);
+        assert_eq!(
+            request
+                .values
+                .as_ref()
+                .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
+                .and_then(Value::as_str),
+            Some(session_uuid),
+            "submit request.values.session_id must equal exact keyboard selection: {:?}",
+            request.values
+        );
+        // Prove the oracle is request.values-only: a draft match without values fails.
+        let mut values_missing = request.clone();
+        values_missing.values = None;
+        assert_ne!(
+            values_missing
+                .values
+                .as_ref()
+                .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
+                .and_then(Value::as_str),
+            Some(session_uuid),
+            "stripped values must not satisfy the exact-uuid oracle"
+        );
+        app.handle_dispatch(InputDispatch::Action(request.clone()));
         assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: WORKSPACES_PACKAGE.to_string(),
-                    request: submit.clone(),
-                }),
+            app.observed_requests.iter().any(|observed| matches!(
+                observed,
+                ObservedRequest::PluginSurfaceAction {
+                    package_name,
+                    request: observed_request
+                } if package_name == WORKSPACES_PACKAGE
+                    && observed_request.action_id.0 == WORKSPACES_ADD_SESSION_ACTION
+                    && observed_request
+                        .values
+                        .as_ref()
+                        .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
+                        .and_then(Value::as_str)
+                        == Some(session_uuid)
+            )),
             "claim submit must travel PluginSurfaceAction with exact uuid: {:?}",
             app.observed_requests
         );
@@ -19677,6 +19740,259 @@ mod tests {
         );
         println!("installed-workspaces-driver: complete cases=3");
         hub.shutdown().expect("installed-driver Hub shuts down");
+    }
+
+    /// Shared-Hub production claim seam: caller-owned Hub injectors, pin ledger,
+    /// keyboard Available sessions claim, membership join, option exclusion.
+    #[test]
+    fn installed_workspaces_claim_driver_runs_through_apps_open() {
+        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
+            skip_or_panic("BOTSTER_HUB_BIN");
+            return;
+        };
+        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
+            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
+            return;
+        };
+        let workspaces_path = PathBuf::from(
+            std::env::var("BOTSTER_WORKSPACES_PACKAGE_PATH")
+                .expect("BOTSTER_WORKSPACES_PACKAGE_PATH is required"),
+        );
+        let Some(hub_source) = std::env::var_os("BOTSTER_HUB_SOURCE_PATH") else {
+            skip_or_panic("BOTSTER_HUB_SOURCE_PATH");
+            return;
+        };
+        let hub_source_path = PathBuf::from(hub_source);
+        validate_workspaces_package(&workspaces_path).expect("validate Workspaces package");
+        assert!(
+            crate::acceptance::workspaces_package_has_available_sessions_form(&workspaces_path)
+                .expect("scan Available sessions form"),
+            "live claim requires Workspaces Available sessions entity_options form"
+        );
+        // Fail closed on pin floors before starting the Hub.
+        let pin_probe = crate::acceptance::ClaimScenario {
+            schema: crate::acceptance::CLAIM_SCHEMA.to_string(),
+            workspace_id: "probe".to_string(),
+            session_uuid: "00000000-0000-4000-8000-0000000000aa".to_string(),
+            hub_source_path: Some(hub_source_path.display().to_string()),
+            workspaces_package_path: Some(workspaces_path.display().to_string()),
+            hub_rev: None,
+            workspaces_rev: None,
+            tui_rev: None,
+            session_worker_rev: None,
+        };
+        let pin_ledger =
+            crate::acceptance::verify_claim_pins(&pin_probe).expect("claim pin ledger fail-closed");
+
+        let root = PathBuf::from(format!("/tmp/btclaim{}", short_suffix() % 1_000_000));
+        std::fs::create_dir_all(&root).expect("create claim-driver fixture root");
+        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(&hub_bin)
+            .session_worker_bin(session_worker_bin)
+            .root(root.join("hub"))
+            .name("botster-tui-installed-workspaces-claim-driver")
+            .start()
+            .expect("isolated Hub starts for claim driver");
+        let mut client =
+            HubConnection::connect(hub.endpoint()).expect("connect fixture Hub client");
+
+        for package_path in [
+            workspaces_path.clone(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        ] {
+            let installed = client
+                .request(&DaemonRequest::InstallPackageLocalPath { path: package_path })
+                .expect("install package through public Hub request");
+            assert!(installed.error.is_none(), "install response: {installed:?}");
+        }
+        for package_name in [WORKSPACES_PACKAGE, "botster-tui"] {
+            let enabled = client
+                .request(&DaemonRequest::EnablePackage {
+                    package_name: package_name.to_string(),
+                })
+                .expect("enable installed package");
+            assert!(enabled.error.is_none(), "enable response: {enabled:?}");
+            let reloaded = client
+                .request(&DaemonRequest::ReloadPackage {
+                    package_name: package_name.to_string(),
+                })
+                .expect("reload enabled package");
+            assert!(reloaded.error.is_none(), "reload response: {reloaded:?}");
+        }
+
+        let created = client
+            .request(&DaemonRequest::PluginMcpCallTool {
+                name: "botster_workspaces.create".to_string(),
+                arguments: json!({ "name": "Claim driver workspace" }),
+            })
+            .expect("create workspace through plugin MCP");
+        assert_eq!(created.plugin_tool_result["ok"], true, "{created:?}");
+        let workspace_id = created.plugin_tool_result["workspace"]["id"]
+            .as_str()
+            .expect("workspace id")
+            .to_string();
+
+        // Seed an unclaimed running Hub session outside membership (not package MCP claim).
+        let session_uuid = format!("00000000-0000-4000-8000-{:012x}", short_suffix() % 0xffff);
+        client
+            .request(&DaemonRequest::Spawn {
+                session_id: session_uuid.clone(),
+                command: "while IFS= read -r line; do :; done".to_string(),
+            })
+            .expect("spawn unclaimed running session");
+
+        let scenario_path = root.join("claim-scenario.json");
+        let evidence_path = root.join("claim-evidence.jsonl");
+        std::fs::write(
+            &scenario_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": crate::acceptance::CLAIM_SCHEMA,
+                "workspace_id": workspace_id,
+                "session_uuid": session_uuid,
+                "hub_source_path": hub_source_path,
+                "workspaces_package_path": workspaces_path,
+            }))
+            .expect("serialize claim scenario"),
+        )
+        .expect("write claim scenario");
+        let scenario_document: Value =
+            serde_json::from_slice(&std::fs::read(&scenario_path).expect("read claim scenario"))
+                .expect("decode claim scenario");
+        crate::acceptance::validate_claim_contract_document(&scenario_document)
+            .expect("claim scenario matches published schema");
+
+        let output = std::process::Command::new(&hub_bin)
+            .args([
+                "apps",
+                "open",
+                "--data-dir",
+                hub.data_dir().to_str().expect("Hub data path is UTF-8"),
+                "botster-tui",
+            ])
+            .env(crate::acceptance::SCENARIO_ENV, &scenario_path)
+            .env(crate::acceptance::EVIDENCE_ENV, &evidence_path)
+            .env(
+                crate::acceptance::WORKSPACES_PACKAGE_PATH_ENV,
+                &workspaces_path,
+            )
+            .env(crate::acceptance::HUB_SOURCE_PATH_ENV, &hub_source_path)
+            .output()
+            .expect("launch claim driver through apps open");
+        assert!(
+            output.status.success(),
+            "installed claim driver failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let evidence = std::fs::read_to_string(&evidence_path).expect("read claim evidence");
+        // Persist a copy for the implement report under the worktree.
+        let report_evidence = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/reports/tui-shared-hub-keyboard-claim-live-evidence.jsonl");
+        if let Some(parent) = report_evidence.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &report_evidence,
+            format!(
+                "{evidence}\n// pin_probe={}\n",
+                serde_json::to_string(&pin_ledger).unwrap_or_default()
+            ),
+        );
+        let records = evidence
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("evidence line is JSON"))
+            .collect::<Vec<_>>();
+        for record in &records {
+            crate::acceptance::validate_claim_contract_document(record)
+                .expect("claim evidence matches published schema");
+        }
+        assert!(
+            records
+                .iter()
+                .all(|record| { record["schema"] == crate::acceptance::CLAIM_SCHEMA })
+        );
+        for kind in [
+            "pin_ledger",
+            "ready",
+            "baseline",
+            "option_present",
+            "dispatched_action",
+            "membership_join",
+            "option_excluded",
+            "complete",
+        ] {
+            assert!(
+                records.iter().any(|record| record["kind"] == kind),
+                "claim evidence missing stage {kind}: {evidence}"
+            );
+        }
+        let baseline = records
+            .iter()
+            .find(|record| record["kind"] == "baseline")
+            .expect("baseline");
+        assert_eq!(baseline["payload"]["session_uuid"], session_uuid);
+        assert_eq!(baseline["payload"]["lifecycle_class"], "current");
+        let join = records
+            .iter()
+            .find(|record| record["kind"] == "membership_join")
+            .expect("membership_join");
+        assert_eq!(join["payload"]["session_uuid"], session_uuid);
+        assert_eq!(join["payload"]["workspace_id"], workspace_id);
+        let submit = records
+            .iter()
+            .find(|record| {
+                record["kind"] == "dispatched_action"
+                    && record["payload"]["action_id"] == WORKSPACES_ADD_SESSION_ACTION
+            })
+            .expect("add_session dispatch");
+        assert_eq!(
+            submit["payload"]["values"]["session_id"], session_uuid,
+            "request.values must carry exact uuid"
+        );
+        let summary = records
+            .iter()
+            .find(|record| record["kind"] == "request_summary")
+            .expect("request_summary");
+        assert_eq!(summary["payload"]["list_sessions_count"], 0);
+        let pin = records
+            .iter()
+            .find(|record| record["kind"] == "pin_ledger")
+            .expect("pin_ledger");
+        assert_eq!(pin["payload"]["hub_ancestry_ok"], true);
+        assert_eq!(pin["payload"]["workspaces_ancestry_ok"], true);
+        assert_eq!(pin["payload"]["tui_ancestry_ok"], true);
+        assert_eq!(
+            pin["payload"]["workspaces_available_sessions_form_ok"],
+            true
+        );
+        println!(
+            "installed-workspaces-claim-driver: complete workspace={workspace_id} session={session_uuid}"
+        );
+        hub.shutdown().expect("claim-driver Hub shuts down");
+    }
+
+    #[test]
+    fn claim_session_baseline_requires_lifecycle_class_current() {
+        let mut app = TuiApp::new(None);
+        app.session_entities.has_snapshot = true;
+        let session_uuid = "00000000-0000-4000-8000-0000000000ee";
+        let mut ended = session_entity(session_uuid, Some("exited"));
+        ended.lifecycle_class = "ended".to_string();
+        app.session_entities
+            .entities
+            .insert(session_uuid.to_string(), ended);
+        assert!(
+            !claim_session_is_current(&app, session_uuid),
+            "ended lifecycle_class must not satisfy claim baseline"
+        );
+        app.session_entities.entities.insert(
+            session_uuid.to_string(),
+            session_entity(session_uuid, Some("running")),
+        );
+        assert!(
+            claim_session_is_current(&app, session_uuid),
+            "current lifecycle_class must satisfy claim baseline"
+        );
     }
 
     fn run_fixture_command(directory: &Path, program: &str, args: &[&str]) {
