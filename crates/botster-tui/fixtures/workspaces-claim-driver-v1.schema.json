@@ -92,7 +92,12 @@
         "workspaces_available_sessions_form_ok",
         "hub_bin_under_source",
         "session_worker_bin_under_source",
-        "sources_clean"
+        "sources_clean",
+        "hub_build_target_dir",
+        "hub_bin_under_build_target",
+        "session_worker_bin_under_build_target",
+        "hub_build_command",
+        "session_worker_build_command"
       ],
       "properties": {
         "hub_minimum": { "$ref": "#/$defs/nonEmpty" },
@@ -114,7 +119,13 @@
         "workspaces_available_sessions_form_ok": { "const": true },
         "hub_bin_under_source": { "const": true },
         "session_worker_bin_under_source": { "const": true },
-        "sources_clean": { "const": true }
+        "sources_clean": { "const": true },
+        "hub_build_target_dir": { "$ref": "#/$defs/nonEmpty" },
+        "hub_bin_under_build_target": { "const": true },
+        "session_worker_bin_under_build_target": { "const": true },
+        "hub_build_command": { "$ref": "#/$defs/nonEmpty" },
+        "session_worker_build_command": { "$ref": "#/$defs/nonEmpty" },
+        "build_receipt_path": { "$ref": "#/$defs/nonEmpty" }
       }
     },
     "membershipJoinPayload": {

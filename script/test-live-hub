@@ -103,13 +103,83 @@ case "$mode" in
     ;;
 esac
 
-hub_bin="$(resolve_binary BOTSTER_HUB_BIN botster-hub)"
-session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   target_dir="$CARGO_TARGET_DIR"
 else
   target_dir="$(mktemp -d "${TMPDIR:-/tmp}/botster-tui-live-target.XXXXXX")"
   trap 'rm -rf "$target_dir"' EXIT
+fi
+
+claim_hub_build_target=""
+claim_build_receipt=""
+if [ "$profile" = "claim-driver" ]; then
+  # Fresh locked Hub + session-worker builds from the recorded Hub checkout.
+  # Do not reuse a stale shared target/release under the Hub source tree.
+  claim_hub_build_target="$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-claim-build.XXXXXX")"
+  trap 'rm -rf "$target_dir" "$claim_hub_build_target"' EXIT
+  hub_source="$(cd "${BOTSTER_HUB_SOURCE_PATH}" && pwd -P)"
+  hub_rev="$(git -C "$hub_source" rev-parse HEAD)"
+  hub_build_cmd="cargo build --locked --release -p botster-hub --manifest-path ${hub_source}/Cargo.toml --target-dir ${claim_hub_build_target}"
+  worker_build_cmd="cargo build --locked --release -p botster-core-daemon --bin botster-session-worker --manifest-path ${hub_source}/Cargo.toml --target-dir ${claim_hub_build_target}"
+  echo "claim-driver: building Hub from ${hub_source} @ ${hub_rev}" >&2
+  echo "claim-driver: ${hub_build_cmd}" >&2
+  # shellcheck disable=SC2086
+  cargo build --locked --release -p botster-hub --manifest-path "${hub_source}/Cargo.toml" --target-dir "${claim_hub_build_target}"
+  echo "claim-driver: ${worker_build_cmd}" >&2
+  # shellcheck disable=SC2086
+  cargo build --locked --release -p botster-core-daemon --bin botster-session-worker --manifest-path "${hub_source}/Cargo.toml" --target-dir "${claim_hub_build_target}"
+  hub_bin="${claim_hub_build_target}/release/botster-hub"
+  session_worker_bin="${claim_hub_build_target}/release/botster-session-worker"
+  if [ ! -x "$hub_bin" ] || [ ! -x "$session_worker_bin" ]; then
+    echo "claim-driver locked Hub build did not produce executable binaries under ${claim_hub_build_target}/release" >&2
+    exit 1
+  fi
+  # Core rev from Hub lock (fragment or rev=).
+  core_rev="$(python3 - "$hub_source" <<'PY'
+import re, sys
+from pathlib import Path
+lock = Path(sys.argv[1], "Cargo.lock").read_text()
+for line in lock.splitlines():
+    line = line.strip()
+    if not line.startswith("source = \"") or "botster-core" not in line:
+        continue
+    if "rev=" in line:
+        rev = re.split(r'[&#"]', line.split("rev=", 1)[1])[0]
+        if len(rev) >= 7:
+            print(rev)
+            raise SystemExit(0)
+    if "#" in line:
+        rev = line.rsplit("#", 1)[-1].rstrip('"')
+        if len(rev) >= 7 and all(c in "0123456789abcdef" for c in rev.lower()):
+            print(rev)
+            raise SystemExit(0)
+raise SystemExit("botster-core pin not found in Hub Cargo.lock")
+PY
+)"
+  claim_build_receipt="${claim_hub_build_target}/claim-build-receipt.json"
+  python3 - "$claim_build_receipt" "$hub_source" "$hub_rev" "$core_rev" "$hub_bin" "$session_worker_bin" "$claim_hub_build_target" "$hub_build_cmd" "$worker_build_cmd" <<'PY'
+import json, sys
+from pathlib import Path
+path, hub_source, hub_rev, core_rev, hub_bin, worker_bin, target_dir, hub_cmd, worker_cmd = sys.argv[1:10]
+Path(path).write_text(json.dumps({
+    "hub_source": hub_source,
+    "hub_rev": hub_rev,
+    "core_rev": core_rev,
+    "hub_bin": str(Path(hub_bin).resolve()),
+    "session_worker_bin": str(Path(worker_bin).resolve()),
+    "target_dir": str(Path(target_dir).resolve()),
+    "hub_build_command": hub_cmd,
+    "session_worker_build_command": worker_cmd,
+}, indent=2) + "\n")
+print(path)
+PY
+  export BOTSTER_HUB_BIN="$hub_bin"
+  export BOTSTER_SESSION_WORKER_BIN="$session_worker_bin"
+  export BOTSTER_HUB_BUILD_TARGET_DIR="$claim_hub_build_target"
+  export BOTSTER_TUI_CLAIM_BUILD_RECEIPT="$claim_build_receipt"
+else
+  hub_bin="$(resolve_binary BOTSTER_HUB_BIN botster-hub)"
+  session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
 fi
 
 cargo build -p botster-tui --target-dir "$target_dir" --locked
@@ -126,6 +196,8 @@ if BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
   BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="${contract_matrix_fixture:-}" \
   BOTSTER_WORKSPACES_PACKAGE_PATH="${workspaces_package:-}" \
   BOTSTER_HUB_SOURCE_PATH="${BOTSTER_HUB_SOURCE_PATH:-}" \
+  BOTSTER_HUB_BUILD_TARGET_DIR="${BOTSTER_HUB_BUILD_TARGET_DIR:-}" \
+  BOTSTER_TUI_CLAIM_BUILD_RECEIPT="${BOTSTER_TUI_CLAIM_BUILD_RECEIPT:-}" \
   BOTSTER_TUI_CLAIM_EVIDENCE_OUT="${BOTSTER_TUI_CLAIM_EVIDENCE_OUT:-}" \
   BOTSTER_TUI_WORKSPACES_PROFILE="$profile" \
   CARGO_TARGET_DIR="$target_dir" \
