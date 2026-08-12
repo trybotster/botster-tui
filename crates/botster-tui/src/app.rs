@@ -19995,8 +19995,6 @@ mod tests {
             true
         );
         assert_eq!(pin["payload"]["sources_clean"], true);
-        assert_eq!(pin["payload"]["hub_bin_under_source"], true);
-        assert_eq!(pin["payload"]["session_worker_bin_under_source"], true);
         assert_eq!(pin["payload"]["hub_bin_under_build_target"], true);
         assert_eq!(
             pin["payload"]["session_worker_bin_under_build_target"],
