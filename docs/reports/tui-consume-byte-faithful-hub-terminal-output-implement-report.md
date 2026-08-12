@@ -2,7 +2,7 @@
 
 - **Ticket:** `ticket_1786562566_712634`
 - **Run:** `run_1786568426_623487`
-- **Step:** `botster_stack_implement`
+- **Step:** `botster_stack_implement` (revisit after `review_1786574835_623607` / `finding_1786574835_381659`)
 - **PR:** https://github.com/trybotster/botster-tui/pull/53
 - **Target repository:** `botster-tui` (`trybotster/botster-tui`)
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
@@ -100,6 +100,19 @@ Edited only `botster-tui` policy, handshake, live-byte apply, tests, and docs. D
 
 `cargo tree -i botster-ui-contract --locked` resolved one git source at `7499c161`. Lock still has a second `botster-core` via hub-test-support `branch=main` at `5a993837`; production Ghostty/core remain on `4d0d1d88`.
 
+## Open finding addressed
+
+### High: live gate did not prove invalid bytes (`finding_1786574835_381659`)
+
+The live producer previously wrote only NUL, a complete ESC reset, and ASCII `BYTEFAITH`. The applied-payload check ORed those tokens, so BYTEFAITH alone could pass.
+
+**Fix in** `headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input`:
+
+- `emit-invalid-bytes` writes exactly `[0x00, 0x1b, 0xff, 0xc0]`
+- Wait until concatenated applied payloads contain that sequence in order
+- Separate asserts for NUL, ESC, `0xff`, `0xc0`, no `EF BF BD` repair
+- Then `emit-later-marker` writes `\033[0mBYTEFAITH` and the painted frame must contain `BYTEFAITH`
+
 ## Deviations from plan
 
 Not product-scope changes:
@@ -107,7 +120,7 @@ Not product-scope changes:
 - Hub pin required a `DaemonDiagnosticKind::WorkerCompatibility` match arm (new enum variant).
 - Shared late-attach fixture at Hub `7499c161` now ships GHOSTSNP goldens. Tests consume that fixture instead of dummy `[0, 255, 71, 84, 89, 1]`.
 - Live split-UTF-8 barrier uses `stty -echo` plus command tokens so the producer writes exact `[0xE2]` then `[0x82, 0xAC]`. Kernel echo of the command line otherwise split the euro sequence.
-- Live NUL/ESC marker uses a complete `\033[0m` before `BYTEFAITH` so an incomplete ESC does not eat the marker.
+- Live invalid-byte proof is two barriers: exact `[0x00, 0x1b, 0xff, 0xc0]`, then a complete `\033[0m` before `BYTEFAITH` so an incomplete ESC does not eat the marker.
 - Kit fetch needed `CARGO_NET_GIT_FETCH_WITH_CLI=true` (libgit2 auth failed).
 
 ## Tests and downstream proof
