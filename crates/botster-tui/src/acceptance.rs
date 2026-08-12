@@ -514,8 +514,11 @@ fn require_executable_env(name: &str) -> io::Result<PathBuf> {
 }
 
 fn require_git_clean(root: &Path, label: &str) -> io::Result<()> {
+    // Tracked modifications only. Untracked env/mise noise is not product code and
+    // must not block pin proof; uncommitted tracked edits must fail closed so HEAD
+    // is the executed source.
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(root)
         .output()
         .map_err(|error| {
@@ -537,7 +540,7 @@ fn require_git_clean(root: &Path, label: &str) -> io::Result<()> {
     let porcelain = String::from_utf8_lossy(&output.stdout);
     if !porcelain.trim().is_empty() {
         return invalid(format!(
-            "{label} checkout is dirty at {}; commit or stash before claim so HEAD is the executed code:\n{}",
+            "{label} checkout has tracked dirt at {}; commit or restore tracked files before claim so HEAD is the executed code:\n{}",
             root.display(),
             porcelain.chars().take(512).collect::<String>()
         ));
