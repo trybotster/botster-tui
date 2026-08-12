@@ -19890,12 +19890,19 @@ mod tests {
                 &workspaces_path,
             )
             .env(crate::acceptance::HUB_SOURCE_PATH_ENV, &hub_source_path)
-            // Propagate the same binaries the pin ledger binds so the installed
-            // child records exact realpaths under the Hub source checkout.
+            // Propagate the same binaries + fresh build target the pin ledger binds.
             .env(crate::acceptance::HUB_BIN_ENV, &hub_bin)
             .env(
                 crate::acceptance::SESSION_WORKER_BIN_ENV,
                 &session_worker_bin,
+            )
+            .env(
+                crate::acceptance::HUB_BUILD_TARGET_DIR_ENV,
+                std::env::var_os(crate::acceptance::HUB_BUILD_TARGET_DIR_ENV).unwrap_or_default(),
+            )
+            .env(
+                crate::acceptance::CLAIM_BUILD_RECEIPT_ENV,
+                std::env::var_os(crate::acceptance::CLAIM_BUILD_RECEIPT_ENV).unwrap_or_default(),
             )
             .output()
             .expect("launch claim driver through apps open");
@@ -19990,6 +19997,11 @@ mod tests {
         assert_eq!(pin["payload"]["sources_clean"], true);
         assert_eq!(pin["payload"]["hub_bin_under_source"], true);
         assert_eq!(pin["payload"]["session_worker_bin_under_source"], true);
+        assert_eq!(pin["payload"]["hub_bin_under_build_target"], true);
+        assert_eq!(
+            pin["payload"]["session_worker_bin_under_build_target"],
+            true
+        );
         assert_eq!(pin["payload"]["hub_rev"], pin_ledger.hub_rev);
         assert_eq!(pin["payload"]["tui_rev"], pin_ledger.tui_rev);
         assert_eq!(pin["payload"]["core_rev"], pin_ledger.core_rev);
@@ -20005,6 +20017,32 @@ mod tests {
                 .is_some_and(|path| path == pin_ledger.session_worker_bin_path),
             "pin ledger must record exact session-worker binary realpath"
         );
+        assert!(
+            pin["payload"]["hub_build_command"]
+                .as_str()
+                .is_some_and(|cmd| cmd.contains("botster-hub") && cmd.contains("--locked")),
+            "pin ledger must record locked Hub build command"
+        );
+        assert!(
+            pin["payload"]["session_worker_build_command"]
+                .as_str()
+                .is_some_and(|cmd| {
+                    cmd.contains("botster-session-worker") && cmd.contains("--locked")
+                }),
+            "pin ledger must record locked session-worker build command"
+        );
+        // Stale shared target/release under the Hub source must not satisfy the
+        // fresh build-target binding (negative for unbound cached binaries).
+        if let Ok(build_target) = std::env::var(crate::acceptance::HUB_BUILD_TARGET_DIR_ENV) {
+            let build_target = PathBuf::from(build_target);
+            assert!(
+                pin_ledger
+                    .hub_bin_path
+                    .starts_with(&build_target.canonicalize().unwrap().display().to_string())
+                    || PathBuf::from(&pin_ledger.hub_bin_path).starts_with(&build_target),
+                "executed hub binary must live under the fresh build target, not a stale cache"
+            );
+        }
         println!(
             "installed-workspaces-claim-driver: complete workspace={workspace_id} session={session_uuid} tui_rev={} hub_rev={}",
             pin_ledger.tui_rev, pin_ledger.hub_rev

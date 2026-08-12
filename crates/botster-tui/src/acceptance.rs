@@ -25,6 +25,12 @@ pub const WORKSPACES_PACKAGE_PATH_ENV: &str = "BOTSTER_WORKSPACES_PACKAGE_PATH";
 pub const HUB_SOURCE_PATH_ENV: &str = "BOTSTER_HUB_SOURCE_PATH";
 pub const HUB_BIN_ENV: &str = "BOTSTER_HUB_BIN";
 pub const SESSION_WORKER_BIN_ENV: &str = "BOTSTER_SESSION_WORKER_BIN";
+/// Fresh Cargo target dir used to build Hub + session-worker for this claim run.
+/// When set, both binaries must live under this directory (rejects stale shared
+/// `target/release` caches that merely sit under the Hub source tree).
+pub const HUB_BUILD_TARGET_DIR_ENV: &str = "BOTSTER_HUB_BUILD_TARGET_DIR";
+/// JSON build receipt written by the live harness after locked Hub builds.
+pub const CLAIM_BUILD_RECEIPT_ENV: &str = "BOTSTER_TUI_CLAIM_BUILD_RECEIPT";
 /// Optional path for the live test harness to copy validated claim evidence
 /// outside the tracked tree. The production claim driver never writes here.
 /// Named for `script/test-live-hub workspaces claim-driver`.
@@ -325,6 +331,14 @@ pub struct PinLedger {
     pub hub_bin_under_source: bool,
     pub session_worker_bin_under_source: bool,
     pub sources_clean: bool,
+    /// Fresh build target dir that owns the executed binaries (required for claim).
+    pub hub_build_target_dir: String,
+    pub hub_bin_under_build_target: bool,
+    pub session_worker_bin_under_build_target: bool,
+    pub hub_build_command: String,
+    pub session_worker_build_command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_receipt_path: Option<String>,
 }
 
 /// Fail-closed pin + Available sessions form presence + binary provenance checks.
@@ -426,6 +440,62 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         ));
     }
 
+    // Fresh build target: reject stale shared target/release caches under the source tree.
+    let build_target = std::env::var_os(HUB_BUILD_TARGET_DIR_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "claim pin ledger requires {HUB_BUILD_TARGET_DIR_ENV} (fresh locked Hub build target; do not reuse a stale shared target/release)"
+                ),
+            )
+        })?;
+    let build_target = fs::canonicalize(&build_target).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "canonicalize {HUB_BUILD_TARGET_DIR_ENV} {}: {error}",
+                build_target.display()
+            ),
+        )
+    })?;
+    let hub_bin_under_build_target = path_is_under(&hub_bin_path, &build_target);
+    let session_worker_bin_under_build_target =
+        path_is_under(&session_worker_bin_path, &build_target);
+    if !hub_bin_under_build_target {
+        return invalid(format!(
+            "Hub binary {} is not under fresh build target {} (stale cached binary rejected)",
+            hub_bin_path.display(),
+            build_target.display()
+        ));
+    }
+    if !session_worker_bin_under_build_target {
+        return invalid(format!(
+            "session-worker binary {} is not under fresh build target {} (stale cached binary rejected)",
+            session_worker_bin_path.display(),
+            build_target.display()
+        ));
+    }
+
+    let (
+        hub_build_command,
+        session_worker_build_command,
+        receipt_hub_rev,
+        receipt_core_rev,
+        build_receipt_path,
+    ) = load_build_receipt_or_defaults(&hub_path, &build_target, &hub_rev, &core_rev)?;
+    if receipt_hub_rev != hub_rev {
+        return invalid(format!(
+            "build receipt hub_rev {receipt_hub_rev} does not match Hub HEAD {hub_rev}"
+        ));
+    }
+    if receipt_core_rev != core_rev {
+        return invalid(format!(
+            "build receipt core_rev {receipt_core_rev} does not match Hub Cargo.lock {core_rev}"
+        ));
+    }
+
     // Optional explicit session_worker_rev must match locked Core when supplied.
     if let Some(explicit) = scenario.session_worker_rev.as_deref()
         && explicit != core_rev
@@ -483,7 +553,109 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         hub_bin_under_source,
         session_worker_bin_under_source,
         sources_clean: true,
+        hub_build_target_dir: build_target.display().to_string(),
+        hub_bin_under_build_target,
+        session_worker_bin_under_build_target,
+        hub_build_command,
+        session_worker_build_command,
+        build_receipt_path,
     })
+}
+
+/// Load the harness build receipt when present; otherwise synthesize command
+/// strings for the default locked Hub build from this checkout + target dir.
+fn load_build_receipt_or_defaults(
+    hub_path: &Path,
+    build_target: &Path,
+    hub_rev: &str,
+    core_rev: &str,
+) -> io::Result<(String, String, String, String, Option<String>)> {
+    let default_hub_cmd = format!(
+        "cargo build --locked --release -p botster-hub --manifest-path {}/Cargo.toml --target-dir {}",
+        hub_path.display(),
+        build_target.display()
+    );
+    let default_worker_cmd = format!(
+        "cargo build --locked --release -p botster-core-daemon --bin botster-session-worker --manifest-path {}/Cargo.toml --target-dir {}",
+        hub_path.display(),
+        build_target.display()
+    );
+    let Some(receipt_path) = std::env::var_os(CLAIM_BUILD_RECEIPT_ENV).map(PathBuf::from) else {
+        return Ok((
+            default_hub_cmd,
+            default_worker_cmd,
+            hub_rev.to_string(),
+            core_rev.to_string(),
+            None,
+        ));
+    };
+    let bytes = fs::read(&receipt_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "read {CLAIM_BUILD_RECEIPT_ENV} {}: {error}",
+                receipt_path.display()
+            ),
+        )
+    })?;
+    let receipt: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode claim build receipt: {error}"),
+        )
+    })?;
+    let hub_cmd = receipt
+        .get("hub_build_command")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_hub_cmd)
+        .to_string();
+    let worker_cmd = receipt
+        .get("session_worker_build_command")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_worker_cmd)
+        .to_string();
+    let receipt_hub_rev = receipt
+        .get("hub_rev")
+        .and_then(Value::as_str)
+        .unwrap_or(hub_rev)
+        .to_string();
+    let receipt_core_rev = receipt
+        .get("core_rev")
+        .and_then(Value::as_str)
+        .unwrap_or(core_rev)
+        .to_string();
+    // Bind receipt binary paths when present.
+    if let Some(receipt_hub_bin) = receipt.get("hub_bin").and_then(Value::as_str) {
+        let expected =
+            fs::canonicalize(receipt_hub_bin).unwrap_or_else(|_| PathBuf::from(receipt_hub_bin));
+        let actual = require_executable_env(HUB_BIN_ENV).and_then(fs::canonicalize)?;
+        if expected != actual {
+            return invalid(format!(
+                "build receipt hub_bin {} does not match {HUB_BIN_ENV} {}",
+                expected.display(),
+                actual.display()
+            ));
+        }
+    }
+    if let Some(receipt_worker) = receipt.get("session_worker_bin").and_then(Value::as_str) {
+        let expected =
+            fs::canonicalize(receipt_worker).unwrap_or_else(|_| PathBuf::from(receipt_worker));
+        let actual = require_executable_env(SESSION_WORKER_BIN_ENV).and_then(fs::canonicalize)?;
+        if expected != actual {
+            return invalid(format!(
+                "build receipt session_worker_bin {} does not match {SESSION_WORKER_BIN_ENV} {}",
+                expected.display(),
+                actual.display()
+            ));
+        }
+    }
+    Ok((
+        hub_cmd,
+        worker_cmd,
+        receipt_hub_rev,
+        receipt_core_rev,
+        Some(receipt_path.display().to_string()),
+    ))
 }
 
 fn require_executable_env(name: &str) -> io::Result<PathBuf> {

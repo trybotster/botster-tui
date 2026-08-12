@@ -319,11 +319,29 @@ Schema: `botster.tui.workspaces-claim-driver/v1` (does not collide with spawn
 ```sh
 export BOTSTER_HUB_CONNECTION='{"transport":{"kind":"unix_socket","path":"/path/to/hub.sock"},...}'
 export BOTSTER_HUB_DATA_DIR=/path/to/shared-hub-data   # or BOTSTER_LIVE_DATA_DIR
-export BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/botster-workspaces   # pin floor + form scan
-export BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub                 # pin ancestry
+export BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/botster-workspaces   # ≥ 7ab4d133… + form scan
+export BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub                 # ≥ de6b099… clean checkout
 ```
 
-3. Write a claim scenario (no node ids / force payloads):
+3. Build pin-matched Hub + session-worker into a **fresh** target directory (do not
+   reuse a stale shared `target/release` cache). The claim pin ledger requires
+   both binaries and `BOTSTER_HUB_BUILD_TARGET_DIR`:
+
+```sh
+export BOTSTER_HUB_BUILD_TARGET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-claim-build.XXXXXX")"
+cargo build --locked --release -p botster-hub \
+  --manifest-path "$BOTSTER_HUB_SOURCE_PATH/Cargo.toml" \
+  --target-dir "$BOTSTER_HUB_BUILD_TARGET_DIR"
+cargo build --locked --release -p botster-core-daemon --bin botster-session-worker \
+  --manifest-path "$BOTSTER_HUB_SOURCE_PATH/Cargo.toml" \
+  --target-dir "$BOTSTER_HUB_BUILD_TARGET_DIR"
+export BOTSTER_HUB_BIN="$BOTSTER_HUB_BUILD_TARGET_DIR/release/botster-hub"
+export BOTSTER_SESSION_WORKER_BIN="$BOTSTER_HUB_BUILD_TARGET_DIR/release/botster-session-worker"
+# The running shared Hub must be this BOTSTER_HUB_BIN (or an identical build of
+# the same source SHA). The claim driver records realpaths + locked Core SHA.
+```
+
+4. Write a claim scenario (no node ids / force payloads):
 
 ```json
 {
@@ -339,12 +357,15 @@ Paths may instead come from `BOTSTER_HUB_SOURCE_PATH` /
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. Explicit `hub_rev` / `workspaces_rev` /
 `tui_rev` / `session_worker_rev` are optional when a git path can resolve HEAD.
 
-4. Launch the installed TUI with a **new** evidence path:
+5. Launch the installed TUI with a **new** evidence path (export the binary
+   variables so the pin ledger can bind them):
 
 ```sh
+export BOTSTER_HUB_BIN BOTSTER_SESSION_WORKER_BIN BOTSTER_HUB_BUILD_TARGET_DIR
+export BOTSTER_HUB_SOURCE_PATH BOTSTER_WORKSPACES_PACKAGE_PATH
 BOTSTER_TUI_ACCEPTANCE_SCENARIO=/path/to/claim.scenario.json \
 BOTSTER_TUI_ACCEPTANCE_EVIDENCE=/path/to/new-claim.evidence.jsonl \
-  botster-hub apps open --data-dir "$BOTSTER_HUB_DATA_DIR" botster-tui
+  "$BOTSTER_HUB_BIN" apps open --data-dir "$BOTSTER_HUB_DATA_DIR" botster-tui
 ```
 
 ### Production path (what the driver exercises)
@@ -385,13 +406,14 @@ Hermetic unit coverage:
 `app::tests::workspaces_claim_keyboard_select_submit_membership_and_exclusion`
 drives real InputRouter keys for select + submit + membership exclusion.
 
-Repository-owned live proof (isolated Hub, pin-matched sources):
+Repository-owned live proof (isolated Hub, pin-matched sources). The wrapper
+rebuilds Hub + session-worker with `--locked` into a fresh target dir and writes
+a build receipt — callers must not pre-point at a stale `target/release`:
 
 ```sh
-BOTSTER_HUB_BIN=/path/to/botster-hub \
-BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
 BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/botster-workspaces \  # ≥ 7ab4d133…
-BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub-source \         # ≥ de6b099…
+BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub-source \         # ≥ de6b099… clean
+BOTSTER_TUI_CLAIM_EVIDENCE_OUT=/tmp/claim-evidence.jsonl \
   script/test-live-hub workspaces claim-driver
 ```
 
