@@ -296,6 +296,95 @@ performs shared cleanup. The downstream Workspaces integration remains
 responsible for independently proving Hub, Git, worktree, package, membership,
 and session truth from its one long-lived shared Hub.
 
+## Caller-owned Workspaces claim acceptance (Available sessions)
+
+Parent claim-stack campaigns need a **public production keyboard seam** that
+claims an already-running unclaimed session through the owner-authored Workspaces
+**Available sessions** `entity_options` form — not through package MCP
+`add_session`, `list_sessions` polling, force interaction, or surface-refresh
+synchronization.
+
+Schema: `botster.tui.workspaces-claim-driver/v1` (does not collide with spawn
+`botster.tui.workspaces-spawn-driver/v1`). Fixtures:
+`crates/botster-tui/fixtures/workspaces-claim-driver-v1.*`.
+
+### Parent entrypoint
+
+1. Own a clean shared Hub with Workspaces installed/enabled, workspace `W`
+   created, and unclaimed running session `S` already present on `/session`.
+2. Export the established Hub injectors (parent prose sometimes says
+   `BOTSTER_LIVE_DATA_DIR`; this binary accepts that as an alias of
+   `BOTSTER_HUB_DATA_DIR` when the latter is unset):
+
+```sh
+export BOTSTER_HUB_CONNECTION='{"transport":{"kind":"unix_socket","path":"/path/to/hub.sock"},...}'
+export BOTSTER_HUB_DATA_DIR=/path/to/shared-hub-data   # or BOTSTER_LIVE_DATA_DIR
+export BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/botster-workspaces   # pin floor + form scan
+export BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub                 # pin ancestry
+```
+
+3. Write a claim scenario (no node ids / force payloads):
+
+```json
+{
+  "schema": "botster.tui.workspaces-claim-driver/v1",
+  "workspace_id": "W",
+  "session_uuid": "S",
+  "hub_source_path": "/path/to/botster-hub",
+  "workspaces_package_path": "/path/to/botster-workspaces"
+}
+```
+
+Paths may instead come from `BOTSTER_HUB_SOURCE_PATH` /
+`BOTSTER_WORKSPACES_PACKAGE_PATH`. Explicit `hub_rev` / `workspaces_rev` /
+`tui_rev` / `session_worker_rev` are optional when a git path can resolve HEAD.
+
+4. Launch the installed TUI with a **new** evidence path:
+
+```sh
+BOTSTER_TUI_ACCEPTANCE_SCENARIO=/path/to/claim.scenario.json \
+BOTSTER_TUI_ACCEPTANCE_EVIDENCE=/path/to/new-claim.evidence.jsonl \
+  botster-hub apps open --data-dir "$BOTSTER_HUB_DATA_DIR" botster-tui
+```
+
+### Production path (what the driver exercises)
+
+Fail-closed pin ledger → connect → authoritative `/session` baseline containing
+exact `S` → open Workspaces surface for `W` → keyboard-activate realized
+**Add existing session** (`botster_workspaces.open` with `dialog=add:W`) → wait
+until field `session_id` / node `botster-workspaces-add-session-id` materializes
+the exact option → keyboard select via production Select open/Down/Enter →
+submit realized `botster_workspaces.add_session` with exact uuid →
+**membership join** on `/botster-workspaces.membership` with exact
+`workspace_id` + `session_uuid` (action `accepted` alone is not join proof) →
+**option exclusion** of `S` without `list_sessions` / MCP claim / force
+interaction (reopens Add once if owner replacement closed the dialog).
+
+### Fail-closed pin floors (minimum SHAs)
+
+| Artifact | Minimum revision |
+| --- | --- |
+| Hub source/binary | `de6b09982e72fd5efd04a5258f5fc645f611adbc` |
+| Workspaces package | `7ab4d1334214b3ea3c8b02e9ea665a27e70c0916` |
+| TUI under test | `abc804e19bc3e01465cd308c11de5f4292331c3d` |
+
+The driver requires `git merge-base --is-ancestor MINIMUM ACTUAL` (or exact
+equality) and refuses to claim when the Workspaces package lacks the Available
+sessions `entity_options` form. Evidence `pin_ledger` records the exact consumed
+SHAs and ancestry booleans.
+
+### Non-goals
+
+- Package MCP `add_session` / `list_sessions` as the UI claim proof
+- Advanced historical UUID field as the normal claim path
+- Force-dispatching action payloads without hit-map focus
+- Starting/stopping Hub or reinstalling packages inside this seam
+- Web dual-browser / race campaign (parent claim-stack owns those)
+
+Hermetic unit coverage:
+`app::tests::workspaces_claim_keyboard_select_submit_membership_and_exclusion`
+drives real InputRouter keys for select + submit + membership exclusion.
+
 The System details diagnostics distinguish:
 
 - missing, malformed, or invalid `BOTSTER_HUB_CONNECTION` configuration;

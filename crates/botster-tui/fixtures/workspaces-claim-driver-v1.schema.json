@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://botster.dev/contracts/tui/workspaces-claim-driver-v1.schema.json",
+  "title": "Botster TUI Workspaces Claim driver v1",
+  "$defs": {
+    "schema": { "const": "botster.tui.workspaces-claim-driver/v1" },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "workspace_id", "session_uuid"],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "workspace_id": { "$ref": "#/$defs/nonEmpty" },
+        "session_uuid": { "$ref": "#/$defs/nonEmpty" },
+        "hub_source_path": { "$ref": "#/$defs/nonEmpty" },
+        "workspaces_package_path": { "$ref": "#/$defs/nonEmpty" },
+        "hub_rev": { "$ref": "#/$defs/nonEmpty" },
+        "workspaces_rev": { "$ref": "#/$defs/nonEmpty" },
+        "tui_rev": { "$ref": "#/$defs/nonEmpty" },
+        "session_worker_rev": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "focusedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/nonEmpty" },
+        "action_id": { "$ref": "#/$defs/nonEmpty" },
+        "field": { "$ref": "#/$defs/nonEmpty" }
+      },
+      "oneOf": [
+        { "required": ["action_id"], "not": { "required": ["field"] } },
+        { "required": ["field"], "not": { "required": ["action_id"] } }
+      ]
+    },
+    "actionRequestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "surface_id", "action_id", "node_id", "kind"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/nonEmpty" },
+        "surface_id": { "$ref": "#/$defs/nonEmpty" },
+        "action_id": { "$ref": "#/$defs/nonEmpty" },
+        "node_id": { "$ref": "#/$defs/nonEmpty" },
+        "kind": { "enum": ["submit", "reset", "validate", "cancel"] },
+        "values": { "type": "object" },
+        "payload": { "type": ["object", "null"] }
+      }
+    },
+    "actionResultPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "surface_id", "action_id", "node_id", "state"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/nonEmpty" },
+        "surface_id": { "$ref": "#/$defs/nonEmpty" },
+        "action_id": { "$ref": "#/$defs/nonEmpty" },
+        "node_id": { "$ref": "#/$defs/nonEmpty" },
+        "state": { "enum": ["accepted", "rejected", "deferred", "error"] },
+        "field_errors": { "type": "object" },
+        "form_errors": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "normalized_values": { "type": "object" },
+        "presentation": { "type": "array" },
+        "replacement": { "type": "object" },
+        "payload": { "type": ["object", "null"] },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "pinLedgerPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hub_minimum",
+        "workspaces_minimum",
+        "tui_minimum",
+        "hub_rev",
+        "workspaces_rev",
+        "tui_rev",
+        "hub_ancestry_ok",
+        "workspaces_ancestry_ok",
+        "tui_ancestry_ok",
+        "workspaces_available_sessions_form_ok"
+      ],
+      "properties": {
+        "hub_minimum": { "$ref": "#/$defs/nonEmpty" },
+        "workspaces_minimum": { "$ref": "#/$defs/nonEmpty" },
+        "tui_minimum": { "$ref": "#/$defs/nonEmpty" },
+        "hub_rev": { "$ref": "#/$defs/nonEmpty" },
+        "workspaces_rev": { "$ref": "#/$defs/nonEmpty" },
+        "tui_rev": { "$ref": "#/$defs/nonEmpty" },
+        "session_worker_rev": { "$ref": "#/$defs/nonEmpty" },
+        "hub_ancestry_ok": { "const": true },
+        "workspaces_ancestry_ok": { "const": true },
+        "tui_ancestry_ok": { "const": true },
+        "workspaces_available_sessions_form_ok": { "const": true }
+      }
+    },
+    "membershipJoinPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "session_uuid", "workspace_id", "membership_id", "snapshot_seq"],
+      "properties": {
+        "family": { "const": "botster-workspaces.membership" },
+        "session_uuid": { "$ref": "#/$defs/nonEmpty" },
+        "workspace_id": { "$ref": "#/$defs/nonEmpty" },
+        "membership_id": { "$ref": "#/$defs/nonEmpty" },
+        "snapshot_seq": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "optionStagePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "node_id", "session_uuid"],
+      "properties": {
+        "field": { "const": "session_id" },
+        "node_id": { "const": "botster-workspaces-add-session-id" },
+        "session_uuid": { "$ref": "#/$defs/nonEmpty" },
+        "option_count": { "type": "integer", "minimum": 0 },
+        "reopened": { "type": "boolean" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "kind", "payload"],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "kind": {
+          "enum": [
+            "pin_ledger",
+            "ready",
+            "baseline",
+            "surface_request",
+            "focused_control",
+            "dispatched_action",
+            "action_result",
+            "option_present",
+            "membership_join",
+            "option_excluded",
+            "request_summary",
+            "complete",
+            "failure"
+          ]
+        },
+        "case_id": { "$ref": "#/$defs/nonEmpty" },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "pin_ledger" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/pinLedgerPayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "ready" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["workspace_id", "session_uuid"],
+                "properties": {
+                  "workspace_id": { "$ref": "#/$defs/nonEmpty" },
+                  "session_uuid": { "$ref": "#/$defs/nonEmpty" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "baseline" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["subscription_id", "snapshot_seq", "has_snapshot", "session_uuid"],
+                "properties": {
+                  "subscription_id": { "$ref": "#/$defs/nonEmpty" },
+                  "snapshot_seq": { "type": "integer", "minimum": 0 },
+                  "has_snapshot": { "const": true },
+                  "session_uuid": { "$ref": "#/$defs/nonEmpty" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "surface_request" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["package_name", "surface_id"],
+                "properties": {
+                  "package_name": { "$ref": "#/$defs/nonEmpty" },
+                  "surface_id": { "$ref": "#/$defs/nonEmpty" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "focused_control" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/focusedPayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "dispatched_action" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/actionRequestPayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "action_result" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/actionResultPayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "option_present" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/optionStagePayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "membership_join" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/membershipJoinPayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "option_excluded" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/optionStagePayload" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "request_summary" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "surface_render_count",
+                  "surface_action_count",
+                  "list_sessions_count",
+                  "surface_renders"
+                ],
+                "properties": {
+                  "surface_render_count": { "type": "integer", "minimum": 1 },
+                  "surface_action_count": { "type": "integer", "minimum": 1 },
+                  "list_sessions_count": { "const": 0 },
+                  "surface_renders": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "array",
+                      "prefixItems": [
+                        { "$ref": "#/$defs/nonEmpty" },
+                        { "$ref": "#/$defs/nonEmpty" }
+                      ],
+                      "minItems": 2,
+                      "maxItems": 2
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "complete" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["workspace_id", "session_uuid", "action_id"],
+                "properties": {
+                  "workspace_id": { "$ref": "#/$defs/nonEmpty" },
+                  "session_uuid": { "$ref": "#/$defs/nonEmpty" },
+                  "action_id": { "const": "botster_workspaces.add_session" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "failure" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "phase",
+                  "message",
+                  "expected_condition",
+                  "subscription_id",
+                  "snapshot_seq",
+                  "surface_render_count",
+                  "focusable_ids",
+                  "last_observation"
+                ],
+                "properties": {
+                  "phase": { "$ref": "#/$defs/nonEmpty" },
+                  "message": { "type": "string", "maxLength": 512 },
+                  "expected_condition": { "$ref": "#/$defs/nonEmpty" },
+                  "subscription_id": { "type": ["string", "null"] },
+                  "snapshot_seq": { "type": ["integer", "null"], "minimum": 0 },
+                  "surface_render_count": { "type": "integer", "minimum": 0 },
+                  "focusable_ids": {
+                    "type": "array",
+                    "maxItems": 24,
+                    "items": { "$ref": "#/$defs/nonEmpty" }
+                  },
+                  "last_observation": { "type": "object" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/evidence" }]
+}

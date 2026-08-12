@@ -57,7 +57,10 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 
-use crate::acceptance::{Config as AcceptanceConfig, EvidenceWriter, FailureContext, ScenarioCase};
+use crate::acceptance::{
+    AcceptanceMode, CLAIM_SCHEMA, ClaimConfig, Config as AcceptanceConfig, EvidenceWriter,
+    FailureContext, SCHEMA, ScenarioCase, verify_claim_pins,
+};
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
@@ -85,10 +88,14 @@ pub struct AppArgs {
 
 impl AppArgs {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
+        // Parent claim-stack prose uses BOTSTER_LIVE_DATA_DIR; prefer the established
+        // BOTSTER_HUB_DATA_DIR injector when both are present.
+        let hub_data_dir = std::env::var_os("BOTSTER_HUB_DATA_DIR")
+            .or_else(|| std::env::var_os(crate::acceptance::LIVE_DATA_DIR_ENV));
         Self::parse_with_environment(
             args,
             std::env::var_os("BOTSTER_HUB_CONNECTION"),
-            std::env::var_os("BOTSTER_HUB_DATA_DIR"),
+            hub_data_dir,
             std::env::var_os("BOTSTER_TUI_HEADLESS_LIVE_RUNTIME").is_some(),
         )
     }
@@ -982,8 +989,12 @@ impl Drop for SessionSubscriptionPump {
 }
 
 pub fn run(args: AppArgs) -> io::Result<()> {
-    if let Some(config) = AcceptanceConfig::from_environment()? {
-        return run_workspaces_acceptance(args, config);
+    match AcceptanceMode::from_environment()? {
+        Some(AcceptanceMode::Spawn(config)) => return run_workspaces_acceptance(args, config),
+        Some(AcceptanceMode::Claim(config)) => {
+            return run_workspaces_claim_acceptance(args, config);
+        }
+        None => {}
     }
     if args.headless_live_runtime {
         return run_headless_live_runtime(args)
@@ -6203,9 +6214,13 @@ const ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(12);
 const WORKSPACES_PACKAGE: &str = "botster-workspaces";
 const WORKSPACES_SURFACE: &str = "workspaces";
 const WORKSPACES_SPAWN_OPENER_ACTION: &str = "botster_workspaces.open_spawn";
+const WORKSPACES_ADD_SESSION_ACTION: &str = "botster_workspaces.add_session";
+const WORKSPACES_ADD_SESSION_FIELD: &str = "session_id";
+const WORKSPACES_ADD_SESSION_NODE: &str = "botster-workspaces-add-session-id";
+const WORKSPACES_MEMBERSHIP_FAMILY: &str = "botster-workspaces.membership";
 
 fn run_workspaces_acceptance(args: AppArgs, config: AcceptanceConfig) -> io::Result<()> {
-    let mut evidence = EvidenceWriter::create(&config.evidence_path)?;
+    let mut evidence = EvidenceWriter::create(&config.evidence_path, SCHEMA)?;
     let mut diagnostics = AcceptanceDiagnostics {
         last_observation: json!({}),
         ..AcceptanceDiagnostics::default()
@@ -6695,6 +6710,7 @@ fn wait_for_acceptance_state(
     let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     while Instant::now() < deadline {
         app.drain_session_subscription();
+        let _ = app.drain_entity_options_subscriptions();
         diagnostics.observe_app(app);
         if ready(app, diagnostics) {
             return Ok(());
@@ -6702,6 +6718,595 @@ fn wait_for_acceptance_state(
         thread::sleep(Duration::from_millis(1));
     }
     invalid_acceptance(format!("timed out waiting for {expectation}"))
+}
+
+fn run_workspaces_claim_acceptance(args: AppArgs, config: ClaimConfig) -> io::Result<()> {
+    let mut evidence = EvidenceWriter::create(&config.evidence_path, CLAIM_SCHEMA)?;
+    let mut diagnostics = AcceptanceDiagnostics {
+        last_observation: json!({}),
+        ..AcceptanceDiagnostics::default()
+    };
+    diagnostics.stage(
+        "pin_ledger",
+        None,
+        "fail-closed Hub/Workspaces/TUI pin ancestry and Available sessions form",
+    );
+    let result = drive_workspaces_claim_acceptance(args, &config, &mut evidence, &mut diagnostics);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = evidence.failure(&diagnostics.failure_context(), &error.to_string());
+            Err(error)
+        }
+    }
+}
+
+fn drive_workspaces_claim_acceptance(
+    args: AppArgs,
+    config: &ClaimConfig,
+    evidence: &mut EvidenceWriter,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> io::Result<()> {
+    let scenario = &config.scenario;
+    let pin_ledger = verify_claim_pins(scenario)?;
+    evidence.event(
+        "pin_ledger",
+        None,
+        serde_json::to_value(&pin_ledger).map_err(io::Error::other)?,
+    )?;
+
+    if let Some(error) = args.connection_error.as_deref() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid Hub connection configuration: {error}"),
+        ));
+    }
+    let endpoint = args.daemon_endpoint().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "claim acceptance requires BOTSTER_HUB_CONNECTION",
+        )
+    })?;
+    let data_dir = args.hub_data_dir.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claim acceptance requires BOTSTER_HUB_DATA_DIR (or BOTSTER_LIVE_DATA_DIR alias)",
+        )
+    })?;
+    if !data_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "injected Hub data directory is not a directory",
+        ));
+    }
+
+    diagnostics.stage(
+        "connect",
+        None,
+        "caller-injected Hub connection and data directory",
+    );
+    let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true);
+    if app.client.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            app.connection_error
+                .clone()
+                .unwrap_or_else(|| "claim driver could not connect to the Hub".to_string()),
+        ));
+    }
+    app.acceptance_audit = Some(AcceptanceRequestAudit::default());
+
+    diagnostics.stage(
+        "baseline",
+        None,
+        "authoritative /session baseline containing exact session_uuid",
+    );
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "authoritative session baseline with exact session_uuid",
+        |app, _| {
+            app.session_entities.has_snapshot
+                && app
+                    .session_entities
+                    .entities
+                    .contains_key(&scenario.session_uuid)
+        },
+    )?;
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "admitted Workspaces navigation",
+        |app, _| {
+            app.package_navigation.iter().any(|entry| {
+                entry.package_name == WORKSPACES_PACKAGE
+                    && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE)
+                    && entry.enabled
+                    && !entry.blocked
+            })
+        },
+    )?;
+    evidence.event(
+        "ready",
+        None,
+        json!({
+            "workspace_id": scenario.workspace_id,
+            "session_uuid": scenario.session_uuid
+        }),
+    )?;
+    evidence.event(
+        "baseline",
+        None,
+        json!({
+            "subscription_id": app.session_entities.subscription_id,
+            "snapshot_seq": app.session_entities.snapshot_seq,
+            "has_snapshot": app.session_entities.has_snapshot,
+            "session_uuid": scenario.session_uuid
+        }),
+    )?;
+
+    let mut router = InputRouter::new(renderer::action_request_context());
+    diagnostics.stage(
+        "initial_surface_open",
+        None,
+        "realized Workspaces navigation and exact workspace detail",
+    );
+    if !acceptance_has_action(
+        &mut app,
+        &mut router,
+        "botster.tui.navigation.open",
+        |payload| payload_field(payload, "surface_id") == Some(WORKSPACES_SURFACE),
+        diagnostics,
+    )? {
+        activate_acceptance_action(
+            &mut app,
+            &mut router,
+            "botster.tui.system.toggle",
+            |_| true,
+            evidence,
+            None,
+            diagnostics,
+        )?;
+    }
+    open_workspaces_surface(
+        &mut app,
+        &mut router,
+        &scenario.workspace_id,
+        evidence,
+        diagnostics,
+    )?;
+
+    diagnostics.stage(
+        "add_dialog_open",
+        None,
+        "realized Add existing session control for exact workspace",
+    );
+    let dialog = format!("add:{}", scenario.workspace_id);
+    let workspace_id = scenario.workspace_id.clone();
+    activate_acceptance_action(
+        &mut app,
+        &mut router,
+        "botster_workspaces.open",
+        move |payload| {
+            payload_field(payload, "selected_workspace") == Some(workspace_id.as_str())
+                && payload_field(payload, "dialog") == Some(dialog.as_str())
+        },
+        evidence,
+        None,
+        diagnostics,
+    )?;
+
+    diagnostics.stage(
+        "option_present",
+        None,
+        "Available sessions entity_options includes exact session_uuid",
+    );
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "Available sessions option for exact session_uuid",
+        |app, diagnostics| {
+            acceptance_field_has_option(
+                app,
+                &mut router,
+                WORKSPACES_ADD_SESSION_FIELD,
+                Some(WORKSPACES_ADD_SESSION_NODE),
+                &scenario.session_uuid,
+                diagnostics,
+            )
+            .unwrap_or(false)
+        },
+    )?;
+    let option_count = acceptance_field_option_count(
+        &mut app,
+        &mut router,
+        WORKSPACES_ADD_SESSION_FIELD,
+        Some(WORKSPACES_ADD_SESSION_NODE),
+        diagnostics,
+    )?;
+    evidence.event(
+        "option_present",
+        None,
+        json!({
+            "field": WORKSPACES_ADD_SESSION_FIELD,
+            "node_id": WORKSPACES_ADD_SESSION_NODE,
+            "session_uuid": scenario.session_uuid,
+            "option_count": option_count
+        }),
+    )?;
+
+    diagnostics.stage(
+        "keyboard_select",
+        None,
+        "production keyboard select of exact session_uuid",
+    );
+    select_acceptance_value(
+        &mut app,
+        &mut router,
+        WORKSPACES_ADD_SESSION_FIELD,
+        &scenario.session_uuid,
+        evidence,
+        "claim",
+        diagnostics,
+    )?;
+
+    diagnostics.stage(
+        "claim_submit",
+        None,
+        "realized botster_workspaces.add_session with exact session_uuid",
+    );
+    let request = activate_acceptance_action(
+        &mut app,
+        &mut router,
+        WORKSPACES_ADD_SESSION_ACTION,
+        |_| true,
+        evidence,
+        None,
+        diagnostics,
+    )?;
+    let request_uuid = request
+        .values
+        .as_ref()
+        .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
+        .and_then(Value::as_str);
+    let draft_uuid = router
+        .draft_value(WORKSPACES_ADD_SESSION_FIELD)
+        .and_then(Value::as_str);
+    if request_uuid != Some(scenario.session_uuid.as_str())
+        && draft_uuid != Some(scenario.session_uuid.as_str())
+    {
+        return invalid_acceptance(format!(
+            "add_session request did not carry exact session_uuid {:?}; values={:?} draft={:?}",
+            scenario.session_uuid, request.values, draft_uuid
+        ));
+    }
+
+    // Action accepted is supporting only — membership entity is the join oracle.
+    // Owner replacement may close the dialog and drop the exclude-family demand;
+    // reopen Add once so `/botster-workspaces.membership` is demanded again and
+    // late frames can apply into the entity-options store.
+    ensure_membership_family_demanded(
+        &mut app,
+        &mut router,
+        &scenario.workspace_id,
+        evidence,
+        diagnostics,
+    )?;
+    diagnostics.stage(
+        "membership_join",
+        None,
+        "authoritative /botster-workspaces.membership row with exact workspace_id and session_uuid",
+    );
+    wait_for_acceptance_state(
+        &mut app,
+        diagnostics,
+        "membership entity row for exact workspace and session",
+        |app, _| membership_entity_contains(app, &scenario.workspace_id, &scenario.session_uuid),
+    )?;
+    let membership = membership_entity_row(&app, &scenario.workspace_id, &scenario.session_uuid)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "membership join wait completed without exact row",
+            )
+        })?;
+    evidence.event(
+        "membership_join",
+        None,
+        json!({
+            "family": WORKSPACES_MEMBERSHIP_FAMILY,
+            "session_uuid": scenario.session_uuid,
+            "workspace_id": scenario.workspace_id,
+            "membership_id": membership.0,
+            "snapshot_seq": membership.1
+        }),
+    )?;
+
+    diagnostics.stage(
+        "option_excluded",
+        None,
+        "Available sessions excludes claimed session without list_sessions or surface refresh sync",
+    );
+    let reopened = ensure_claim_option_exclusion(
+        &mut app,
+        &mut router,
+        &scenario.workspace_id,
+        &scenario.session_uuid,
+        evidence,
+        diagnostics,
+    )?;
+    let excluded_count = acceptance_field_option_count(
+        &mut app,
+        &mut router,
+        WORKSPACES_ADD_SESSION_FIELD,
+        Some(WORKSPACES_ADD_SESSION_NODE),
+        diagnostics,
+    )
+    .unwrap_or(0);
+    evidence.event(
+        "option_excluded",
+        None,
+        json!({
+            "field": WORKSPACES_ADD_SESSION_FIELD,
+            "node_id": WORKSPACES_ADD_SESSION_NODE,
+            "session_uuid": scenario.session_uuid,
+            "option_count": excluded_count,
+            "reopened": reopened
+        }),
+    )?;
+
+    let audit = app
+        .acceptance_audit
+        .as_ref()
+        .expect("acceptance audit enabled");
+    if audit.list_sessions != 0 {
+        return invalid_acceptance(format!(
+            "claim path must not issue session-list reads; count={}",
+            audit.list_sessions
+        ));
+    }
+    evidence.event(
+        "request_summary",
+        None,
+        json!({
+            "surface_render_count": audit.surface_renders.len(),
+            "surface_action_count": audit.surface_actions.len(),
+            "list_sessions_count": audit.list_sessions,
+            "surface_renders": audit.surface_renders
+        }),
+    )?;
+    evidence.event(
+        "complete",
+        None,
+        json!({
+            "workspace_id": scenario.workspace_id,
+            "session_uuid": scenario.session_uuid,
+            "action_id": WORKSPACES_ADD_SESSION_ACTION
+        }),
+    )
+}
+
+fn ensure_membership_family_demanded(
+    app: &mut TuiApp,
+    router: &mut InputRouter,
+    workspace_id: &str,
+    evidence: &mut EvidenceWriter,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> io::Result<()> {
+    if app
+        .entity_options
+        .family(WORKSPACES_MEMBERSHIP_FAMILY)
+        .is_some()
+        || app
+            .entity_options_subscriptions
+            .contains_key(WORKSPACES_MEMBERSHIP_FAMILY)
+    {
+        return Ok(());
+    }
+    let dialog = format!("add:{workspace_id}");
+    let workspace = workspace_id.to_string();
+    if !acceptance_has_action(
+        app,
+        router,
+        "botster_workspaces.open",
+        |payload| {
+            payload_field(payload, "selected_workspace") == Some(workspace.as_str())
+                && payload_field(payload, "dialog") == Some(dialog.as_str())
+        },
+        diagnostics,
+    )? {
+        return Ok(());
+    }
+    activate_acceptance_action(
+        app,
+        router,
+        "botster_workspaces.open",
+        |payload| {
+            payload_field(payload, "selected_workspace") == Some(workspace.as_str())
+                && payload_field(payload, "dialog") == Some(dialog.as_str())
+        },
+        evidence,
+        None,
+        diagnostics,
+    )?;
+    Ok(())
+}
+
+fn membership_entity_contains(app: &TuiApp, workspace_id: &str, session_uuid: &str) -> bool {
+    membership_entity_row(app, workspace_id, session_uuid).is_some()
+}
+
+fn membership_entity_row(
+    app: &TuiApp,
+    workspace_id: &str,
+    session_uuid: &str,
+) -> Option<(String, Option<u64>)> {
+    let family = app.entity_options.family(WORKSPACES_MEMBERSHIP_FAMILY)?;
+    if !family.has_snapshot && family.records.is_empty() {
+        return None;
+    }
+    for (id, fields) in &family.records {
+        let row_session = fields
+            .get("session_uuid")
+            .and_then(Value::as_str)
+            .or_else(|| fields.get("id").and_then(Value::as_str));
+        let row_workspace = fields.get("workspace_id").and_then(Value::as_str);
+        if row_session == Some(session_uuid) && row_workspace == Some(workspace_id) {
+            return Some((id.clone(), family.snapshot_seq));
+        }
+    }
+    None
+}
+
+fn acceptance_field_has_option(
+    app: &mut TuiApp,
+    router: &mut InputRouter,
+    field_name: &str,
+    node_id: Option<&str>,
+    expected: &str,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> io::Result<bool> {
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
+    let target = Value::String(expected.to_string());
+    Ok(hit_map.regions().iter().any(|region| {
+        let node_ok = node_id.is_none_or(|id| region.node_id == id);
+        node_ok
+            && region.field.as_ref().is_some_and(|field| {
+                field.name == field_name && field.options.iter().any(|value| value == &target)
+            })
+    }))
+}
+
+fn acceptance_field_option_count(
+    app: &mut TuiApp,
+    router: &mut InputRouter,
+    field_name: &str,
+    node_id: Option<&str>,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> io::Result<usize> {
+    let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
+    let field = hit_map.regions().iter().find_map(|region| {
+        let node_ok = node_id.is_none_or(|id| region.node_id == id);
+        if node_ok {
+            region
+                .field
+                .as_ref()
+                .filter(|field| field.name == field_name)
+                .cloned()
+        } else {
+            None
+        }
+    });
+    Ok(field.map(|field| field.options.len()).unwrap_or(0))
+}
+
+/// Prove claimed session is absent from Available sessions options.
+/// Returns whether the Add dialog was reopened after owner replacement closed it.
+fn ensure_claim_option_exclusion(
+    app: &mut TuiApp,
+    router: &mut InputRouter,
+    workspace_id: &str,
+    session_uuid: &str,
+    evidence: &mut EvidenceWriter,
+    diagnostics: &mut AcceptanceDiagnostics,
+) -> io::Result<bool> {
+    let target = Value::String(session_uuid.to_string());
+    let mut reopened = false;
+    let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
+    while Instant::now() < deadline {
+        app.drain_session_subscription();
+        let _ = app.drain_entity_options_subscriptions();
+        let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
+        let field = hit_map.regions().iter().find_map(|region| {
+            (region.node_id == WORKSPACES_ADD_SESSION_NODE)
+                .then_some(region.field.as_ref())
+                .flatten()
+                .filter(|field| field.name == WORKSPACES_ADD_SESSION_FIELD)
+                .cloned()
+        });
+        if let Some(field) = field {
+            if !field.options.iter().any(|value| value == &target) {
+                return Ok(reopened);
+            }
+        } else if membership_entity_contains(app, workspace_id, session_uuid)
+            && !session_option_projected(app, session_uuid)
+        {
+            // Owner replacement closed the dialog; reopen once and re-check options.
+            let dialog = format!("add:{workspace_id}");
+            let workspace = workspace_id.to_string();
+            if acceptance_has_action(
+                app,
+                router,
+                "botster_workspaces.open",
+                |payload| {
+                    payload_field(payload, "selected_workspace") == Some(workspace.as_str())
+                        && payload_field(payload, "dialog") == Some(dialog.as_str())
+                },
+                diagnostics,
+            )? {
+                activate_acceptance_action(
+                    app,
+                    router,
+                    "botster_workspaces.open",
+                    |payload| {
+                        payload_field(payload, "selected_workspace") == Some(workspace.as_str())
+                            && payload_field(payload, "dialog") == Some(dialog.as_str())
+                    },
+                    evidence,
+                    None,
+                    diagnostics,
+                )?;
+                reopened = true;
+                wait_for_acceptance_state(
+                    app,
+                    diagnostics,
+                    "reopened Available sessions without claimed session",
+                    |app, diagnostics| {
+                        let (_, hit_map) = match acceptance_frame(app, router, diagnostics) {
+                            Ok(frame) => frame,
+                            Err(_) => return false,
+                        };
+                        hit_map.regions().iter().any(|region| {
+                            region.node_id == WORKSPACES_ADD_SESSION_NODE
+                                && region.field.as_ref().is_some_and(|field| {
+                                    field.name == WORKSPACES_ADD_SESSION_FIELD
+                                        && !field.options.iter().any(|value| value == &target)
+                                })
+                        })
+                    },
+                )?;
+                return Ok(reopened);
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    invalid_acceptance(format!(
+        "timed out waiting for Available sessions to exclude {session_uuid}"
+    ))
+}
+
+fn session_option_projected(app: &TuiApp, session_uuid: &str) -> bool {
+    let store = app.entity_options_projection_store();
+    let session_records = store.get("session");
+    let membership_records = store.get(WORKSPACES_MEMBERSHIP_FAMILY);
+    let Some(sessions) = session_records else {
+        return false;
+    };
+    if !sessions.contains_key(session_uuid) {
+        return false;
+    }
+    if let Some(membership) = membership_records {
+        for fields in membership.values() {
+            let claimed = fields
+                .get("session_uuid")
+                .and_then(Value::as_str)
+                .or_else(|| fields.get("id").and_then(Value::as_str));
+            if claimed == Some(session_uuid) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn acceptance_frame(
@@ -16700,6 +17305,282 @@ mod tests {
             source.matches(concat!("List", "Sessions")).count(),
             2,
             "the legacy list request may appear only in the acceptance audit and its positive control"
+        );
+    }
+
+    /// Hermetic production-path proof for the Available sessions claim seam:
+    /// keyboard-select exact session_uuid, submit botster_workspaces.add_session,
+    /// membership entity join, then option exclusion without surface refresh.
+    #[test]
+    fn workspaces_claim_keyboard_select_submit_membership_and_exclusion() {
+        let session_uuid = "00000000-0000-4000-8000-000000000099";
+        let workspace_id = "workspace-claim-fixture";
+        let body = ui_node(json!({
+            "type": "form",
+            "id": "botster-workspaces-add-form-fixture",
+            "props": {
+                "action": {
+                    "id": "botster_workspaces.add_session",
+                    "payload": { "workspace_id": workspace_id }
+                },
+                "submit_label": "Add session"
+            },
+            "children": [{
+                "type": "select",
+                "id": "botster-workspaces-add-session-id",
+                "props": {
+                    "name": "session_id",
+                    "label": "Available sessions",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/session",
+                        "value_field": "session_uuid",
+                        "display_fields": ["session_uuid", "lifecycle_class"],
+                        "order": ["session_uuid"],
+                        "exclude": {
+                            "source": "/botster-workspaces.membership",
+                            "value_field": "session_uuid"
+                        }
+                    }
+                }
+            }]
+        }));
+
+        let mut app = TuiApp::new(None);
+        app.workspace_test_mode = true;
+        app.entity_options_local_pumps = true;
+        app.acceptance_audit = Some(AcceptanceRequestAudit::default());
+        app.connection_error = None;
+        app.observed_requests.clear();
+        app.apply_response(plugin_surface_response(canonical_surface(
+            WORKSPACES_PACKAGE,
+            WORKSPACES_SURFACE,
+            body.clone(),
+        )));
+        app.error = None;
+        app.connection_error = None;
+        app.drop_entity_options_subscriptions();
+
+        // Process-wide /session row used by Available sessions projection.
+        app.session_entities.has_snapshot = true;
+        app.session_entities.snapshot_seq = Some(1);
+        app.session_entities.subscription_id = Some("sess-claim-1".to_string());
+        app.session_entities.entity_order = vec![session_uuid.to_string()];
+        app.session_entities.entities.insert(
+            session_uuid.to_string(),
+            session_entity(session_uuid, Some("running")),
+        );
+
+        // Membership exclude family starts empty (unclaimed).
+        app.start_entity_options_subscription(WORKSPACES_MEMBERSHIP_FAMILY)
+            .expect("membership pump starts");
+        let membership_sub = app
+            .entity_options
+            .family(WORKSPACES_MEMBERSHIP_FAMILY)
+            .and_then(|family| family.subscription_id.clone())
+            .expect("membership generation");
+        let injector = app
+            .entity_options_frame_injectors
+            .get(WORKSPACES_MEMBERSHIP_FAMILY)
+            .expect("membership injector")
+            .clone();
+        injector
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Snapshot {
+                    subscription_id: membership_sub.clone(),
+                    entity_type: WORKSPACES_MEMBERSHIP_FAMILY.to_string(),
+                    snapshot_seq: 1,
+                    items: vec![],
+                    resync_reason: None,
+                },
+            ))
+            .expect("empty membership snapshot");
+        assert!(!app.drain_entity_options_subscriptions());
+
+        // Sanity: process-wide session projection must feed Available sessions.
+        let projection_store = app.entity_options_projection_store();
+        assert!(
+            projection_store
+                .get("session")
+                .is_some_and(|records| records.contains_key(session_uuid)),
+            "session process-wide store must include the seeded row: {:?}",
+            projection_store
+                .get("session")
+                .map(|r| r.keys().collect::<Vec<_>>())
+        );
+
+        let mut router = InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE));
+        let (lines, hit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
+        let rendered = lines.join("\n");
+        let focusable = hit_map
+            .focusable_regions()
+            .map(|region| region.node_id.clone())
+            .collect::<Vec<_>>();
+        let select_field = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == WORKSPACES_ADD_SESSION_NODE)
+            .and_then(|region| region.field.as_ref());
+        let select_field = select_field.unwrap_or_else(|| {
+            panic!(
+                "Available sessions field must materialize; focusable={focusable:?}; rendered={rendered}"
+            )
+        });
+        assert!(
+            select_field
+                .options
+                .iter()
+                .any(|value| value == &json!(session_uuid)),
+            "exact session must appear before claim: {rendered}"
+        );
+
+        // Production keyboard path: Tab focus, open select, choose exact uuid.
+        focus_hit_map_node_by_tab(&mut router, &hit_map, WORKSPACES_ADD_SESSION_NODE);
+        let (_, open_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
+        let _ = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &open_map,
+        );
+        // Only one option — commit it.
+        let (_, commit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
+        let _ = router.dispatch_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &commit_map,
+        );
+        assert_eq!(
+            router.draft_value(WORKSPACES_ADD_SESSION_FIELD),
+            Some(&json!(session_uuid)),
+            "keyboard must select exact session_uuid"
+        );
+        app.set_drafts(router.draft_values());
+
+        let mut submit = plugin_request(
+            "req-claim-add-session",
+            WORKSPACES_SURFACE,
+            WORKSPACES_ADD_SESSION_ACTION,
+            "botster-workspaces-add-form-fixture",
+        );
+        submit.values = Some(UiFormValues(
+            json!({ "session_id": session_uuid })
+                .as_object()
+                .expect("values object")
+                .clone(),
+        ));
+        submit.payload = Some(json!({ "workspace_id": workspace_id }));
+        app.handle_dispatch(InputDispatch::Action(submit.clone()));
+        assert!(
+            app.observed_requests
+                .contains(&ObservedRequest::PluginSurfaceAction {
+                    package_name: WORKSPACES_PACKAGE.to_string(),
+                    request: submit.clone(),
+                }),
+            "claim submit must travel PluginSurfaceAction with exact uuid: {:?}",
+            app.observed_requests
+        );
+        assert_eq!(
+            app.acceptance_audit
+                .as_ref()
+                .map(|audit| audit.list_sessions)
+                .unwrap_or(1),
+            0,
+            "claim path must not issue session-list reads"
+        );
+
+        // Offline transport clears the surface; restore form + membership generation
+        // so the join oracle can apply entity frames without a surface re-render RPC.
+        app.apply_response(plugin_surface_response(canonical_surface(
+            WORKSPACES_PACKAGE,
+            WORKSPACES_SURFACE,
+            body.clone(),
+        )));
+        app.error = None;
+        app.connection_error = None;
+        app.drop_entity_options_subscriptions();
+        app.session_entities.has_snapshot = true;
+        app.session_entities.snapshot_seq = Some(1);
+        app.session_entities.subscription_id = Some("sess-claim-1".to_string());
+        app.session_entities.entity_order = vec![session_uuid.to_string()];
+        app.session_entities.entities.insert(
+            session_uuid.to_string(),
+            session_entity(session_uuid, Some("running")),
+        );
+        app.start_entity_options_subscription(WORKSPACES_MEMBERSHIP_FAMILY)
+            .expect("membership pump restarts");
+        let membership_sub = app
+            .entity_options
+            .family(WORKSPACES_MEMBERSHIP_FAMILY)
+            .and_then(|family| family.subscription_id.clone())
+            .expect("membership generation after restore");
+        let injector = app
+            .entity_options_frame_injectors
+            .get(WORKSPACES_MEMBERSHIP_FAMILY)
+            .expect("membership injector after restore")
+            .clone();
+        injector
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Snapshot {
+                    subscription_id: membership_sub.clone(),
+                    entity_type: WORKSPACES_MEMBERSHIP_FAMILY.to_string(),
+                    snapshot_seq: 1,
+                    items: vec![],
+                    resync_reason: None,
+                },
+            ))
+            .expect("restored empty membership snapshot");
+        assert!(!app.drain_entity_options_subscriptions());
+
+        // Membership join via entity frame (not action result alone).
+        injector
+            .send(SessionSubscriptionMessage::Frame(
+                DaemonEntityFrame::Upsert {
+                    subscription_id: membership_sub.clone(),
+                    entity_type: WORKSPACES_MEMBERSHIP_FAMILY.to_string(),
+                    snapshot_seq: 2,
+                    id: session_uuid.to_string(),
+                    entity: json!({
+                        "id": session_uuid,
+                        "session_uuid": session_uuid,
+                        "workspace_id": workspace_id
+                    }),
+                },
+            ))
+            .expect("membership upsert");
+        assert!(!app.drain_entity_options_subscriptions());
+        assert!(
+            membership_entity_contains(&app, workspace_id, session_uuid),
+            "membership entity row must record exact W+S"
+        );
+
+        // Option exclusion without surface refresh.
+        let surface_renders_before = app
+            .observed_requests
+            .iter()
+            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
+            .count();
+        app.reconcile_entity_option_drafts();
+        let (after_lines, after_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
+        let after = after_lines.join("\n");
+        let after_field = after_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == WORKSPACES_ADD_SESSION_NODE)
+            .and_then(|region| region.field.as_ref())
+            .expect("select remains for exclusion observation");
+        assert!(
+            !after_field
+                .options
+                .iter()
+                .any(|value| value == &json!(session_uuid)),
+            "claimed session must leave Available sessions options: {after}"
+        );
+        let surface_renders_after = app
+            .observed_requests
+            .iter()
+            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
+            .count();
+        assert_eq!(
+            surface_renders_before, surface_renders_after,
+            "exclusion must not issue PluginSurfaceRender sync"
         );
     }
 
