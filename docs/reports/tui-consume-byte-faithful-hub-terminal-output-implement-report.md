@@ -3,6 +3,7 @@
 - **Ticket:** `ticket_1786562566_712634`
 - **Run:** `run_1786568426_623487`
 - **Step:** `botster_stack_implement`
+- **PR:** https://github.com/trybotster/botster-tui/pull/53
 - **Target repository:** `botster-tui` (`trybotster/botster-tui`)
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
 - **Base:** `f2bc11fc8c0b14b57ebcf9b6ace4f1d80565720f`
