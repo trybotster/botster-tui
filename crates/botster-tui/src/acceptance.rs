@@ -306,7 +306,22 @@ impl ClaimScenario {
     }
 }
 
-/// Resolved pin ledger written into claim evidence.
+/// Strict typed claim build receipt. All fields required; unknown fields rejected.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimBuildReceipt {
+    pub hub_source: String,
+    pub hub_rev: String,
+    pub core_rev: String,
+    pub hub_bin: String,
+    pub session_worker_bin: String,
+    pub target_dir: String,
+    pub hub_build_command: String,
+    pub session_worker_build_command: String,
+}
+
+/// Resolved pin ledger. Path fields are **root labels** for committed evidence
+/// (`$HUB_SOURCE`, `$HUB_BUILD_TARGET`, …) — never machine-local absolute paths.
 #[derive(Clone, Debug, Serialize)]
 pub struct PinLedger {
     pub hub_minimum: &'static str,
@@ -317,8 +332,7 @@ pub struct PinLedger {
     pub tui_rev: String,
     /// Locked botster-core SHA from the Hub checkout Cargo.lock (session-worker provenance).
     pub core_rev: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_worker_rev: Option<String>,
+    pub session_worker_rev: String,
     pub hub_bin_path: String,
     pub session_worker_bin_path: String,
     pub hub_source_path: String,
@@ -331,15 +345,20 @@ pub struct PinLedger {
     pub hub_bin_under_source: bool,
     pub session_worker_bin_under_source: bool,
     pub sources_clean: bool,
-    /// Fresh build target dir that owns the executed binaries (required for claim).
+    /// Fresh build target dir label that owns the executed binaries.
     pub hub_build_target_dir: String,
     pub hub_bin_under_build_target: bool,
     pub session_worker_bin_under_build_target: bool,
     pub hub_build_command: String,
     pub session_worker_build_command: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_receipt_path: Option<String>,
+    pub build_receipt_path: String,
 }
+
+/// Path-neutral root labels for committed claim evidence (no machine-local paths).
+pub const LABEL_HUB_SOURCE: &str = "$HUB_SOURCE";
+pub const LABEL_TUI_SOURCE: &str = "$TUI_SOURCE";
+pub const LABEL_WORKSPACES_PACKAGE: &str = "$WORKSPACES_PACKAGE";
+pub const LABEL_HUB_BUILD_TARGET: &str = "$HUB_BUILD_TARGET";
 
 /// Fail-closed pin + Available sessions form presence + binary provenance checks.
 pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
@@ -466,23 +485,15 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
     let hub_bin_under_source = path_is_under(&hub_bin_path, &hub_path);
     let session_worker_bin_under_source = path_is_under(&session_worker_bin_path, &hub_path);
 
-    let (
-        hub_build_command,
-        session_worker_build_command,
-        receipt_hub_rev,
-        receipt_core_rev,
-        build_receipt_path,
-    ) = load_build_receipt_or_defaults(&hub_path, &build_target, &hub_rev, &core_rev)?;
-    if receipt_hub_rev != hub_rev {
-        return invalid(format!(
-            "build receipt hub_rev {receipt_hub_rev} does not match Hub HEAD {hub_rev}"
-        ));
-    }
-    if receipt_core_rev != core_rev {
-        return invalid(format!(
-            "build receipt core_rev {receipt_core_rev} does not match Hub Cargo.lock {core_rev}"
-        ));
-    }
+    // Strict typed receipt is mandatory — never synthesize build proof.
+    let receipt = load_strict_build_receipt(
+        &hub_path,
+        &build_target,
+        &hub_rev,
+        &core_rev,
+        &hub_bin_path,
+        &session_worker_bin_path,
+    )?;
 
     // Optional explicit session_worker_rev must match locked Core when supplied.
     if let Some(explicit) = scenario.session_worker_rev.as_deref()
@@ -520,6 +531,7 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         );
     }
 
+    // Evidence uses path-neutral labels only (no machine-local absolute paths).
     Ok(PinLedger {
         hub_minimum: MIN_HUB_REV,
         workspaces_minimum: MIN_WORKSPACES_REV,
@@ -528,12 +540,12 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         workspaces_rev,
         tui_rev,
         core_rev: core_rev.clone(),
-        session_worker_rev: Some(core_rev),
-        hub_bin_path: hub_bin_path.display().to_string(),
-        session_worker_bin_path: session_worker_bin_path.display().to_string(),
-        hub_source_path: hub_path.display().to_string(),
-        workspaces_package_path: workspaces_path.display().to_string(),
-        tui_source_path: tui_root.display().to_string(),
+        session_worker_rev: core_rev,
+        hub_bin_path: format!("{LABEL_HUB_BUILD_TARGET}/release/botster-hub"),
+        session_worker_bin_path: format!("{LABEL_HUB_BUILD_TARGET}/release/botster-session-worker"),
+        hub_source_path: LABEL_HUB_SOURCE.to_string(),
+        workspaces_package_path: LABEL_WORKSPACES_PACKAGE.to_string(),
+        tui_source_path: LABEL_TUI_SOURCE.to_string(),
         hub_ancestry_ok,
         workspaces_ancestry_ok,
         tui_ancestry_ok,
@@ -541,43 +553,63 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         hub_bin_under_source,
         session_worker_bin_under_source,
         sources_clean: true,
-        hub_build_target_dir: build_target.display().to_string(),
+        hub_build_target_dir: LABEL_HUB_BUILD_TARGET.to_string(),
         hub_bin_under_build_target,
         session_worker_bin_under_build_target,
-        hub_build_command,
-        session_worker_build_command,
-        build_receipt_path,
+        hub_build_command: sanitize_build_command(
+            &receipt.hub_build_command,
+            &hub_path,
+            &build_target,
+        ),
+        session_worker_build_command: sanitize_build_command(
+            &receipt.session_worker_build_command,
+            &hub_path,
+            &build_target,
+        ),
+        build_receipt_path: format!("{LABEL_HUB_BUILD_TARGET}/claim-build-receipt.json"),
     })
 }
 
-/// Load the harness build receipt when present; otherwise synthesize command
-/// strings for the default locked Hub build from this checkout + target dir.
-fn load_build_receipt_or_defaults(
+/// Require and validate a complete typed build receipt against observed pins.
+fn load_strict_build_receipt(
     hub_path: &Path,
     build_target: &Path,
     hub_rev: &str,
     core_rev: &str,
-) -> io::Result<(String, String, String, String, Option<String>)> {
-    let default_hub_cmd = format!(
-        "cargo build --locked --release -p botster-hub --manifest-path {}/Cargo.toml --target-dir {}",
-        hub_path.display(),
-        build_target.display()
-    );
-    let default_worker_cmd = format!(
-        "cargo build --locked --release -p botster-core-daemon --bin botster-session-worker --manifest-path {}/Cargo.toml --target-dir {}",
-        hub_path.display(),
-        build_target.display()
-    );
-    let Some(receipt_path) = std::env::var_os(CLAIM_BUILD_RECEIPT_ENV).map(PathBuf::from) else {
-        return Ok((
-            default_hub_cmd,
-            default_worker_cmd,
-            hub_rev.to_string(),
-            core_rev.to_string(),
-            None,
-        ));
-    };
-    let bytes = fs::read(&receipt_path).map_err(|error| {
+    hub_bin_path: &Path,
+    session_worker_bin_path: &Path,
+) -> io::Result<ClaimBuildReceipt> {
+    let receipt_path = std::env::var_os(CLAIM_BUILD_RECEIPT_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "claim pin ledger requires {CLAIM_BUILD_RECEIPT_ENV} (strict build receipt; refuse to fabricate build proof)"
+                ),
+            )
+        })?;
+    load_strict_build_receipt_from(
+        &receipt_path,
+        hub_path,
+        build_target,
+        hub_rev,
+        core_rev,
+        hub_bin_path,
+        session_worker_bin_path,
+    )
+}
+
+fn load_strict_build_receipt_from(
+    receipt_path: &Path,
+    hub_path: &Path,
+    build_target: &Path,
+    hub_rev: &str,
+    core_rev: &str,
+    hub_bin_path: &Path,
+    session_worker_bin_path: &Path,
+) -> io::Result<ClaimBuildReceipt> {
+    let bytes = fs::read(receipt_path).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -586,64 +618,106 @@ fn load_build_receipt_or_defaults(
             ),
         )
     })?;
-    let receipt: Value = serde_json::from_slice(&bytes).map_err(|error| {
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return invalid("claim build receipt is empty");
+    }
+    let receipt: ClaimBuildReceipt = serde_json::from_slice(&bytes).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("decode claim build receipt: {error}"),
+            format!("decode claim build receipt (strict typed, no unknown fields): {error}"),
         )
     })?;
-    let hub_cmd = receipt
-        .get("hub_build_command")
-        .and_then(Value::as_str)
-        .unwrap_or(&default_hub_cmd)
-        .to_string();
-    let worker_cmd = receipt
-        .get("session_worker_build_command")
-        .and_then(Value::as_str)
-        .unwrap_or(&default_worker_cmd)
-        .to_string();
-    let receipt_hub_rev = receipt
-        .get("hub_rev")
-        .and_then(Value::as_str)
-        .unwrap_or(hub_rev)
-        .to_string();
-    let receipt_core_rev = receipt
-        .get("core_rev")
-        .and_then(Value::as_str)
-        .unwrap_or(core_rev)
-        .to_string();
-    // Bind receipt binary paths when present.
-    if let Some(receipt_hub_bin) = receipt.get("hub_bin").and_then(Value::as_str) {
-        let expected =
-            fs::canonicalize(receipt_hub_bin).unwrap_or_else(|_| PathBuf::from(receipt_hub_bin));
-        let actual = require_executable_env(HUB_BIN_ENV).and_then(fs::canonicalize)?;
-        if expected != actual {
-            return invalid(format!(
-                "build receipt hub_bin {} does not match {HUB_BIN_ENV} {}",
-                expected.display(),
-                actual.display()
-            ));
+
+    let receipt_hub_source = fs::canonicalize(&receipt.hub_source)
+        .unwrap_or_else(|_| PathBuf::from(&receipt.hub_source));
+    let receipt_target = fs::canonicalize(&receipt.target_dir)
+        .unwrap_or_else(|_| PathBuf::from(&receipt.target_dir));
+    let receipt_hub_bin =
+        fs::canonicalize(&receipt.hub_bin).unwrap_or_else(|_| PathBuf::from(&receipt.hub_bin));
+    let receipt_worker = fs::canonicalize(&receipt.session_worker_bin)
+        .unwrap_or_else(|_| PathBuf::from(&receipt.session_worker_bin));
+
+    if receipt_hub_source != hub_path {
+        return invalid(format!(
+            "build receipt hub_source {} does not match Hub checkout {}",
+            receipt_hub_source.display(),
+            hub_path.display()
+        ));
+    }
+    if receipt_target != build_target {
+        return invalid(format!(
+            "build receipt target_dir {} does not match {HUB_BUILD_TARGET_DIR_ENV} {}",
+            receipt_target.display(),
+            build_target.display()
+        ));
+    }
+    if receipt.hub_rev != hub_rev {
+        return invalid(format!(
+            "build receipt hub_rev {} does not match Hub HEAD {hub_rev}",
+            receipt.hub_rev
+        ));
+    }
+    if receipt.core_rev != core_rev {
+        return invalid(format!(
+            "build receipt core_rev {} does not match Hub Cargo.lock {core_rev}",
+            receipt.core_rev
+        ));
+    }
+    if receipt_hub_bin != hub_bin_path {
+        return invalid(format!(
+            "build receipt hub_bin {} does not match {HUB_BIN_ENV} {}",
+            receipt_hub_bin.display(),
+            hub_bin_path.display()
+        ));
+    }
+    if receipt_worker != session_worker_bin_path {
+        return invalid(format!(
+            "build receipt session_worker_bin {} does not match {SESSION_WORKER_BIN_ENV} {}",
+            receipt_worker.display(),
+            session_worker_bin_path.display()
+        ));
+    }
+    if receipt.hub_build_command.trim().is_empty()
+        || !receipt.hub_build_command.contains("botster-hub")
+        || !receipt.hub_build_command.contains("--locked")
+    {
+        return invalid(
+            "build receipt hub_build_command must be a non-empty locked botster-hub build",
+        );
+    }
+    if receipt.session_worker_build_command.trim().is_empty()
+        || !receipt
+            .session_worker_build_command
+            .contains("botster-session-worker")
+        || !receipt.session_worker_build_command.contains("--locked")
+    {
+        return invalid(
+            "build receipt session_worker_build_command must be a non-empty locked session-worker build",
+        );
+    }
+    Ok(receipt)
+}
+
+fn sanitize_build_command(command: &str, hub_path: &Path, build_target: &Path) -> String {
+    let mut out = command.to_string();
+    for root in [hub_path, build_target] {
+        let display = root.display().to_string();
+        out = out.replace(&display, path_label_for(root, hub_path, build_target));
+        if let Some(stripped) = display.strip_prefix("/private") {
+            out = out.replace(stripped, path_label_for(root, hub_path, build_target));
         }
     }
-    if let Some(receipt_worker) = receipt.get("session_worker_bin").and_then(Value::as_str) {
-        let expected =
-            fs::canonicalize(receipt_worker).unwrap_or_else(|_| PathBuf::from(receipt_worker));
-        let actual = require_executable_env(SESSION_WORKER_BIN_ENV).and_then(fs::canonicalize)?;
-        if expected != actual {
-            return invalid(format!(
-                "build receipt session_worker_bin {} does not match {SESSION_WORKER_BIN_ENV} {}",
-                expected.display(),
-                actual.display()
-            ));
-        }
+    out
+}
+
+fn path_label_for(path: &Path, hub_path: &Path, build_target: &Path) -> &'static str {
+    if path == hub_path {
+        LABEL_HUB_SOURCE
+    } else {
+        // build_target and any other root map to the build-target label.
+        let _ = build_target;
+        LABEL_HUB_BUILD_TARGET
     }
-    Ok((
-        hub_cmd,
-        worker_cmd,
-        receipt_hub_rev,
-        receipt_core_rev,
-        Some(receipt_path.display().to_string()),
-    ))
 }
 
 fn require_executable_env(name: &str) -> io::Result<PathBuf> {
@@ -1249,6 +1323,153 @@ mod tests {
         assert_eq!(record["payload"]["subscription_id"], "subscription-a");
         assert_eq!(record["payload"]["surface_render_count"], 2);
         validate_contract_document(&record).expect("failure evidence matches published schema");
+    }
+
+    #[test]
+    fn strict_build_receipt_rejects_missing_empty_and_mismatched() {
+        // No receipt env.
+        let err = load_strict_build_receipt(
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            "abc",
+            "def",
+            Path::new("/tmp/a"),
+            Path::new("/tmp/b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(CLAIM_BUILD_RECEIPT_ENV),
+            "missing receipt must fail: {err}"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "botster-tui-receipt-{}",
+            crate::app::short_suffix()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let empty = root.join("empty.json");
+        fs::write(&empty, b"   \n").unwrap();
+        let err = load_strict_build_receipt_from(
+            &empty,
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            "abc",
+            "def",
+            Path::new("/tmp/a"),
+            Path::new("/tmp/b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "empty receipt must fail: {err}"
+        );
+
+        let incomplete = root.join("incomplete.json");
+        fs::write(&incomplete, br#"{}"#).unwrap();
+        let err = load_strict_build_receipt_from(
+            &incomplete,
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            "abc",
+            "def",
+            Path::new("/tmp/a"),
+            Path::new("/tmp/b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("decode") || err.to_string().contains("missing"),
+            "incomplete receipt must fail: {err}"
+        );
+
+        // Unknown field rejected by deny_unknown_fields.
+        let unknown = root.join("unknown.json");
+        fs::write(
+            &unknown,
+            br#"{
+              "hub_source":"/tmp",
+              "hub_rev":"abc",
+              "core_rev":"def",
+              "hub_bin":"/tmp/a",
+              "session_worker_bin":"/tmp/b",
+              "target_dir":"/tmp",
+              "hub_build_command":"cargo build --locked -p botster-hub",
+              "session_worker_build_command":"cargo build --locked --bin botster-session-worker",
+              "extra":true
+            }"#,
+        )
+        .unwrap();
+        let err = load_strict_build_receipt_from(
+            &unknown,
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            "abc",
+            "def",
+            Path::new("/tmp/a"),
+            Path::new("/tmp/b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown") || err.to_string().contains("decode"),
+            "unknown fields must fail: {err}"
+        );
+
+        // Mismatched target dir.
+        let mismatch = root.join("mismatch.json");
+        fs::write(
+            &mismatch,
+            br#"{
+              "hub_source":"/tmp",
+              "hub_rev":"abc",
+              "core_rev":"def",
+              "hub_bin":"/tmp/a",
+              "session_worker_bin":"/tmp/b",
+              "target_dir":"/tmp/other-target",
+              "hub_build_command":"cargo build --locked --release -p botster-hub",
+              "session_worker_build_command":"cargo build --locked --release --bin botster-session-worker"
+            }"#,
+        )
+        .unwrap();
+        let err = load_strict_build_receipt_from(
+            &mismatch,
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            "abc",
+            "def",
+            Path::new("/tmp/a"),
+            Path::new("/tmp/b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("target_dir") || err.to_string().contains("does not match"),
+            "mismatched target must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn committed_claim_live_evidence_has_no_machine_local_paths() {
+        let evidence =
+            include_str!("../../../docs/reports/tui-shared-hub-keyboard-claim-live-evidence.jsonl");
+        // Known-positive control: the scan must detect local paths when present.
+        let poison = format!("/Users/someone/{evidence}");
+        assert!(
+            poison.contains("/Users/"),
+            "positive control must detect /Users/ paths"
+        );
+        for forbidden in [
+            "/Users/",
+            "/var/folders/",
+            "/private/var/",
+            "/home/",
+            "jasonconigliari",
+        ] {
+            assert!(
+                !evidence.contains(forbidden),
+                "committed claim live evidence must not contain machine-local path fragment {forbidden:?}"
+            );
+        }
+        // Labels and SHAs must remain.
+        assert!(evidence.contains(LABEL_HUB_SOURCE) || evidence.contains("hub_rev"));
+        assert!(evidence.contains("de6b099") || evidence.contains("hub_rev"));
     }
 
     #[test]

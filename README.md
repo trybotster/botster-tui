@@ -337,8 +337,30 @@ cargo build --locked --release -p botster-core-daemon --bin botster-session-work
   --target-dir "$BOTSTER_HUB_BUILD_TARGET_DIR"
 export BOTSTER_HUB_BIN="$BOTSTER_HUB_BUILD_TARGET_DIR/release/botster-hub"
 export BOTSTER_SESSION_WORKER_BIN="$BOTSTER_HUB_BUILD_TARGET_DIR/release/botster-session-worker"
+# Strict build receipt is required (claim mode refuses to fabricate build proof):
+export BOTSTER_TUI_CLAIM_BUILD_RECEIPT="$BOTSTER_HUB_BUILD_TARGET_DIR/claim-build-receipt.json"
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+hub = Path(os.environ["BOTSTER_HUB_SOURCE_PATH"]).resolve()
+tgt = Path(os.environ["BOTSTER_HUB_BUILD_TARGET_DIR"]).resolve()
+hub_bin = Path(os.environ["BOTSTER_HUB_BIN"]).resolve()
+worker = Path(os.environ["BOTSTER_SESSION_WORKER_BIN"]).resolve()
+Path(os.environ["BOTSTER_TUI_CLAIM_BUILD_RECEIPT"]).write_text(json.dumps({
+  "hub_source": str(hub),
+  "hub_rev": __import__("subprocess").check_output(["git","-C",str(hub),"rev-parse","HEAD"], text=True).strip(),
+  "core_rev": "<from Hub Cargo.lock botster-core pin>",
+  "hub_bin": str(hub_bin),
+  "session_worker_bin": str(worker),
+  "target_dir": str(tgt),
+  "hub_build_command": f"cargo build --locked --release -p botster-hub --manifest-path {hub}/Cargo.toml --target-dir {tgt}",
+  "session_worker_build_command": f"cargo build --locked --release -p botster-core-daemon --bin botster-session-worker --manifest-path {hub}/Cargo.toml --target-dir {tgt}",
+}, indent=2) + "\n")
+print(os.environ["BOTSTER_TUI_CLAIM_BUILD_RECEIPT"])
+PY
+# Set core_rev in the receipt to the Hub Cargo.lock botster-core pin (required).
 # The running shared Hub must be this BOTSTER_HUB_BIN (or an identical build of
-# the same source SHA). The claim driver records realpaths + locked Core SHA.
+# the same source SHA). Committed evidence uses path-neutral $LABEL roots only.
 ```
 
 4. Write a claim scenario (no node ids / force payloads):
