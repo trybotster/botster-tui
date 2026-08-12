@@ -2,7 +2,7 @@
 
 - **Ticket:** `ticket_1786562566_712634`
 - **Run:** `run_1786568426_623487`
-- **Step:** `botster_stack_implement` (revisit after `review_1786574835_623607` / `finding_1786574835_381659`)
+- **Step:** `botster_stack_implement` (revisit after Verify `review_1786576144_691162` / `finding_1786576144_434023`)
 - **PR:** https://github.com/trybotster/botster-tui/pull/53
 - **Target repository:** `botster-tui` (`trybotster/botster-tui`)
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
@@ -101,6 +101,17 @@ Edited only `botster-tui` policy, handshake, live-byte apply, tests, and docs. D
 `cargo tree -i botster-ui-contract --locked` resolved one git source at `7499c161`. Lock still has a second `botster-core` via hub-test-support `branch=main` at `5a993837`; production Ghostty/core remain on `4d0d1d88`.
 
 ## Open finding addressed
+
+### High: README advertised the removed protocol-6 pin set (`finding_1786576144_434023`)
+
+Session-types and Workspaces README instructions still claimed handshake floor 33, protocol 6, Hub `891cc796`, and kit `9d4a566`. Those lanes share the one production client contract.
+
+**Fix in** `README.md`:
+
+- Handshake floor **36**; Hub `7499c1615078069ba391489b20c6f39c55c2d4c6`; kit `c07f793fb9ac46c24dcf1688881cd08be18ebc27`
+- Session-types live binaries and fail-closed floor updated
+- Workspaces lanes documented against protocol 7 / current Hub pin
+- Repo grep of `README.md` has no remaining current instruction for protocol 6, floor 33, Hub `891cc796`, or kit `9d4a566`
 
 ### High: live gate did not prove invalid bytes (`finding_1786574835_381659`)
 

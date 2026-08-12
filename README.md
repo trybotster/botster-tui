@@ -208,18 +208,18 @@ Session types are authoritative Hub descriptors consumed through the
   the Hub effective `session_type_id` with `request.target_id = T`. Freeform
   `DaemonRequest::Spawn { command }` is not a product affordance (headless /
   Workspaces harness seeding may still use raw Spawn).
-- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 33` and does
+- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 36` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `891cc796faeab51ee4bee1a0e8494562b233036e`, kit
-  `9d4a566f309e9d848771b5448764a87f4721468e`. Cargo.lock must keep a single
+- Pins: Hub crates `7499c1615078069ba391489b20c6f39c55c2d4c6`, kit
+  `c07f793fb9ac46c24dcf1688881cd08be18ebc27`. Cargo.lock must keep a single
   `botster-ui-contract` at that Hub rev and dual `botster-core` sources
-  (direct `16bf08f2…` plus `branch=main` at `9d41ad4…` via hub-test-support).
+  (direct `4d0d1d88…` plus `branch=main` at `5a993837…` via hub-test-support).
 
 Live proof (independent of contract-matrix):
 
 ```sh
-# Prefer Hub + session-worker binaries built from 891cc79 (exact pin preferred).
+# Prefer Hub + session-worker binaries built from 7499c161 (exact pin preferred).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -227,7 +227,7 @@ export BOTSTER_SESSION_WORKER_BIN=/path/to/pin-matched/botster-session-worker
 script/test-live-hub session-types
 ```
 
-The profile fail-closes when the live handshake reports conformance &lt; 33 or
+The profile fail-closes when the live handshake reports conformance &lt; 36 or
 missing `session_type_entity_subscriptions`. It proves product launch through
 list-for-target for a real admitted spawn point `T` (not `device:local`).
 
@@ -236,8 +236,8 @@ list-for-target for a real admitted spawn point `T` (not `device:local`).
 `script/test-live-hub workspaces installed-driver`, `plumbing`, and `lifecycle`
 are the repository-owned runtime proof that the installed Workspaces package,
 including the spawn-form `session_type_id` field and lifecycle bindings, works
-against a protocol-6 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `891cc796faeab51ee4bee1a0e8494562b233036e`) and an
+against a protocol-7 Hub. They require pin-matched Hub binaries (the revision
+this crate pins, currently `7499c1615078069ba391489b20c6f39c55c2d4c6`) and an
 explicit clean post-migration `botster-workspaces` package path via
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
 also pins the acceptance driver field key so a silent `template_id` revert
