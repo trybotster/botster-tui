@@ -19797,13 +19797,14 @@ mod tests {
             }
         }
 
-        let root = PathBuf::from(format!("/tmp/btclaim{}", short_suffix() % 1_000_000));
+        // Keep the Hub data path short: unix socket paths must fit SUN_LEN.
+        let root = PathBuf::from(format!("/tmp/btc{}", short_suffix() % 100_000));
         std::fs::create_dir_all(&root).expect("create claim-driver fixture root");
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
             .hub_bin(&hub_bin)
             .session_worker_bin(&session_worker_bin)
-            .root(root.join("hub"))
-            .name("botster-tui-installed-workspaces-claim-driver")
+            .root(root.join("h"))
+            .name("btc")
             .start()
             .expect("isolated Hub starts for claim driver");
         let mut client =
