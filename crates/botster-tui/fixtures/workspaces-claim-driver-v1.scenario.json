@@ -1,0 +1,8 @@
+{
+  "schema": "botster.tui.workspaces-claim-driver/v1",
+  "workspace_id": "workspace-claim-example",
+  "session_uuid": "00000000-0000-4000-8000-000000000001",
+  "hub_rev": "de6b09982e72fd5efd04a5258f5fc645f611adbc",
+  "workspaces_rev": "7ab4d1334214b3ea3c8b02e9ea665a27e70c0916",
+  "tui_rev": "abc804e19bc3e01465cd308c11de5f4292331c3d"
+}

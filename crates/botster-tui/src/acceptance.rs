@@ -3,14 +3,49 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Spawn-driver schema (existing parent entrypoint).
 pub const SCHEMA: &str = "botster.tui.workspaces-spawn-driver/v1";
+/// Shared-Hub keyboard claim schema (Available sessions entity_options path).
+pub const CLAIM_SCHEMA: &str = "botster.tui.workspaces-claim-driver/v1";
 pub const SCENARIO_ENV: &str = "BOTSTER_TUI_ACCEPTANCE_SCENARIO";
 pub const EVIDENCE_ENV: &str = "BOTSTER_TUI_ACCEPTANCE_EVIDENCE";
+
+/// Fail-closed pin floors from the approved claim plan (full SHAs).
+pub const MIN_HUB_REV: &str = "de6b09982e72fd5efd04a5258f5fc645f611adbc";
+pub const MIN_WORKSPACES_REV: &str = "7ab4d1334214b3ea3c8b02e9ea665a27e70c0916";
+pub const MIN_TUI_REV: &str = "abc804e19bc3e01465cd308c11de5f4292331c3d";
+
+pub const WORKSPACES_PACKAGE_PATH_ENV: &str = "BOTSTER_WORKSPACES_PACKAGE_PATH";
+pub const HUB_SOURCE_PATH_ENV: &str = "BOTSTER_HUB_SOURCE_PATH";
+/// Parent ticket prose alias; maps to `BOTSTER_HUB_DATA_DIR` when that is unset.
+pub const LIVE_DATA_DIR_ENV: &str = "BOTSTER_LIVE_DATA_DIR";
+
+#[derive(Debug)]
+pub enum AcceptanceMode {
+    Spawn(SpawnConfig),
+    Claim(ClaimConfig),
+}
+
+#[derive(Debug)]
+pub struct SpawnConfig {
+    pub scenario: Scenario,
+    pub evidence_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct ClaimConfig {
+    pub scenario: ClaimScenario,
+    pub evidence_path: PathBuf,
+}
+
+/// Backward-compatible name used by the spawn acceptance driver.
+pub type Config = SpawnConfig;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -46,13 +81,31 @@ pub struct ExpectedFacts {
     pub worktree_path: String,
 }
 
-#[derive(Debug)]
-pub struct Config {
-    pub scenario: Scenario,
-    pub evidence_path: PathBuf,
+/// Caller-owned shared-Hub claim scenario.
+///
+/// Parent seeds workspace `workspace_id` and unclaimed running `session_uuid`
+/// before launch. Paths/revs feed the fail-closed pin ledger.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimScenario {
+    pub schema: String,
+    pub workspace_id: String,
+    pub session_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces_package_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces_rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_worker_rev: Option<String>,
 }
 
-impl Config {
+impl AcceptanceMode {
     pub fn from_environment() -> io::Result<Option<Self>> {
         Self::from_paths(
             std::env::var_os(SCENARIO_ENV).map(PathBuf::from),
@@ -85,17 +138,74 @@ impl Config {
                 ),
             )
         })?;
-        let scenario: Scenario = serde_json::from_slice(&bytes).map_err(|error| {
+        let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("decode acceptance scenario: {error}"),
+                format!("decode acceptance scenario JSON: {error}"),
             )
         })?;
-        scenario.validate()?;
-        Ok(Some(Self {
-            scenario,
-            evidence_path,
-        }))
+        let schema = document
+            .get("schema")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "acceptance scenario missing schema",
+                )
+            })?;
+        match schema {
+            SCHEMA => {
+                let scenario: Scenario = serde_json::from_value(document).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("decode spawn acceptance scenario: {error}"),
+                    )
+                })?;
+                scenario.validate()?;
+                Ok(Some(Self::Spawn(SpawnConfig {
+                    scenario,
+                    evidence_path,
+                })))
+            }
+            CLAIM_SCHEMA => {
+                let mut scenario: ClaimScenario =
+                    serde_json::from_value(document).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("decode claim acceptance scenario: {error}"),
+                        )
+                    })?;
+                scenario.apply_env_path_defaults();
+                scenario.validate()?;
+                Ok(Some(Self::Claim(ClaimConfig {
+                    scenario,
+                    evidence_path,
+                })))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported acceptance schema {other:?}; expected {SCHEMA:?} or {CLAIM_SCHEMA:?}"
+                ),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+impl SpawnConfig {
+    fn from_paths(
+        scenario_path: Option<PathBuf>,
+        evidence_path: Option<PathBuf>,
+    ) -> io::Result<Option<Self>> {
+        match AcceptanceMode::from_paths(scenario_path, evidence_path)? {
+            None => Ok(None),
+            Some(AcceptanceMode::Spawn(config)) => Ok(Some(config)),
+            Some(AcceptanceMode::Claim(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected spawn schema",
+            )),
+        }
     }
 }
 
@@ -145,6 +255,214 @@ impl Scenario {
     }
 }
 
+impl ClaimScenario {
+    fn apply_env_path_defaults(&mut self) {
+        if self.workspaces_package_path.is_none()
+            && let Ok(path) = std::env::var(WORKSPACES_PACKAGE_PATH_ENV)
+            && !path.trim().is_empty()
+        {
+            self.workspaces_package_path = Some(path);
+        }
+        if self.hub_source_path.is_none()
+            && let Ok(path) = std::env::var(HUB_SOURCE_PATH_ENV)
+            && !path.trim().is_empty()
+        {
+            self.hub_source_path = Some(path);
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.schema != CLAIM_SCHEMA {
+            return invalid(format!("unsupported claim schema {:?}", self.schema));
+        }
+        require_identifier("workspace_id", &self.workspace_id)?;
+        require_identifier("session_uuid", &self.session_uuid)?;
+        for (name, value) in [
+            ("hub_source_path", &self.hub_source_path),
+            ("workspaces_package_path", &self.workspaces_package_path),
+            ("hub_rev", &self.hub_rev),
+            ("workspaces_rev", &self.workspaces_rev),
+            ("tui_rev", &self.tui_rev),
+            ("session_worker_rev", &self.session_worker_rev),
+        ] {
+            if let Some(value) = value {
+                require_identifier(name, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolved pin ledger written into claim evidence.
+#[derive(Clone, Debug, Serialize)]
+pub struct PinLedger {
+    pub hub_minimum: &'static str,
+    pub workspaces_minimum: &'static str,
+    pub tui_minimum: &'static str,
+    pub hub_rev: String,
+    pub workspaces_rev: String,
+    pub tui_rev: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_worker_rev: Option<String>,
+    pub hub_ancestry_ok: bool,
+    pub workspaces_ancestry_ok: bool,
+    pub tui_ancestry_ok: bool,
+    pub workspaces_available_sessions_form_ok: bool,
+}
+
+/// Fail-closed pin + Available sessions form presence checks for the claim seam.
+pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
+    let workspaces_path = scenario
+        .workspaces_package_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "claim pin ledger requires workspaces_package_path or {WORKSPACES_PACKAGE_PATH_ENV}"
+                ),
+            )
+        })?;
+    if !workspaces_path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Workspaces package path is not a directory: {}",
+                workspaces_path.display()
+            ),
+        ));
+    }
+
+    let workspaces_rev = resolve_rev(
+        scenario.workspaces_rev.as_deref(),
+        Some(workspaces_path.as_path()),
+        "Workspaces",
+    )?;
+    let hub_path = scenario.hub_source_path.as_deref().map(PathBuf::from);
+    let hub_rev = resolve_rev(scenario.hub_rev.as_deref(), hub_path.as_deref(), "Hub")?;
+    let tui_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tui_rev = resolve_rev(scenario.tui_rev.as_deref(), Some(tui_root.as_path()), "TUI")?;
+
+    let hub_ancestry_ok = is_ancestor_or_equal(MIN_HUB_REV, &hub_rev, hub_path.as_deref())?;
+    let workspaces_ancestry_ok =
+        is_ancestor_or_equal(MIN_WORKSPACES_REV, &workspaces_rev, Some(&workspaces_path))?;
+    let tui_ancestry_ok = is_ancestor_or_equal(MIN_TUI_REV, &tui_rev, Some(&tui_root))?;
+    let form_ok = workspaces_package_has_available_sessions_form(&workspaces_path)?;
+
+    if !hub_ancestry_ok {
+        return invalid(format!(
+            "Hub rev {hub_rev} is not a descendant of minimum {MIN_HUB_REV}"
+        ));
+    }
+    if !workspaces_ancestry_ok {
+        return invalid(format!(
+            "Workspaces rev {workspaces_rev} is not a descendant of minimum {MIN_WORKSPACES_REV}"
+        ));
+    }
+    if !tui_ancestry_ok {
+        return invalid(format!(
+            "TUI rev {tui_rev} is not a descendant of minimum {MIN_TUI_REV}"
+        ));
+    }
+    if !form_ok {
+        return invalid(
+            "Workspaces package lacks Available sessions entity_options form (botster-workspaces-add-session-id + entity_options)",
+        );
+    }
+
+    Ok(PinLedger {
+        hub_minimum: MIN_HUB_REV,
+        workspaces_minimum: MIN_WORKSPACES_REV,
+        tui_minimum: MIN_TUI_REV,
+        hub_rev,
+        workspaces_rev,
+        tui_rev,
+        session_worker_rev: scenario.session_worker_rev.clone(),
+        hub_ancestry_ok,
+        workspaces_ancestry_ok,
+        tui_ancestry_ok,
+        workspaces_available_sessions_form_ok: form_ok,
+    })
+}
+
+fn resolve_rev(explicit: Option<&str>, git_root: Option<&Path>, label: &str) -> io::Result<String> {
+    if let Some(rev) = explicit {
+        return Ok(rev.to_string());
+    }
+    let Some(root) = git_root else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} pin requires an explicit rev or a source path"),
+        ));
+    };
+    git_rev_parse(root)
+}
+
+fn git_rev_parse(root: &Path) -> io::Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("git rev-parse failed in {}: {error}", root.display()),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "git rev-parse failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if rev.is_empty() {
+        return invalid(format!("empty git rev-parse in {}", root.display()));
+    }
+    Ok(rev)
+}
+
+fn is_ancestor_or_equal(minimum: &str, actual: &str, git_root: Option<&Path>) -> io::Result<bool> {
+    if minimum == actual {
+        return Ok(true);
+    }
+    let Some(root) = git_root else {
+        // Without a checkout we can only accept exact equality (handled above).
+        return Ok(false);
+    };
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", minimum, actual])
+        .current_dir(root)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("git merge-base failed in {}: {error}", root.display()),
+            )
+        })?;
+    Ok(status.success())
+}
+
+/// Scan installed/on-disk Workspaces package for Available sessions entity_options.
+pub fn workspaces_package_has_available_sessions_form(package_root: &Path) -> io::Result<bool> {
+    let plugin = package_root.join("plugin.lua");
+    let source = fs::read_to_string(&plugin).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read Workspaces plugin.lua {}: {error}", plugin.display()),
+        )
+    })?;
+    let has_field = source.contains("botster-workspaces-add-session-id");
+    let has_kind = source.contains("entity_options");
+    let has_label = source.contains("Available sessions");
+    Ok(has_field && has_kind && has_label)
+}
+
 fn require_identifier(name: &str, value: &str) -> io::Result<()> {
     if value.trim().is_empty() || value != value.trim() {
         return invalid(format!("{name} must be a non-empty trimmed string"));
@@ -152,7 +470,7 @@ fn require_identifier(name: &str, value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn invalid(message: impl Into<String>) -> io::Result<()> {
+fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidData, message.into()))
 }
 
@@ -181,6 +499,7 @@ fn canonical_candidate(path: &Path) -> io::Result<PathBuf> {
 
 pub struct EvidenceWriter {
     writer: BufWriter<File>,
+    schema: &'static str,
     terminal_written: bool,
 }
 
@@ -197,10 +516,11 @@ pub struct FailureContext {
 }
 
 impl EvidenceWriter {
-    pub fn create(path: &Path) -> io::Result<Self> {
+    pub fn create(path: &Path, schema: &'static str) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
+            schema,
             terminal_written: false,
         })
     }
@@ -211,7 +531,7 @@ impl EvidenceWriter {
         }
         let terminal = matches!(kind, "complete" | "failure");
         let record = EvidenceRecord {
-            schema: SCHEMA,
+            schema: self.schema,
             kind,
             case_id,
             payload,
@@ -260,6 +580,18 @@ pub fn validate_contract_document(document: &Value) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
+pub fn validate_claim_contract_document(document: &Value) -> Result<(), String> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../fixtures/workspaces-claim-driver-v1.schema.json"
+    ))
+    .map_err(|error| error.to_string())?;
+    let validator = jsonschema::validator_for(&schema).map_err(|error| error.to_string())?;
+    validator
+        .validate(document)
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Serialize)]
 struct EvidenceRecord<'a> {
     schema: &'static str,
@@ -280,6 +612,13 @@ mod tests {
         .expect("checked-in scenario decodes")
     }
 
+    fn claim_scenario() -> ClaimScenario {
+        serde_json::from_str(include_str!(
+            "../fixtures/workspaces-claim-driver-v1.scenario.json"
+        ))
+        .expect("checked-in claim scenario decodes")
+    }
+
     #[test]
     fn checked_in_scenario_is_strict_and_complete() {
         let scenario = scenario();
@@ -288,6 +627,19 @@ mod tests {
         validate_contract_document(&value).expect("checked-in scenario matches published schema");
         value["unknown"] = json!(true);
         assert!(serde_json::from_value::<Scenario>(value).is_err());
+    }
+
+    #[test]
+    fn checked_in_claim_scenario_is_strict() {
+        let scenario = claim_scenario();
+        scenario.validate().expect("claim scenario validates");
+        let mut value = serde_json::to_value(scenario).unwrap();
+        validate_claim_contract_document(&value).expect("claim scenario matches schema");
+        value["unknown"] = json!(true);
+        assert!(serde_json::from_value::<ClaimScenario>(value).is_err());
+        let mut wrong = claim_scenario();
+        wrong.schema = SCHEMA.to_string();
+        assert!(wrong.validate().is_err());
     }
 
     #[test]
@@ -321,17 +673,47 @@ mod tests {
         )
         .unwrap();
 
-        assert!(Config::from_paths(Some(scenario_path.clone()), None).is_err());
-        assert!(Config::from_paths(None, Some(evidence_path.clone())).is_err());
+        assert!(SpawnConfig::from_paths(Some(scenario_path.clone()), None).is_err());
+        assert!(SpawnConfig::from_paths(None, Some(evidence_path.clone())).is_err());
         assert!(
-            Config::from_paths(Some(scenario_path.clone()), Some(scenario_path.clone())).is_err()
+            SpawnConfig::from_paths(Some(scenario_path.clone()), Some(scenario_path.clone()))
+                .is_err()
         );
 
-        let config = Config::from_paths(Some(scenario_path), Some(evidence_path.clone()))
+        let config = SpawnConfig::from_paths(Some(scenario_path), Some(evidence_path.clone()))
             .unwrap()
             .expect("paired paths enable acceptance mode");
         fs::write(&evidence_path, b"already exists\n").unwrap();
-        assert!(EvidenceWriter::create(&config.evidence_path).is_err());
+        assert!(EvidenceWriter::create(&config.evidence_path, SCHEMA).is_err());
+    }
+
+    #[test]
+    fn mode_routes_claim_schema_without_colliding_with_spawn() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-tui-claim-mode-{}",
+            crate::app::short_suffix()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let scenario_path = root.join("claim-scenario.json");
+        let evidence_path = root.join("claim-evidence.jsonl");
+        fs::write(
+            &scenario_path,
+            include_bytes!("../fixtures/workspaces-claim-driver-v1.scenario.json"),
+        )
+        .unwrap();
+        match AcceptanceMode::from_paths(Some(scenario_path), Some(evidence_path))
+            .unwrap()
+            .expect("claim mode")
+        {
+            AcceptanceMode::Claim(config) => {
+                assert_eq!(config.scenario.schema, CLAIM_SCHEMA);
+                assert_eq!(
+                    config.scenario.session_uuid,
+                    "00000000-0000-4000-8000-000000000001"
+                );
+            }
+            AcceptanceMode::Spawn(_) => panic!("claim schema must not decode as spawn"),
+        }
     }
 
     #[test]
@@ -342,11 +724,11 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("evidence.jsonl");
-        let mut writer = EvidenceWriter::create(&path).unwrap();
+        let mut writer = EvidenceWriter::create(&path, SCHEMA).unwrap();
         writer.event("ready", None, json!({})).unwrap();
         writer.event("complete", None, json!({})).unwrap();
         assert!(writer.event("complete", None, json!({})).is_err());
-        assert!(EvidenceWriter::create(&path).is_err());
+        assert!(EvidenceWriter::create(&path, SCHEMA).is_err());
         let lines = fs::read_to_string(path).unwrap();
         assert_eq!(lines.lines().count(), 2);
     }
@@ -403,6 +785,63 @@ mod tests {
     }
 
     #[test]
+    fn claim_evidence_fixture_carries_membership_join_and_exclusion_stages() {
+        let records = include_str!("../fixtures/workspaces-claim-driver-v1.evidence.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("claim fixture line is JSON"))
+            .collect::<Vec<_>>();
+        for record in &records {
+            validate_claim_contract_document(record)
+                .expect("claim evidence record matches published schema");
+        }
+        assert!(
+            records
+                .iter()
+                .all(|record| record["schema"] == CLAIM_SCHEMA)
+        );
+        let kinds = records
+            .iter()
+            .filter_map(|record| record["kind"].as_str())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "pin_ledger",
+            "ready",
+            "baseline",
+            "option_present",
+            "dispatched_action",
+            "membership_join",
+            "option_excluded",
+            "complete",
+        ] {
+            assert!(kinds.contains(required), "missing evidence kind {required}");
+        }
+        let join = records
+            .iter()
+            .find(|record| record["kind"] == "membership_join")
+            .expect("membership_join");
+        assert_eq!(
+            join["payload"]["session_uuid"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(join["payload"]["workspace_id"], "workspace-claim-example");
+        let excluded = records
+            .iter()
+            .find(|record| record["kind"] == "option_excluded")
+            .expect("option_excluded");
+        assert_eq!(
+            excluded["payload"]["session_uuid"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record["kind"].as_str(), Some("complete" | "failure")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn failure_evidence_is_bounded_and_terminal() {
         let root = std::env::temp_dir().join(format!(
             "botster-tui-acceptance-failure-{}",
@@ -410,7 +849,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("evidence.jsonl");
-        let mut writer = EvidenceWriter::create(&path).unwrap();
+        let mut writer = EvidenceWriter::create(&path, SCHEMA).unwrap();
         let context = FailureContext {
             case_id: Some("case-a".to_string()),
             phase: "entity_reconciliation".to_string(),
@@ -433,5 +872,34 @@ mod tests {
         assert_eq!(record["payload"]["subscription_id"], "subscription-a");
         assert_eq!(record["payload"]["surface_render_count"], 2);
         validate_contract_document(&record).expect("failure evidence matches published schema");
+    }
+
+    #[test]
+    fn form_presence_scan_requires_entity_options_field() {
+        let root = std::env::temp_dir().join(format!(
+            "botster-tui-claim-form-scan-{}",
+            crate::app::short_suffix()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let plugin = root.join("plugin.lua");
+        fs::write(
+            &plugin,
+            r#"
+            entity_options_select(
+              "botster-workspaces-add-session-id",
+              "session_id",
+              "Available sessions",
+              { ["$kind"] = "entity_options", source = "/session" }
+            )
+            "#,
+        )
+        .unwrap();
+        assert!(workspaces_package_has_available_sessions_form(&root).unwrap());
+        fs::write(
+            &plugin,
+            r#"text_input("botster-workspaces-add-session-id", "session_id", "Session ID")"#,
+        )
+        .unwrap();
+        assert!(!workspaces_package_has_available_sessions_form(&root).unwrap());
     }
 }
