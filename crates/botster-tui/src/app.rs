@@ -19783,12 +19783,25 @@ mod tests {
         };
         let pin_ledger =
             crate::acceptance::verify_claim_pins(&pin_probe).expect("claim pin ledger fail-closed");
+        // Evidence copy path is owned by the wrapper (outside the tracked tree during the run).
+        let evidence_out =
+            std::env::var_os(crate::acceptance::CLAIM_EVIDENCE_OUT_ENV).map(PathBuf::from);
+        if let Some(path) = evidence_out.as_ref() {
+            assert!(
+                path.is_absolute(),
+                "{} must be an absolute path",
+                crate::acceptance::CLAIM_EVIDENCE_OUT_ENV
+            );
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create claim evidence out parent");
+            }
+        }
 
         let root = PathBuf::from(format!("/tmp/btclaim{}", short_suffix() % 1_000_000));
         std::fs::create_dir_all(&root).expect("create claim-driver fixture root");
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
             .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
+            .session_worker_bin(&session_worker_bin)
             .root(root.join("hub"))
             .name("botster-tui-installed-workspaces-claim-driver")
             .start()
@@ -19876,6 +19889,13 @@ mod tests {
                 &workspaces_path,
             )
             .env(crate::acceptance::HUB_SOURCE_PATH_ENV, &hub_source_path)
+            // Propagate the same binaries the pin ledger binds so the installed
+            // child records exact realpaths under the Hub source checkout.
+            .env(crate::acceptance::HUB_BIN_ENV, &hub_bin)
+            .env(
+                crate::acceptance::SESSION_WORKER_BIN_ENV,
+                &session_worker_bin,
+            )
             .output()
             .expect("launch claim driver through apps open");
         assert!(
@@ -19885,19 +19905,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let evidence = std::fs::read_to_string(&evidence_path).expect("read claim evidence");
-        // Persist a copy for the implement report under the worktree.
-        let report_evidence = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/reports/tui-shared-hub-keyboard-claim-live-evidence.jsonl");
-        if let Some(parent) = report_evidence.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            &report_evidence,
-            format!(
-                "{evidence}\n// pin_probe={}\n",
-                serde_json::to_string(&pin_ledger).unwrap_or_default()
-            ),
-        );
         let records = evidence
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("evidence line is JSON"))
@@ -19911,6 +19918,20 @@ mod tests {
                 .iter()
                 .all(|record| { record["schema"] == crate::acceptance::CLAIM_SCHEMA })
         );
+        // Optional wrapper-owned copy: fail closed when requested and write fails.
+        if let Some(out_path) = evidence_out.as_ref() {
+            std::fs::write(out_path, &evidence).unwrap_or_else(|error| {
+                panic!(
+                    "failed to write claim evidence to {}: {error}",
+                    out_path.display()
+                )
+            });
+            let copied = std::fs::read_to_string(out_path).expect("re-read claim evidence out");
+            assert_eq!(
+                copied, evidence,
+                "claim evidence out path must match driver evidence bytes"
+            );
+        }
         for kind in [
             "pin_ledger",
             "ready",
@@ -19965,8 +19986,27 @@ mod tests {
             pin["payload"]["workspaces_available_sessions_form_ok"],
             true
         );
+        assert_eq!(pin["payload"]["sources_clean"], true);
+        assert_eq!(pin["payload"]["hub_bin_under_source"], true);
+        assert_eq!(pin["payload"]["session_worker_bin_under_source"], true);
+        assert_eq!(pin["payload"]["hub_rev"], pin_ledger.hub_rev);
+        assert_eq!(pin["payload"]["tui_rev"], pin_ledger.tui_rev);
+        assert_eq!(pin["payload"]["core_rev"], pin_ledger.core_rev);
+        assert!(
+            pin["payload"]["hub_bin_path"]
+                .as_str()
+                .is_some_and(|path| path == pin_ledger.hub_bin_path),
+            "pin ledger must record exact hub binary realpath"
+        );
+        assert!(
+            pin["payload"]["session_worker_bin_path"]
+                .as_str()
+                .is_some_and(|path| path == pin_ledger.session_worker_bin_path),
+            "pin ledger must record exact session-worker binary realpath"
+        );
         println!(
-            "installed-workspaces-claim-driver: complete workspace={workspace_id} session={session_uuid}"
+            "installed-workspaces-claim-driver: complete workspace={workspace_id} session={session_uuid} tui_rev={} hub_rev={}",
+            pin_ledger.tui_rev, pin_ledger.hub_rev
         );
         hub.shutdown().expect("claim-driver Hub shuts down");
     }

@@ -126,6 +126,7 @@ if BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
   BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="${contract_matrix_fixture:-}" \
   BOTSTER_WORKSPACES_PACKAGE_PATH="${workspaces_package:-}" \
   BOTSTER_HUB_SOURCE_PATH="${BOTSTER_HUB_SOURCE_PATH:-}" \
+  BOTSTER_TUI_CLAIM_EVIDENCE_OUT="${BOTSTER_TUI_CLAIM_EVIDENCE_OUT:-}" \
   BOTSTER_TUI_WORKSPACES_PROFILE="$profile" \
   CARGO_TARGET_DIR="$target_dir" \
   cargo test -p botster-tui "$test_filter" -- --exact --nocapture >"$test_output" 2>&1
@@ -162,6 +163,10 @@ if [ "$mode" = "workspaces" ]; then
     claim-driver)
       if ! grep -F "installed-workspaces-claim-driver: complete" "$test_output" >/dev/null; then
         echo "Workspaces claim-driver acceptance did not complete" >&2
+        exit 1
+      fi
+      if [ -n "${BOTSTER_TUI_CLAIM_EVIDENCE_OUT:-}" ] && [ ! -s "${BOTSTER_TUI_CLAIM_EVIDENCE_OUT}" ]; then
+        echo "claim-driver evidence out path is missing or empty: ${BOTSTER_TUI_CLAIM_EVIDENCE_OUT}" >&2
         exit 1
       fi
       exit 0

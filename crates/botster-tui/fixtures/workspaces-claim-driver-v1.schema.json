@@ -79,10 +79,20 @@
         "hub_rev",
         "workspaces_rev",
         "tui_rev",
+        "core_rev",
+        "session_worker_rev",
+        "hub_bin_path",
+        "session_worker_bin_path",
+        "hub_source_path",
+        "workspaces_package_path",
+        "tui_source_path",
         "hub_ancestry_ok",
         "workspaces_ancestry_ok",
         "tui_ancestry_ok",
-        "workspaces_available_sessions_form_ok"
+        "workspaces_available_sessions_form_ok",
+        "hub_bin_under_source",
+        "session_worker_bin_under_source",
+        "sources_clean"
       ],
       "properties": {
         "hub_minimum": { "$ref": "#/$defs/nonEmpty" },
@@ -91,11 +101,20 @@
         "hub_rev": { "$ref": "#/$defs/nonEmpty" },
         "workspaces_rev": { "$ref": "#/$defs/nonEmpty" },
         "tui_rev": { "$ref": "#/$defs/nonEmpty" },
+        "core_rev": { "$ref": "#/$defs/nonEmpty" },
         "session_worker_rev": { "$ref": "#/$defs/nonEmpty" },
+        "hub_bin_path": { "$ref": "#/$defs/nonEmpty" },
+        "session_worker_bin_path": { "$ref": "#/$defs/nonEmpty" },
+        "hub_source_path": { "$ref": "#/$defs/nonEmpty" },
+        "workspaces_package_path": { "$ref": "#/$defs/nonEmpty" },
+        "tui_source_path": { "$ref": "#/$defs/nonEmpty" },
         "hub_ancestry_ok": { "const": true },
         "workspaces_ancestry_ok": { "const": true },
         "tui_ancestry_ok": { "const": true },
-        "workspaces_available_sessions_form_ok": { "const": true }
+        "workspaces_available_sessions_form_ok": { "const": true },
+        "hub_bin_under_source": { "const": true },
+        "session_worker_bin_under_source": { "const": true },
+        "sources_clean": { "const": true }
       }
     },
     "membershipJoinPayload": {
