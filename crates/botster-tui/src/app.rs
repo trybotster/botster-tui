@@ -20003,44 +20003,72 @@ mod tests {
         assert_eq!(pin["payload"]["hub_rev"], pin_ledger.hub_rev);
         assert_eq!(pin["payload"]["tui_rev"], pin_ledger.tui_rev);
         assert_eq!(pin["payload"]["core_rev"], pin_ledger.core_rev);
-        assert!(
-            pin["payload"]["hub_bin_path"]
-                .as_str()
-                .is_some_and(|path| path == pin_ledger.hub_bin_path),
-            "pin ledger must record exact hub binary realpath"
+        // Committed evidence uses path-neutral labels only (no machine-local paths).
+        assert_eq!(
+            pin["payload"]["hub_source_path"],
+            crate::acceptance::LABEL_HUB_SOURCE
         );
-        assert!(
-            pin["payload"]["session_worker_bin_path"]
-                .as_str()
-                .is_some_and(|path| path == pin_ledger.session_worker_bin_path),
-            "pin ledger must record exact session-worker binary realpath"
+        assert_eq!(
+            pin["payload"]["tui_source_path"],
+            crate::acceptance::LABEL_TUI_SOURCE
+        );
+        assert_eq!(
+            pin["payload"]["workspaces_package_path"],
+            crate::acceptance::LABEL_WORKSPACES_PACKAGE
+        );
+        assert_eq!(
+            pin["payload"]["hub_build_target_dir"],
+            crate::acceptance::LABEL_HUB_BUILD_TARGET
+        );
+        assert_eq!(
+            pin["payload"]["hub_bin_path"],
+            format!(
+                "{}/release/botster-hub",
+                crate::acceptance::LABEL_HUB_BUILD_TARGET
+            )
+        );
+        assert_eq!(
+            pin["payload"]["session_worker_bin_path"],
+            format!(
+                "{}/release/botster-session-worker",
+                crate::acceptance::LABEL_HUB_BUILD_TARGET
+            )
         );
         assert!(
             pin["payload"]["hub_build_command"]
                 .as_str()
-                .is_some_and(|cmd| cmd.contains("botster-hub") && cmd.contains("--locked")),
-            "pin ledger must record locked Hub build command"
+                .is_some_and(|cmd| {
+                    cmd.contains("botster-hub")
+                        && cmd.contains("--locked")
+                        && cmd.contains(crate::acceptance::LABEL_HUB_SOURCE)
+                        && !cmd.contains("/Users/")
+                }),
+            "pin ledger must record path-neutral locked Hub build command"
         );
         assert!(
             pin["payload"]["session_worker_build_command"]
                 .as_str()
                 .is_some_and(|cmd| {
-                    cmd.contains("botster-session-worker") && cmd.contains("--locked")
+                    cmd.contains("botster-session-worker")
+                        && cmd.contains("--locked")
+                        && !cmd.contains("/Users/")
                 }),
-            "pin ledger must record locked session-worker build command"
+            "pin ledger must record path-neutral locked session-worker build command"
         );
-        // Stale shared target/release under the Hub source must not satisfy the
-        // fresh build-target binding (negative for unbound cached binaries).
-        if let Ok(build_target) = std::env::var(crate::acceptance::HUB_BUILD_TARGET_DIR_ENV) {
-            let build_target = PathBuf::from(build_target);
-            assert!(
-                pin_ledger
-                    .hub_bin_path
-                    .starts_with(&build_target.canonicalize().unwrap().display().to_string())
-                    || PathBuf::from(&pin_ledger.hub_bin_path).starts_with(&build_target),
-                "executed hub binary must live under the fresh build target, not a stale cache"
-            );
-        }
+        // Executed binary still bound to the fresh build target env (not a stale cache).
+        let executed_hub = PathBuf::from(&hub_bin)
+            .canonicalize()
+            .expect("canonicalize executed hub bin");
+        let build_target = PathBuf::from(
+            std::env::var(crate::acceptance::HUB_BUILD_TARGET_DIR_ENV)
+                .expect("fresh build target required"),
+        )
+        .canonicalize()
+        .expect("canonicalize build target");
+        assert!(
+            executed_hub.starts_with(&build_target),
+            "executed hub binary must live under the fresh build target, not a stale cache"
+        );
         println!(
             "installed-workspaces-claim-driver: complete workspace={workspace_id} session={session_uuid} tui_rev={} hub_rev={}",
             pin_ledger.tui_rev, pin_ledger.hub_rev
