@@ -23,6 +23,13 @@ pub const MIN_TUI_REV: &str = "abc804e19bc3e01465cd308c11de5f4292331c3d";
 
 pub const WORKSPACES_PACKAGE_PATH_ENV: &str = "BOTSTER_WORKSPACES_PACKAGE_PATH";
 pub const HUB_SOURCE_PATH_ENV: &str = "BOTSTER_HUB_SOURCE_PATH";
+pub const HUB_BIN_ENV: &str = "BOTSTER_HUB_BIN";
+pub const SESSION_WORKER_BIN_ENV: &str = "BOTSTER_SESSION_WORKER_BIN";
+/// Optional path for the live test harness to copy validated claim evidence
+/// outside the tracked tree. The production claim driver never writes here.
+/// Named for `script/test-live-hub workspaces claim-driver`.
+#[cfg(test)]
+pub const CLAIM_EVIDENCE_OUT_ENV: &str = "BOTSTER_TUI_CLAIM_EVIDENCE_OUT";
 /// Parent ticket prose alias; maps to `BOTSTER_HUB_DATA_DIR` when that is unset.
 pub const LIVE_DATA_DIR_ENV: &str = "BOTSTER_LIVE_DATA_DIR";
 
@@ -302,20 +309,31 @@ pub struct PinLedger {
     pub hub_rev: String,
     pub workspaces_rev: String,
     pub tui_rev: String,
+    /// Locked botster-core SHA from the Hub checkout Cargo.lock (session-worker provenance).
+    pub core_rev: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_worker_rev: Option<String>,
+    pub hub_bin_path: String,
+    pub session_worker_bin_path: String,
+    pub hub_source_path: String,
+    pub workspaces_package_path: String,
+    pub tui_source_path: String,
     pub hub_ancestry_ok: bool,
     pub workspaces_ancestry_ok: bool,
     pub tui_ancestry_ok: bool,
     pub workspaces_available_sessions_form_ok: bool,
+    pub hub_bin_under_source: bool,
+    pub session_worker_bin_under_source: bool,
+    pub sources_clean: bool,
 }
 
-/// Fail-closed pin + Available sessions form presence checks for the claim seam.
+/// Fail-closed pin + Available sessions form presence + binary provenance checks.
 pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
     let workspaces_path = scenario
         .workspaces_package_path
         .as_deref()
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os(WORKSPACES_PACKAGE_PATH_ENV).map(PathBuf::from))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -334,15 +352,11 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         ));
     }
 
-    let workspaces_rev = resolve_rev(
-        scenario.workspaces_rev.as_deref(),
-        Some(workspaces_path.as_path()),
-        "Workspaces",
-    )?;
     let hub_path = scenario
         .hub_source_path
         .as_deref()
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os(HUB_SOURCE_PATH_ENV).map(PathBuf::from))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -357,9 +371,69 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
             format!("Hub source path is not a directory: {}", hub_path.display()),
         ));
     }
-    let hub_rev = resolve_rev(scenario.hub_rev.as_deref(), Some(hub_path.as_path()), "Hub")?;
+
     let tui_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tui_root = fs::canonicalize(&tui_root).unwrap_or(tui_root);
+    let hub_path = fs::canonicalize(&hub_path).unwrap_or(hub_path);
+    let workspaces_path = fs::canonicalize(&workspaces_path).unwrap_or(workspaces_path);
+
+    // Fail closed on dirty sources so HEAD is the executed code.
+    require_git_clean(&hub_path, "Hub")?;
+    require_git_clean(&workspaces_path, "Workspaces")?;
+    require_git_clean(&tui_root, "TUI")?;
+
+    let workspaces_rev = resolve_rev(
+        scenario.workspaces_rev.as_deref(),
+        Some(workspaces_path.as_path()),
+        "Workspaces",
+    )?;
+    let hub_rev = resolve_rev(scenario.hub_rev.as_deref(), Some(hub_path.as_path()), "Hub")?;
     let tui_rev = resolve_rev(scenario.tui_rev.as_deref(), Some(tui_root.as_path()), "TUI")?;
+    let core_rev = locked_core_rev_from_hub(&hub_path)?;
+
+    let hub_bin = require_executable_env(HUB_BIN_ENV)?;
+    let session_worker_bin = require_executable_env(SESSION_WORKER_BIN_ENV)?;
+    let hub_bin_path = fs::canonicalize(&hub_bin).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("canonicalize {HUB_BIN_ENV} {}: {error}", hub_bin.display()),
+        )
+    })?;
+    let session_worker_bin_path = fs::canonicalize(&session_worker_bin).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "canonicalize {SESSION_WORKER_BIN_ENV} {}: {error}",
+                session_worker_bin.display()
+            ),
+        )
+    })?;
+
+    let hub_bin_under_source = path_is_under(&hub_bin_path, &hub_path);
+    let session_worker_bin_under_source = path_is_under(&session_worker_bin_path, &hub_path);
+    if !hub_bin_under_source {
+        return invalid(format!(
+            "Hub binary {} is not under Hub source checkout {}",
+            hub_bin_path.display(),
+            hub_path.display()
+        ));
+    }
+    if !session_worker_bin_under_source {
+        return invalid(format!(
+            "session-worker binary {} is not under Hub source checkout {} (expected build from the same Hub tree that locks Core)",
+            session_worker_bin_path.display(),
+            hub_path.display()
+        ));
+    }
+
+    // Optional explicit session_worker_rev must match locked Core when supplied.
+    if let Some(explicit) = scenario.session_worker_rev.as_deref()
+        && explicit != core_rev
+    {
+        return invalid(format!(
+            "session_worker_rev {explicit} does not match Hub Cargo.lock botster-core {core_rev}"
+        ));
+    }
 
     let hub_ancestry_ok = is_ancestor_or_equal(MIN_HUB_REV, &hub_rev, Some(&hub_path))?;
     let workspaces_ancestry_ok =
@@ -395,12 +469,124 @@ pub fn verify_claim_pins(scenario: &ClaimScenario) -> io::Result<PinLedger> {
         hub_rev,
         workspaces_rev,
         tui_rev,
-        session_worker_rev: scenario.session_worker_rev.clone(),
+        core_rev: core_rev.clone(),
+        session_worker_rev: Some(core_rev),
+        hub_bin_path: hub_bin_path.display().to_string(),
+        session_worker_bin_path: session_worker_bin_path.display().to_string(),
+        hub_source_path: hub_path.display().to_string(),
+        workspaces_package_path: workspaces_path.display().to_string(),
+        tui_source_path: tui_root.display().to_string(),
         hub_ancestry_ok,
         workspaces_ancestry_ok,
         tui_ancestry_ok,
         workspaces_available_sessions_form_ok: form_ok,
+        hub_bin_under_source,
+        session_worker_bin_under_source,
+        sources_clean: true,
     })
+}
+
+fn require_executable_env(name: &str) -> io::Result<PathBuf> {
+    let path = std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("claim pin ledger requires {name} so the executed binary path is recorded"),
+        )
+    })?;
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is not a file: {}", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path)?.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} is not executable: {}", path.display()),
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn require_git_clean(root: &Path, label: &str) -> io::Result<()> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("git status failed in {}: {error}", root.display()),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "git status failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    let porcelain = String::from_utf8_lossy(&output.stdout);
+    if !porcelain.trim().is_empty() {
+        return invalid(format!(
+            "{label} checkout is dirty at {}; commit or stash before claim so HEAD is the executed code:\n{}",
+            root.display(),
+            porcelain.chars().take(512).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+fn path_is_under(child: &Path, parent: &Path) -> bool {
+    child.starts_with(parent)
+}
+
+/// Read the locked botster-core revision from the Hub checkout Cargo.lock.
+fn locked_core_rev_from_hub(hub_root: &Path) -> io::Result<String> {
+    let lock_path = hub_root.join("Cargo.lock");
+    let lock = fs::read_to_string(&lock_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read Hub Cargo.lock {}: {error}", lock_path.display()),
+        )
+    })?;
+    // Prefer explicit rev= pins, then #fragment SHAs on botster-core sources.
+    for line in lock.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("source = \"") {
+            if !rest.contains("botster-core") {
+                continue;
+            }
+            if let Some(idx) = rest.find("rev=") {
+                let rev = rest[idx + 4..]
+                    .split(['&', '#', '"'])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if rev.len() >= 7 {
+                    return Ok(rev.to_string());
+                }
+            }
+            if let Some(idx) = rest.rfind('#') {
+                let rev = rest[idx + 1..].trim_end_matches('"').trim();
+                if rev.len() >= 7 && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Ok(rev.to_string());
+                }
+            }
+        }
+    }
+    invalid(format!(
+        "Hub Cargo.lock at {} does not pin a botster-core revision for session-worker provenance",
+        lock_path.display()
+    ))
 }
 
 /// Derive the consumed revision from the actual checkout. When the scenario
