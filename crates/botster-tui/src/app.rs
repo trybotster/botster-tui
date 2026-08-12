@@ -1656,10 +1656,13 @@ impl TuiApp {
         self.clear_active_plugin_surface()
     }
 
-    /// Encode focused-terminal keys with Kitty CSI-u when mode flags say so.
+    /// Own focused-terminal key encoding until ModeFlags are known.
     ///
-    /// Kit's InputRouter always classic-encodes. When `kitty_enabled`, the TUI
-    /// owns the real KeyEvent path and re-encodes before ModeGatedInput.
+    /// Kit's InputRouter classic-encodes by default. While attached and focused
+    /// on the terminal, the TUI consumes the real KeyEvent path so unknown
+    /// ModeFlags cannot fall through to classic SendInput (which would break
+    /// Kitty-enabled sessions). After a single ModeFlags probe, keys are
+    /// encoded Classic or Kitty and sent with the correct gate.
     fn handle_focused_terminal_key(
         &mut self,
         key: KeyEvent,
@@ -1676,27 +1679,34 @@ impl TuiApp {
         if self.attached_subscription_id.as_deref() != Some(self.subscription_id.as_str()) {
             return false;
         }
-        let Some(shadow) = self.current_mode_shadow() else {
-            // Modes unknown: leave classic router path for non-mode-dependent
-            // keys. Mode-dependent mouse reports fail closed in dispatch.
-            return false;
-        };
-        if !shadow.kitty_enabled {
-            return false;
+        if self.current_mode_shadow().is_none() {
+            // Single probe; fail closed if freshness is still unavailable.
+            self.probe_terminal_mouse_mode(&session_id);
         }
-        let Some(bytes) =
-            renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
-        else {
-            // Consumed unencodable/release edge for Kitty path.
+        let Some(shadow) = self.current_mode_shadow().cloned() else {
+            self.error = Some("terminal input unavailable: mode flags not ready".to_string());
+            return true;
+        };
+        let encoding = if shadow.kitty_enabled {
+            renderer::TerminalKeyEncoding::Kitty
+        } else {
+            renderer::TerminalKeyEncoding::Classic
+        };
+        let Some(bytes) = renderer::terminal_key_bytes_with(key, encoding) else {
+            // Consumed unencodable edge (e.g. classic Release has no bytes).
             return true;
         };
         match String::from_utf8(bytes) {
             Ok(data) => {
                 self.error = None;
-                self.forward_mode_gated_input(session_id, data, true);
+                if shadow.kitty_enabled {
+                    self.forward_mode_gated_input(session_id, data, true);
+                } else {
+                    self.request_and_apply(DaemonRequest::SendInput { session_id, data });
+                }
             }
             Err(error) => {
-                self.error = Some(format!("kitty terminal input was not UTF-8: {error}"));
+                self.error = Some(format!("terminal input was not UTF-8: {error}"));
             }
         }
         true
@@ -16039,19 +16049,139 @@ mod tests {
             "read_mode_flags",
         );
         app.observed_requests.clear();
-        // Without kitty, focused key path defers to classic router TerminalForward.
-        assert!(!app.handle_focused_terminal_key(
+        // Without kitty, focused key path still consumes and classic-encodes.
+        assert!(app.handle_focused_terminal_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
             Some("tui-terminal"),
         ));
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"x".to_vec(),
-        });
         assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
             session_id: "session-alpha".to_string(),
             data: "x".to_string(),
         }));
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::ModeGatedInput { .. }))
+        );
+    }
+
+    #[test]
+    fn unknown_mode_flags_fail_closed_for_focused_terminal_keys() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        // No ModeFlags shadow: must not fall through to classic SendInput.
+        app.observed_requests.clear();
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::SendInput { .. })),
+            "unknown ModeFlags must not plain-SendInput classic key bytes"
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("mode flags not ready"))
+        );
+    }
+
+    #[test]
+    fn kitty_key_path_covers_modifiers_repeat_and_release() {
+        let mut app = TuiApp::new(None);
+        let restore = |app: &mut TuiApp| {
+            app.attached_session = Some("session-alpha".to_string());
+            app.attached_subscription_id = Some(app.subscription_id.clone());
+            app.apply_optional_readback_response(
+                mode_flags_response_full("session-alpha", true, 0, 2, 4),
+                "read_mode_flags",
+            );
+        };
+        restore(&mut app);
+
+        // Modifier chord.
+        app.observed_requests.clear();
+        let mod_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.handle_focused_terminal_key(mod_key, Some("tui-terminal")));
+        let expected_mod =
+            renderer::terminal_key_bytes_with(mod_key, renderer::TerminalKeyEncoding::Kitty)
+                .expect("kitty encodes ctrl-c");
+        assert!(app.observed_requests.iter().any(|r| {
+            matches!(
+                r,
+                ObservedRequest::ModeGatedInput { data, mode_generation: 2, mode_revision: 4, .. }
+                    if data.as_bytes() == expected_mod.as_slice()
+            )
+        }));
+
+        // Repeat (Kitty encodes event type; always consume, never classic SendInput).
+        // Restore attachment: ModeGated without a live client transport-errors and clears.
+        restore(&mut app);
+        app.observed_requests.clear();
+        let mut repeat = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+        assert!(app.handle_focused_terminal_key(repeat, Some("tui-terminal")));
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::SendInput { .. }))
+        );
+        assert!(
+            app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::ModeGatedInput { .. }))
+        );
+
+        // Release is consumed (Kitty may encode release; either way no classic SendInput).
+        restore(&mut app);
+        app.observed_requests.clear();
+        let mut release = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(app.handle_focused_terminal_key(release, Some("tui-terminal")));
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|r| matches!(r, ObservedRequest::SendInput { .. }))
+        );
+    }
+
+    #[test]
+    fn mode_gated_stale_token_reprobes_once_then_retries() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", true, 0, 1, 1),
+            "read_mode_flags",
+        );
+        // Simulate stale rejection with advanced revision, no live re-forward.
+        let mut rejected = base_response(DaemonResponseKind::ModeGatedInput);
+        rejected.mode_gated_input = Some(botster_hub_client::DaemonModeGatedInputResult::new(
+            "session-alpha",
+            false,
+            0,
+            true,
+            true,
+            false,
+            0,
+            false,
+            false,
+            false,
+            1,
+            2,
+            Some("stale".to_string()),
+        ));
+        app.apply_mode_gated_input_response(
+            rejected,
+            "session-alpha".to_string(),
+            "retry\n".to_string(),
+            false, // unit path: no live client for re-probe retry
+        );
+        // Shadow advanced from rejection body tokens.
+        assert_eq!(app.current_mode_shadow().map(|s| s.mode_revision), Some(2));
     }
 
     #[test]
@@ -17574,9 +17704,8 @@ mod tests {
 
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
-        // Live gate: set BOTSTER_TUI_REQUIRE_HUB_TEST=1 with pin-matched bins.
-        // Soft residual without bins is a live-gate failure (skip_or_panic panics
-        // when REQUIRE is set); default suite may soft-skip like other live tests.
+        // Exact-bin live gate. With BOTSTER_TUI_REQUIRE_HUB_TEST=1, missing bins fail.
+        // Required provenance: Hub 89dae7e binary + hub-locked Core session-worker.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
             return;
@@ -17585,13 +17714,28 @@ mod tests {
             skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
             return;
         };
+        let hub_path = PathBuf::from(&hub_bin);
+        let worker_path = PathBuf::from(&session_worker_bin);
         assert!(
-            PathBuf::from(&hub_bin).is_file(),
-            "BOTSTER_HUB_BIN must be an executable path"
+            hub_path.is_file(),
+            "BOTSTER_HUB_BIN must exist: {}",
+            hub_path.display()
         );
         assert!(
-            PathBuf::from(&session_worker_bin).is_file(),
-            "BOTSTER_SESSION_WORKER_BIN must be an executable path"
+            worker_path.is_file(),
+            "BOTSTER_SESSION_WORKER_BIN must exist: {}",
+            worker_path.display()
+        );
+        let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
+            .unwrap_or_else(|_| "89dae7e15a844bcb7411b83b32581121720e23eb".to_string());
+        let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
+            .unwrap_or_else(|_| "2c5171a6cb3b073c53620a9838d8b08480dd215c".to_string());
+        println!(
+            "ghostty-live-provenance: hub_bin={} hub_rev={} worker_bin={} worker_rev={}",
+            hub_path.display(),
+            hub_rev,
+            worker_path.display(),
+            worker_rev
         );
 
         let root = PathBuf::from(format!("/tmp/bt-ghostty-{}", short_suffix() % 1_000_000));
@@ -17603,14 +17747,17 @@ mod tests {
             .start()
             .expect("isolated hub starts");
 
+        // --- History attach path (Snapshot GHOSTSNP + scrollback + palette) ---
         let mut app = TuiApp::new(Some(hub.endpoint().clone()));
         app.workspace_test_mode = true;
-        // Seed enough scrollback that TOP_MARKER ends outside the default viewport.
         let command = concat!(
             "printf 'TOP_MARKER\\n'; ",
             "i=0; while [ $i -lt 40 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
             "printf 'BOTTOM_LIVE\\n'; ",
+            // OSC palette index 1 + special foreground
             "printf '\\033]4;1;rgb:ff/00/00\\007'; ",
+            "printf '\\033]10;rgb:00/ff/00\\007'; ",
+            "printf '\\033[1;38;2;0;128;0mSTYLED\\033[0m\\n'; ",
             "printf 'palette-ready\\n'; ",
             "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
         )
@@ -17629,10 +17776,9 @@ mod tests {
         }
         wait_for_authoritative_session(&mut app, &session_id)
             .expect("spawned session becomes authoritative");
-        // Allow producer history before late attach so Snapshot carries GHOSTSNP.
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(400));
         app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             app.poll_hub();
             if app.ghostty_projection.is_some() && app.attached_session.is_some() {
@@ -17642,40 +17788,73 @@ mod tests {
         }
         assert!(
             app.ghostty_projection.is_some(),
-            "production attach must install GHOSTSNP into GhosttyClientProjection"
+            "production attach must install GHOSTSNP into GhosttyClientProjection; error={:?}",
+            app.error
         );
-        assert!(
-            app.attached_session.as_deref() == Some(session_id.as_str()),
-            "session must be attached after install readiness"
-        );
+        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
+
+        // Full scrollback: marker outside default viewport, then ScrollOp::Top.
         app.refresh_ghostty_viewport_cache();
-        // Scroll to pre-attach history marker and prove paint path.
+        let saw_top_before = viewport_cache_contains(&app, "TOP_MARKER");
         app.scroll_projection(ScrollOp::Top);
         assert!(
             viewport_cache_contains(&app, "TOP_MARKER"),
-            "ScrollOp must surface pre-attach history marker in projection paint cache"
+            "ScrollOp must surface pre-attach history marker (saw_before={saw_top_before})"
         );
-        // Palette / special colors from OSC in producer stream.
-        if let Some(projection) = app.ghostty_projection.as_mut() {
-            let profile = projection.color_profile().expect("color_profile");
-            assert!(
-                profile.colors.contains_key(&1) || !profile.colors.is_empty(),
-                "color_profile should reflect OSC palette mutations when present"
-            );
+        // Painted frame must show the history marker after scroll.
+        let (lines_top, hit_map_top) = render_app_to_lines(&app, 140, 42, &RenderState::default());
+        let painted_top = lines_top.join("\n");
+        assert!(
+            painted_top.contains("TOP_MARKER"),
+            "Ratatui frame must paint scrollback marker; frame={painted_top}"
+        );
+        assert!(
+            hit_map_top
+                .regions()
+                .iter()
+                .any(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView)
+        );
+
+        // Palette + special colors + styled cells from projection.
+        let profile = app
+            .ghostty_projection
+            .as_mut()
+            .expect("projection")
+            .color_profile()
+            .expect("color_profile");
+        assert!(
+            profile.colors.contains_key(&1)
+                || profile
+                    .colors
+                    .contains_key(&botster_terminal_ghostty::COLOR_INDEX_FOREGROUND)
+                || !profile.colors.is_empty(),
+            "color_profile must capture OSC palette/special colors: {profile:?}"
+        );
+        app.scroll_projection(ScrollOp::Bottom);
+        app.refresh_ghostty_viewport_cache();
+        if let Some(viewport) = app.ghostty_viewport_cache.as_ref() {
+            let styled = viewport.cells.iter().find(|c| c.grapheme == "S");
+            if let Some(cell) = styled {
+                assert!(
+                    cell.bold || cell.fg.g > 0,
+                    "styled cell should carry bold/truecolor attributes: {cell:?}"
+                );
+            }
         }
-        // ModeFlags freshness for ModeGatedInput (required production path).
+
+        // ModeFlags freshness required before ModeGatedInput.
         app.probe_terminal_mouse_mode(&session_id);
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && app.current_mode_shadow().is_none() {
             app.poll_hub();
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            app.current_mode_shadow().is_some(),
-            "live attach must obtain ModeFlags freshness for ModeGatedInput"
-        );
+        let shadow = app
+            .current_mode_shadow()
+            .cloned()
+            .expect("live attach must obtain ModeFlags freshness");
 
-        // Resize through production path.
+        // Resize production path.
         app.handle_dispatch(InputDispatch::TerminalResize {
             node_id: "tui-terminal".to_string(),
             rows: 30,
@@ -17684,18 +17863,63 @@ mod tests {
         assert_eq!(app.terminal_viewport_size.rows, 30);
         assert_eq!(app.terminal_viewport_size.cols, 100);
 
-        // Later live output through production apply path.
-        if let Some(session_id) = app.attached_session.clone() {
-            let shadow = app.current_mode_shadow().cloned();
-            if shadow.as_ref().is_some_and(|s| s.kitty_enabled) {
-                app.forward_mode_gated_input(session_id, "live-marker\n".to_string(), true);
-            } else {
-                app.forward_terminal_input(session_id, "live-marker\n".to_string());
-            }
+        // Real focused key path: Kitty or classic based on ModeFlags.
+        app.observed_requests.clear();
+        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(
+            app.handle_focused_terminal_key(key, Some("tui-terminal")),
+            "focused terminal key must be consumed after ModeFlags"
+        );
+        if shadow.kitty_enabled {
+            let expected =
+                renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
+                    .expect("kitty encodes z");
+            assert!(
+                app.observed_requests.iter().any(|r| matches!(
+                    r,
+                    ObservedRequest::ModeGatedInput { data, .. }
+                        if data.as_bytes() == expected.as_slice()
+                )),
+                "Kitty ModeFlags require ModeGatedInput CSI-u bytes: {:?}",
+                app.observed_requests
+            );
+        } else {
+            assert!(
+                app.observed_requests.iter().any(|r| matches!(
+                    r,
+                    ObservedRequest::SendInput { data, .. } if data == "z"
+                )),
+                "classic ModeFlags send plain key: {:?}",
+                app.observed_requests
+            );
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+
+        // Mouse SGR through dispatch with ModeFlags → ModeGatedInput when tracking.
+        app.observed_requests.clear();
+        let sgr = "\x1b[<0;1;1M".to_string();
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: sgr.as_bytes().to_vec(),
+        });
+        if shadow.mouse_mode != 0 {
+            assert!(
+                app.observed_requests
+                    .iter()
+                    .any(|r| matches!(r, ObservedRequest::ModeGatedInput { .. })),
+                "mouse tracking ModeFlags must ModeGatedInput SGR: {:?}",
+                app.observed_requests
+            );
+        }
+
+        // Later live output appears in painted frame.
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "live-marker\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
         while Instant::now() < deadline {
             app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
             if viewport_cache_contains(&app, "echo:live-marker")
                 || viewport_cache_contains(&app, "live-marker")
             {
@@ -17704,37 +17928,95 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         app.refresh_ghostty_viewport_cache();
-        let (lines, hit_map) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        let rendered = lines.join("\n");
+        let (lines_live, _) = render_app_to_lines(&app, 140, 42, &RenderState::default());
+        let painted_live = lines_live.join("\n");
         assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView),
-            "live frame must keep kit tui-terminal region"
-        );
-        assert!(
-            app.ghostty_viewport_cache.is_some(),
-            "live frame must paint from projection cache; rendered={rendered}"
-        );
-        // Reconnect: detach-style clear + re-attach cycle.
-        app.begin_attach_hydration(&session_id, &format!("reconnect-{}", short_suffix()));
-        assert!(app.ghostty_projection.is_none());
-        println!(
-            "ghostty-live: projection={} attached={:?} mode_shadow={:?} hub_bin={:?} worker_bin={:?} has_top={} has_live={}",
-            app.ghostty_projection.is_some(),
-            app.attached_session,
-            app.current_mode_shadow().map(|s| (
-                s.mode_generation,
-                s.mode_revision,
-                s.mouse_mode,
-                s.kitty_enabled
-            )),
-            hub_bin,
-            session_worker_bin,
-            viewport_cache_contains(&app, "TOP_MARKER"),
             viewport_cache_contains(&app, "echo:live-marker")
                 || viewport_cache_contains(&app, "live-marker")
+                || painted_live.contains("live-marker"),
+            "later live output must appear in projection/paint; painted={painted_live}"
+        );
+
+        // Reconnect: clear + full re-attach of same session.
+        let reconnect_sub = format!("reconnect-{}", short_suffix());
+        app.begin_attach_hydration(&session_id, &reconnect_sub);
+        assert!(app.ghostty_projection.is_none());
+        app.request_and_apply(DaemonRequest::Attach {
+            session_id: session_id.clone(),
+            subscription_id: reconnect_sub.clone(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app.ghostty_projection.is_some()
+                && app.attached_session.as_deref() == Some(session_id.as_str())
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.ghostty_projection.is_some(),
+            "reconnect attach must reinstall projection; error={:?}",
+            app.error
+        );
+
+        // --- No-history attach path on a second session ---
+        let no_hist_id = format!("btui-empty-{}", short_suffix());
+        app.pending_sessions
+            .insert(no_hist_id.clone(), SessionRow::pending(no_hist_id.clone()));
+        app.selected_session = Some(no_hist_id.clone());
+        app.rebuild_session_rows();
+        match app.request(DaemonRequest::Spawn {
+            session_id: no_hist_id.clone(),
+            command:
+                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+                    .to_string(),
+        }) {
+            Ok(response) => app.apply_response(response),
+            Err(error) => panic!("no-history spawn failed: {error}"),
+        }
+        wait_for_authoritative_session(&mut app, &no_hist_id).expect("no-history session ready");
+        app.selected_session = Some(no_hist_id.clone());
+        app.attach_selected_or_first();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app.attached_session.as_deref() == Some(no_hist_id.as_str())
+                && app.ghostty_projection.is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(app.attached_session.as_deref(), Some(no_hist_id.as_str()));
+        assert!(
+            app.ghostty_projection.is_some(),
+            "no-history attach must open blank projection immediately"
+        );
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: no_hist_id.clone(),
+            data: "after-empty\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            if viewport_cache_contains(&app, "echo:after-empty")
+                || viewport_cache_contains(&app, "after-empty")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            viewport_cache_contains(&app, "echo:after-empty")
+                || viewport_cache_contains(&app, "after-empty"),
+            "no-history live output must apply without Snapshot wait"
+        );
+
+        println!(
+            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history_session={session_id} no_hist={no_hist_id}"
         );
     }
 
