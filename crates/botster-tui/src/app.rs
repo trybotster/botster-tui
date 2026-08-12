@@ -19221,8 +19221,10 @@ mod tests {
             "    printf '\\342'; ",
             "  elif [ \"$line\" = emit-split-rest ]; then ",
             "    printf '\\202\\254'; ",
-            "  elif [ \"$line\" = emit-nul-esc-marker ]; then ",
-            "    printf '\\000\\033[0mBYTEFAITH'; ",
+            "  elif [ \"$line\" = emit-invalid-bytes ]; then ",
+            "    printf '\\000\\033\\377\\300'; ",
+            "  elif [ \"$line\" = emit-later-marker ]; then ",
+            "    printf '\\033[0mBYTEFAITH'; ",
             "  else ",
             "    printf 'echo:%s\\n' \"$line\"; ",
             "  fi; ",
@@ -19565,7 +19567,55 @@ mod tests {
         app.applied_live_payloads.clear();
         app.request_and_apply(DaemonRequest::SendInput {
             session_id: session_id.clone(),
-            data: "emit-nul-esc-marker\n".to_string(),
+            data: "emit-invalid-bytes\n".to_string(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut saw_invalid_sequence = false;
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app
+                .applied_live_payloads
+                .concat()
+                .windows(4)
+                .any(|window| window == [0x00, 0x1b, 0xff, 0xc0])
+            {
+                saw_invalid_sequence = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let applied = app.applied_live_payloads.concat();
+        assert!(
+            saw_invalid_sequence,
+            "live path must apply [0x00, 0x1b, 0xff, 0xc0] in order; applied={:?}",
+            app.applied_live_payloads
+        );
+        assert!(
+            applied.contains(&0x00),
+            "NUL must reach apply_terminal_output; applied={applied:?}"
+        );
+        assert!(
+            applied.contains(&0x1b),
+            "ESC must reach apply_terminal_output; applied={applied:?}"
+        );
+        assert!(
+            applied.contains(&0xff),
+            "invalid 0xff must reach apply_terminal_output unrepaired; applied={applied:?}"
+        );
+        assert!(
+            applied.contains(&0xc0),
+            "invalid 0xc0 must reach apply_terminal_output unrepaired; applied={applied:?}"
+        );
+        assert!(
+            !applied
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD]),
+            "live invalid bytes must not be UTF-8-repaired to U+FFFD; applied={applied:?}"
+        );
+
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: "emit-later-marker\n".to_string(),
         });
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut painted_marker = String::new();
@@ -19580,19 +19630,8 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            app.applied_live_payloads.iter().any(|payload| {
-                payload
-                    .windows(b"BYTEFAITH".len())
-                    .any(|window| window == b"BYTEFAITH")
-                    || payload.contains(&0x00)
-                    || payload.contains(&0x1b)
-            }),
-            "NUL/ESC/marker payload must reach apply_terminal_output; applied={:?}",
-            app.applied_live_payloads
-        );
-        assert!(
             viewport_cache_contains(&app, "BYTEFAITH") || painted_marker.contains("BYTEFAITH"),
-            "later ASCII marker after NUL+ESC must paint; painted={painted_marker}"
+            "later ASCII marker after invalid/NUL/ESC prefix must paint; painted={painted_marker}"
         );
 
         // Reconnect must restore pre-attach history marker after reinstall.
