@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {
+      "argv": ["cargo", "build", "--locked", "-p", "botster-tui"],
+      "timeout_seconds": 1800
+    }
+  ]
+}
