@@ -7443,20 +7443,34 @@ const CLAIM_SESSION_DISPLAY_FIELDS: &[&str] = &[
     "spawn_point",
 ];
 
-fn claim_session_option_fields<'a>(
-    app: &'a TuiApp,
-    session_uuid: &str,
-) -> Option<&'a serde_json::Map<String, Value>> {
-    app.entity_options
-        .family("session")
-        .and_then(|family| family.records.get(session_uuid))
+fn claim_session_option_fields(app: &TuiApp, session_uuid: &str) -> Option<serde_json::Map<String, Value>> {
+    // Session family is process-wide: projection injects session_entities, not entity_options.
+    let store = app.entity_options_projection_store();
+    store
+        .get("session")
+        .and_then(|records| records.get(session_uuid).cloned())
+        .or_else(|| {
+            app.session_entities.entities.get(session_uuid).and_then(|entity| {
+                match serde_json::to_value(entity) {
+                    Ok(Value::Object(fields)) => Some(fields),
+                    _ => None,
+                }
+            })
+        })
+}
+
+fn json_field_string(fields: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    match fields.get(key)? {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn claim_option_lifecycle(app: &TuiApp, session_uuid: &str) -> Option<String> {
     claim_session_option_fields(app, session_uuid)
-        .and_then(|fields| fields.get("lifecycle"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+        .and_then(|fields| json_field_string(&fields, "lifecycle"))
         .or_else(|| {
             app.session_entities
                 .entities
@@ -7467,26 +7481,23 @@ fn claim_option_lifecycle(app: &TuiApp, session_uuid: &str) -> Option<String> {
 
 fn claim_option_dedicated_label(app: &TuiApp, session_uuid: &str) -> Option<String> {
     claim_session_option_fields(app, session_uuid)
-        .and_then(|fields| fields.get("label"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != session_uuid)
-        .map(str::to_string)
+        .and_then(|fields| json_field_string(&fields, "label"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != session_uuid)
 }
 
 fn claim_option_compact_label(app: &TuiApp, session_uuid: &str) -> Option<String> {
     let fields = claim_session_option_fields(app, session_uuid)?;
     let mut metadata = std::collections::BTreeMap::new();
     for field in CLAIM_SESSION_DISPLAY_FIELDS {
-        if let Some(value) = fields.get(*field).and_then(Value::as_str) {
-            if !value.is_empty() {
-                metadata.insert((*field).to_string(), value.to_string());
-            }
+        if let Some(value) = json_field_string(&fields, field) {
+            metadata.insert((*field).to_string(), value);
         }
     }
-    if metadata.is_empty() {
-        return None;
-    }
+    // Always include session_uuid so the compact label is non-empty when the option exists.
+    metadata
+        .entry("session_uuid".to_string())
+        .or_insert_with(|| session_uuid.to_string());
     let option = botster_ui_contract::EntityOption {
         value: session_uuid.to_string(),
         label: metadata
