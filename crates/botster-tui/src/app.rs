@@ -18001,7 +18001,10 @@ mod tests {
             shadow.mouse_mode
         );
 
-        // Resize production path.
+        // Resize production path: local viewport update + Hub DaemonRequest::Resize.
+        // Client-owned dimensions alone are not enough — require Hub success, then
+        // prove session-worker applied 30x100 via reconnect Snapshot dimensions.
+        app.error = None;
         app.handle_dispatch(InputDispatch::TerminalResize {
             node_id: "tui-terminal".to_string(),
             rows: 30,
@@ -18009,6 +18012,18 @@ mod tests {
         });
         assert_eq!(app.terminal_viewport_size.rows, 30);
         assert_eq!(app.terminal_viewport_size.cols, 100);
+        assert!(
+            app.error.is_none(),
+            "TerminalResize must complete without Hub/transport error after DaemonRequest::Resize; error={:?}",
+            app.error
+        );
+        let post_resize_dims = app
+            .ghostty_projection
+            .as_ref()
+            .expect("projection still present after resize")
+            .dimensions();
+        assert_eq!(post_resize_dims.rows, 30);
+        assert_eq!(post_resize_dims.cols, 100);
 
         // Required Kitty branch: real focused KeyEvent → ModeGatedInput CSI-u.
         app.observed_requests.clear();
@@ -18099,6 +18114,36 @@ mod tests {
             "reconnect attach must reinstall projection; error={:?}",
             app.error
         );
+        // Downstream oracle: GHOSTSNP Snapshot dimensions come from the session
+        // worker after Resize, not from the client-side TerminalResize handler.
+        let reconnect_dims = app
+            .ghostty_projection
+            .as_ref()
+            .expect("projection after reconnect Snapshot")
+            .dimensions();
+        assert_eq!(
+            reconnect_dims.rows, 30,
+            "reconnect Snapshot projection rows must be worker-applied 30; dims={reconnect_dims:?}"
+        );
+        assert_eq!(
+            reconnect_dims.cols, 100,
+            "reconnect Snapshot projection cols must be worker-applied 100; dims={reconnect_dims:?}"
+        );
+        assert_eq!(
+            app.terminal_viewport_size.rows, 30,
+            "terminal viewport rows must track Snapshot install (30)"
+        );
+        assert_eq!(
+            app.terminal_viewport_size.cols, 100,
+            "terminal viewport cols must track Snapshot install (100)"
+        );
+        app.refresh_ghostty_viewport_cache();
+        let reconnect_viewport = app
+            .ghostty_viewport_cache
+            .as_ref()
+            .expect("viewport cache after reconnect Snapshot");
+        assert_eq!(reconnect_viewport.rows, 30);
+        assert_eq!(reconnect_viewport.cols, 100);
         app.scroll_projection(ScrollOp::Top);
         assert!(
             viewport_cache_contains(&app, "TOP_MARKER"),
