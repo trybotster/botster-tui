@@ -16,24 +16,28 @@ use botster_core::{
     contract::terminal_screen::TerminalScreenSize,
 };
 use botster_hub_client::{
-    DaemonApp, DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
-    DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
-    DaemonEntityFrame, DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason,
-    DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
-    DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
-    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
+    ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE, DaemonApp, DaemonAvailablePackage,
+    DaemonCaptureSnapshot, DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic,
+    DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonPackage,
+    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
+    DaemonPackageNavigationEntry, DaemonPackagePin, DaemonPackageRouteDescriptor,
+    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeDefinition,
+    DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
     FEATURE_MODE_GATED_INPUT, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
     FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS,
+    FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, FEATURE_TERMINAL_READBACK,
     FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
     read_frame_from_reader, subscribe_entities, subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
 use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
-use botster_terminal_ghostty::{GhosttyClientProjection, ScrollOp, ViewportProjection};
+use botster_terminal_ghostty::{
+    GhosttyClientProjection, GhosttySnapshotDecodeProgress, ScrollOp, ViewportProjection,
+};
 use botster_ui_contract::{
     EntityFamilyStore, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
     UiActionRequest, UiActionResult, UiAuthoredNodeId, UiChild, UiCondition, UiConditional,
@@ -68,11 +72,10 @@ const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r
 const HEADLESS_INPUT: &str = "botster-tui-headless\n";
 const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
-const ATTACH_HYDRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 36;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 38;
 const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DEFAULT_TERMINAL_COLS: u16 = 80;
@@ -190,10 +193,15 @@ struct SessionRow {
 struct AttachHydration {
     session_id: String,
     subscription_id: String,
-    deadline: Instant,
     buffered_live_output: Vec<u8>,
-    /// True after a verified Snapshot GHOSTSNP was installed into the projection.
-    snapshot_installed: bool,
+    pending_input: Vec<String>,
+    pending_resize: Option<TerminalScreenSize>,
+    /// True after the incremental decoder validates READY.
+    snapshot_ready: bool,
+    /// True after FINISH NO_VALUE or a post-READY history failure.
+    snapshot_finished: bool,
+    /// True after the matching attached state arrives.
+    attached_seen: bool,
 }
 
 /// Attachment-scoped Hub mode flags used for ModeGatedInput freshness.
@@ -215,7 +223,6 @@ enum DestructiveAction {
 
 #[derive(Default)]
 struct HydrationEvidence {
-    opaque_state_received: bool,
     lifecycle_ended: bool,
 }
 
@@ -1359,7 +1366,7 @@ struct TuiApp {
     subscription_id: String,
     terminal_output: String,
     terminal_output_session_id: Option<String>,
-    /// Core-owned Ghostty client projection for GHOSTSNP install + live apply.
+    /// Core-owned Ghostty projection for incremental GHOSTSNP and live output.
     ghostty_projection: Option<GhosttyClientProjection>,
     ghostty_projection_session_id: Option<String>,
     /// Last projected viewport for immutable frame paint after kit TerminalView.
@@ -1540,7 +1547,15 @@ impl TuiApp {
         else {
             return;
         };
-        let request = DaemonRequest::Drain { session_id };
+        let subscription_id = self
+            .attach_hydration
+            .as_ref()
+            .map(|hydration| hydration.subscription_id.clone())
+            .or_else(|| self.attached_subscription_id.clone());
+        let request = DaemonRequest::Drain {
+            session_id,
+            subscription_id,
+        };
         #[cfg(test)]
         self.record_request(&request);
         match self.request(request) {
@@ -1560,6 +1575,18 @@ impl TuiApp {
                 }
             }
             InputDispatch::TerminalForward { bytes, .. } => {
+                if let Some(hydration) = self.attach_hydration.as_mut() {
+                    match String::from_utf8(bytes) {
+                        Ok(data) => {
+                            hydration.pending_input.push(data);
+                            self.error = None;
+                        }
+                        Err(error) => {
+                            self.error = Some(format!("terminal input was not UTF-8: {error}"));
+                        }
+                    }
+                    return;
+                }
                 let Some(session_id) = self.attached_session.clone() else {
                     self.error = Some(
                         "terminal stream unavailable: attach a session before sending terminal input"
@@ -1585,6 +1612,10 @@ impl TuiApp {
                 }
             }
             InputDispatch::TerminalResize { rows, cols, .. } => {
+                if let Some(hydration) = self.attach_hydration.as_mut() {
+                    hydration.pending_resize = Some(TerminalScreenSize::new(rows, cols));
+                    return;
+                }
                 self.terminal_viewport_size = TerminalScreenSize::new(rows, cols);
                 if let Some(projection) = self.ghostty_projection.as_mut() {
                     let _ = projection.resize(self.terminal_viewport_size);
@@ -3253,9 +3284,8 @@ impl TuiApp {
     }
 
     fn begin_attach_hydration(&mut self, session_id: &str, subscription_id: &str) {
-        // H0: every Attach owns a fresh subscription generation and clears
-        // projection + presentation. Authoritative restore is Snapshot GHOSTSNP
-        // install (H2); ReadScreen remains optional diagnostic text only.
+        // Every Attach owns a fresh subscription generation and incremental
+        // snapshot barrier. ReadScreen remains optional diagnostic text only.
         self.subscription_id = subscription_id.to_string();
         self.attached_session = None;
         self.attached_subscription_id = None;
@@ -3267,9 +3297,12 @@ impl TuiApp {
         self.attach_hydration = Some(AttachHydration {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
-            deadline: Instant::now() + ATTACH_HYDRATION_TIMEOUT,
             buffered_live_output: Vec::new(),
-            snapshot_installed: false,
+            pending_input: Vec::new(),
+            pending_resize: None,
+            snapshot_ready: false,
+            snapshot_finished: false,
+            attached_seen: false,
         });
     }
 
@@ -3313,12 +3346,23 @@ impl TuiApp {
     }
 
     fn detach_attached(&mut self) {
-        let Some(session_id) = self.attached_session.clone() else {
+        let attachment = self
+            .attach_hydration
+            .as_ref()
+            .map(|hydration| {
+                (
+                    hydration.session_id.clone(),
+                    hydration.subscription_id.clone(),
+                )
+            })
+            .or_else(|| {
+                Some((
+                    self.attached_session.clone()?,
+                    self.attached_subscription_id.clone()?,
+                ))
+            });
+        let Some((session_id, subscription_id)) = attachment else {
             self.error = Some("no attached terminal stream to detach".to_string());
-            return;
-        };
-        let Some(subscription_id) = self.attached_subscription_id.clone() else {
-            self.error = Some("attached terminal stream has no current subscription".to_string());
             return;
         };
         self.error = None;
@@ -3499,13 +3543,20 @@ impl TuiApp {
                 session_id: session_id.clone(),
                 subscription_id: subscription_id.clone(),
             }),
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id,
+            } => self.observed_requests.push(ObservedRequest::Detach {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            }),
             DaemonRequest::ShutdownSession { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::ShutdownSession(session_id.clone())),
             DaemonRequest::RemoveSession { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::RemoveSession(session_id.clone())),
-            DaemonRequest::Drain { session_id } => self
+            DaemonRequest::Drain { session_id, .. } => self
                 .observed_requests
                 .push(ObservedRequest::Drain(session_id.clone())),
             DaemonRequest::ReadScreen { session_id } => self
@@ -3517,6 +3568,15 @@ impl TuiApp {
             DaemonRequest::CaptureSnapshot { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::CaptureSnapshot(session_id.clone())),
+            DaemonRequest::Resize {
+                session_id,
+                rows,
+                cols,
+            } => self.observed_requests.push(ObservedRequest::Resize {
+                session_id: session_id.clone(),
+                rows: *rows,
+                cols: *cols,
+            }),
             DaemonRequest::SendInput { session_id, data } => {
                 self.observed_requests.push(ObservedRequest::SendInput {
                     session_id: session_id.clone(),
@@ -3637,18 +3697,6 @@ impl TuiApp {
         if evidence.lifecycle_ended {
             // Live PTY bytes are not diagnostic text. Drop any unflushed buffer.
             let _ = self.attach_hydration.take();
-            return;
-        }
-        if evidence.opaque_state_received {
-            self.complete_attach_hydration(false);
-            return;
-        }
-        if self
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| Instant::now() >= hydration.deadline)
-        {
-            self.complete_attach_hydration(true);
         }
     }
 
@@ -3763,7 +3811,7 @@ impl TuiApp {
                         }
                     };
                     if self.hydration_matches(&session_id, &subscription_id) {
-                        // H1: buffer live output until Snapshot install (H2) completes.
+                        // Buffer live output until FINISH and attached release the barrier.
                         if let Some(hydration) = self.attach_hydration.as_mut() {
                             hydration.buffered_live_output.extend_from_slice(&data);
                         }
@@ -3778,15 +3826,9 @@ impl TuiApp {
                     subscription_id,
                     history,
                 } => {
-                    // H2: install verified Snapshot GHOSTSNP only. Never Scrollback.
-                    let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
-                    let attached_matches = self.attached_matches(&session_id, &subscription_id);
-                    if hydration_matches || attached_matches {
-                        if hydration_matches {
-                            hydration_evidence.opaque_state_received = true;
-                        }
+                    if self.hydration_matches(&session_id, &subscription_id) {
                         match history.decoded_bytes() {
-                            Ok(bytes) => self.install_ghostsnp_from_snapshot(&session_id, &bytes),
+                            Ok(bytes) => self.apply_incremental_snapshot(&session_id, bytes),
                             Err(error) => {
                                 self.error = Some(format!(
                                     "snapshot history decode failed (install closed): {error}"
@@ -3800,11 +3842,8 @@ impl TuiApp {
                     subscription_id,
                     ..
                 } => {
-                    // Scrollback is never GHOSTSNP install input. It remains an
-                    // opaque ordering signal only (may complete ReadScreen diagnostic path).
-                    if self.hydration_matches(&session_id, &subscription_id) {
-                        hydration_evidence.opaque_state_received = true;
-                    }
+                    // Scrollback is never GHOSTSNP incremental input.
+                    let _ = (session_id, subscription_id);
                 }
                 DaemonEvent::ProcessExit {
                     session_id,
@@ -3835,11 +3874,29 @@ impl TuiApp {
                     }
                     self.action_feedback = Some(format!("attach {state}: {session_id}"));
                     if state == "attached" && hydration_matches {
-                        self.attached_session = Some(session_id.clone());
-                        self.attached_subscription_id = Some(subscription_id);
-                        // H3/H5: open live path immediately (blank projection when
-                        // no Snapshot). Do not wait on ReadScreen or the 5s deadline.
-                        self.open_attach_live_path(&session_id);
+                        if let Some(hydration) = self.attach_hydration.as_mut() {
+                            hydration.attached_seen = true;
+                        }
+                        self.maybe_open_attach_live_path(&session_id);
+                    } else if state == ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE && hydration_matches
+                    {
+                        if let Some(projection) = self.ghostty_projection.as_mut() {
+                            projection.abort_ghostsnp_history();
+                        }
+                        if let Some(hydration) = self
+                            .attach_hydration
+                            .as_mut()
+                            .filter(|hydration| hydration.snapshot_ready)
+                        {
+                            hydration.snapshot_finished = true;
+                        } else {
+                            self.error =
+                                Some("snapshot history failed before READY (closed)".to_string());
+                            continue;
+                        }
+                        self.action_feedback =
+                            Some(format!("attach snapshot history incomplete: {session_id}"));
+                        self.maybe_open_attach_live_path(&session_id);
                     } else if state == "detached" {
                         self.attached_session = None;
                         self.attached_subscription_id = None;
@@ -3874,28 +3931,9 @@ impl TuiApp {
         }
     }
 
-    fn complete_attach_hydration(&mut self, deadline_expired: bool) {
-        let Some(session_id) = self
-            .attach_hydration
-            .as_ref()
-            .map(|hydration| hydration.session_id.clone())
-        else {
-            return;
-        };
-        // Deadline or opaque ordering signal: open live path without ReadScreen
-        // authority. Prefer Attached-driven open_attach_live_path when possible.
-        if deadline_expired || self.attached_session.as_deref() == Some(session_id.as_str()) {
-            self.open_attach_live_path(&session_id);
-        }
-    }
-
-    fn finish_attach_hydration(&mut self, session_id: &str, restored_text: &str) {
+    fn finish_attach_hydration(&mut self, _session_id: &str, restored_text: &str) {
         // Diagnostic-only ReadScreen path. Never promotes text into projection
         // authority or terminal_content primary paint.
-        let _ = restored_text;
-        if self.attach_hydration.is_some() {
-            self.open_attach_live_path(session_id);
-        }
         // Keep restored text only as a detached/diagnostic fallback when there
         // is still no Ghostty projection (non-GHOSTSNP / install-closed cases).
         if self.ghostty_projection.is_none() && !restored_text.is_empty() {
@@ -3966,45 +4004,53 @@ impl TuiApp {
         }
     }
 
-    fn install_ghostsnp_from_snapshot(&mut self, session_id: &str, bytes: &[u8]) {
-        // Non-GHOSTSNP opaque Snapshot bodies (conformance fixtures / foreign
-        // history) are not installable. Fail closed without projecting and
-        // without elevating to a hard UI error so ReadScreen can still supply
-        // diagnostic text. Real GHOSTSNP decode failures set a hard error.
-        if !bytes.starts_with(botster_terminal_ghostty::GHOSTSNP_MAGIC) {
-            self.clear_ghostty_projection();
-            self.action_feedback = Some(
-                "snapshot history was not GHOSTSNP; using diagnostic ReadScreen only".to_string(),
-            );
-            return;
-        }
+    fn apply_incremental_snapshot(&mut self, session_id: &str, bytes: Vec<u8>) {
+        let ready = self
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready);
         self.ensure_ghostty_projection(session_id);
-        let install_result = {
-            let Some(projection) = self.ghostty_projection.as_mut() else {
-                return;
-            };
-            let result = projection.install_ghostsnp(bytes);
-            let dimensions = projection.dimensions();
-            (result, dimensions)
+        let Some(projection) = self.ghostty_projection.as_mut() else {
+            return;
         };
-        match install_result {
-            (Ok(()), dimensions) => {
-                self.ghostty_projection_session_id = Some(session_id.to_string());
+        let result = if ready {
+            projection.apply_ghostsnp_history(bytes)
+        } else {
+            projection.install_ghostsnp_ready(bytes)
+        };
+        match result {
+            Ok(GhosttySnapshotDecodeProgress::Ready) if !ready => {
                 if let Some(hydration) = self.attach_hydration.as_mut() {
-                    hydration.snapshot_installed = true;
+                    hydration.snapshot_ready = true;
                 }
-                // Dimensions come from decoded Ghostty after install.
-                self.terminal_viewport_size = dimensions;
+                self.ghostty_projection_session_id = Some(session_id.to_string());
+                self.terminal_viewport_size = projection.dimensions();
                 self.refresh_ghostty_viewport_cache();
-                // If already attached, open live path immediately after install.
-                if self.attached_session.as_deref() == Some(session_id) {
-                    self.open_attach_live_path(session_id);
-                }
             }
-            (Err(error), _) => {
-                // Fail closed: do not keep a partially installed projection.
-                self.clear_ghostty_projection();
-                self.error = Some(format!("GHOSTSNP install failed (closed): {error}"));
+            Ok(GhosttySnapshotDecodeProgress::History) if ready => {
+                // One Snapshot carries one PAGE. Paint the new retained history now.
+                self.refresh_ghostty_viewport_cache();
+            }
+            Ok(GhosttySnapshotDecodeProgress::Finish) if ready => {
+                if let Some(hydration) = self.attach_hydration.as_mut() {
+                    hydration.snapshot_finished = true;
+                }
+                self.refresh_ghostty_viewport_cache();
+                self.maybe_open_attach_live_path(session_id);
+            }
+            Ok(progress) => {
+                self.error = Some(format!(
+                    "GHOSTSNP incremental sequence failed (closed): unexpected {progress:?}"
+                ));
+            }
+            Err(error) => {
+                // A post-READY failure keeps the renderable READY terminal.
+                if !ready {
+                    self.clear_ghostty_projection();
+                }
+                self.error = Some(format!(
+                    "GHOSTSNP incremental apply failed (closed): {error}"
+                ));
             }
         }
     }
@@ -4022,24 +4068,53 @@ impl TuiApp {
         // Live PTY frames are never copied into the diagnostic String.
     }
 
-    /// Open the post-attach live path: blank or installed projection, flush
-    /// buffered live bytes, drop ReadScreen as readiness gate.
+    fn maybe_open_attach_live_path(&mut self, session_id: &str) {
+        let Some(hydration) = self.attach_hydration.as_ref() else {
+            return;
+        };
+        if hydration.session_id != session_id
+            || !hydration.snapshot_finished
+            || !hydration.attached_seen
+        {
+            return;
+        }
+        self.attached_session = Some(session_id.to_string());
+        self.attached_subscription_id = Some(hydration.subscription_id.clone());
+        self.open_attach_live_path(session_id);
+    }
+
+    /// Open the post-barrier live path and release queued client operations.
     fn open_attach_live_path(&mut self, session_id: &str) {
         let Some(hydration) = self.attach_hydration.take() else {
-            if self.ghostty_projection.is_none() {
-                self.ensure_ghostty_projection(session_id);
-            }
             return;
         };
         if hydration.session_id != session_id || hydration.subscription_id != self.subscription_id {
             self.attach_hydration = Some(hydration);
             return;
         }
-        if !hydration.snapshot_installed {
-            self.ensure_ghostty_projection(session_id);
+        if !hydration.snapshot_finished || !hydration.attached_seen {
+            self.attach_hydration = Some(hydration);
+            return;
+        }
+        if let Some(size) = hydration.pending_resize {
+            self.terminal_viewport_size = size;
+            if let Some(projection) = self.ghostty_projection.as_mut()
+                && let Err(error) = projection.resize(size)
+            {
+                self.error = Some(format!("terminal resize failed: {error}"));
+            }
+            self.refresh_ghostty_viewport_cache();
+            self.request_and_apply(DaemonRequest::Resize {
+                session_id: session_id.to_string(),
+                rows: size.rows,
+                cols: size.cols,
+            });
         }
         if !hydration.buffered_live_output.is_empty() {
             self.apply_live_terminal_output(&hydration.buffered_live_output);
+        }
+        for data in hydration.pending_input {
+            self.forward_terminal_input(session_id.to_string(), data);
         }
         // Optional diagnostic ReadScreen only — never terminal content authority.
         self.request_optional_readback(
@@ -5827,7 +5902,9 @@ impl TuiApp {
             "tui-terminal",
             json!({
                 "title": self.terminal_title(),
-                "session_id": self.attached_session.clone().unwrap_or_else(|| "not attached".to_string())
+                "session_id": self.attached_session.clone()
+                    .or_else(|| self.attach_hydration.as_ref().map(|hydration| hydration.session_id.clone()))
+                    .unwrap_or_else(|| "not attached".to_string())
             }),
         );
         terminal.children = vec![child(node(
@@ -5839,10 +5916,17 @@ impl TuiApp {
     }
 
     fn terminal_title(&self) -> String {
-        match (&self.attached_session, &self.selected_session) {
-            (Some(attached), _) => format!("Terminal · {attached}"),
-            (None, Some(selected)) => format!("Terminal · {selected} · detached"),
-            (None, None) => "Terminal".to_string(),
+        match (
+            &self.attached_session,
+            self.attach_hydration.as_ref(),
+            &self.selected_session,
+        ) {
+            (None, Some(hydration), _) => {
+                format!("Terminal · {} · attaching", hydration.session_id)
+            }
+            (Some(attached), _, _) => format!("Terminal · {attached}"),
+            (None, None, Some(selected)) => format!("Terminal · {selected} · detached"),
+            (None, None, None) => "Terminal".to_string(),
         }
     }
 
@@ -5850,7 +5934,12 @@ impl TuiApp {
         // When a Ghostty projection is installed, styled paint is authoritative.
         // Kit Text child is chrome placeholder only — not ReadScreen authority.
         if self.ghostty_projection.is_some() || self.ghostty_viewport_cache.is_some() {
-            if self.attached_session.is_some() {
+            if self.attached_session.is_some()
+                || self
+                    .attach_hydration
+                    .as_ref()
+                    .is_some_and(|hydration| hydration.snapshot_ready)
+            {
                 return String::new();
             }
             return "Detached · Ghostty projection retained for scrollback.".to_string();
@@ -5941,12 +6030,21 @@ enum ObservedRequest {
         session_id: String,
         subscription_id: String,
     },
+    Detach {
+        session_id: String,
+        subscription_id: String,
+    },
     ShutdownSession(String),
     RemoveSession(String),
     Drain(String),
     ReadScreen(String),
     ReadModeFlags(String),
     CaptureSnapshot(String),
+    Resize {
+        session_id: String,
+        rows: u16,
+        cols: u16,
+    },
     SendInput {
         session_id: String,
         data: String,
@@ -8235,6 +8333,7 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_TERMINAL_READBACK.to_string(),
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
             FEATURE_MODE_GATED_INPUT.to_string(),
+            FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string(),
         ],
         minimum_conformance_fixture_revision: MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
@@ -11240,8 +11339,15 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_7_revision_36_mode_gated_input_and_session_entity_subscriptions() {
+    fn tui_requires_protocol_7_revision_38_and_incremental_snapshot_delivery() {
         let requirement = tui_compatibility_requirement();
+        let compatible_hub = || {
+            let mut compatibility = DaemonCompatibility::current();
+            compatibility
+                .features
+                .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+            compatibility
+        };
 
         assert_eq!(
             requirement.minimum_conformance_fixture_revision,
@@ -11252,7 +11358,13 @@ mod tests {
             botster_hub_client::PROTOCOL_VERSION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 38);
+        assert!(
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
+        );
         assert!(
             requirement
                 .required_features
@@ -11272,20 +11384,20 @@ mod tests {
                 .any(|feature| feature == FEATURE_MODE_GATED_INPUT)
         );
 
-        for revision in 16..36 {
-            let mut older_hub = DaemonCompatibility::current();
+        for revision in 16..38 {
+            let mut older_hub = compatible_hub();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-byte-faithful-contract fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 36"));
+            assert!(error.diagnostic.contains("requires at least 38"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
         // directions are covered deliberately: dropping the newer-protocol case
         // would silently restore the old minimum semantics this bump replaced.
         for protocol_version in (2..7).chain(8..10) {
-            let mut mismatched_hub = DaemonCompatibility::current();
+            let mut mismatched_hub = compatible_hub();
             mismatched_hub.protocol_version = protocol_version;
             let error = botster_hub_client::ensure_compatible(&requirement, &mismatched_hub)
                 .expect_err("protocol version must match the client exactly");
@@ -11296,12 +11408,12 @@ mod tests {
             );
             assert!(error.diagnostic.contains("client requires 7"));
         }
-        botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-            .expect("protocol 7 fixture revision 36 hub should connect");
-        let mut future_hub = DaemonCompatibility::current();
-        future_hub.conformance_fixture_revision = 37;
+        botster_hub_client::ensure_compatible(&requirement, &compatible_hub())
+            .expect("protocol 7 fixture revision 38 hub should connect");
+        let mut future_hub = compatible_hub();
+        future_hub.conformance_fixture_revision = 39;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 37");
+            .expect("runtime compatibility must preserve minimum semantics for revision 39");
     }
 
     #[test]
@@ -13394,9 +13506,12 @@ mod tests {
         app.attach_hydration = Some(AttachHydration {
             session_id: "session-alpha".to_string(),
             subscription_id: "terminal-generation".to_string(),
-            deadline: Instant::now() + Duration::from_secs(1),
             buffered_live_output: Vec::new(),
-            snapshot_installed: false,
+            pending_input: Vec::new(),
+            pending_resize: None,
+            snapshot_ready: false,
+            snapshot_finished: false,
+            attached_seen: false,
         });
         let (sender, receiver) = mpsc::channel();
         let (cancel_sender, _cancel_receiver) = mpsc::channel();
@@ -13452,9 +13567,12 @@ mod tests {
         requirement
             .required_features
             .push("botster-tui-future-feature".to_string());
-        let error =
-            botster_hub_client::ensure_compatible(&requirement, &DaemonCompatibility::current())
-                .expect_err("unsatisfied requirement should produce compatibility error");
+        let mut compatibility = DaemonCompatibility::current();
+        compatibility
+            .features
+            .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+        let error = botster_hub_client::ensure_compatible(&requirement, &compatibility)
+            .expect_err("unsatisfied requirement should produce compatibility error");
 
         app.record_transport_error(DaemonTransportError::Compatibility(error));
 
@@ -15472,6 +15590,7 @@ mod tests {
         app.selected_session = Some("session-beta".to_string());
         app.begin_attach_hydration("session-beta", "sub-test");
 
+        apply_incremental_snapshot_frames(&mut app, "session-beta", "sub-test", b"");
         app.apply_response(attach_state_response("session-beta", "attached"));
 
         let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
@@ -15493,6 +15612,8 @@ mod tests {
             state: "attached".to_string(),
         }]));
         assert!(app.attached_session.is_none());
+
+        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-current", b"");
 
         app.apply_response(events_response(vec![
             DaemonEvent::AttachState {
@@ -15587,14 +15708,14 @@ mod tests {
             },
         ]));
 
-        // Non-GHOSTSNP Snapshot never installs as text; live opens on a blank projection.
+        // Invalid opaque bytes never become text and cannot bypass FINISH.
         assert!(!viewport_cache_contains(&app, "snapshot"));
         assert!(!viewport_cache_contains(&app, "scrollback"));
-        assert!(viewport_cache_contains(&app, "live"));
+        assert!(!viewport_cache_contains(&app, "live"));
+        assert!(app.attach_hydration.is_some());
+        assert!(app.attached_session.is_none());
         let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
-        let rendered = lines.join("\n");
-        assert!(!rendered.contains("snapshot"));
-        assert!(!rendered.contains("scrollback"));
+        let _rendered = lines.join("\n");
         assert!(
             hit_map
                 .regions()
@@ -15617,16 +15738,14 @@ mod tests {
                 matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
             })
             .expect("shared fixture includes attaching state");
-        let opaque_state_index = scenario
+        let snapshot_indices = scenario
             .history_then_live
             .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. }
-                )
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, DaemonEvent::Snapshot { .. }).then_some(index)
             })
-            .expect("shared fixture includes opaque engine state");
+            .collect::<Vec<_>>();
         let attached_index = scenario
             .history_then_live
             .iter()
@@ -15639,8 +15758,26 @@ mod tests {
             .iter()
             .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
             .expect("shared fixture includes live output");
-        assert!(attaching_index < opaque_state_index);
-        assert!(opaque_state_index < attached_index);
+        assert!(
+            !scenario
+                .history_then_live
+                .iter()
+                .any(|event| matches!(event, DaemonEvent::Scrollback { .. }))
+        );
+        assert!(snapshot_indices.len() >= 3);
+        assert!(
+            snapshot_indices
+                .iter()
+                .all(|index| { attaching_index < *index && *index < attached_index })
+        );
+        assert_eq!(snapshot_indices[0], attaching_index + 1);
+        assert!(
+            snapshot_indices
+                .windows(2)
+                .all(|indices| indices[1] == indices[0] + 1)
+        );
+        assert_eq!(attached_index, snapshot_indices.last().unwrap() + 1);
+        assert_eq!(live_index, attached_index + 1);
         assert!(attached_index < live_index);
 
         let mut app = TuiApp::new(None);
@@ -15659,29 +15796,24 @@ mod tests {
         assert!(app.attached_session.is_none());
         assert!(app.observed_requests.is_empty());
 
-        let opaque_event = scenario.history_then_live[opaque_state_index].clone();
-        let decoded = match &opaque_event {
-            DaemonEvent::Snapshot { history, .. } | DaemonEvent::Scrollback { history, .. } => {
-                history
-                    .decoded_bytes()
-                    .expect("fixture opaque state decodes")
+        for (frame_index, event_index) in snapshot_indices.iter().enumerate() {
+            app.apply_response(events_response(vec![
+                scenario.history_then_live[*event_index].clone(),
+            ]));
+            assert!(app.terminal_output.is_empty());
+            assert!(app.attach_hydration.is_some());
+            assert!(app.ghostty_projection.is_some());
+            if frame_index == 0 {
+                assert!(app.attach_hydration.as_ref().is_some_and(|hydration| {
+                    hydration.snapshot_ready && !hydration.snapshot_finished
+                }));
             }
-            other => panic!("expected shared opaque history event, got {other:?}"),
-        };
-        assert!(
-            decoded.starts_with(b"GHOSTSNP"),
-            "shared history fixture ships a GHOSTSNP Snapshot, not dummy bytes"
-        );
-        app.apply_response(events_response(vec![opaque_event]));
-        // Snapshot GHOSTSNP installs; diagnostic String stays unused.
-        assert!(app.terminal_output.is_empty());
-        assert!(app.attach_hydration.is_some());
+        }
         assert!(
             app.attach_hydration
                 .as_ref()
-                .is_some_and(|hydration| hydration.snapshot_installed)
+                .is_some_and(|hydration| hydration.snapshot_finished)
         );
-        assert!(app.ghostty_projection.is_some());
 
         app.apply_response(events_response(vec![
             scenario.history_then_live[attached_index].clone(),
@@ -15719,6 +15851,7 @@ mod tests {
                     .count()
             })
             .unwrap_or(0);
+        assert_eq!(history_hits_before, 1);
         app.apply_optional_readback_response(
             read_screen_response(&scenario.session_id, &scenario.read_screen_text),
             "read_screen_diagnostic",
@@ -15767,18 +15900,30 @@ mod tests {
             .iter()
             .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
             .expect("idle fixture includes live output");
-        let idle_snapshot_index = scenario
+        let snapshot_indices = scenario
             .no_history_then_live
             .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. }
-                )
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, DaemonEvent::Snapshot { .. }).then_some(index)
             })
-            .expect("idle fixture includes blank GHOSTSNP Snapshot");
-        assert!(attaching_index < idle_snapshot_index);
-        assert!(idle_snapshot_index < attached_index);
+            .collect::<Vec<_>>();
+        assert!(
+            !scenario
+                .no_history_then_live
+                .iter()
+                .any(|event| matches!(event, DaemonEvent::Scrollback { .. }))
+        );
+        assert_eq!(snapshot_indices.len(), 2);
+        assert!(
+            snapshot_indices
+                .iter()
+                .all(|index| { attaching_index < *index && *index < attached_index })
+        );
+        assert_eq!(snapshot_indices[0], attaching_index + 1);
+        assert_eq!(snapshot_indices[1], snapshot_indices[0] + 1);
+        assert_eq!(attached_index, snapshot_indices[1] + 1);
+        assert_eq!(live_index, attached_index + 1);
         assert!(attached_index < live_index);
 
         let mut app = TuiApp::new(None);
@@ -15791,7 +15936,26 @@ mod tests {
 
         app.apply_response(events_response(vec![
             scenario.no_history_then_live[attaching_index].clone(),
-            scenario.no_history_then_live[idle_snapshot_index].clone(),
+            scenario.no_history_then_live[snapshot_indices[0]].clone(),
+        ]));
+        assert!(
+            app.attach_hydration.as_ref().is_some_and(|hydration| {
+                hydration.snapshot_ready && !hydration.snapshot_finished
+            })
+        );
+        assert!(app.attached_session.is_none());
+
+        app.apply_response(events_response(vec![
+            scenario.no_history_then_live[snapshot_indices[1]].clone(),
+        ]));
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.snapshot_finished)
+        );
+        assert!(app.attached_session.is_none());
+
+        app.apply_response(events_response(vec![
             scenario.no_history_then_live[attached_index].clone(),
         ]));
 
@@ -15833,6 +15997,69 @@ mod tests {
     }
 
     #[test]
+    fn shared_history_incomplete_keeps_ready_then_opens_the_live_path() {
+        let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
+        let events = scenario.history_incomplete_then_live;
+        let (session_id, subscription_id) = match &events[0] {
+            DaemonEvent::AttachState {
+                session_id,
+                subscription_id,
+                state,
+            } if state == "attaching" => (session_id.clone(), subscription_id.clone()),
+            event => panic!("expected attaching state, got {event:?}"),
+        };
+        assert!(matches!(&events[1], DaemonEvent::Snapshot { .. }));
+        assert!(matches!(
+            &events[2],
+            DaemonEvent::AttachState { state, .. }
+                if state == ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE
+        ));
+        assert!(matches!(
+            &events[3],
+            DaemonEvent::AttachState { state, .. } if state == "attached"
+        ));
+        assert!(matches!(&events[4], DaemonEvent::TerminalOutput { .. }));
+
+        let mut app = TuiApp::new(None);
+        app.subscription_id = subscription_id.clone();
+        app.begin_attach_hydration(&session_id, &subscription_id);
+        app.observed_requests.clear();
+
+        app.apply_response(events_response(events[..2].to_vec()));
+        assert!(viewport_cache_contains(
+            &app,
+            scenario.read_screen_text.trim()
+        ));
+        assert!(
+            app.ghostty_projection
+                .as_ref()
+                .is_some_and(GhosttyClientProjection::snapshot_history_pending)
+        );
+
+        app.apply_response(events_response(vec![events[2].clone()]));
+        assert!(viewport_cache_contains(
+            &app,
+            scenario.read_screen_text.trim()
+        ));
+        assert!(
+            app.ghostty_projection
+                .as_ref()
+                .is_some_and(|projection| !projection.snapshot_history_pending())
+        );
+        assert!(app.attached_session.is_none());
+
+        app.apply_response(events_response(vec![events[3].clone()]));
+        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
+        app.apply_response(events_response(vec![events[4].clone()]));
+        assert!(viewport_cache_contains(&app, "live-after-attach"));
+        assert!(viewport_cache_contains(
+            &app,
+            scenario.read_screen_text.trim()
+        ));
+        assert!(app.observed_requests.is_empty());
+    }
+
+    #[test]
     fn opaque_empty_snapshot_does_not_finish_visible_history_hydration() {
         let mut app = TuiApp::new(None);
         app.subscription_id = "sub-opaque".to_string();
@@ -15856,33 +16083,40 @@ mod tests {
             },
         ]));
 
-        // Non-GHOSTSNP Snapshot never becomes text content; attach opens blank projection.
+        // Invalid opaque Snapshot bytes cannot bypass READY or FINISH.
         assert!(app.terminal_output.is_empty());
-        assert!(app.attach_hydration.is_none());
-        assert_eq!(app.attached_session.as_deref(), Some("session-opaque"));
-        assert!(app.ghostty_projection.is_some());
+        assert!(app.attach_hydration.is_some());
+        assert!(app.attached_session.is_none());
+        assert!(app.ghostty_projection.is_none());
     }
 
     #[test]
-    fn expired_empty_hydration_finishes_before_synthetic_screen_response_renders() {
+    fn empty_response_never_bypasses_the_finish_barrier() {
         let mut app = TuiApp::new(None);
         app.subscription_id = "sub-captured".to_string();
         app.begin_attach_hydration("session-captured", "sub-captured");
-        app.attach_hydration.as_mut().unwrap().deadline = Instant::now();
-        // Attached before deadline so complete_attach_hydration can open live path.
-        app.attached_session = Some("session-captured".to_string());
-        app.attached_subscription_id = Some("sub-captured".to_string());
         app.observed_requests.clear();
 
+        app.apply_response(attach_state_response("session-captured", "attached"));
         app.apply_response(events_response(Vec::new()));
+        assert!(app.attach_hydration.is_some());
+        assert!(app.attached_session.is_none());
+        assert!(app.ghostty_projection.is_none());
+    }
+
+    #[test]
+    fn detach_cancels_an_incremental_attach_with_its_subscription() {
+        let mut app = TuiApp::new(None);
+        app.begin_attach_hydration("session-cancel", "sub-cancel");
+        app.observed_requests.clear();
+
+        app.detach_attached();
+
         assert!(app.attach_hydration.is_none());
-        assert!(app.ghostty_projection.is_some());
-        // ReadScreen diagnostic must not become primary terminal content.
-        app.apply_optional_readback_response(
-            read_screen_response("session-captured", "restored screen"),
-            "read_screen_diagnostic",
-        );
-        assert!(!app.terminal_content().contains("restored screen"));
+        assert!(app.observed_requests.contains(&ObservedRequest::Detach {
+            session_id: "session-cancel".to_string(),
+            subscription_id: "sub-cancel".to_string(),
+        }));
     }
 
     #[test]
@@ -15913,18 +16147,17 @@ mod tests {
         let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-alpha");
 
-        app.apply_response(events_response(vec![
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-alpha".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"authoritative-live"),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-alpha".to_string(),
-                state: "attached".to_string(),
-            },
-        ]));
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"authoritative-live"),
+        }]));
+        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-alpha", b"");
+        app.apply_response(events_response(vec![DaemonEvent::AttachState {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            state: "attached".to_string(),
+        }]));
         assert!(viewport_cache_contains(&app, "authoritative-live"));
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "restored-first\n"),
@@ -15947,18 +16180,17 @@ mod tests {
     fn read_screen_overlap_is_not_duplicated_when_live_output_is_flushed() {
         let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-alpha");
-        app.apply_response(events_response(vec![
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-alpha".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"marker\r\n"),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-alpha".to_string(),
-                state: "attached".to_string(),
-            },
-        ]));
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"marker\r\n"),
+        }]));
+        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-alpha", b"");
+        app.apply_response(events_response(vec![DaemonEvent::AttachState {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-alpha".to_string(),
+            state: "attached".to_string(),
+        }]));
         assert!(viewport_cache_contains(&app, "marker"));
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "prompt marker"),
@@ -16587,6 +16819,42 @@ mod tests {
             .expect("export GHOSTSNP producer bytes")
     }
 
+    fn producer_incremental_ghostsnp(
+        size: TerminalScreenSize,
+        bytes: &[u8],
+    ) -> Vec<botster_terminal_ghostty::GhosttySnapshotFrame> {
+        use botster_terminal_ghostty::{GhosttyAdapterConfig, GhosttyTerminal};
+        let mut producer = GhosttyTerminal::with_config(
+            size,
+            GhosttyAdapterConfig::with_max_scrollback_bytes(8 * 1024 * 1024),
+        )
+        .expect("producer GhosttyTerminal");
+        producer.write_output_bytes(bytes);
+        let mut frames = Vec::new();
+        producer
+            .export_snapshot_frames(|frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("export incremental GHOSTSNP frames");
+        frames
+    }
+
+    fn apply_incremental_snapshot_frames(
+        app: &mut TuiApp,
+        session_id: &str,
+        subscription_id: &str,
+        bytes: &[u8],
+    ) {
+        for frame in producer_incremental_ghostsnp(app.terminal_viewport_size, bytes) {
+            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+                session_id: session_id.to_string(),
+                subscription_id: subscription_id.to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
+            }]));
+        }
+    }
+
     fn viewport_cache_contains(app: &TuiApp, needle: &str) -> bool {
         let Some(viewport) = app.ghostty_viewport_cache.as_ref() else {
             return false;
@@ -16681,30 +16949,233 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_install_snapshot_before_live_applies_output() {
-        let size = TerminalScreenSize::new(8, 40);
-        let ghostsnp = producer_ghostsnp(size, b"seed-install");
+    fn incremental_attach_paints_ready_before_finish_and_retains_history() {
+        use botster_terminal_ghostty::GhosttySnapshotFrameKind;
+
+        let size = TerminalScreenSize::new(6, 48);
+        let mut source = b"HISTORY_MARKER\r\n".to_vec();
+        for line in 0..12_000 {
+            source.extend_from_slice(format!("history line {line:05}\r\n").as_bytes());
+        }
+        source.extend_from_slice(b"READY_MARKER");
+        let frames = producer_incremental_ghostsnp(size, &source);
+        assert_eq!(
+            frames.first().map(|frame| frame.kind),
+            Some(GhosttySnapshotFrameKind::Ready)
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.kind == GhosttySnapshotFrameKind::History),
+            "the production encoder must emit at least one history PAGE"
+        );
+        assert_eq!(
+            frames.last().map(|frame| frame.kind),
+            Some(GhosttySnapshotFrameKind::Finish)
+        );
+
         let mut app = TuiApp::new(None);
         app.terminal_viewport_size = size;
         app.begin_attach_hydration("session-alpha", "sub-test");
+        app.observed_requests.clear();
+        app.apply_response(events_response(vec![DaemonEvent::AttachState {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            state: "attaching".to_string(),
+        }]));
+
+        let ready = frames.first().expect("READY frame");
+        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
+        }]));
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.snapshot_ready && !hydration.snapshot_finished)
+        );
+        assert!(app.attached_session.is_none());
+        let (ready_paint, _, _) = render_app_painted(&app, 140, 42);
+        assert!(
+            ready_paint.contains("READY_MARKER"),
+            "READY must paint before FINISH: {ready_paint}"
+        );
+
+        for frame in frames.iter().skip(1) {
+            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
+            }]));
+        }
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.snapshot_finished)
+        );
+        assert!(app.attached_session.is_none());
+        assert!(app.observed_requests.is_empty());
+
+        app.apply_response(events_response(vec![DaemonEvent::AttachState {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            state: "attached".to_string(),
+        }]));
+        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
+        assert!(app.attach_hydration.is_none());
+
+        app.scroll_projection(ScrollOp::Top);
+        let (history_paint, _, _) = render_app_painted(&app, 140, 42);
+        assert!(
+            history_paint.contains("HISTORY_MARKER"),
+            "incremental PAGE delivery must retain painted history: {history_paint}"
+        );
+    }
+
+    #[test]
+    fn attach_queues_input_and_only_the_latest_resize_until_both_barriers() {
+        let size = TerminalScreenSize::new(6, 48);
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-test");
+        app.observed_requests.clear();
+
+        let frames = producer_incremental_ghostsnp(size, b"");
+        assert_eq!(
+            frames.iter().map(|frame| frame.kind).collect::<Vec<_>>(),
+            vec![
+                botster_terminal_ghostty::GhosttySnapshotFrameKind::Ready,
+                botster_terminal_ghostty::GhosttySnapshotFrameKind::Finish,
+            ]
+        );
+        let ready = frames.first().expect("READY frame");
+        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
+        }]));
+
+        app.handle_dispatch(InputDispatch::TerminalResize {
+            node_id: "tui-terminal".to_string(),
+            rows: 10,
+            cols: 50,
+        });
+        app.handle_dispatch(InputDispatch::TerminalResize {
+            node_id: "tui-terminal".to_string(),
+            rows: 12,
+            cols: 60,
+        });
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: b"queued-input\n".to_vec(),
+        });
+        assert_eq!(app.terminal_viewport_size, size);
+        assert!(app.observed_requests.is_empty());
+
+        for frame in frames.iter().skip(1) {
+            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
+            }]));
+        }
+        assert_eq!(app.terminal_viewport_size, size);
+        assert!(app.observed_requests.is_empty());
+        app.apply_response(attach_state_response("session-alpha", "attached"));
+
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::Resize { .. }))
+                .count(),
+            1
+        );
+        assert!(app.observed_requests.contains(&ObservedRequest::Resize {
+            session_id: "session-alpha".to_string(),
+            rows: 12,
+            cols: 60,
+        }));
+        assert!(app.observed_requests.iter().any(|request| matches!(
+            request,
+            ObservedRequest::SendInput { session_id, data }
+                if session_id == "session-alpha" && data == "queued-input\n"
+        )));
+    }
+
+    #[test]
+    fn incremental_history_failure_keeps_ready_terminal_and_then_attaches() {
+        let size = TerminalScreenSize::new(6, 48);
+        let frames = producer_incremental_ghostsnp(size, b"READY_SURVIVES");
+        let ready = frames.first().expect("READY frame");
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-test");
+
+        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
+        }]));
+        assert!(viewport_cache_contains(&app, "READY_SURVIVES"));
+        assert!(
+            app.ghostty_projection
+                .as_ref()
+                .is_some_and(GhosttyClientProjection::snapshot_history_pending)
+        );
+        assert!(app.attached_session.is_none());
+
+        app.apply_response(events_response(vec![DaemonEvent::AttachState {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            state: ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE.to_string(),
+        }]));
+        assert!(viewport_cache_contains(&app, "READY_SURVIVES"));
+        assert!(
+            app.ghostty_projection
+                .as_ref()
+                .is_some_and(|projection| !projection.snapshot_history_pending())
+        );
+        assert!(app.attached_session.is_none());
+
         app.apply_response(events_response(vec![
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"pre-install-live"),
-            },
-            DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
-            },
             DaemonEvent::AttachState {
                 session_id: "session-alpha".to_string(),
                 subscription_id: "sub-test".to_string(),
                 state: "attached".to_string(),
             },
+            DaemonEvent::TerminalOutput {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                payload: DaemonLiveOutputPayload::from_bytes(b"\r\nLIVE_AFTER_BARRIER"),
+            },
         ]));
-        // Attached opens live path immediately after Snapshot install.
+
+        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
+        assert!(app.attach_hydration.is_none());
+        assert!(viewport_cache_contains(&app, "READY_SURVIVES"));
+        assert!(viewport_cache_contains(&app, "LIVE_AFTER_BARRIER"));
+        let (painted, _, _) = render_app_painted(&app, 140, 42);
+        assert!(painted.contains("LIVE_AFTER_BARRIER"));
+    }
+
+    #[test]
+    fn ghostty_install_snapshot_before_live_applies_output() {
+        let size = TerminalScreenSize::new(8, 40);
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-test");
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-test".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"pre-install-live"),
+        }]));
+        assert!(app.applied_live_payloads.is_empty());
+        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-test", b"seed-install");
+        assert!(app.applied_live_payloads.is_empty());
+        assert!(app.attach_hydration.is_some());
+        app.apply_response(attach_state_response("session-alpha", "attached"));
+        // FINISH and attached open the live path after incremental install.
         assert!(app.attach_hydration.is_none());
         assert!(
             app.ghostty_projection.is_some(),
@@ -16712,6 +17183,10 @@ mod tests {
         );
         assert!(viewport_cache_contains(&app, "seed-install"));
         assert!(viewport_cache_contains(&app, "pre-install-live"));
+        assert_eq!(
+            app.applied_live_payloads,
+            vec![b"pre-install-live".to_vec()]
+        );
         // ReadScreen is diagnostic only and must not become terminal content.
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", "diagnostic-only"),
@@ -16731,22 +17206,11 @@ mod tests {
 
     fn attach_with_ghostsnp_seed(seed: &[u8]) -> TuiApp {
         let size = TerminalScreenSize::new(8, 40);
-        let ghostsnp = producer_ghostsnp(size, seed);
         let mut app = TuiApp::new(None);
         app.terminal_viewport_size = size;
         app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(events_response(vec![
-            DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                state: "attached".to_string(),
-            },
-        ]));
+        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-test", seed);
+        app.apply_response(attach_state_response("session-alpha", "attached"));
         assert!(app.attach_hydration.is_none());
         assert!(app.ghostty_projection.is_some());
         app.applied_live_payloads.clear();
@@ -16888,7 +17352,7 @@ mod tests {
         assert!(
             app.attach_hydration
                 .as_ref()
-                .is_some_and(|h| !h.snapshot_installed)
+                .is_some_and(|h| !h.snapshot_ready)
         );
         assert!(!viewport_cache_contains(
             &app,
@@ -16984,16 +17448,24 @@ mod tests {
             producer.write_output_bytes(format!("live edge {i}\r\n").as_bytes());
         }
         producer.write_output_bytes(b"BOTTOM_LIVE");
-        let ghostsnp = producer.export_snapshot_bytes().expect("export");
+        let mut frames = Vec::new();
+        producer
+            .export_snapshot_frames(|frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("export incremental frames");
 
         let mut app = TuiApp::new(None);
         app.terminal_viewport_size = size;
         app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
-        }]));
+        for frame in frames {
+            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+                session_id: "session-alpha".to_string(),
+                subscription_id: "sub-test".to_string(),
+                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
+            }]));
+        }
         app.apply_optional_readback_response(
             read_screen_response("session-alpha", ""),
             "read_screen",
@@ -17099,22 +17571,16 @@ mod tests {
     #[test]
     fn read_screen_is_non_authoritative_when_projection_installed() {
         let size = TerminalScreenSize::new(6, 40);
-        let ghostsnp = producer_ghostsnp(size, b"projection-authority");
         let mut app = TuiApp::new(None);
         app.terminal_viewport_size = size;
         app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(events_response(vec![
-            DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                state: "attached".to_string(),
-            },
-        ]));
+        apply_incremental_snapshot_frames(
+            &mut app,
+            "session-alpha",
+            "sub-test",
+            b"projection-authority",
+        );
+        app.apply_response(attach_state_response("session-alpha", "attached"));
         assert!(app.attach_hydration.is_none());
         assert!(viewport_cache_contains(&app, "projection-authority"));
         app.apply_optional_readback_response(
@@ -19163,8 +19629,8 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub 7499c161 and that Hub lock's Core worker tip
-        // (currently 5a993837). Export BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
+        // Build matching binaries from Hub f9f0d8df and Core 033cd01c. Export
+        // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
             skip_or_panic("BOTSTER_HUB_BIN");
@@ -19182,9 +19648,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "7499c1615078069ba391489b20c6f39c55c2d4c6".to_string());
+            .unwrap_or_else(|_| "f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "5a9938377b492ee1fa3acfb31365ebbebccc2a96".to_string());
+            .unwrap_or_else(|_| "033cd01ca307e57fb9fd8c8b6deadb6d691ab45b".to_string());
         println!(
             "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} hub_bin_set=true worker_bin_set=true"
         );
@@ -24305,11 +24771,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_36() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_38() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 36,
-            "hub-test-support pin must publish fixture revision 36"
+            scenario.conformance_fixture_revision, 38,
+            "hub-test-support pin must publish fixture revision 38"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -24373,7 +24839,7 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 38);
     }
 
     #[test]
@@ -25230,6 +25696,7 @@ exit 0
             session_type_definition: None,
             resolved_session_type: None,
             hub_update: None,
+            hub_update_execution: None,
             session_context: None,
             read_screen: None,
             mode_flags: None,
