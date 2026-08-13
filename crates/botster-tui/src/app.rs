@@ -16,14 +16,14 @@ use botster_core::{
     contract::terminal_screen::TerminalScreenSize,
 };
 use botster_hub_client::{
-    ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE, DaemonApp, DaemonAvailablePackage,
-    DaemonCaptureSnapshot, DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnostic,
-    DaemonDiagnosticKind, DaemonEndpoint, DaemonEntityFrame, DaemonEvent, DaemonPackage,
-    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
-    DaemonPackageNavigationEntry, DaemonPackagePin, DaemonPackageRouteDescriptor,
-    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeDefinition,
-    DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
+    ATTACH_STATE_ATTACH_FAILED, ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE, DaemonApp,
+    DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
+    DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
+    DaemonEntityFrame, DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason,
+    DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
+    DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
+    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
+    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
     FEATURE_MODE_GATED_INPUT, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
@@ -3346,6 +3346,7 @@ impl TuiApp {
     }
 
     fn detach_attached(&mut self) {
+        let cancelling_hydration = self.attach_hydration.is_some();
         let attachment = self
             .attach_hydration
             .as_ref()
@@ -3367,6 +3368,12 @@ impl TuiApp {
         };
         self.error = None;
         self.action_feedback = Some(format!("detach requested: {session_id}"));
+        if cancelling_hydration {
+            if let Some(projection) = self.ghostty_projection.as_mut() {
+                projection.abort_ghostsnp_history();
+            }
+            self.clear_ghostty_projection();
+        }
         self.attach_hydration = None;
         self.clear_terminal_mouse_mode();
         self.request_and_apply(DaemonRequest::Detach {
@@ -3897,6 +3904,14 @@ impl TuiApp {
                         self.action_feedback =
                             Some(format!("attach snapshot history incomplete: {session_id}"));
                         self.maybe_open_attach_live_path(&session_id);
+                    } else if state == ATTACH_STATE_ATTACH_FAILED && hydration_matches {
+                        if let Some(projection) = self.ghostty_projection.as_mut() {
+                            projection.abort_ghostsnp_history();
+                        }
+                        self.attach_hydration = None;
+                        self.clear_ghostty_projection();
+                        self.error =
+                            Some(format!("attach failed before READY (closed): {session_id}"));
                     } else if state == "detached" {
                         self.attached_session = None;
                         self.attached_subscription_id = None;
@@ -16107,16 +16122,74 @@ mod tests {
     #[test]
     fn detach_cancels_an_incremental_attach_with_its_subscription() {
         let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = TerminalScreenSize::new(6, 48);
         app.begin_attach_hydration("session-cancel", "sub-cancel");
+        let ready = producer_incremental_ghostsnp(app.terminal_viewport_size, b"READY_CANCEL")
+            .into_iter()
+            .next()
+            .expect("READY frame");
+        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
+            session_id: "session-cancel".to_string(),
+            subscription_id: "sub-cancel".to_string(),
+            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
+        }]));
+        assert!(
+            app.ghostty_projection
+                .as_ref()
+                .is_some_and(GhosttyClientProjection::snapshot_history_pending)
+        );
         app.observed_requests.clear();
 
         app.detach_attached();
 
         assert!(app.attach_hydration.is_none());
+        assert!(app.ghostty_projection.is_none());
         assert!(app.observed_requests.contains(&ObservedRequest::Detach {
             session_id: "session-cancel".to_string(),
             subscription_id: "sub-cancel".to_string(),
         }));
+        app.handle_dispatch(InputDispatch::TerminalResize {
+            node_id: "tui-terminal".to_string(),
+            rows: 10,
+            cols: 50,
+        });
+        assert_eq!(app.terminal_viewport_size, TerminalScreenSize::new(10, 50));
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn attach_failed_before_ready_ends_hydration_without_opening_live() {
+        let mut app = TuiApp::new(None);
+        app.begin_attach_hydration("session-failed", "sub-failed");
+
+        app.apply_response(events_response(vec![
+            DaemonEvent::AttachState {
+                session_id: "session-failed".to_string(),
+                subscription_id: "sub-failed".to_string(),
+                state: "attaching".to_string(),
+            },
+            DaemonEvent::AttachState {
+                session_id: "session-failed".to_string(),
+                subscription_id: "sub-failed".to_string(),
+                state: ATTACH_STATE_ATTACH_FAILED.to_string(),
+            },
+        ]));
+
+        assert!(app.attach_hydration.is_none());
+        assert!(app.attached_session.is_none());
+        assert!(app.ghostty_projection.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("attach failed before READY (closed)"))
+        );
+
+        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
+            session_id: "session-failed".to_string(),
+            subscription_id: "sub-failed".to_string(),
+            payload: DaemonLiveOutputPayload::from_bytes(b"must-not-open"),
+        }]));
+        assert!(app.applied_live_payloads.is_empty());
     }
 
     #[test]
