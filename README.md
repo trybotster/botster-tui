@@ -31,21 +31,27 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / `botster-ui-contract` / live hub | Hub `7499c1615078069ba391489b20c6f39c55c2d4c6` |
-| `botster-tui-kit` | `c07f793fb9ac46c24dcf1688881cd08be18ebc27` (ui-contract → same Hub rev) |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` | Core `4d0d1d8832d19352454a0789419a3e31e67d50df` with `libghostty-vt` |
+| `botster-hub-client` / `botster-ui-contract` / live hub | Hub `f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d` |
+| `botster-hub-test-support` package | `@trybotster/hub-test-support@0.1.33` |
+| `botster-tui-kit` | `d2f809c75403e576022c42e512454a2a13a05586` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` | Core `033cd01ca307e57fb9fd8c8b6deadb6d691ab45b` with `libghostty-vt` |
 
-`botster-terminal-ghostty` owns GHOSTSNP install, live VT apply, viewport
-projection, scrollbar, and color profile. The TUI installs Hub
-`Snapshot.history.decoded_bytes()` before attached readiness, applies later
-`TerminalOutput.payload.decoded_bytes()` without UTF-8 repair, and paints
-styled cells through a TUI-owned `ProjectionWidget` after kit `TerminalView`
-chrome (HitMap region `tui-terminal` + `terminal_inner_rect`). Kit does not
-gain Ghostty truth. Kitty keyboard and mouse encodings use Hub
+`botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
+viewport projection, scrollbar, and color profile. The TUI passes opaque Hub
+Snapshot bytes to that crate. The TUI paints after READY, applies one later
+Snapshot per history PAGE, and waits for FINISH plus `attached` before it
+releases queued input, the latest queued resize, or live output. A
+`snapshot_history_incomplete` state keeps the READY terminal and still permits
+the later `attached` state. The TUI applies
+`TerminalOutput.payload.decoded_bytes()` without UTF-8 repair and paints styled
+cells through a TUI-owned `ProjectionWidget` after kit `TerminalView` chrome
+(HitMap region `tui-terminal` + `terminal_inner_rect`). Kit does not gain
+Ghostty truth. Kitty keyboard and mouse encodings use Hub
 `ModeGatedInput` with `ReadModeFlags` freshness (`mode_generation` /
 `mode_revision`). ReadScreen remains optional diagnostic text only.
-Handshake requires protocol **7**, conformance floor **36**, and feature
-`mode_gated_input`. Live Ghostty proof is `script/test-live-hub ghostty`.
+Handshake requires protocol **7**, conformance floor **38**, and features
+`mode_gated_input` and `snapshot_delivery=ready_then_history`. Live Ghostty
+proof is `script/test-live-hub ghostty`.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -140,7 +146,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`7499c1615078069ba391489b20c6f39c55c2d4c6` (same Hub pin as Foundation above).
+`f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, ModeGatedInput, resize, and drain events. `botster-tui` does not
@@ -166,16 +172,16 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
   cargo run -p botster-tui -- --headless-live-runtime
 ```
 
-Byte-faithful Ghostty live proof (protocol 7 / floor 36). Build Hub
-`7499c1615078069ba391489b20c6f39c55c2d4c6` and that checkout's locked Core
-worker `5a9938377b492ee1fa3acfb31365ebbebccc2a96` into a fresh target dir,
+Incremental Ghostty live proof (protocol 7 / floor 38). Build Hub
+`f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d` and Core worker
+`033cd01ca307e57fb9fd8c8b6deadb6d691ab45b` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=7499c1615078069ba391489b20c6f39c55c2d4c6
-export BOTSTER_SESSION_WORKER_BIN_REV=5a9938377b492ee1fa3acfb31365ebbebccc2a96
+export BOTSTER_HUB_BIN_REV=f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d
+export BOTSTER_SESSION_WORKER_BIN_REV=033cd01ca307e57fb9fd8c8b6deadb6d691ab45b
 script/test-live-hub ghostty
 ```
 
@@ -208,18 +214,17 @@ Session types are authoritative Hub descriptors consumed through the
   the Hub effective `session_type_id` with `request.target_id = T`. Freeform
   `DaemonRequest::Spawn { command }` is not a product affordance (headless /
   Workspaces harness seeding may still use raw Spawn).
-- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 36` and does
+- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 38` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `7499c1615078069ba391489b20c6f39c55c2d4c6`, kit
-  `c07f793fb9ac46c24dcf1688881cd08be18ebc27`. Cargo.lock must keep a single
-  `botster-ui-contract` at that Hub rev and dual `botster-core` sources
-  (direct `4d0d1d88…` plus `branch=main` at `5a993837…` via hub-test-support).
+- Pins: Hub crates `f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d`, Core crates
+  `033cd01ca307e57fb9fd8c8b6deadb6d691ab45b`, and kit
+  `d2f809c75403e576022c42e512454a2a13a05586`.
 
 Live proof (independent of contract-matrix):
 
 ```sh
-# Prefer Hub + session-worker binaries built from 7499c161 (exact pin preferred).
+# Use Hub f9f0d8df and Core 033cd01c binaries.
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -237,7 +242,7 @@ list-for-target for a real admitted spawn point `T` (not `device:local`).
 are the repository-owned runtime proof that the installed Workspaces package,
 including the spawn-form `session_type_id` field and lifecycle bindings, works
 against a protocol-7 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `7499c1615078069ba391489b20c6f39c55c2d4c6`) and an
+this crate pins, currently `f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d`) and an
 explicit clean post-migration `botster-workspaces` package path via
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
 also pins the acceptance driver field key so a silent `template_id` revert
@@ -522,7 +527,7 @@ of being collapsed into the generic unavailable/reconnecting state.
 The daemon protocol version is matched **exactly**, not as a floor: the client
 requires protocol version 7 and refuses any other, so a newer Hub is rejected as
 firmly as an older one. The conformance fixture revision keeps minimum
-semantics with a floor of 36. Fixture revisions 16–35 and every protocol version
+semantics with a floor of 38. Fixture revisions 16–37 and every protocol version
 other than 7 fail through the structured compatibility diagnostic; there is no
 fallback path. Live `TerminalOutput` is a validated base64 envelope
 (`payload_base64` / `payload_encoding` / `bytes`); retired `data` is rejected.
