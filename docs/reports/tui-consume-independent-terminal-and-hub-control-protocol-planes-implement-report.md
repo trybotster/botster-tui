@@ -75,7 +75,7 @@ Task-surface:
 
 Not loaded: [[project-pipelines-playbook]] (no Project Pipelines package/plugin paths).
 
-Convention conflicts: none that blocked TUI-owned consume work. Cargo cannot `[patch]` Hub `branch=main` onto Core `rev=f4f6bf5` because those are the same git source. Live whole-mux stall still cannot prove Core `core_adapter_closed`. Both gaps are registered Hub tickets.
+Convention conflicts: none. UI contract identity is the Git tag `botster-ui-contract-v0.3.2`. The retired `third_party/botster-ui-contract` vendor is deleted.
 
 ## Files changed
 
@@ -85,6 +85,7 @@ Convention conflicts: none that blocked TUI-owned consume work. Cargo cannot `[p
 - `README.md` — pins, handshake, mux, Ghostty provenance
 - `docs/plans/tui-consume-independent-terminal-and-hub-control-protocol-planes-plan.md` — plan rev 4 plus Implement-revisit acceptance resync
 - `docs/reports/tui-consume-independent-terminal-and-hub-control-protocol-planes-implement-report.md` — this report
+- `third_party/botster-ui-contract/**` — deleted retired v0.3.1 vendor / `[patch]` identity path
 
 ## Ownership boundaries preserved
 
@@ -114,7 +115,7 @@ Edited only `botster-tui` application policy, handshake, mux consumption, hydrat
 1. **Live Core write-budget oracle.** Consumed Hub `4f30d695`. Live Ghostty keeps reading the flood connection, sends host Status, and requires exact `core_adapter_closed`. It does not stall the mux.
 2. **One terminal-protocol identity.** Consumed. Hub `3bee3a57` pins hub-client to Core `f4f6bf5`. `cargo tree` shows one identity.
 3. **8 MiB Ghostty scrollback.** `GhosttyClientProjection::new` defaults to 0 bytes. Production decoder uses `GhosttyAdapterConfig::with_max_scrollback_bytes(8 MiB)`.
-4. **`third_party/botster-ui-contract`.** Leftover unused vendor. Not deleted.
+4. **`third_party/botster-ui-contract`.** Removed. The workspace has no `[patch]`. UI contract identity is the Git tag `botster-ui-contract-v0.3.2` only.
 
 ## Tests and downstream proof
 
@@ -143,7 +144,7 @@ Live (`script/test-live-hub ghostty` on Hub `4f30d695`):
 - Exact close reason `core_adapter_closed` generation 1 (`ghostty-live-write-budget`)
 - Sibling frames continued after that close (`ghostty-live-sibling` 14 total, 1 after close)
 - Printed `ghostty-live-complete`
-- Repeatability: `script/test-live-hub ghostty` passed three consecutive times (37.28s, 37.80s, 36.69s), each with exact `core_adapter_closed`
+- Repeatability: `script/test-live-hub ghostty` passed three consecutive times (37.28s, 37.80s, 36.69s), each with exact `core_adapter_closed`. After vendor deletion it passed again (37.77s, `core_adapter_closed`).
 
 Production entry point: `HubConnection::connect` calls `connect_and_hello_with_terminal_requirement`, requires `ack.terminal_compatibility`, `ensure_terminal_compatible`, then `Attach`. `poll_hub` reads mux frames and does not send `DaemonRequest::Drain`. Entity pumps stay on separate host-control connections.
 
@@ -162,7 +163,6 @@ Production entry point: `HubConnection::connect` calls `connect_and_hello_with_t
 
 - Live 12k PAGE apply can still hit Ghostty `-2` on some Hub-encoded history pages. READY terminal stays usable.
 - Historical Hub `aafd6c2` live stall produced `host_adapter_closed`. That is not the current oracle. Hub `4f30d695` live proof requires exact `core_adapter_closed`.
-- `third_party/botster-ui-contract` leftover is unused.
 
 ## Missing vault guidance discovered
 

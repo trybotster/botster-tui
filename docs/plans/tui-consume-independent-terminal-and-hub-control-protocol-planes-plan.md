@@ -169,7 +169,7 @@ Ask-human only if live Hub `aafd6c2` omits `ack.terminal_compatibility` when the
 
 Assumptions: Hub `aafd6c2` is the consume pin. Attach stays session_id + subscription_id. TUI mints a unique `subscription_id` per Attach and never reuses it, so late close events for a retired subscription cannot hit the replacement. Entity pumps stay host control. Not a session-type eligibility consumer.
 
-Unknowns Implement must verify on the live pin: mux Response/Event/Terminal interleaving on one socket; whether `third_party/botster-ui-contract` is still referenced.
+Unknowns Implement must verify on the live pin: mux Response/Event/Terminal interleaving on one socket. `third_party/botster-ui-contract` is removed; it is not a consume path.
 
 ## Affected surfaces / files
 
