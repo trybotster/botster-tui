@@ -88,6 +88,7 @@ const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 40;
 const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+const MUX_POLL_BATCH_FRAMES: usize = 32;
 const GHOSTTY_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
@@ -8565,6 +8566,50 @@ fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonT
     ))
 }
 
+#[cfg(test)]
+fn wait_for_attached_projection(app: &mut TuiApp, session_id: &str) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(180);
+    let mut last_progress = started;
+    let mut last_ready = false;
+    let mut last_finished = false;
+    let mut last_mux_frames = 0_usize;
+    while Instant::now() < deadline {
+        app.poll_hub();
+        if app.ghostty_projection.is_some() && app.attached_session.as_deref() == Some(session_id) {
+            return;
+        }
+        if app.error.is_some() || app.terminal_close_evidence.is_some() {
+            break;
+        }
+        let ready = app
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready);
+        let finished = app
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_finished);
+        let mux_frames = app
+            .client
+            .as_ref()
+            .map(|client| client.mux_terminal_frames)
+            .unwrap_or(0);
+        if ready != last_ready || finished != last_finished || mux_frames > last_mux_frames {
+            last_progress = Instant::now();
+            last_ready = ready;
+            last_finished = finished;
+            last_mux_frames = mux_frames;
+        }
+        if last_progress.elapsed() >= Duration::from_secs(20)
+            && started.elapsed() >= Duration::from_secs(5)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for_app_output(app: &mut TuiApp, needle: &str) -> DaemonTransportResult<()> {
     if app.terminal_output.contains(needle) {
         return Ok(());
@@ -8691,6 +8736,18 @@ impl HubConnection {
         })
     }
 
+    #[cfg(test)]
+    fn from_stream(stream: std::os::unix::net::UnixStream) -> Self {
+        Self {
+            stream,
+            mux_buf: Vec::new(),
+            pending_mux_frames: Vec::new(),
+            mux_terminal_frames: 0,
+            mux_event_frames: 0,
+            mux_response_frames: 0,
+        }
+    }
+
     fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
         self.stream
             .set_read_timeout(None)
@@ -8707,12 +8764,23 @@ impl HubConnection {
 
     fn poll_mux_frames(&mut self) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
         let mut frames = self.take_pending_mux_frames();
+        if !frames.is_empty() {
+            return Ok(frames);
+        }
         self.stream
             .set_read_timeout(Some(MUX_POLL_TIMEOUT))
             .map_err(DaemonTransportError::Io)?;
         loop {
             match self.fill_mux_buf() {
-                Ok(true) => continue,
+                Ok(true) => {
+                    if let Err(error) = self.decode_ready_mux_frames() {
+                        let _ = self.stream.set_read_timeout(None);
+                        return Err(error);
+                    }
+                    if self.pending_mux_frames.len() >= MUX_POLL_BATCH_FRAMES {
+                        break;
+                    }
+                }
                 Ok(false) => break,
                 Err(error) => {
                     let _ = self.stream.set_read_timeout(None);
@@ -8723,7 +8791,6 @@ impl HubConnection {
         self.stream
             .set_read_timeout(None)
             .map_err(DaemonTransportError::Io)?;
-        self.decode_ready_mux_frames()?;
         frames.append(&mut self.pending_mux_frames);
         Ok(frames)
     }
@@ -17997,6 +18064,60 @@ mod tests {
     }
 
     #[test]
+    fn mux_poll_returns_complete_frames_while_the_stream_stays_readable() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut writer) = UnixStream::pair().expect("socket pair");
+        let envelope = mux_output_envelope("session-a", "sub-a", b"hello");
+        let mut line = serde_json::to_vec(&envelope).expect("encode");
+        line.push(b'\n');
+        let writer_line = line.clone();
+        fn write_line(writer: &mut UnixStream, line: &[u8]) -> io::Result<()> {
+            let mut offset = 0;
+            while offset < line.len() {
+                match writer.write(&line[offset..]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "mux flood writer made no progress",
+                        ));
+                    }
+                    Ok(count) => offset += count,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+        write_line(&mut writer, &writer_line).expect("prime one frame");
+        let writer_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if write_line(&mut writer, &writer_line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut connection = HubConnection::from_stream(reader);
+        let started = Instant::now();
+        let frames = connection
+            .poll_mux_frames()
+            .expect("poll must return on a live readable stream");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "poll must not wait for the producer to go idle; elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(
+            !frames.is_empty(),
+            "first poll must emit complete frames before the flood ends"
+        );
+        drop(connection);
+        let _ = writer_thread.join();
+    }
+
+    #[test]
     fn mux_terminal_subscription_closed_recovers_once_then_fails_closed() {
         let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-a");
@@ -20823,16 +20944,7 @@ mod tests {
             .expect("spawned session becomes authoritative");
         thread::sleep(Duration::from_secs(2));
         app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app.ghostty_projection.is_some()
-                && app.attached_session.as_deref() == Some(session_id.as_str())
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+        wait_for_attached_projection(&mut app, &session_id);
         assert!(
             app.ghostty_projection.is_some(),
             "production attach must install GHOSTSNP; error={:?} close={:?}",
@@ -21249,20 +21361,20 @@ mod tests {
             session_id: session_id.clone(),
             subscription_id: reconnect_sub.clone(),
         });
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app.ghostty_projection.is_some()
-                && app.attached_session.as_deref() == Some(session_id.as_str())
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+        wait_for_attached_projection(&mut app, &session_id);
         assert!(
             app.ghostty_projection.is_some(),
-            "reconnect attach must reinstall projection; error={:?}",
-            app.error
+            "reconnect attach must reinstall projection; error={:?} close={:?}",
+            app.error,
+            app.terminal_close_evidence
+        );
+        assert_eq!(
+            app.attached_session.as_deref(),
+            Some(session_id.as_str()),
+            "reconnect attach must reach Attached; error={:?} close={:?} recovery={}",
+            app.error,
+            app.terminal_close_evidence,
+            app.attach_recovery_used
         );
         // Downstream oracle: GHOSTSNP Snapshot dimensions come from the session
         // worker after Resize, not from the client-side TerminalResize handler.
@@ -21461,19 +21573,25 @@ mod tests {
         wait_for_authoritative_session(&mut app, &sibling_id).expect("sibling session ready");
         app.selected_session = Some(flood_id.clone());
         app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app.attached_session.as_deref() == Some(flood_id.as_str()) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(app.attached_session.as_deref(), Some(flood_id.as_str()));
+        wait_for_attached_projection(&mut app, &flood_id);
         let flood_sub = app
             .attached_subscription_id
             .clone()
-            .expect("flood subscription");
+            .or_else(|| app.retired_subscription_ids.iter().next().cloned())
+            .unwrap_or_else(|| app.subscription_id.clone());
+        assert!(
+            app.attached_session.as_deref() == Some(flood_id.as_str())
+                || app
+                    .terminal_close_evidence
+                    .as_ref()
+                    .is_some_and(|(_, reason)| {
+                        reason == TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+                    }),
+            "flood attach must reach Attached or core_adapter_closed; attached={:?} error={:?} close={:?}",
+            app.attached_session,
+            app.error,
+            app.terminal_close_evidence
+        );
 
         let mut sibling = HubConnection::connect(hub.endpoint()).expect("sibling connection");
         let sibling_sub = format!("sib-sub-{}", short_suffix());

@@ -55,8 +55,10 @@ including `unix_terminal_adapter` and `terminal_subscription_closed`. Terminal
 Hello uses `TerminalCompatibilityRequirement::for_ready_then_history_attach()`
 with `client_name = "botster-tui"` and `ensure_terminal_compatible` before
 Attach. Production connect is `connect_and_hello_with_terminal_requirement`.
-The attach socket reads `read_unix_mux_frame_from_reader` (`Response` / `Event`
-/ `Terminal`) and does not send terminal Drain. `TerminalSubscriptionClosed`
+The attach socket reads the Unix mux with a persistent byte buffer
+(`UnixStream::read`, `parse_unix_mux_value`) and emits each complete
+`Response` / `Event` / `Terminal` frame without waiting for the producer to
+go idle. It does not send terminal Drain. `TerminalSubscriptionClosed`
 for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. Live Ghostty proof is

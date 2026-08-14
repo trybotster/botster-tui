@@ -143,6 +143,7 @@ Live (`script/test-live-hub ghostty` on Hub `4f30d695`):
 - Exact close reason `core_adapter_closed` generation 1 (`ghostty-live-write-budget`)
 - Sibling frames continued after that close (`ghostty-live-sibling` 14 total, 1 after close)
 - Printed `ghostty-live-complete`
+- Repeatability: `script/test-live-hub ghostty` passed three consecutive times (37.28s, 37.80s, 36.69s), each with exact `core_adapter_closed`
 
 Production entry point: `HubConnection::connect` calls `connect_and_hello_with_terminal_requirement`, requires `ack.terminal_compatibility`, `ensure_terminal_compatible`, then `Attach`. `poll_hub` reads mux frames and does not send `DaemonRequest::Drain`. Entity pumps stay on separate host-control connections.
 
@@ -155,13 +156,12 @@ Production entry point: `HubConnection::connect` calls `connect_and_hello_with_t
 | Late-message matrix | Close events and leftover mux Terminal frames for retired `subscription_id` are ignored. Generation is evidence only. |
 | Production-path proof | Live Ghostty path: Hello split → mux Terminal → one decoder → FINISH/incomplete + Attached. Keep-reading flood attach yields exact `core_adapter_closed`. Host Status stays readable. Sibling frames continue after close. |
 | Ownership identity | TUI mints a unique `subscription_id` per Attach and never reuses it. Match close on session+subscription only. |
-| Sibling / fail-closed | Sequential attach B survives closed A. Live second connection receives sibling frames during a stall. Second recovery close fails that subscription. |
+| Sibling / fail-closed | Sequential attach B survives closed A. Live second connection receives sibling frames after `core_adapter_closed`. Second recovery close fails that subscription. |
 
 ## Unverified behavior or residual risk
 
 - Live 12k PAGE apply can still hit Ghostty `-2` on some Hub-encoded history pages. READY terminal stays usable.
-- Live stall reason on Hub `aafd6c2` is host egress, not Core 512-tick `core_adapter_closed`.
-- Live 12k PAGE apply can still hit Ghostty `-2` on some Hub-encoded history pages. READY terminal stays usable.
+- Historical Hub `aafd6c2` live stall produced `host_adapter_closed`. That is not the current oracle. Hub `4f30d695` live proof requires exact `core_adapter_closed`.
 - `third_party/botster-ui-contract` leftover is unused.
 
 ## Missing vault guidance discovered
