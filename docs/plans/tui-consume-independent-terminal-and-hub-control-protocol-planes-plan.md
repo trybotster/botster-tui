@@ -17,7 +17,7 @@ Plan revision 4
 | Branch | `project-pipelines/ticket_1786661009_551067` |
 | `teardown_class_applies` | **yes** |
 | Session-type eligibility consumer | **false** |
-| Implement blocked on | none. Hub parent `ticket_1786705502_228757` is closed at `aafd6c2cde430804f1bb54094c568fc88c15944b` |
+| Implement blocked on | none for TUI-owned consume work. Hub parent `ticket_1786705502_228757` is closed at `aafd6c2cde430804f1bb54094c568fc88c15944b`. Formal Hub follow-ups: `ticket_1786716545_950076` (one terminal-protocol identity) and `ticket_1786716545_417854` (`core_adapter_closed` while host mux stays readable). |
 
 ## Plan Review corrections
 
@@ -26,6 +26,15 @@ Plan revision 4
 | `finding_1786705308_744616` no live terminal handshake | product / blocker | Human 1B. Hub merge `aafd6c2` ships `DaemonHello.terminal_compatibility` and `DaemonHelloAck.terminal_compatibility`. TUI uses `connect_and_hello_with_terminal_requirement` plus Core `ensure_terminal_compatible`. |
 | `finding_1786705308_512406` no bounded close trigger | product / high | Hub merge emits `DaemonEvent::TerminalSubscriptionClosed` on mux `Event`. Reasons: `core_adapter_closed`, `host_adapter_closed`. TUI treats that as the authoritative incomplete-stream signal. |
 | `finding_1786712667_764862` TUI cannot match the active Core generation | product / high | Hub `aafd6c2` puts `generation` only on `TerminalSubscriptionClosed`. Attach, AttachState, and the mux envelope omit it. TUI owner key is the unique `(session_id, subscription_id)` it mints. Treat `generation` as close-event evidence only. Every recovery mints a new `subscription_id`. Do not register a Hub generation-on-attach ticket. |
+
+## Implement revisit after Review `changes_required`
+
+| Finding | TUI action | Formal owner |
+| --- | --- | --- |
+| `finding_1786715974_149013` dual `botster-terminal-protocol` identities | Keep decoder pin on Core `f4f6bf5`. Do not `[patch]` the same git source; Cargo rejects branch-to-rev retarget. | Hub `ticket_1786716545_950076` |
+| `finding_1786715974_898936` mux poll can drop partial or concatenated frames | Persistent `mux_buf`, `Read::read`, keep partial lines, `parse_unix_mux_value` per JSON value. | TUI |
+| `finding_1786715974_797854` Ghostty sequence failures must fresh-attach | Unexpected progress and apply `Err` call `recover_current_subscription`. Keep `SnapshotHistoryIncomplete` separate. | TUI |
+| `finding_1786715974_781287` live test does not prove Core hard-stop or sibling isolation | Live Ghostty keeps a second Unix connection readable during a stall. Do not widen the oracle to `host_adapter_closed`. | Hub `ticket_1786716545_417854` |
 
 ## Repository playbook loaded
 
@@ -110,7 +119,8 @@ Surgical TUI consumer cutover against Hub `aafd6c2`. Implement may edit now.
 6. Docs and live proof
    - Update README pins, handshake, and Ghostty provenance to Hub `aafd6c2` / Core `f4f6bf5`.
    - Hermetic tests for Hello split, mux `Event`, Core events, one recovery then fail closed.
-   - `script/test-live-hub ghostty` against Hub `aafd6c2` and Core worker `f4f6bf5`: 12,000 history lines, READY before FINISH, PAGE, live output, detach, reconnect, ProcessExited, and authentic write-budget close that yields `core_adapter_closed`.
+   - `script/test-live-hub ghostty` against Hub `aafd6c2` and Core worker `f4f6bf5`: 12,000 history lines, READY before FINISH, PAGE, live output, detach, reconnect, ProcessExited, and a second Unix connection that keeps receiving sibling terminal frames while this client stalls.
+   - Do not treat a whole-mux stall `host_adapter_closed` as Core write-budget proof. Authentic `core_adapter_closed` while host frames continue is Hub `ticket_1786716545_417854`.
    - Merge directly into main. Do not create a PR.
 
 ## Non-scope
@@ -138,6 +148,11 @@ Dependencies, all closed, on their repository targets:
 - `ticket_1786661008_634435` Hub Unix adapters
 - `ticket_1786661009_576857` TUI Kit identity
 - `ticket_1786705502_228757` Hub Hello split + `TerminalSubscriptionClosed`
+
+Open Hub follow-ups registered from Implement revisit:
+
+- `ticket_1786716545_950076` pin hub-client `botster-terminal-protocol` to a Core rev, not `branch=main`
+- `ticket_1786716545_417854` emit `core_adapter_closed` while the Unix host mux stays readable
 
 ## Product decision ledger
 
@@ -168,7 +183,7 @@ Unknowns Implement must verify on the live pin: mux Response/Event/Terminal inte
 | `teardown_isolation` | One unique `(session_id, subscription_id)` owns one decoder/hydration. Sibling sessions and entity pumps survive. Socket loss tears down this client. |
 | `teardown_bounds` | Authoritative incomplete-stream trigger is `TerminalSubscriptionClosed` for the current pair. One recovery Attach with a new `subscription_id`. Second close or second decode/phase gap fails closed. No `block_on` Hub close. No 20s timer. |
 | `late_message_matrix` | See table. |
-| `production_path_proof` | `connect_and_hello_with_terminal_requirement` → `ensure_terminal_compatible` → `Attach` → mux `Terminal` → `TerminalEvent::from_frame` → one decoder → FINISH+Attached. Close event or decode/phase gap → one fresh Attach with a new `subscription_id`. Live oracle: `script/test-live-hub ghostty` on Hub `aafd6c2` / Core `f4f6bf5`, including stalled-read write-budget → `core_adapter_closed`. |
+| `production_path_proof` | `connect_and_hello_with_terminal_requirement` → `ensure_terminal_compatible` → `Attach` → mux `Terminal` → `TerminalEvent::from_frame` → one decoder → FINISH+Attached. Close event or decode/phase gap → one fresh Attach with a new `subscription_id`. Live oracle on this pin: `script/test-live-hub ghostty` history/PAGE/live/ProcessExit plus a sibling Unix connection that stays readable while this client stalls. Authentic Core 512-tick `core_adapter_closed` while host frames continue is Hub `ticket_1786716545_417854`. |
 | `ownership_identity` | TUI mints a unique `subscription_id` per Attach and never reuses it. Match close events on `session_id` + `subscription_id` only. Record `generation` as evidence. Do not compare generation against an unknown live value. |
 | `sibling_fail_closed_policy` | Successful close keeps other sessions. Second recovery close fails that subscription. Prove sequential attach B survives closed A. |
 
@@ -204,7 +219,11 @@ Unknowns Implement must verify on the live pin: mux Response/Event/Terminal inte
 - Hello test: missing `snapshot_delivery=ready_then_history` on terminal ack fails before Attach
 - Hermetic mux tests: 12,000-line READY-before-FINISH, barriers, cancel+Detach, `AttachFailed`, decode/phase-gap fresh attach with no replay, `TerminalSubscriptionClosed` one recovery then fail closed, ProcessExited isolation, sibling attach survival
 - Hermetic late-close test: after recovery to subscription B, a `TerminalSubscriptionClosed` for retired subscription A must leave B's decoder and hydration intact, even if the event carries A's generation
-- `script/test-live-hub ghostty` with Hub bin from `aafd6c2` and worker from Core `f4f6bf5`: history, PAGE, live output, detach, reconnect, ProcessExited, authentic `core_adapter_closed`
+- Mux decoder keeps a partial line across polls and emits every concatenated JSON value on one line
+- Ghostty unexpected progress and post-READY apply errors call `recover_current_subscription`; `SnapshotHistoryIncomplete` stays separate
+- `script/test-live-hub ghostty` with Hub bin from `aafd6c2` and worker from Core `f4f6bf5`: history, PAGE, live output, detach, reconnect, ProcessExited, sibling connection stays readable during a stall
+- Do not require live `core_adapter_closed` on Hub `aafd6c2`. That oracle is Hub `ticket_1786716545_417854`
+- `cargo tree -p botster-tui -e normal` still shows two `botster-terminal-protocol` identities until Hub `ticket_1786716545_950076`. TUI `[patch]` cannot retarget `branch=main` to a rev of the same git source
 - Fresh `BOTSTER_LIVE_HUB_TARGET_DIR`
 - Distinct Hub and Core binary realpaths
 - Production entry point: Hello split + mux read; `poll_hub` does not send terminal Drain
