@@ -7,6 +7,8 @@
 - **Target repository:** `botster-tui` (`trybotster/botster-tui`)
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
 - **Base:** `origin/main` `5d2af28e92eef94d51d8f59c45ab94b8e9a58c7c`
+- **First Implement commit:** `0698c1af625f53c853600b137459c01fc439efc5`
+- **Review-revisit commit:** `13b02b9fdaed98c83d225c3c5dd0ccd04e62fc74`
 - **teardown_class_applies:** yes
 - **Plan revision:** 4 (`artifact_1786712757_521533`)
 
