@@ -17,7 +17,7 @@ Plan revision 4
 | Branch | `project-pipelines/ticket_1786661009_551067` |
 | `teardown_class_applies` | **yes** |
 | Session-type eligibility consumer | **false** |
-| Implement blocked on | none for TUI-owned consume work. Hub parent `ticket_1786705502_228757` is closed at `aafd6c2cde430804f1bb54094c568fc88c15944b`. Formal Hub follow-ups: `ticket_1786716545_950076` (one terminal-protocol identity) and `ticket_1786716545_417854` (`core_adapter_closed` while host mux stays readable). |
+| Implement blocked on | Hub `ticket_1786716545_417854` (`core_adapter_closed` while host mux stays readable). Identity parent `ticket_1786716545_950076` is closed at `3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79`. Hello parent `ticket_1786705502_228757` is closed at `aafd6c2cde430804f1bb54094c568fc88c15944b`. |
 
 ## Plan Review corrections
 
@@ -79,7 +79,7 @@ Surgical TUI consumer cutover against Hub `aafd6c2`. Implement may edit now.
 
 1. Pin identities
    - `botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }`
-   - `botster-hub-client` and `botster-hub-test-support` to `aafd6c2cde430804f1bb54094c568fc88c15944b`
+   - `botster-hub-client` and `botster-hub-test-support` to `3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79`
    - `botster-tui-kit` to `c83ba6c518e2324e34ce24c7abe5a8a05e56293c`
    - `botster-core`, `botster-terminal-ghostty`, `botster-core-test-support`, `botster-terminal-protocol-client` to Core `f4f6bf5babe92dfb9241a760c414187f711c2c42`
    - Prove one UI-contract source with `cargo tree -i botster-ui-contract`
@@ -117,9 +117,9 @@ Surgical TUI consumer cutover against Hub `aafd6c2`. Implement may edit now.
    - Reconnect: new subscription_id, new decoder.
 
 6. Docs and live proof
-   - Update README pins, handshake, and Ghostty provenance to Hub `aafd6c2` / Core `f4f6bf5`.
+   - Update README pins, handshake, and Ghostty provenance to Hub `3bee3a57` / Core `f4f6bf5`.
    - Hermetic tests for Hello split, mux `Event`, Core events, one recovery then fail closed.
-   - `script/test-live-hub ghostty` against Hub `aafd6c2` and Core worker `f4f6bf5`: 12,000 history lines, READY before FINISH, PAGE, live output, detach, reconnect, ProcessExited, and a second Unix connection that keeps receiving sibling terminal frames while this client stalls.
+   - `script/test-live-hub ghostty` against Hub `3bee3a57` and Core worker `f4f6bf5`: 12,000 history lines, READY before FINISH, PAGE, live output, detach, reconnect, ProcessExited, and a second Unix connection that keeps receiving sibling terminal frames while this client stalls.
    - Do not treat a whole-mux stall `host_adapter_closed` as Core write-budget proof. Authentic `core_adapter_closed` while host frames continue is Hub `ticket_1786716545_417854`.
    - Merge directly into main. Do not create a PR.
 
@@ -149,9 +149,12 @@ Dependencies, all closed, on their repository targets:
 - `ticket_1786661009_576857` TUI Kit identity
 - `ticket_1786705502_228757` Hub Hello split + `TerminalSubscriptionClosed`
 
-Open Hub follow-ups registered from Implement revisit:
+Closed Hub identity follow-up:
 
-- `ticket_1786716545_950076` pin hub-client `botster-terminal-protocol` to a Core rev, not `branch=main`
+- `ticket_1786716545_950076` pin hub-client `botster-terminal-protocol` to Core `f4f6bf5` at Hub `3bee3a57`
+
+Open Hub follow-up:
+
 - `ticket_1786716545_417854` emit `core_adapter_closed` while the Unix host mux stays readable
 
 ## Product decision ledger
@@ -221,9 +224,9 @@ Unknowns Implement must verify on the live pin: mux Response/Event/Terminal inte
 - Hermetic late-close test: after recovery to subscription B, a `TerminalSubscriptionClosed` for retired subscription A must leave B's decoder and hydration intact, even if the event carries A's generation
 - Mux decoder keeps a partial line across polls and emits every concatenated JSON value on one line
 - Ghostty unexpected progress and post-READY apply errors call `recover_current_subscription`; `SnapshotHistoryIncomplete` stays separate
-- `script/test-live-hub ghostty` with Hub bin from `aafd6c2` and worker from Core `f4f6bf5`: history, PAGE, live output, detach, reconnect, ProcessExited, sibling connection stays readable during a stall
-- Do not require live `core_adapter_closed` on Hub `aafd6c2`. That oracle is Hub `ticket_1786716545_417854`
-- `cargo tree -p botster-tui -e normal` still shows two `botster-terminal-protocol` identities until Hub `ticket_1786716545_950076`. TUI `[patch]` cannot retarget `branch=main` to a rev of the same git source
+- `script/test-live-hub ghostty` with Hub bin from `3bee3a57` and worker from Core `f4f6bf5`: history, PAGE, live output, detach, reconnect, ProcessExited, sibling connection stays readable during a stall
+- Do not require live `core_adapter_closed` until Hub `ticket_1786716545_417854` merges. Do not claim a held-open slow-client proof on this pin.
+- `cargo tree -p botster-tui -e normal -i botster-terminal-protocol` shows one identity at Core `f4f6bf5` after Hub `3bee3a57`
 - Fresh `BOTSTER_LIVE_HUB_TARGET_DIR`
 - Distinct Hub and Core binary realpaths
 - Production entry point: Hello split + mux read; `poll_hub` does not send terminal Drain

@@ -20730,7 +20730,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub aafd6c2c and Core f4f6bf5b. Export
+        // Build matching binaries from Hub 3bee3a57 and Core f4f6bf5b. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -20749,7 +20749,7 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "aafd6c2cde430804f1bb54094c568fc88c15944b".to_string());
+            .unwrap_or_else(|_| "3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
             .unwrap_or_else(|_| "f4f6bf5babe92dfb9241a760c414187f711c2c42".to_string());
         let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
