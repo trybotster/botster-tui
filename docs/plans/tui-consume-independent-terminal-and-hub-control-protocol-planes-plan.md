@@ -17,7 +17,7 @@ Plan revision 4
 | Branch | `project-pipelines/ticket_1786661009_551067` |
 | `teardown_class_applies` | **yes** |
 | Session-type eligibility consumer | **false** |
-| Implement blocked on | Hub `ticket_1786716545_417854` (`core_adapter_closed` while host mux stays readable). Identity parent `ticket_1786716545_950076` is closed at `3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79`. Hello parent `ticket_1786705502_228757` is closed at `aafd6c2cde430804f1bb54094c568fc88c15944b`. |
+| Implement blocked on | none. Identity parent `ticket_1786716545_950076` closed at `3bee3a57`. Slow-client parent `ticket_1786716545_417854` closed at `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`. Hello parent `ticket_1786705502_228757` closed at `aafd6c2`. |
 
 ## Plan Review corrections
 
@@ -79,7 +79,7 @@ Surgical TUI consumer cutover against Hub `aafd6c2`. Implement may edit now.
 
 1. Pin identities
    - `botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.2" }`
-   - `botster-hub-client` and `botster-hub-test-support` to `3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79`
+   - `botster-hub-client` and `botster-hub-test-support` to `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`
    - `botster-tui-kit` to `c83ba6c518e2324e34ce24c7abe5a8a05e56293c`
    - `botster-core`, `botster-terminal-ghostty`, `botster-core-test-support`, `botster-terminal-protocol-client` to Core `f4f6bf5babe92dfb9241a760c414187f711c2c42`
    - Prove one UI-contract source with `cargo tree -i botster-ui-contract`
@@ -117,9 +117,9 @@ Surgical TUI consumer cutover against Hub `aafd6c2`. Implement may edit now.
    - Reconnect: new subscription_id, new decoder.
 
 6. Docs and live proof
-   - Update README pins, handshake, and Ghostty provenance to Hub `3bee3a57` / Core `f4f6bf5`.
+   - Update README pins, handshake, and Ghostty provenance to Hub `4f30d695` / Core `f4f6bf5`.
    - Hermetic tests for Hello split, mux `Event`, Core events, one recovery then fail closed.
-   - `script/test-live-hub ghostty` against Hub `3bee3a57` and Core worker `f4f6bf5`: 12,000 history lines, READY before FINISH, PAGE, live output, detach, reconnect, ProcessExited, and a second Unix connection that keeps receiving sibling terminal frames while this client stalls.
+   - `script/test-live-hub ghostty` against Hub `4f30d695` and Core worker `f4f6bf5`: 12,000 history lines, READY before FINISH, PAGE, live output, detach, reconnect, ProcessExited, host Status while the flood connection keeps reading, exact `core_adapter_closed`, and sibling frames after that close.
    - Do not treat a whole-mux stall `host_adapter_closed` as Core write-budget proof. Authentic `core_adapter_closed` while host frames continue is Hub `ticket_1786716545_417854`.
    - Merge directly into main. Do not create a PR.
 
@@ -186,7 +186,7 @@ Unknowns Implement must verify on the live pin: mux Response/Event/Terminal inte
 | `teardown_isolation` | One unique `(session_id, subscription_id)` owns one decoder/hydration. Sibling sessions and entity pumps survive. Socket loss tears down this client. |
 | `teardown_bounds` | Authoritative incomplete-stream trigger is `TerminalSubscriptionClosed` for the current pair. One recovery Attach with a new `subscription_id`. Second close or second decode/phase gap fails closed. No `block_on` Hub close. No 20s timer. |
 | `late_message_matrix` | See table. |
-| `production_path_proof` | `connect_and_hello_with_terminal_requirement` → `ensure_terminal_compatible` → `Attach` → mux `Terminal` → `TerminalEvent::from_frame` → one decoder → FINISH+Attached. Close event or decode/phase gap → one fresh Attach with a new `subscription_id`. Live oracle on this pin: `script/test-live-hub ghostty` history/PAGE/live/ProcessExit plus a sibling Unix connection that stays readable while this client stalls. Authentic Core 512-tick `core_adapter_closed` while host frames continue is Hub `ticket_1786716545_417854`. |
+| `production_path_proof` | `connect_and_hello_with_terminal_requirement` → `ensure_terminal_compatible` → `Attach` → mux `Terminal` → `TerminalEvent::from_frame` → one decoder → FINISH+Attached. Close event or decode/phase gap → one fresh Attach with a new `subscription_id`. Live oracle: `script/test-live-hub ghostty` on Hub `4f30d695` / Core `f4f6bf5`, including keep-reading write-budget → exact `core_adapter_closed` and sibling frames after close. |
 | `ownership_identity` | TUI mints a unique `subscription_id` per Attach and never reuses it. Match close events on `session_id` + `subscription_id` only. Record `generation` as evidence. Do not compare generation against an unknown live value. |
 | `sibling_fail_closed_policy` | Successful close keeps other sessions. Second recovery close fails that subscription. Prove sequential attach B survives closed A. |
 
@@ -224,8 +224,8 @@ Unknowns Implement must verify on the live pin: mux Response/Event/Terminal inte
 - Hermetic late-close test: after recovery to subscription B, a `TerminalSubscriptionClosed` for retired subscription A must leave B's decoder and hydration intact, even if the event carries A's generation
 - Mux decoder keeps a partial line across polls and emits every concatenated JSON value on one line
 - Ghostty unexpected progress and post-READY apply errors call `recover_current_subscription`; `SnapshotHistoryIncomplete` stays separate
-- `script/test-live-hub ghostty` with Hub bin from `3bee3a57` and worker from Core `f4f6bf5`: history, PAGE, live output, detach, reconnect, ProcessExited, sibling connection stays readable during a stall
-- Do not require live `core_adapter_closed` until Hub `ticket_1786716545_417854` merges. Do not claim a held-open slow-client proof on this pin.
+- `script/test-live-hub ghostty` with Hub bin from `4f30d695` and worker from Core `f4f6bf5`: history, PAGE, live output, detach, reconnect, ProcessExited, host Status on the flood connection, exact `core_adapter_closed`, sibling frames after close
+- Do not accept `host_adapter_closed` as the Core write-budget oracle
 - `cargo tree -p botster-tui -e normal -i botster-terminal-protocol` shows one identity at Core `f4f6bf5` after Hub `3bee3a57`
 - Fresh `BOTSTER_LIVE_HUB_TARGET_DIR`
 - Distinct Hub and Core binary realpaths

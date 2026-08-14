@@ -20730,7 +20730,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub 3bee3a57 and Core f4f6bf5b. Export
+        // Build matching binaries from Hub 4f30d695 and Core f4f6bf5b. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -20749,7 +20749,7 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79".to_string());
+            .unwrap_or_else(|_| "4f30d6952f9a29541ab3a670a54bf5e136b8eb8e".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
             .unwrap_or_else(|_| "f4f6bf5babe92dfb9241a760c414187f711c2c42".to_string());
         let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
@@ -20823,20 +20823,30 @@ mod tests {
             .expect("spawned session becomes authoritative");
         thread::sleep(Duration::from_secs(2));
         app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             app.poll_hub();
-            if app.ghostty_projection.is_some() && app.attached_session.is_some() {
+            if app.ghostty_projection.is_some()
+                && app.attached_session.as_deref() == Some(session_id.as_str())
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
         assert!(
             app.ghostty_projection.is_some(),
-            "production attach must install GHOSTSNP; error={:?}",
-            app.error
+            "production attach must install GHOSTSNP; error={:?} close={:?}",
+            app.error,
+            app.terminal_close_evidence
         );
-        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            app.attached_session.as_deref(),
+            Some(session_id.as_str()),
+            "history attach must reach Attached; error={:?} close={:?} recovery={}",
+            app.error,
+            app.terminal_close_evidence,
+            app.attach_recovery_used
+        );
 
         // 12,000 history lines sit above the live screen. ScrollOp::Top must
         // reveal retained PAGE history; the live screen keeps BOTTOM_LIVE.
@@ -21423,10 +21433,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // Stall this Unix connection to prove a sibling connection stays readable.
-        // This is host-egress isolation, not Core 512-tick core_adapter_closed.
-        // Authentic core_adapter_closed while host mux stays readable is Hub ticket
-        // ticket_1786716545_417854.
+        // Keep reading this Unix mux while `yes` fills the Core adapter.
+        // Hub 4f30d695 emits core_adapter_closed without host egress close.
         let flood_id = format!("btui-flood-{}", short_suffix());
         let sibling_id = format!("btui-sib-{}", short_suffix());
         app.reset_attach_campaign();
@@ -21436,7 +21444,7 @@ mod tests {
         app.rebuild_session_rows();
         match app.request(DaemonRequest::Spawn {
             session_id: flood_id.clone(),
-            command: "while true; do printf 'FLOOD-%s\\n' \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; done".to_string(),
+            command: "yes write-budget-stall".to_string(),
         }) {
             Ok(response) => app.apply_response(response),
             Err(error) => panic!("flood spawn failed: {error}"),
@@ -21475,49 +21483,103 @@ mod tests {
                 subscription_id: sibling_sub.clone(),
             })
             .expect("sibling attach");
-        let stall_deadline = Instant::now() + Duration::from_secs(20);
+
+        let mut saw_pre_close_status = false;
         let mut sibling_terminal_frames = 0_usize;
-        while Instant::now() < stall_deadline {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            app.poll_hub();
             let frames = sibling
                 .poll_mux_frames()
-                .expect("sibling mux stays readable");
+                .expect("sibling mux stays readable during flood");
             sibling_terminal_frames += frames
                 .iter()
                 .filter(|frame| matches!(frame, DaemonUnixMuxFrame::Terminal(_)))
                 .count();
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            sibling_terminal_frames > 0,
-            "sibling subscription must keep receiving terminal frames while the flood connection is stalled"
-        );
-        println!("ghostty-live-sibling: terminal_frames={sibling_terminal_frames}");
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            app.poll_hub();
+            if !saw_pre_close_status && app.terminal_close_evidence.is_none() {
+                match app.request(DaemonRequest::Status) {
+                    Ok(response) => {
+                        assert_ne!(
+                            response.kind,
+                            botster_hub_client::DaemonResponseKind::OperatorError,
+                            "host Status must stay readable before core_adapter_closed: {:?}",
+                            response.error
+                        );
+                        app.apply_response(response);
+                        saw_pre_close_status = true;
+                    }
+                    Err(error) => panic!("pre-close Status failed: {error}"),
+                }
+            }
             if app.terminal_close_evidence.is_some() {
                 break;
             }
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            saw_pre_close_status,
+            "must read a host Status on the flood connection before close"
+        );
         let close_reason = app
             .terminal_close_evidence
             .as_ref()
-            .map(|(_, reason)| reason.as_str());
-        assert!(
-            app.terminal_close_evidence.is_some(),
-            "stalled flood attach must yield TerminalSubscriptionClosed; evidence={:?}",
+            .map(|(_, reason)| reason.clone());
+        assert_eq!(
+            close_reason.as_deref(),
+            Some(TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER),
+            "exact core_adapter_closed required; evidence={:?}",
             app.terminal_close_evidence
+        );
+        assert_ne!(
+            close_reason.as_deref(),
+            Some("host_adapter_closed"),
+            "host_adapter_closed is not the Core write-budget oracle"
         );
         assert!(
             app.attach_recovery_used,
             "adapter close must start the one recovery attach"
         );
         assert!(app.retired_subscription_ids.contains(&flood_sub));
+
+        match app.request(DaemonRequest::Status) {
+            Ok(response) => {
+                assert_ne!(
+                    response.kind,
+                    botster_hub_client::DaemonResponseKind::OperatorError,
+                    "host Status must stay readable after core_adapter_closed: {:?}",
+                    response.error
+                );
+                app.apply_response(response);
+            }
+            Err(error) => panic!("post-close Status failed: {error}"),
+        }
+
+        let sibling_after = Instant::now() + Duration::from_secs(8);
+        let sibling_before_close = sibling_terminal_frames;
+        while Instant::now() < sibling_after {
+            let frames = sibling
+                .poll_mux_frames()
+                .expect("sibling mux stays readable after core close");
+            sibling_terminal_frames += frames
+                .iter()
+                .filter(|frame| matches!(frame, DaemonUnixMuxFrame::Terminal(_)))
+                .count();
+            if sibling_terminal_frames > sibling_before_close {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            sibling_terminal_frames > sibling_before_close,
+            "sibling must keep receiving terminal frames after core_adapter_closed; before={sibling_before_close} after={sibling_terminal_frames}"
+        );
+        println!(
+            "ghostty-live-sibling: terminal_frames={sibling_terminal_frames} after_close={}",
+            sibling_terminal_frames - sibling_before_close
+        );
         println!(
             "ghostty-live-write-budget: reason={} generation={:?} retired={flood_sub}",
-            close_reason.unwrap_or("missing"),
+            close_reason.as_deref().unwrap_or("missing"),
             app.terminal_close_evidence
                 .as_ref()
                 .map(|(generation, _)| *generation)

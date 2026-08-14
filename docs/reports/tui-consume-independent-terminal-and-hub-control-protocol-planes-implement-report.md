@@ -79,7 +79,7 @@ Convention conflicts: none that blocked TUI-owned consume work. Cargo cannot `[p
 
 ## Files changed
 
-- `crates/botster-tui/Cargo.toml` — Hub `3bee3a57`, Core `f4f6bf5`, kit `c83ba6c`, UI contract tag `botster-ui-contract-v0.3.2`, add `botster-terminal-protocol-client`
+- `crates/botster-tui/Cargo.toml` — Hub `4f30d695`, Core `f4f6bf5`, kit `c83ba6c`, UI contract tag `botster-ui-contract-v0.3.2`, add `botster-terminal-protocol-client`
 - `Cargo.lock` — regenerated from those pins; one `botster-terminal-protocol` at Core `f4f6bf5`
 - `crates/botster-tui/src/app.rs` — split Hello, incremental mux buffer, no production Drain, Core `TerminalEvent` apply, Ghostty recover-on-error, fail-closed recovery, hermetic mux tests, live Ghostty 12k + sibling isolation
 - `README.md` — pins, handshake, mux, Ghostty provenance
@@ -98,7 +98,7 @@ Edited only `botster-tui` application policy, handshake, mux consumption, hydrat
 | `ticket_1786661009_576857` | TUI Kit | closed | UI contract identity |
 | `ticket_1786705502_228757` | Hub | closed at `aafd6c2` | Hello split + `TerminalSubscriptionClosed` |
 | `ticket_1786716545_950076` | Hub | closed at `3bee3a57` | Pin hub-client `botster-terminal-protocol` to Core `f4f6bf5` |
-| `ticket_1786716545_417854` | Hub | open | Emit `core_adapter_closed` while Unix host mux stays readable |
+| `ticket_1786716545_417854` | Hub | closed at `4f30d695` | Emit `core_adapter_closed` while Unix host mux stays readable |
 
 ## Review findings this revisit
 
@@ -107,11 +107,11 @@ Edited only `botster-tui` application policy, handshake, mux consumption, hydrat
 | `finding_1786715974_149013` dual protocol identities | Consumed Hub `3bee3a57` (`ticket_1786716545_950076` closed). `cargo tree -p botster-tui -e normal -i botster-terminal-protocol` shows one identity: Core `f4f6bf5`. |
 | `finding_1786715974_898936` mux drop | Fixed in TUI. Persistent `mux_buf`, `Read::read`, keep partial lines, parse every JSON value. Tests: split write, two values on one line, two newline-delimited lines. |
 | `finding_1786715974_797854` Ghostty sequence | Fixed in TUI. Unexpected progress and apply `Err` call `recover_current_subscription`. `SnapshotHistoryIncomplete` still keeps READY. |
-| `finding_1786715974_781287` Core hard-stop | TUI live test proves a sibling Unix connection stays readable during a stall. It does not require `core_adapter_closed`. Registered `ticket_1786716545_417854`. |
+| `finding_1786715974_781287` Core hard-stop | Consumed Hub `4f30d695`. Live Ghostty keeps reading, requires exact `core_adapter_closed`, and proves sibling frames after that close. |
 
 ## Deviations from plan
 
-1. **Live Core write-budget oracle.** Plan asked for authentic `core_adapter_closed`. Hub `aafd6c2` still closes the stalled Unix connection as `host_adapter_closed`. This revisit does not widen that oracle. Formal owner is Hub `ticket_1786716545_417854`. Plan acceptance checks now match.
+1. **Live Core write-budget oracle.** Consumed Hub `4f30d695`. Live Ghostty keeps reading the flood connection, sends host Status, and requires exact `core_adapter_closed`. It does not stall the mux.
 2. **One terminal-protocol identity.** Consumed. Hub `3bee3a57` pins hub-client to Core `f4f6bf5`. `cargo tree` shows one identity.
 3. **8 MiB Ghostty scrollback.** `GhosttyClientProjection::new` defaults to 0 bytes. Production decoder uses `GhosttyAdapterConfig::with_max_scrollback_bytes(8 MiB)`.
 4. **`third_party/botster-ui-contract`.** Leftover unused vendor. Not deleted.
@@ -134,13 +134,14 @@ New/updated hermetic proofs:
 - Mux 12k READY-before-FINISH, close once then fail closed, late close for retired A leaves B, ProcessExit isolation, sibling attach survival, `poll_hub` sends no Drain
 - Host floor 40 plus `unix_terminal_adapter` and `terminal_subscription_closed`
 
-Live (`script/test-live-hub ghostty` on Hub `3bee3a57`):
+Live (`script/test-live-hub ghostty` on Hub `4f30d695`):
 
-- Hub bin realpath `/private/tmp/botster-tui-live-hub-3bee3a57.pin/release/botster-hub`, rev `3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79`
+- Hub bin realpath `/private/tmp/botster-tui-live-hub-4f30d695.pin/release/botster-hub`, rev `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`
 - Worker bin distinct realpath `/private/tmp/botster-tui-live-core-f4f6bf5.pin/botster-session-worker`, locked Core `f4f6bf5babe92dfb9241a760c414187f711c2c42`
 - 12k history PAGEs, READY attach, live output, detach/reconnect, ProcessExit/exited row
-- Sibling second Unix connection received 81 terminal frames during the 20s stall (`ghostty-live-sibling`)
-- Stalled flood close reason `host_adapter_closed` generation 1 (`ghostty-live-write-budget`). Not treated as Core 512-tick proof. `ticket_1786716545_417854` remains open.
+- Host Status readable on the flood connection before close
+- Exact close reason `core_adapter_closed` generation 1 (`ghostty-live-write-budget`)
+- Sibling frames continued after that close (`ghostty-live-sibling` 14 total, 1 after close)
 - Printed `ghostty-live-complete`
 
 Production entry point: `HubConnection::connect` calls `connect_and_hello_with_terminal_requirement`, requires `ack.terminal_compatibility`, `ensure_terminal_compatible`, then `Attach`. `poll_hub` reads mux frames and does not send `DaemonRequest::Drain`. Entity pumps stay on separate host-control connections.
@@ -152,7 +153,7 @@ Production entry point: `HubConnection::connect` calls `connect_and_hello_with_t
 | Isolation | One unique `(session_id, subscription_id)` owns one decoder/hydration. Entity pumps and other sessions survive. Socket loss tears down this client. |
 | Bounds | Authoritative incomplete-stream trigger is `TerminalSubscriptionClosed` for the current pair. One recovery Attach with a new `subscription_id`. Second close or second decode/phase gap fails closed. No `block_on` Hub close. No 20s timer. |
 | Late-message matrix | Close events and leftover mux Terminal frames for retired `subscription_id` are ignored. Generation is evidence only. |
-| Production-path proof | Live Ghostty path: Hello split → mux Terminal → one decoder → FINISH/incomplete + Attached. Sibling Unix connection stays readable during a stall. Authentic `core_adapter_closed` is Hub `ticket_1786716545_417854`. |
+| Production-path proof | Live Ghostty path: Hello split → mux Terminal → one decoder → FINISH/incomplete + Attached. Keep-reading flood attach yields exact `core_adapter_closed`. Host Status stays readable. Sibling frames continue after close. |
 | Ownership identity | TUI mints a unique `subscription_id` per Attach and never reuses it. Match close on session+subscription only. |
 | Sibling / fail-closed | Sequential attach B survives closed A. Live second connection receives sibling frames during a stall. Second recovery close fails that subscription. |
 
@@ -160,7 +161,7 @@ Production entry point: `HubConnection::connect` calls `connect_and_hello_with_t
 
 - Live 12k PAGE apply can still hit Ghostty `-2` on some Hub-encoded history pages. READY terminal stays usable.
 - Live stall reason on Hub `aafd6c2` is host egress, not Core 512-tick `core_adapter_closed`.
-- Authentic held-open `core_adapter_closed` proof remains Hub `ticket_1786716545_417854`. This pin does not claim that proof.
+- Live 12k PAGE apply can still hit Ghostty `-2` on some Hub-encoded history pages. READY terminal stays usable.
 - `third_party/botster-ui-contract` leftover is unused.
 
 ## Missing vault guidance discovered
