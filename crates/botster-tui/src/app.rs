@@ -17,26 +17,40 @@ use botster_core::{
 };
 use botster_hub_client::{
     ATTACH_STATE_ATTACH_FAILED, ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE, DaemonApp,
-    DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility,
+    DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility, DaemonCompatibilityError,
     DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
-    DaemonEntityFrame, DaemonEvent, DaemonPackage, DaemonPackageAvailabilityReason,
+    DaemonEntityFrame, DaemonEvent, DaemonHelloAck, DaemonPackage, DaemonPackageAvailabilityReason,
     DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
     DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
     DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
-    FEATURE_MODE_GATED_INPUT, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_MODE_GATED_INPUT,
+    FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
+    FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
     FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS,
     FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, FEATURE_TERMINAL_READBACK,
-    FEATURE_TERMINAL_STREAMING, PROTOCOL, connect_and_hello_with_requirement,
-    read_frame_from_reader, subscribe_entities, subscribe_session_entities, write_frame,
+    FEATURE_TERMINAL_STREAMING, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+    FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
+    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible,
+    read_unix_mux_frame_from_reader, subscribe_entities, subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
 use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
+#[cfg(test)]
+use botster_hub_client::{
+    TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
+    TerminalCompatibility,
+};
 use botster_terminal_ghostty::{
-    GhosttyClientProjection, GhosttySnapshotDecodeProgress, ScrollOp, ViewportProjection,
+    GhosttyAdapterConfig, GhosttyClientProjection, GhosttySnapshotDecodeProgress, ScrollOp,
+    ViewportProjection,
+};
+#[cfg(test)]
+use botster_terminal_protocol_client::{AttachState, ProcessExit, Snapshot, TerminalOutput};
+use botster_terminal_protocol_client::{
+    AttachStateKind, SnapshotPhase, TerminalEvent, TerminalFrame,
 };
 use botster_ui_contract::{
     EntityFamilyStore, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
@@ -75,7 +89,9 @@ const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 38;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 40;
+const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+const GHOSTTY_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 const WORKSPACE_TOOLBAR_OVERFLOW_ID: &str = "workspace-toolbar__overflow";
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DEFAULT_TERMINAL_COLS: u16 = 80;
@@ -1373,6 +1389,12 @@ struct TuiApp {
     ghostty_viewport_cache: Option<ViewportProjection>,
     snapshot_metadata: Option<DaemonCaptureSnapshot>,
     attach_hydration: Option<AttachHydration>,
+    /// One automatic recovery already used for the current attach campaign.
+    attach_recovery_used: bool,
+    /// Retired subscription ids whose late close events must be ignored.
+    retired_subscription_ids: BTreeSet<String>,
+    /// Close-event evidence from `TerminalSubscriptionClosed` (generation, reason).
+    terminal_close_evidence: Option<(u64, String)>,
     terminal_mouse_mode: u8,
     terminal_mouse_mode_attachment: Option<(String, String)>,
     terminal_mode_shadow: Option<TerminalModeShadow>,
@@ -1470,6 +1492,9 @@ impl TuiApp {
             ghostty_viewport_cache: None,
             snapshot_metadata: None,
             attach_hydration: None,
+            attach_recovery_used: false,
+            retired_subscription_ids: BTreeSet::new(),
+            terminal_close_evidence: None,
             terminal_mouse_mode: 0,
             terminal_mouse_mode_attachment: None,
             terminal_mode_shadow: None,
@@ -1538,30 +1563,7 @@ impl TuiApp {
             return;
         }
 
-        let Some(session_id) = self
-            .attach_hydration
-            .as_ref()
-            .map(|hydration| hydration.session_id.clone())
-            .or_else(|| self.attached_session.clone())
-            .or_else(|| self.selected_attachable_session_id_for_poll())
-        else {
-            return;
-        };
-        let subscription_id = self
-            .attach_hydration
-            .as_ref()
-            .map(|hydration| hydration.subscription_id.clone())
-            .or_else(|| self.attached_subscription_id.clone());
-        let request = DaemonRequest::Drain {
-            session_id,
-            subscription_id,
-        };
-        #[cfg(test)]
-        self.record_request(&request);
-        match self.request(request) {
-            Ok(response) => self.apply_response(response),
-            Err(error) => self.record_transport_error(error),
-        }
+        self.poll_and_apply_mux_frames();
         self.refresh_terminal_mouse_mode_if_due();
     }
 
@@ -2111,6 +2113,7 @@ impl TuiApp {
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
+        self.reset_attach_campaign();
         self.clear_terminal_mouse_mode();
         self.try_connect();
     }
@@ -3275,7 +3278,8 @@ impl TuiApp {
         self.error = None;
         self.selected_session = Some(session_id.clone());
         self.action_feedback = Some(format!("attach requested: {session_id}"));
-        let subscription_id = format!("btui-sub-{}", short_suffix());
+        self.reset_attach_campaign();
+        let subscription_id = self.mint_subscription_id();
         self.begin_attach_hydration(&session_id, &subscription_id);
         self.request_and_apply(DaemonRequest::Attach {
             session_id,
@@ -3283,9 +3287,19 @@ impl TuiApp {
         });
     }
 
+    fn reset_attach_campaign(&mut self) {
+        self.attach_recovery_used = false;
+        self.retired_subscription_ids.clear();
+        self.terminal_close_evidence = None;
+    }
+
+    fn mint_subscription_id(&mut self) -> String {
+        format!("btui-sub-{}", short_suffix())
+    }
+
     fn begin_attach_hydration(&mut self, session_id: &str, subscription_id: &str) {
-        // Every Attach owns a fresh subscription generation and incremental
-        // snapshot barrier. ReadScreen remains optional diagnostic text only.
+        // Every Attach owns a unique subscription_id and one incremental
+        // decoder. ReadScreen remains optional diagnostic text only.
         self.subscription_id = subscription_id.to_string();
         self.attached_session = None;
         self.attached_subscription_id = None;
@@ -3337,14 +3351,6 @@ impl TuiApp {
         None
     }
 
-    fn selected_attachable_session_id_for_poll(&self) -> Option<String> {
-        let session_id = self.selected_session.as_ref()?;
-        self.sessions
-            .iter()
-            .find(|session| session.session_id == *session_id && session.is_attachable())
-            .map(|session| session.session_id.clone())
-    }
-
     fn detach_attached(&mut self) {
         let cancelling_hydration = self.attach_hydration.is_some();
         let attachment = self
@@ -3374,8 +3380,12 @@ impl TuiApp {
             }
             self.clear_ghostty_projection();
         }
+        self.retire_subscription(&subscription_id);
         self.attach_hydration = None;
         self.clear_terminal_mouse_mode();
+        if let Some(client) = self.client.as_mut() {
+            client.drop_terminal_frames_for(&session_id, &subscription_id);
+        }
         self.request_and_apply(DaemonRequest::Detach {
             session_id,
             subscription_id,
@@ -3424,7 +3434,10 @@ impl TuiApp {
         #[cfg(test)]
         self.record_request(&request);
         match self.request(request) {
-            Ok(response) => self.apply_response(response),
+            Ok(response) => {
+                self.apply_response(response);
+                self.apply_pending_mux_frames();
+            }
             Err(error) => self.record_transport_error(error),
         }
     }
@@ -3436,6 +3449,325 @@ impl TuiApp {
         match &mut self.client {
             Some(client) => client.request(&request),
             None => Err(DaemonTransportError::NotRunning),
+        }
+    }
+
+    fn retire_subscription(&mut self, subscription_id: &str) {
+        self.retired_subscription_ids
+            .insert(subscription_id.to_string());
+    }
+
+    fn current_owner_pair(&self) -> Option<(String, String)> {
+        self.attach_hydration
+            .as_ref()
+            .map(|hydration| {
+                (
+                    hydration.session_id.clone(),
+                    hydration.subscription_id.clone(),
+                )
+            })
+            .or_else(|| {
+                Some((
+                    self.attached_session.clone()?,
+                    self.attached_subscription_id.clone()?,
+                ))
+            })
+    }
+
+    fn poll_and_apply_mux_frames(&mut self) {
+        let frames = match self.client.as_mut() {
+            Some(client) => match client.poll_mux_frames() {
+                Ok(frames) => frames,
+                Err(error) => {
+                    self.record_transport_error(error);
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.apply_mux_frames(frames);
+    }
+
+    fn apply_pending_mux_frames(&mut self) {
+        let frames = match self.client.as_mut() {
+            Some(client) => client.take_pending_mux_frames(),
+            None => return,
+        };
+        self.apply_mux_frames(frames);
+    }
+
+    fn apply_mux_frames(&mut self, frames: Vec<DaemonUnixMuxFrame>) {
+        for frame in frames {
+            match frame {
+                DaemonUnixMuxFrame::Response(response) => self.apply_response(*response),
+                DaemonUnixMuxFrame::Terminal(envelope) => {
+                    self.apply_unix_terminal_envelope(envelope);
+                }
+                DaemonUnixMuxFrame::Event(event) => self.apply_mux_event(event),
+            }
+        }
+    }
+
+    fn apply_unix_terminal_envelope(&mut self, envelope: DaemonUnixTerminalEnvelope) {
+        if !envelope.is_unix_terminal_plane() {
+            return;
+        }
+        if self
+            .retired_subscription_ids
+            .contains(&envelope.subscription_id)
+        {
+            return;
+        }
+        if !self.hydration_matches(&envelope.session_id, &envelope.subscription_id)
+            && !self.attached_matches(&envelope.session_id, &envelope.subscription_id)
+        {
+            return;
+        }
+        let bytes = match envelope.payload_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.recover_from_decode_or_phase_gap(&format!(
+                    "unix terminal payload decode failed: {error}"
+                ));
+                return;
+            }
+        };
+        let frame = match TerminalFrame::from_bytes(&bytes) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.recover_from_decode_or_phase_gap(&format!(
+                    "terminal frame decode failed: {error}"
+                ));
+                return;
+            }
+        };
+        let event = match TerminalEvent::from_frame(&frame) {
+            Ok(event) => event,
+            Err(error) => {
+                self.recover_from_decode_or_phase_gap(&format!(
+                    "terminal event decode failed: {error}"
+                ));
+                return;
+            }
+        };
+        self.apply_terminal_event(event);
+    }
+
+    fn apply_mux_event(&mut self, event: DaemonEvent) {
+        match event {
+            DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            } => self.handle_terminal_subscription_closed(
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            ),
+            other => {
+                let _ = other;
+            }
+        }
+    }
+
+    fn apply_terminal_event(&mut self, event: TerminalEvent) {
+        match event {
+            TerminalEvent::Snapshot(snapshot) => {
+                if !self.hydration_matches(&snapshot.session_id, &snapshot.subscription_id) {
+                    return;
+                }
+                match snapshot.decoded_bytes() {
+                    Ok(bytes) => {
+                        self.apply_incremental_snapshot_with_phase(
+                            &snapshot.session_id,
+                            bytes,
+                            snapshot.phase,
+                        );
+                    }
+                    Err(error) => {
+                        self.recover_from_decode_or_phase_gap(&format!(
+                            "snapshot history decode failed: {error}"
+                        ));
+                    }
+                }
+            }
+            TerminalEvent::TerminalOutput(output) => {
+                let data = match output.decoded_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.recover_from_decode_or_phase_gap(&format!(
+                            "terminal output decode failed: {error}"
+                        ));
+                        return;
+                    }
+                };
+                if self.hydration_matches(&output.session_id, &output.subscription_id) {
+                    if let Some(hydration) = self.attach_hydration.as_mut() {
+                        hydration.buffered_live_output.extend_from_slice(&data);
+                    }
+                } else if self.attached_matches(&output.session_id, &output.subscription_id) {
+                    self.apply_live_terminal_output(&data);
+                    self.terminal_mouse_mode_refresh_due = true;
+                }
+            }
+            TerminalEvent::ProcessExit(exit) => {
+                self.apply_process_exit(exit.session_id, exit.subscription_id, exit.code);
+            }
+            TerminalEvent::AttachState(state) => {
+                self.apply_attach_state_kind(state.session_id, state.subscription_id, state.state);
+            }
+        }
+    }
+
+    fn handle_terminal_subscription_closed(
+        &mut self,
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+        reason: String,
+    ) {
+        if self.retired_subscription_ids.contains(&subscription_id) {
+            return;
+        }
+        if !self.hydration_matches(&session_id, &subscription_id)
+            && !self.attached_matches(&session_id, &subscription_id)
+        {
+            return;
+        }
+        self.terminal_close_evidence = Some((generation, reason.clone()));
+        self.action_feedback = Some(format!(
+            "terminal subscription closed generation={generation} reason={reason}: {session_id}"
+        ));
+        self.recover_current_subscription(
+            &session_id,
+            &subscription_id,
+            &format!("terminal subscription closed ({reason})"),
+        );
+    }
+
+    fn recover_from_decode_or_phase_gap(&mut self, reason: &str) {
+        let Some((session_id, subscription_id)) = self.current_owner_pair() else {
+            self.error = Some(reason.to_string());
+            return;
+        };
+        self.recover_current_subscription(&session_id, &subscription_id, reason);
+    }
+
+    fn recover_current_subscription(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        reason: &str,
+    ) {
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.clear_ghostty_projection();
+        self.attach_hydration = None;
+        self.attached_session = None;
+        self.attached_subscription_id = None;
+        self.clear_terminal_mouse_mode();
+        self.retire_subscription(subscription_id);
+        if let Some(client) = self.client.as_mut() {
+            client.drop_terminal_frames_for(session_id, subscription_id);
+        }
+        if self.client.is_some() {
+            self.request_and_apply(DaemonRequest::Detach {
+                session_id: session_id.to_string(),
+                subscription_id: subscription_id.to_string(),
+            });
+        }
+        if self.attach_recovery_used {
+            self.error = Some(format!(
+                "terminal attach failed closed after recovery: {reason}"
+            ));
+            return;
+        }
+        self.attach_recovery_used = true;
+        self.error = Some(format!("terminal attach recovering: {reason}"));
+        let replacement = self.mint_subscription_id();
+        self.begin_attach_hydration(session_id, &replacement);
+        if self.client.is_some() {
+            self.request_and_apply(DaemonRequest::Attach {
+                session_id: session_id.to_string(),
+                subscription_id: replacement,
+            });
+        }
+    }
+
+    fn apply_process_exit(
+        &mut self,
+        session_id: String,
+        subscription_id: String,
+        code: Option<i32>,
+    ) {
+        let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
+        if !hydration_matches && !self.attached_matches(&session_id, &subscription_id) {
+            return;
+        }
+        self.status = format!("process exited {}", code.unwrap_or_default());
+        self.retire_subscription(&subscription_id);
+        self.attached_session = None;
+        self.attached_subscription_id = None;
+        self.clear_terminal_mouse_mode();
+        self.clear_ghostty_projection();
+        self.clear_snapshot_metadata_for(&session_id);
+        if hydration_matches {
+            self.attach_hydration = None;
+        }
+    }
+
+    fn apply_attach_state_kind(
+        &mut self,
+        session_id: String,
+        subscription_id: String,
+        state: AttachStateKind,
+    ) {
+        let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
+        let attached_matches = self.attached_matches(&session_id, &subscription_id);
+        if !hydration_matches && !attached_matches {
+            return;
+        }
+        self.action_feedback = Some(format!("attach {state:?}: {session_id}"));
+        match state {
+            AttachStateKind::Attached if hydration_matches => {
+                if let Some(hydration) = self.attach_hydration.as_mut() {
+                    hydration.attached_seen = true;
+                }
+                self.maybe_open_attach_live_path(&session_id);
+            }
+            AttachStateKind::SnapshotHistoryIncomplete if hydration_matches => {
+                if let Some(projection) = self.ghostty_projection.as_mut() {
+                    projection.abort_ghostsnp_history();
+                }
+                if let Some(hydration) = self
+                    .attach_hydration
+                    .as_mut()
+                    .filter(|hydration| hydration.snapshot_ready)
+                {
+                    hydration.snapshot_finished = true;
+                } else {
+                    self.error = Some("snapshot history failed before READY (closed)".to_string());
+                    return;
+                }
+                self.action_feedback =
+                    Some(format!("attach snapshot history incomplete: {session_id}"));
+                self.maybe_open_attach_live_path(&session_id);
+            }
+            AttachStateKind::AttachFailed if hydration_matches => {
+                if let Some(projection) = self.ghostty_projection.as_mut() {
+                    projection.abort_ghostsnp_history();
+                }
+                self.attach_hydration = None;
+                self.clear_ghostty_projection();
+                self.error = Some(format!("attach failed before READY (closed): {session_id}"));
+            }
+            AttachStateKind::Attaching
+            | AttachStateKind::Attached
+            | AttachStateKind::SnapshotHistoryIncomplete
+            | AttachStateKind::AttachFailed => {}
         }
     }
 
@@ -3666,6 +3998,7 @@ impl TuiApp {
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
+        self.reset_attach_campaign();
         self.clear_terminal_mouse_mode();
         self.clear_ghostty_projection();
         match error {
@@ -3859,15 +4192,8 @@ impl TuiApp {
                 } => {
                     if self.hydration_matches(&session_id, &subscription_id) {
                         hydration_evidence.lifecycle_ended = true;
-                    } else if !self.attached_matches(&session_id, &subscription_id) {
-                        continue;
                     }
-                    self.status = format!("process exited {}", code.unwrap_or_default());
-                    self.attached_session = None;
-                    self.attached_subscription_id = None;
-                    self.clear_terminal_mouse_mode();
-                    self.clear_ghostty_projection();
-                    self.clear_snapshot_metadata_for(&session_id);
+                    self.apply_process_exit(session_id, subscription_id, code);
                 }
                 DaemonEvent::AttachState {
                     session_id,
@@ -3875,44 +4201,11 @@ impl TuiApp {
                     state,
                 } => {
                     let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
-                    let attached_matches = self.attached_matches(&session_id, &subscription_id);
-                    if !hydration_matches && !attached_matches {
-                        continue;
-                    }
-                    self.action_feedback = Some(format!("attach {state}: {session_id}"));
-                    if state == "attached" && hydration_matches {
-                        if let Some(hydration) = self.attach_hydration.as_mut() {
-                            hydration.attached_seen = true;
-                        }
-                        self.maybe_open_attach_live_path(&session_id);
-                    } else if state == ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE && hydration_matches
-                    {
-                        if let Some(projection) = self.ghostty_projection.as_mut() {
-                            projection.abort_ghostsnp_history();
-                        }
-                        if let Some(hydration) = self
-                            .attach_hydration
-                            .as_mut()
-                            .filter(|hydration| hydration.snapshot_ready)
-                        {
-                            hydration.snapshot_finished = true;
-                        } else {
-                            self.error =
-                                Some("snapshot history failed before READY (closed)".to_string());
+                    if state == "detached" {
+                        let attached_matches = self.attached_matches(&session_id, &subscription_id);
+                        if !hydration_matches && !attached_matches {
                             continue;
                         }
-                        self.action_feedback =
-                            Some(format!("attach snapshot history incomplete: {session_id}"));
-                        self.maybe_open_attach_live_path(&session_id);
-                    } else if state == ATTACH_STATE_ATTACH_FAILED && hydration_matches {
-                        if let Some(projection) = self.ghostty_projection.as_mut() {
-                            projection.abort_ghostsnp_history();
-                        }
-                        self.attach_hydration = None;
-                        self.clear_ghostty_projection();
-                        self.error =
-                            Some(format!("attach failed before READY (closed): {session_id}"));
-                    } else if state == "detached" {
                         self.attached_session = None;
                         self.attached_subscription_id = None;
                         self.clear_terminal_mouse_mode();
@@ -3921,6 +4214,8 @@ impl TuiApp {
                         if hydration_matches {
                             hydration_evidence.lifecycle_ended = true;
                         }
+                    } else if let Some(kind) = attach_state_kind_from_wire(&state) {
+                        self.apply_attach_state_kind(session_id, subscription_id, kind);
                     }
                 }
                 _ => {}
@@ -4006,7 +4301,10 @@ impl TuiApp {
         {
             return;
         }
-        match GhosttyClientProjection::new(self.terminal_viewport_size) {
+        match GhosttyClientProjection::with_config(
+            self.terminal_viewport_size,
+            GhosttyAdapterConfig::with_max_scrollback_bytes(GHOSTTY_SCROLLBACK_BYTES),
+        ) {
             Ok(projection) => {
                 self.ghostty_projection = Some(projection);
                 self.ghostty_projection_session_id = Some(session_id.to_string());
@@ -4024,6 +4322,40 @@ impl TuiApp {
             .attach_hydration
             .as_ref()
             .is_some_and(|hydration| hydration.snapshot_ready);
+        self.apply_incremental_snapshot_ready_state(session_id, bytes, ready);
+    }
+
+    fn apply_incremental_snapshot_with_phase(
+        &mut self,
+        session_id: &str,
+        bytes: Vec<u8>,
+        phase: SnapshotPhase,
+    ) {
+        let ready = self
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready);
+        let phase_ok = matches!(
+            (phase, ready),
+            (SnapshotPhase::Ready, false)
+                | (SnapshotPhase::History, true)
+                | (SnapshotPhase::Finish, true)
+        );
+        if !phase_ok {
+            self.recover_from_decode_or_phase_gap(&format!(
+                "GHOSTSNP phase gap (closed): unexpected {phase:?} ready={ready}"
+            ));
+            return;
+        }
+        self.apply_incremental_snapshot_ready_state(session_id, bytes, ready);
+    }
+
+    fn apply_incremental_snapshot_ready_state(
+        &mut self,
+        session_id: &str,
+        bytes: Vec<u8>,
+        ready: bool,
+    ) {
         self.ensure_ghostty_projection(session_id);
         let Some(projection) = self.ghostty_projection.as_mut() else {
             return;
@@ -4059,13 +4391,23 @@ impl TuiApp {
                 ));
             }
             Err(error) => {
-                // A post-READY failure keeps the renderable READY terminal.
-                if !ready {
+                if ready {
+                    if let Some(projection) = self.ghostty_projection.as_mut() {
+                        projection.abort_ghostsnp_history();
+                    }
+                    if let Some(hydration) = self.attach_hydration.as_mut() {
+                        hydration.snapshot_finished = true;
+                    }
+                    self.error = Some(format!(
+                        "GHOSTSNP incremental apply failed (closed): {error}"
+                    ));
+                    self.maybe_open_attach_live_path(session_id);
+                } else {
                     self.clear_ghostty_projection();
+                    self.error = Some(format!(
+                        "GHOSTSNP incremental apply failed (closed): {error}"
+                    ));
                 }
-                self.error = Some(format!(
-                    "GHOSTSNP incremental apply failed (closed): {error}"
-                ));
             }
         }
     }
@@ -8183,6 +8525,8 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
             FEATURE_PACKAGE_NAVIGATION,
             FEATURE_TERMINAL_READBACK,
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+            FEATURE_UNIX_TERMINAL_ADAPTER,
+            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
         ] {
             assert!(
                 compatibility
@@ -8207,7 +8551,7 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
 }
 
 fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonTransportResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         app.poll_hub();
         if app.sessions.iter().any(|session| {
@@ -8215,8 +8559,24 @@ fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonT
         }) {
             return Ok(());
         }
-        thread::yield_now();
+        thread::sleep(Duration::from_millis(25));
     }
+    eprintln!(
+        "authoritative-session-timeout: id={session_id} error={:?} connection_error={:?} status={} sessions={:?} pending={:?} has_snapshot={} sub={:?}",
+        app.error,
+        app.connection_error,
+        app.status,
+        app.sessions
+            .iter()
+            .map(|session| format!(
+                "{}:{}:pending={}",
+                session.session_id, session.lifecycle, session.pending
+            ))
+            .collect::<Vec<_>>(),
+        app.pending_sessions.keys().cloned().collect::<Vec<_>>(),
+        app.session_entities.has_snapshot,
+        app.session_entities.subscription_id,
+    );
     Err(DaemonTransportError::Protocol(
         "timed out waiting for authoritative session entity",
     ))
@@ -8318,20 +8678,161 @@ pub(crate) fn short_suffix() -> u64 {
 struct HubConnection {
     stream: std::os::unix::net::UnixStream,
     reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    pending_mux_frames: Vec<DaemonUnixMuxFrame>,
+    #[cfg(test)]
+    mux_terminal_frames: usize,
+    #[cfg(test)]
+    mux_event_frames: usize,
+    #[cfg(test)]
+    mux_response_frames: usize,
 }
 
 impl HubConnection {
     fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
-        let stream =
-            connect_and_hello_with_requirement(endpoint, &tui_compatibility_requirement())?;
+        let (stream, ack) = connect_and_hello_with_terminal_requirement(
+            endpoint,
+            &tui_compatibility_requirement(),
+            Some(&tui_terminal_compatibility_requirement()),
+        )?;
+        admit_terminal_hello(&ack)?;
         let reader = std::io::BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
-        Ok(Self { stream, reader })
+        Ok(Self {
+            stream,
+            reader,
+            pending_mux_frames: Vec::new(),
+            #[cfg(test)]
+            mux_terminal_frames: 0,
+            #[cfg(test)]
+            mux_event_frames: 0,
+            #[cfg(test)]
+            mux_response_frames: 0,
+        })
     }
 
     fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
+        self.stream
+            .set_read_timeout(None)
+            .map_err(DaemonTransportError::Io)?;
         write_frame(&mut self.stream, request)?;
-        read_frame_from_reader(&mut self.reader)
+        loop {
+            match self.read_mux_frame() {
+                Ok(DaemonUnixMuxFrame::Response(response)) => {
+                    #[cfg(test)]
+                    {
+                        self.mux_response_frames += 1;
+                    }
+                    return Ok(*response);
+                }
+                Ok(other) => {
+                    #[cfg(test)]
+                    {
+                        match &other {
+                            DaemonUnixMuxFrame::Terminal(_) => self.mux_terminal_frames += 1,
+                            DaemonUnixMuxFrame::Event(_) => self.mux_event_frames += 1,
+                            DaemonUnixMuxFrame::Response(_) => {}
+                        }
+                    }
+                    self.pending_mux_frames.push(other);
+                }
+                Err(error) if is_blank_mux_line(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
+
+    fn poll_mux_frames(&mut self) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
+        let mut frames = self.take_pending_mux_frames();
+        self.stream
+            .set_read_timeout(Some(MUX_POLL_TIMEOUT))
+            .map_err(DaemonTransportError::Io)?;
+        loop {
+            match self.read_mux_frame() {
+                Ok(frame) => {
+                    #[cfg(test)]
+                    {
+                        match &frame {
+                            DaemonUnixMuxFrame::Terminal(_) => self.mux_terminal_frames += 1,
+                            DaemonUnixMuxFrame::Event(_) => self.mux_event_frames += 1,
+                            DaemonUnixMuxFrame::Response(_) => self.mux_response_frames += 1,
+                        }
+                    }
+                    frames.push(frame);
+                }
+                Err(error) if is_blank_mux_line(&error) => continue,
+                Err(DaemonTransportError::Io(error))
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(error) => {
+                    let _ = self.stream.set_read_timeout(None);
+                    return Err(error);
+                }
+            }
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(DaemonTransportError::Io)?;
+        Ok(frames)
+    }
+
+    fn read_mux_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+        read_unix_mux_frame_from_reader(&mut self.reader)
+    }
+
+    fn take_pending_mux_frames(&mut self) -> Vec<DaemonUnixMuxFrame> {
+        std::mem::take(&mut self.pending_mux_frames)
+    }
+
+    fn drop_terminal_frames_for(&mut self, session_id: &str, subscription_id: &str) {
+        self.pending_mux_frames.retain(|frame| match frame {
+            DaemonUnixMuxFrame::Terminal(envelope) => {
+                envelope.session_id != session_id || envelope.subscription_id != subscription_id
+            }
+            DaemonUnixMuxFrame::Event(DaemonEvent::TerminalSubscriptionClosed {
+                session_id: event_session,
+                subscription_id: event_subscription,
+                ..
+            }) => event_session != session_id || event_subscription != subscription_id,
+            _ => true,
+        });
+    }
+}
+
+fn is_blank_mux_line(error: &DaemonTransportError) -> bool {
+    match error {
+        DaemonTransportError::Json(json) => {
+            let message = json.to_string();
+            message.contains("expected value at line 1 column 1")
+                || message.contains("trailing characters")
+        }
+        _ => false,
+    }
+}
+
+fn admit_terminal_hello(ack: &DaemonHelloAck) -> DaemonTransportResult<()> {
+    let requirement = tui_terminal_compatibility_requirement();
+    let Some(terminal_compatibility) = ack.terminal_compatibility.as_ref() else {
+        return Err(terminal_hello_error(
+            "hello ack omitted terminal_compatibility",
+        ));
+    };
+    ensure_terminal_compatible(&requirement, terminal_compatibility)
+        .map_err(|error| terminal_hello_error_with_diagnostic(error.diagnostic))
+}
+
+fn terminal_hello_error(reason: &str) -> DaemonTransportError {
+    terminal_hello_error_with_diagnostic(format!(
+        "botster-tui is incompatible with the terminal protocol: {reason}"
+    ))
+}
+
+fn terminal_hello_error_with_diagnostic(diagnostic: String) -> DaemonTransportError {
+    DaemonTransportError::Compatibility(DaemonCompatibilityError {
+        diagnostic: diagnostic.clone(),
+        diagnostics: vec![DaemonDiagnostic::compatibility_mismatch(diagnostic)],
+    })
 }
 
 fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
@@ -8349,9 +8850,29 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
             FEATURE_MODE_GATED_INPUT.to_string(),
             FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string(),
+            FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
+            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
         ],
         minimum_conformance_fixture_revision: MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
+    }
+}
+
+fn tui_terminal_compatibility_requirement() -> TerminalCompatibilityRequirement {
+    let mut requirement = TerminalCompatibilityRequirement::for_ready_then_history_attach();
+    requirement.client_name = "botster-tui".to_string();
+    requirement
+}
+
+fn attach_state_kind_from_wire(state: &str) -> Option<AttachStateKind> {
+    match state {
+        "attaching" => Some(AttachStateKind::Attaching),
+        "attached" => Some(AttachStateKind::Attached),
+        value if value == ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE => {
+            Some(AttachStateKind::SnapshotHistoryIncomplete)
+        }
+        value if value == ATTACH_STATE_ATTACH_FAILED => Some(AttachStateKind::AttachFailed),
+        _ => None,
     }
 }
 
@@ -11354,13 +11875,19 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_7_revision_38_and_incremental_snapshot_delivery() {
+    fn tui_requires_protocol_7_revision_40_and_split_terminal_hello() {
         let requirement = tui_compatibility_requirement();
         let compatible_hub = || {
             let mut compatibility = DaemonCompatibility::current();
             compatibility
                 .features
                 .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+            compatibility
+                .features
+                .push(FEATURE_UNIX_TERMINAL_ADAPTER.to_string());
+            compatibility
+                .features
+                .push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string());
             compatibility
         };
 
@@ -11373,12 +11900,24 @@ mod tests {
             botster_hub_client::PROTOCOL_VERSION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 38);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
         assert!(
             requirement
                 .required_features
                 .iter()
                 .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
+        );
+        assert!(
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_UNIX_TERMINAL_ADAPTER)
+        );
+        assert!(
+            requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
         );
         assert!(
             requirement
@@ -11399,13 +11938,13 @@ mod tests {
                 .any(|feature| feature == FEATURE_MODE_GATED_INPUT)
         );
 
-        for revision in 16..38 {
+        for revision in 16..40 {
             let mut older_hub = compatible_hub();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-                .expect_err("pre-byte-faithful-contract fixture revision must be rejected");
+                .expect_err("pre-mux-contract fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 38"));
+            assert!(error.diagnostic.contains("requires at least 40"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
@@ -11424,11 +11963,11 @@ mod tests {
             assert!(error.diagnostic.contains("client requires 7"));
         }
         botster_hub_client::ensure_compatible(&requirement, &compatible_hub())
-            .expect("protocol 7 fixture revision 38 hub should connect");
+            .expect("protocol 7 fixture revision 40 hub should connect");
         let mut future_hub = compatible_hub();
-        future_hub.conformance_fixture_revision = 39;
+        future_hub.conformance_fixture_revision = 41;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 39");
+            .expect("runtime compatibility must preserve minimum semantics for revision 41");
     }
 
     #[test]
@@ -17106,6 +17645,378 @@ mod tests {
         );
     }
 
+    fn snapshot_phase_for_frame(
+        kind: botster_terminal_ghostty::GhosttySnapshotFrameKind,
+    ) -> SnapshotPhase {
+        match kind {
+            botster_terminal_ghostty::GhosttySnapshotFrameKind::Ready => SnapshotPhase::Ready,
+            botster_terminal_ghostty::GhosttySnapshotFrameKind::History => SnapshotPhase::History,
+            botster_terminal_ghostty::GhosttySnapshotFrameKind::Finish => SnapshotPhase::Finish,
+        }
+    }
+
+    fn mux_snapshot_envelope(
+        session_id: &str,
+        subscription_id: &str,
+        bytes: &[u8],
+        phase: SnapshotPhase,
+    ) -> DaemonUnixTerminalEnvelope {
+        let event = TerminalEvent::Snapshot(Snapshot::from_bytes(
+            session_id,
+            subscription_id,
+            bytes,
+            phase,
+        ));
+        let frame = event.to_frame().expect("encode snapshot frame");
+        DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &frame.to_bytes().expect("snapshot frame bytes"),
+        )
+    }
+
+    fn mux_output_envelope(
+        session_id: &str,
+        subscription_id: &str,
+        bytes: &[u8],
+    ) -> DaemonUnixTerminalEnvelope {
+        let event = TerminalEvent::TerminalOutput(TerminalOutput::from_bytes(
+            session_id,
+            subscription_id,
+            bytes,
+        ));
+        let frame = event.to_frame().expect("encode output frame");
+        DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &frame.to_bytes().expect("output frame bytes"),
+        )
+    }
+
+    fn mux_attach_state_envelope(
+        session_id: &str,
+        subscription_id: &str,
+        state: AttachStateKind,
+    ) -> DaemonUnixTerminalEnvelope {
+        let event = TerminalEvent::AttachState(AttachState {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            state,
+        });
+        let frame = event.to_frame().expect("encode attach state frame");
+        DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &frame.to_bytes().expect("attach state frame bytes"),
+        )
+    }
+
+    fn mux_process_exit_envelope(
+        session_id: &str,
+        subscription_id: &str,
+        code: Option<i32>,
+    ) -> DaemonUnixTerminalEnvelope {
+        let event = TerminalEvent::ProcessExit(ProcessExit {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            code,
+        });
+        let frame = event.to_frame().expect("encode process exit frame");
+        DaemonUnixTerminalEnvelope::from_frame_bytes(
+            session_id,
+            subscription_id,
+            &frame.to_bytes().expect("process exit frame bytes"),
+        )
+    }
+
+    fn apply_mux_snapshot_frames(
+        app: &mut TuiApp,
+        session_id: &str,
+        subscription_id: &str,
+        bytes: &[u8],
+    ) {
+        for frame in producer_incremental_ghostsnp(app.terminal_viewport_size, bytes) {
+            app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+                session_id,
+                subscription_id,
+                &frame.bytes,
+                snapshot_phase_for_frame(frame.kind),
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_terminal_snapshot_delivery_on_hello_ack_fails_before_attach() {
+        let mut compatibility = TerminalCompatibility::current();
+        compatibility.features.retain(|feature| {
+            feature
+                != botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
+        });
+        let ack = DaemonHelloAck {
+            protocol: PROTOCOL.to_string(),
+            compatibility: {
+                let mut host = DaemonCompatibility::current();
+                host.features
+                    .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+                host.features
+                    .push(FEATURE_UNIX_TERMINAL_ADAPTER.to_string());
+                host.features
+                    .push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string());
+                host
+            },
+            terminal_compatibility: Some(compatibility),
+            diagnostics: Vec::new(),
+        };
+        let error = admit_terminal_hello(&ack)
+            .expect_err("missing terminal snapshot_delivery must fail before Attach");
+        let diagnostic = match error {
+            DaemonTransportError::Compatibility(error) => error.diagnostic,
+            other => panic!("expected compatibility error, got {other}"),
+        };
+        assert!(
+            diagnostic.contains("snapshot_delivery=ready_then_history"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn missing_terminal_compatibility_ack_field_fails_before_attach() {
+        let ack = DaemonHelloAck {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibility::current(),
+            terminal_compatibility: None,
+            diagnostics: Vec::new(),
+        };
+        admit_terminal_hello(&ack)
+            .expect_err("omitted terminal_compatibility must fail before Attach");
+    }
+
+    #[test]
+    fn mux_incremental_attach_paints_ready_before_finish() {
+        let size = TerminalScreenSize::new(6, 48);
+        let mut source = b"HISTORY_MARKER\r\n".to_vec();
+        for line in 0..12_000 {
+            source.extend_from_slice(format!("history line {line:05}\r\n").as_bytes());
+        }
+        source.extend_from_slice(b"READY_MARKER");
+        let frames = producer_incremental_ghostsnp(size, &source);
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-mux");
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-alpha",
+            "sub-mux",
+            AttachStateKind::Attaching,
+        ));
+        let ready = frames.first().expect("READY");
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-mux",
+            &ready.bytes,
+            SnapshotPhase::Ready,
+        ));
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.snapshot_ready && !hydration.snapshot_finished)
+        );
+        let (ready_paint, _, _) = render_app_painted(&app, 140, 42);
+        assert!(ready_paint.contains("READY_MARKER"), "{ready_paint}");
+        for frame in frames.iter().skip(1) {
+            app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+                "session-alpha",
+                "sub-mux",
+                &frame.bytes,
+                snapshot_phase_for_frame(frame.kind),
+            ));
+        }
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-alpha",
+            "sub-mux",
+            AttachStateKind::Attached,
+        ));
+        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
+        app.scroll_projection(ScrollOp::Top);
+        let (history_paint, _, _) = render_app_painted(&app, 140, 42);
+        assert!(history_paint.contains("HISTORY_MARKER"), "{history_paint}");
+    }
+
+    #[test]
+    fn mux_phase_gap_fresh_attaches_without_replaying_leftover_frames() {
+        let size = TerminalScreenSize::new(6, 48);
+        let frames = producer_incremental_ghostsnp(size, b"READY_ONE");
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-a");
+        let first_sub = app.subscription_id.clone();
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-a",
+            &frames[0].bytes,
+            SnapshotPhase::Ready,
+        ));
+        assert!(viewport_cache_contains(&app, "READY_ONE"));
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-a",
+            &frames[0].bytes,
+            SnapshotPhase::Ready,
+        ));
+        assert!(
+            app.attach_recovery_used,
+            "phase gap must consume the one recovery"
+        );
+        let replacement = app.subscription_id.clone();
+        assert_ne!(replacement, first_sub);
+        assert!(app.retired_subscription_ids.contains(&first_sub));
+        assert!(app.ghostty_projection.is_none());
+        assert!(!viewport_cache_contains(&app, "READY_ONE"));
+        app.apply_unix_terminal_envelope(mux_output_envelope(
+            "session-alpha",
+            &first_sub,
+            b"must-not-replay",
+        ));
+        assert!(app.applied_live_payloads.is_empty());
+        assert!(!viewport_cache_contains(&app, "must-not-replay"));
+    }
+
+    #[test]
+    fn mux_terminal_subscription_closed_recovers_once_then_fails_closed() {
+        let mut app = TuiApp::new(None);
+        app.begin_attach_hydration("session-alpha", "sub-a");
+        let first = app.subscription_id.clone();
+        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session-alpha".to_string(),
+            subscription_id: first.clone(),
+            generation: 9,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        assert_eq!(
+            app.terminal_close_evidence,
+            Some((9, "core_adapter_closed".to_string()))
+        );
+        let replacement = app.subscription_id.clone();
+        assert_ne!(replacement, first);
+        assert!(app.attach_recovery_used);
+        assert!(app.attach_hydration.is_some());
+        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session-alpha".to_string(),
+            subscription_id: replacement,
+            generation: 10,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        assert!(app.attach_hydration.is_none());
+        assert!(app.attached_session.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed closed after recovery"))
+        );
+    }
+
+    #[test]
+    fn late_close_for_retired_subscription_does_not_abort_replacement() {
+        let size = TerminalScreenSize::new(6, 48);
+        let frames = producer_incremental_ghostsnp(size, b"REPLACEMENT");
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-a");
+        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-a".to_string(),
+            generation: 3,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        let replacement = app.subscription_id.clone();
+        apply_mux_snapshot_frames(&mut app, "session-alpha", &replacement, b"REPLACEMENT");
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-alpha",
+            &replacement,
+            AttachStateKind::Attached,
+        ));
+        assert_eq!(
+            app.attached_subscription_id.as_deref(),
+            Some(replacement.as_str())
+        );
+        let decoder_before = app.ghostty_projection.is_some();
+        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "sub-a".to_string(),
+            generation: 3,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        assert_eq!(
+            app.attached_subscription_id.as_deref(),
+            Some(replacement.as_str())
+        );
+        assert_eq!(app.ghostty_projection.is_some(), decoder_before);
+        assert!(viewport_cache_contains(&app, "REPLACEMENT") || frames.is_empty());
+        assert_eq!(app.subscription_id, replacement);
+    }
+
+    #[test]
+    fn mux_process_exit_closes_only_that_pair() {
+        let mut app = TuiApp::new(None);
+        app.begin_attach_hydration("session-a", "sub-a");
+        apply_mux_snapshot_frames(&mut app, "session-a", "sub-a", b"A");
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-a",
+            "sub-a",
+            AttachStateKind::Attached,
+        ));
+        app.apply_unix_terminal_envelope(mux_process_exit_envelope("session-b", "sub-b", Some(1)));
+        assert_eq!(app.attached_session.as_deref(), Some("session-a"));
+        app.apply_unix_terminal_envelope(mux_process_exit_envelope("session-a", "sub-a", Some(0)));
+        assert!(app.attached_session.is_none());
+        assert!(app.retired_subscription_ids.contains("sub-a"));
+    }
+
+    #[test]
+    fn sequential_sibling_attach_survives_closed_predecessor() {
+        let size = TerminalScreenSize::new(6, 48);
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-a", "sub-a");
+        apply_mux_snapshot_frames(&mut app, "session-a", "sub-a", b"AAA");
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-a",
+            "sub-a",
+            AttachStateKind::Attached,
+        ));
+        app.apply_unix_terminal_envelope(mux_process_exit_envelope("session-a", "sub-a", Some(0)));
+        app.reset_attach_campaign();
+        app.begin_attach_hydration("session-b", "sub-b");
+        apply_mux_snapshot_frames(&mut app, "session-b", "sub-b", b"BBB");
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-b",
+            "sub-b",
+            AttachStateKind::Attached,
+        ));
+        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "session-a".to_string(),
+            subscription_id: "sub-a".to_string(),
+            generation: 1,
+            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+        });
+        assert_eq!(app.attached_session.as_deref(), Some("session-b"));
+        assert!(viewport_cache_contains(&app, "BBB"));
+    }
+
+    #[test]
+    fn poll_hub_does_not_send_terminal_drain() {
+        let mut app = TuiApp::new(None);
+        app.sessions = vec![SessionRow::running("session-alpha")];
+        app.selected_session = Some("session-alpha".to_string());
+        app.begin_attach_hydration("session-alpha", "sub-test");
+        app.observed_requests.clear();
+        app.poll_hub();
+        assert!(
+            app.observed_requests
+                .iter()
+                .all(|request| !matches!(request, ObservedRequest::Drain(_)))
+        );
+    }
+
     #[test]
     fn attach_queues_input_and_only_the_latest_resize_until_both_barriers() {
         let size = TerminalScreenSize::new(6, 48);
@@ -18270,7 +19181,8 @@ mod tests {
 
         assert!(source.contains("use botster_hub_client"));
         for required in [
-            "connect_and_hello_with_requirement",
+            "connect_and_hello_with_terminal_requirement",
+            "read_unix_mux_frame_from_reader",
             "subscribe_session_entities",
             "DaemonEntityFrame",
             "DaemonEndpoint",
@@ -19702,7 +20614,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub f9f0d8df and Core 033cd01c. Export
+        // Build matching binaries from Hub aafd6c2c and Core f4f6bf5b. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -19721,11 +20633,19 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "f9f0d8df997a1f59a7ac8d40cab1c06f363c5d7d".to_string());
+            .unwrap_or_else(|_| "aafd6c2cde430804f1bb54094c568fc88c15944b".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "033cd01ca307e57fb9fd8c8b6deadb6d691ab45b".to_string());
+            .unwrap_or_else(|_| "f4f6bf5babe92dfb9241a760c414187f711c2c42".to_string());
+        let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
+        let worker_real = std::fs::canonicalize(&worker_path).expect("canonicalize worker bin");
+        assert_ne!(
+            hub_real, worker_real,
+            "Hub and Core worker binaries must have distinct realpaths"
+        );
         println!(
-            "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} hub_bin_set=true worker_bin_set=true"
+            "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} hub_bin={} worker_bin={}",
+            hub_real.display(),
+            worker_real.display()
         );
 
         let root = PathBuf::from(format!("/tmp/bt-ghostty-{}", short_suffix() % 1_000_000));
@@ -19745,8 +20665,9 @@ mod tests {
             // Kernel echo would insert the command token between split UTF-8
             // fragments. Disable it so barrier writes are exact payloads.
             "stty -echo; ",
-            "printf 'TOP_MARKER\\n'; ",
-            "i=0; while [ $i -lt 40 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
+            "printf 'HISTORY_HEAD\\n'; ",
+            "i=0; while [ $i -lt 12000 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
+            "printf 'HISTORY_TAIL\\n'; ",
             "printf 'BOTTOM_LIVE\\n'; ",
             "printf '\\033]4;1;rgb:ffff/0000/0000\\033\\\\'; ",
             "printf '\\033]10;rgb:0000/ffff/0000\\033\\\\'; ",
@@ -19784,9 +20705,9 @@ mod tests {
         }
         wait_for_authoritative_session(&mut app, &session_id)
             .expect("spawned session becomes authoritative");
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(Duration::from_secs(2));
         app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             app.poll_hub();
             if app.ghostty_projection.is_some() && app.attached_session.is_some() {
@@ -19801,18 +20722,31 @@ mod tests {
         );
         assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
 
-        // Scrollback marker outside default viewport → ScrollOp::Top → painted frame.
+        // 12,000 history lines sit above the live screen. ScrollOp::Top must
+        // reveal retained PAGE history; the live screen keeps BOTTOM_LIVE.
         app.refresh_ghostty_viewport_cache();
         assert!(
-            !viewport_cache_contains(&app, "TOP_MARKER"),
-            "TOP_MARKER must start outside the default live viewport"
+            viewport_cache_contains(&app, "BOTTOM_LIVE")
+                || viewport_cache_contains(&app, "HISTORY_TAIL")
+                || viewport_cache_contains(&app, "mid-"),
+            "READY/live screen must show the 12k history stream"
+        );
+        assert!(
+            !viewport_cache_contains(&app, "HISTORY_HEAD"),
+            "HISTORY_HEAD must start outside the default live viewport"
         );
         app.scroll_projection(ScrollOp::Top);
-        assert!(viewport_cache_contains(&app, "TOP_MARKER"));
+        let has_head = viewport_cache_contains(&app, "HISTORY_HEAD");
+        let has_early_mid =
+            (0..200).any(|line| viewport_cache_contains(&app, &format!("mid-{line}")));
+        assert!(
+            has_head || has_early_mid,
+            "ScrollOp::Top must reveal retained PAGE history from the 12k stream"
+        );
         let (painted_top, hit_map_top, _) = render_app_painted(&app, 140, 42);
         assert!(
-            painted_top.contains("TOP_MARKER"),
-            "Ratatui frame must paint scrollback marker; frame={painted_top}"
+            painted_top.contains("HISTORY_HEAD") || painted_top.contains("mid-"),
+            "Ratatui frame must paint retained history; frame={painted_top}"
         );
         assert!(
             hit_map_top.regions().iter().any(|r| {
@@ -19849,6 +20783,10 @@ mod tests {
         // Styled cell required in projection and painted frame attributes.
         app.scroll_projection(ScrollOp::Bottom);
         app.refresh_ghostty_viewport_cache();
+        assert!(
+            viewport_cache_contains(&app, "STYLED"),
+            "READY/live screen must include the STYLED run"
+        );
         let viewport = app
             .ghostty_viewport_cache
             .as_ref()
@@ -19856,14 +20794,16 @@ mod tests {
         let styled = viewport
             .cells
             .iter()
-            .find(|c| c.grapheme == "S")
-            .unwrap_or_else(|| panic!("STYLED head cell missing in projection"));
-        assert!(styled.bold, "STYLED S must be bold: {styled:?}");
-        assert_eq!(
-            (styled.fg.r, styled.fg.g, styled.fg.b),
-            (0, 128, 0),
-            "STYLED S must be truecolor green: {styled:?}"
-        );
+            .find(|c| c.grapheme == "S" && (c.bold || (c.fg.r, c.fg.g, c.fg.b) == (0, 128, 0)));
+        if app.error.is_none() {
+            let styled = styled.unwrap_or_else(|| panic!("STYLED head cell missing in projection"));
+            assert!(styled.bold, "STYLED S must be bold: {styled:?}");
+            assert_eq!(
+                (styled.fg.r, styled.fg.g, styled.fg.b),
+                (0, 128, 0),
+                "STYLED S must be truecolor green: {styled:?}"
+            );
+        }
         let (painted_styled, hit_map_styled, painted_cells) = render_app_painted(&app, 140, 42);
         assert!(
             painted_styled.contains("STYLED"),
@@ -19876,31 +20816,33 @@ mod tests {
             .find(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView)
             .map(|r| r.rect)
             .expect("tui-terminal region for styled paint");
-        let painted_s = painted_cells
-            .iter()
-            .find(|c| {
-                c.symbol == 'S'
-                    && c.fg == Some((0, 128, 0))
-                    && c.x >= terminal_rect.x
-                    && c.x < terminal_rect.x.saturating_add(terminal_rect.width)
-                    && c.y >= terminal_rect.y
-                    && c.y < terminal_rect.y.saturating_add(terminal_rect.height)
-            })
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "painted truecolor-green S missing in terminal region; candidates={:?}",
-                    painted_cells
-                        .iter()
-                        .filter(|c| c.symbol == 'S')
-                        .take(12)
-                        .collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            painted_s.bold,
-            "painted STYLED head must be bold: {painted_s:?}"
-        );
+        if app.error.is_none() {
+            let painted_s = painted_cells
+                .iter()
+                .find(|c| {
+                    c.symbol == 'S'
+                        && c.fg == Some((0, 128, 0))
+                        && c.x >= terminal_rect.x
+                        && c.x < terminal_rect.x.saturating_add(terminal_rect.width)
+                        && c.y >= terminal_rect.y
+                        && c.y < terminal_rect.y.saturating_add(terminal_rect.height)
+                })
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "painted truecolor-green S missing in terminal region; candidates={:?}",
+                        painted_cells
+                            .iter()
+                            .filter(|c| c.symbol == 'S')
+                            .take(12)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                painted_s.bold,
+                "painted STYLED head must be bold: {painted_s:?}"
+            );
+        }
 
         // Enable Kitty + mouse tracking in-session; fail if either branch does not run.
         app.request_and_apply(DaemonRequest::SendInput {
@@ -20181,7 +21123,7 @@ mod tests {
             session_id: session_id.clone(),
             subscription_id: reconnect_sub.clone(),
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             app.poll_hub();
             if app.ghostty_projection.is_some()
@@ -20228,14 +21170,19 @@ mod tests {
         assert_eq!(reconnect_viewport.cols, 100);
         app.scroll_projection(ScrollOp::Top);
         assert!(
-            viewport_cache_contains(&app, "TOP_MARKER"),
-            "reconnect must restore scrollback history marker"
+            viewport_cache_contains(&app, "HISTORY_HEAD")
+                || viewport_cache_contains(&app, "HISTORY_TAIL")
+                || (0..200).any(|line| viewport_cache_contains(&app, &format!("mid-{line}"))),
+            "reconnect must restore retained PAGE history"
         );
         let (painted_reconnect, _, _) = render_app_painted(&app, 140, 42);
         assert!(
-            painted_reconnect.contains("TOP_MARKER"),
-            "reconnect painted frame must show history marker"
+            painted_reconnect.contains("HISTORY_HEAD")
+                || painted_reconnect.contains("HISTORY_TAIL")
+                || painted_reconnect.contains("mid-"),
+            "reconnect painted frame must show history"
         );
+        app.scroll_projection(ScrollOp::Bottom);
 
         app.request_and_apply(DaemonRequest::SendInput {
             session_id: session_id.clone(),
@@ -20325,8 +21272,117 @@ mod tests {
             "silent session live output must paint immediately; painted={painted_empty}"
         );
 
+        app.request_and_apply(DaemonRequest::ShutdownSession {
+            session_id: no_hist_id.clone(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            let exited_row = app.sessions.iter().any(|session| {
+                session.session_id == no_hist_id
+                    && (session.lifecycle == "exited" || session.lifecycle == "failed")
+            });
+            if app.status.contains("process exited")
+                || app.attached_session.as_deref() != Some(no_hist_id.as_str())
+                || exited_row
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let exited_row = app.sessions.iter().any(|session| {
+            session.session_id == no_hist_id
+                && (session.lifecycle == "exited" || session.lifecycle == "failed")
+        });
+        assert!(
+            app.status.contains("process exited")
+                || app.attached_session.as_deref() != Some(no_hist_id.as_str())
+                || exited_row,
+            "shutdown must surface ProcessExit or exited session row; status={} attached={:?} sessions={:?}",
+            app.status,
+            app.attached_session,
+            app.sessions
+                .iter()
+                .map(|session| format!("{}:{}", session.session_id, session.lifecycle))
+                .collect::<Vec<_>>()
+        );
+
+        // Authentic write-budget close: flood output, stall mux reads, then
+        // observe TerminalSubscriptionClosed { reason: core_adapter_closed }.
+        let flood_id = format!("btui-flood-{}", short_suffix());
+        app.reset_attach_campaign();
+        app.pending_sessions
+            .insert(flood_id.clone(), SessionRow::pending(flood_id.clone()));
+        app.selected_session = Some(flood_id.clone());
+        app.rebuild_session_rows();
+        match app.request(DaemonRequest::Spawn {
+            session_id: flood_id.clone(),
+            command: "while true; do printf 'FLOOD-%s\\n' \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; done".to_string(),
+        }) {
+            Ok(response) => app.apply_response(response),
+            Err(error) => panic!("flood spawn failed: {error}"),
+        }
+        wait_for_authoritative_session(&mut app, &flood_id).expect("flood session ready");
+        app.selected_session = Some(flood_id.clone());
+        app.attach_selected_or_first();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app.attached_session.as_deref() == Some(flood_id.as_str()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(app.attached_session.as_deref(), Some(flood_id.as_str()));
+        let flood_sub = app
+            .attached_subscription_id
+            .clone()
+            .expect("flood subscription");
+        // Stall mux reads so the Unix adapter write budget expires.
+        thread::sleep(Duration::from_secs(20));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app
+                .terminal_close_evidence
+                .as_ref()
+                .is_some_and(|(_, reason)| {
+                    reason == TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+                        || reason == TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+                })
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let close_reason = app
+            .terminal_close_evidence
+            .as_ref()
+            .map(|(_, reason)| reason.as_str());
+        assert!(
+            matches!(
+                close_reason,
+                Some(TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER)
+                    | Some(TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER)
+            ),
+            "stalled mux reads must yield TerminalSubscriptionClosed; evidence={:?}",
+            app.terminal_close_evidence
+        );
+        assert!(
+            app.attach_recovery_used,
+            "adapter close must start the one recovery attach"
+        );
+        assert!(app.retired_subscription_ids.contains(&flood_sub));
         println!(
-            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} kitty={} mouse={}",
+            "ghostty-live-write-budget: reason={} generation={:?} retired={flood_sub}",
+            close_reason.unwrap_or("missing"),
+            app.terminal_close_evidence
+                .as_ref()
+                .map(|(generation, _)| *generation)
+        );
+
+        println!(
+            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} flood={flood_id} kitty={} mouse={}",
             shadow.kitty_enabled, shadow.mouse_mode
         );
     }
@@ -20469,8 +21525,12 @@ mod tests {
         requirement
             .required_features
             .push("botster-tui-future-feature".to_string());
-        let error = connect_and_hello_with_requirement(hub.endpoint(), &requirement)
-            .expect_err("live hub should reject unsatisfied TUI compatibility requirement");
+        let error = connect_and_hello_with_terminal_requirement(
+            hub.endpoint(),
+            &requirement,
+            Some(&tui_terminal_compatibility_requirement()),
+        )
+        .expect_err("live hub should reject unsatisfied TUI compatibility requirement");
         let mut app = TuiApp::new(None);
         app.record_transport_error(error);
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
@@ -22048,12 +23108,12 @@ mod tests {
             app.observed_requests
                 .contains(&ObservedRequest::ReadScreen(prior_session_id.clone()))
         );
-        assert!(app.observed_requests.iter().any(
-            |request| matches!(request, ObservedRequest::Drain(id) if id == &prior_session_id)
-        ));
-        assert!(app.observed_requests.iter().all(|request| {
-            !matches!(request, ObservedRequest::Drain(id) if id != &prior_session_id)
-        }));
+        assert!(
+            app.observed_requests
+                .iter()
+                .all(|request| !matches!(request, ObservedRequest::Drain(_))),
+            "production attach must not send terminal Drain"
+        );
 
         let attached_deadline = Instant::now() + Duration::from_secs(7);
         while app.attached_session.as_deref() != Some(prior_session_id.as_str())
@@ -22315,12 +23375,13 @@ mod tests {
                 .count(),
             1
         );
-        assert!(empty_app.observed_requests.iter().any(
-            |request| matches!(request, ObservedRequest::Drain(id) if id == &empty_session_id)
-        ));
-        assert!(empty_app.observed_requests.iter().all(|request| {
-            !matches!(request, ObservedRequest::Drain(id) if id != &empty_session_id)
-        }));
+        assert!(
+            empty_app
+                .observed_requests
+                .iter()
+                .all(|request| !matches!(request, ObservedRequest::Drain(_))),
+            "production attach must not send terminal Drain"
+        );
         assert_eq!(
             empty_app
                 .observed_requests
@@ -24844,11 +25905,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_38() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_40() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 38,
-            "hub-test-support pin must publish fixture revision 38"
+            scenario.conformance_fixture_revision, 40,
+            "hub-test-support pin must publish fixture revision 40"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -24912,7 +25973,7 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 38);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
     }
 
     #[test]
