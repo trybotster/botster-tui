@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Stdout},
+    io::{self, Read, Stdout},
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
@@ -33,16 +33,13 @@ use botster_hub_client::{
     FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, FEATURE_TERMINAL_READBACK,
     FEATURE_TERMINAL_STREAMING, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
     FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
-    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible,
-    read_unix_mux_frame_from_reader, subscribe_entities, subscribe_session_entities, write_frame,
+    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible, parse_unix_mux_value,
+    subscribe_entities, subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
 use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
 #[cfg(test)]
-use botster_hub_client::{
-    TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
-    TerminalCompatibility,
-};
+use botster_hub_client::{TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TerminalCompatibility};
 use botster_terminal_ghostty::{
     GhosttyAdapterConfig, GhosttyClientProjection, GhosttySnapshotDecodeProgress, ScrollOp,
     ViewportProjection,
@@ -4386,28 +4383,14 @@ impl TuiApp {
                 self.maybe_open_attach_live_path(session_id);
             }
             Ok(progress) => {
-                self.error = Some(format!(
+                self.recover_from_decode_or_phase_gap(&format!(
                     "GHOSTSNP incremental sequence failed (closed): unexpected {progress:?}"
                 ));
             }
             Err(error) => {
-                if ready {
-                    if let Some(projection) = self.ghostty_projection.as_mut() {
-                        projection.abort_ghostsnp_history();
-                    }
-                    if let Some(hydration) = self.attach_hydration.as_mut() {
-                        hydration.snapshot_finished = true;
-                    }
-                    self.error = Some(format!(
-                        "GHOSTSNP incremental apply failed (closed): {error}"
-                    ));
-                    self.maybe_open_attach_live_path(session_id);
-                } else {
-                    self.clear_ghostty_projection();
-                    self.error = Some(format!(
-                        "GHOSTSNP incremental apply failed (closed): {error}"
-                    ));
-                }
+                self.recover_from_decode_or_phase_gap(&format!(
+                    "GHOSTSNP incremental apply failed (closed): {error}"
+                ));
             }
         }
     }
@@ -8677,7 +8660,7 @@ pub(crate) fn short_suffix() -> u64 {
 
 struct HubConnection {
     stream: std::os::unix::net::UnixStream,
-    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    mux_buf: Vec<u8>,
     pending_mux_frames: Vec<DaemonUnixMuxFrame>,
     #[cfg(test)]
     mux_terminal_frames: usize,
@@ -8695,10 +8678,9 @@ impl HubConnection {
             Some(&tui_terminal_compatibility_requirement()),
         )?;
         admit_terminal_hello(&ack)?;
-        let reader = std::io::BufReader::new(stream.try_clone().map_err(DaemonTransportError::Io)?);
         Ok(Self {
             stream,
-            reader,
+            mux_buf: Vec::new(),
             pending_mux_frames: Vec::new(),
             #[cfg(test)]
             mux_terminal_frames: 0,
@@ -8715,28 +8697,11 @@ impl HubConnection {
             .map_err(DaemonTransportError::Io)?;
         write_frame(&mut self.stream, request)?;
         loop {
-            match self.read_mux_frame() {
-                Ok(DaemonUnixMuxFrame::Response(response)) => {
-                    #[cfg(test)]
-                    {
-                        self.mux_response_frames += 1;
-                    }
-                    return Ok(*response);
-                }
-                Ok(other) => {
-                    #[cfg(test)]
-                    {
-                        match &other {
-                            DaemonUnixMuxFrame::Terminal(_) => self.mux_terminal_frames += 1,
-                            DaemonUnixMuxFrame::Event(_) => self.mux_event_frames += 1,
-                            DaemonUnixMuxFrame::Response(_) => {}
-                        }
-                    }
-                    self.pending_mux_frames.push(other);
-                }
-                Err(error) if is_blank_mux_line(&error) => continue,
-                Err(error) => return Err(error),
+            if let Some(response) = self.take_pending_response() {
+                return Ok(response);
             }
+            self.fill_mux_buf()?;
+            self.decode_ready_mux_frames()?;
         }
     }
 
@@ -8746,25 +8711,9 @@ impl HubConnection {
             .set_read_timeout(Some(MUX_POLL_TIMEOUT))
             .map_err(DaemonTransportError::Io)?;
         loop {
-            match self.read_mux_frame() {
-                Ok(frame) => {
-                    #[cfg(test)]
-                    {
-                        match &frame {
-                            DaemonUnixMuxFrame::Terminal(_) => self.mux_terminal_frames += 1,
-                            DaemonUnixMuxFrame::Event(_) => self.mux_event_frames += 1,
-                            DaemonUnixMuxFrame::Response(_) => self.mux_response_frames += 1,
-                        }
-                    }
-                    frames.push(frame);
-                }
-                Err(error) if is_blank_mux_line(&error) => continue,
-                Err(DaemonTransportError::Io(error))
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
+            match self.fill_mux_buf() {
+                Ok(true) => continue,
+                Ok(false) => break,
                 Err(error) => {
                     let _ = self.stream.set_read_timeout(None);
                     return Err(error);
@@ -8774,11 +8723,57 @@ impl HubConnection {
         self.stream
             .set_read_timeout(None)
             .map_err(DaemonTransportError::Io)?;
+        self.decode_ready_mux_frames()?;
+        frames.append(&mut self.pending_mux_frames);
         Ok(frames)
     }
 
-    fn read_mux_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
-        read_unix_mux_frame_from_reader(&mut self.reader)
+    fn fill_mux_buf(&mut self) -> DaemonTransportResult<bool> {
+        let mut chunk = [0_u8; 8192];
+        match self.stream.read(&mut chunk) {
+            Ok(0) => Err(DaemonTransportError::ClientDisconnected),
+            Ok(count) => {
+                self.mux_buf.extend_from_slice(&chunk[..count]);
+                Ok(true)
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(DaemonTransportError::Io(error)),
+        }
+    }
+
+    fn decode_ready_mux_frames(&mut self) -> DaemonTransportResult<()> {
+        let frames = decode_complete_mux_frames(&mut self.mux_buf)?;
+        for frame in frames {
+            self.observe_mux_frame(&frame);
+            self.pending_mux_frames.push(frame);
+        }
+        Ok(())
+    }
+
+    fn take_pending_response(&mut self) -> Option<DaemonResponse> {
+        let index = self
+            .pending_mux_frames
+            .iter()
+            .position(|frame| matches!(frame, DaemonUnixMuxFrame::Response(_)))?;
+        match self.pending_mux_frames.remove(index) {
+            DaemonUnixMuxFrame::Response(response) => Some(*response),
+            _ => None,
+        }
+    }
+
+    fn observe_mux_frame(&mut self, frame: &DaemonUnixMuxFrame) {
+        let _ = frame;
+        #[cfg(test)]
+        match frame {
+            DaemonUnixMuxFrame::Terminal(_) => self.mux_terminal_frames += 1,
+            DaemonUnixMuxFrame::Event(_) => self.mux_event_frames += 1,
+            DaemonUnixMuxFrame::Response(_) => self.mux_response_frames += 1,
+        }
     }
 
     fn take_pending_mux_frames(&mut self) -> Vec<DaemonUnixMuxFrame> {
@@ -8800,15 +8795,34 @@ impl HubConnection {
     }
 }
 
-fn is_blank_mux_line(error: &DaemonTransportError) -> bool {
-    match error {
-        DaemonTransportError::Json(json) => {
-            let message = json.to_string();
-            message.contains("expected value at line 1 column 1")
-                || message.contains("trailing characters")
+fn decode_complete_mux_frames(
+    buffer: &mut Vec<u8>,
+) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
+    let mut frames = Vec::new();
+    loop {
+        let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let mut line: Vec<u8> = buffer.drain(..=newline).collect();
+        if line.last() == Some(&b'\n') {
+            line.pop();
         }
-        _ => false,
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        frames.extend(decode_mux_line(&line)?);
     }
+    Ok(frames)
+}
+
+fn decode_mux_line(line: &[u8]) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
+    let mut frames = Vec::new();
+    let mut deserializer = serde_json::Deserializer::from_slice(line).into_iter::<Value>();
+    for value in deserializer.by_ref() {
+        let value = value.map_err(DaemonTransportError::Json)?;
+        frames.push(parse_unix_mux_value(value).map_err(DaemonTransportError::Json)?);
+    }
+    Ok(frames)
 }
 
 fn admit_terminal_hello(ack: &DaemonHelloAck) -> DaemonTransportResult<()> {
@@ -17881,6 +17895,108 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_sequence_error_after_ready_starts_fresh_attach_without_replay() {
+        let size = TerminalScreenSize::new(6, 48);
+        let frames = producer_incremental_ghostsnp(size, b"READY_ONE");
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-a");
+        let first_sub = app.subscription_id.clone();
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-a",
+            &frames[0].bytes,
+            SnapshotPhase::Ready,
+        ));
+        assert!(viewport_cache_contains(&app, "READY_ONE"));
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-a",
+            b"not-a-ghostsnp-page",
+            SnapshotPhase::History,
+        ));
+        assert!(
+            app.attach_recovery_used,
+            "client-detected decode error must start one recovery"
+        );
+        let replacement = app.subscription_id.clone();
+        assert_ne!(replacement, first_sub);
+        assert!(app.retired_subscription_ids.contains(&first_sub));
+        assert!(app.attached_session.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("recovering"))
+        );
+        app.apply_unix_terminal_envelope(mux_output_envelope(
+            "session-alpha",
+            &first_sub,
+            b"must-not-replay",
+        ));
+        assert!(app.applied_live_payloads.is_empty());
+        assert!(!viewport_cache_contains(&app, "must-not-replay"));
+    }
+
+    #[test]
+    fn unexpected_ghostty_progress_starts_fresh_attach() {
+        let size = TerminalScreenSize::new(6, 48);
+        let frames = producer_incremental_ghostsnp(size, b"READY_ONE");
+        let mut app = TuiApp::new(None);
+        app.terminal_viewport_size = size;
+        app.begin_attach_hydration("session-alpha", "sub-a");
+        let first_sub = app.subscription_id.clone();
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-a",
+            &frames[0].bytes,
+            SnapshotPhase::Ready,
+        ));
+        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
+            "session-alpha",
+            "sub-a",
+            &frames[0].bytes,
+            SnapshotPhase::History,
+        ));
+        assert!(app.attach_recovery_used);
+        assert_ne!(app.subscription_id, first_sub);
+        assert!(app.retired_subscription_ids.contains(&first_sub));
+        assert!(app.attached_session.is_none());
+    }
+
+    #[test]
+    fn mux_decoder_keeps_partial_lines_and_emits_concatenated_values() {
+        let envelope = mux_output_envelope("session-a", "sub-a", b"hello");
+        let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
+        let mut buffer = bytes[..7].to_vec();
+        let first = decode_complete_mux_frames(&mut buffer).expect("partial line stays");
+        assert!(first.is_empty());
+        assert_eq!(buffer, bytes[..7]);
+        buffer.extend_from_slice(&bytes[7..]);
+        buffer.push(b'\n');
+        let complete = decode_complete_mux_frames(&mut buffer).expect("complete line");
+        assert_eq!(complete.len(), 1);
+        assert!(buffer.is_empty());
+
+        let second = mux_attach_state_envelope("session-a", "sub-a", AttachStateKind::Attached);
+        let mut concatenated = serde_json::to_vec(&envelope).expect("first");
+        concatenated.extend(serde_json::to_vec(&second).expect("second"));
+        concatenated.push(b'\n');
+        let frames = decode_complete_mux_frames(&mut concatenated).expect("two values");
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(frames[0], DaemonUnixMuxFrame::Terminal(_)));
+        assert!(matches!(frames[1], DaemonUnixMuxFrame::Terminal(_)));
+        assert!(concatenated.is_empty());
+
+        let mut two_lines = serde_json::to_vec(&envelope).expect("line one");
+        two_lines.push(b'\n');
+        two_lines.extend(serde_json::to_vec(&second).expect("line two"));
+        two_lines.push(b'\n');
+        let split_lines = decode_complete_mux_frames(&mut two_lines).expect("two lines");
+        assert_eq!(split_lines.len(), 2);
+        assert!(two_lines.is_empty());
+    }
+
+    #[test]
     fn mux_terminal_subscription_closed_recovers_once_then_fails_closed() {
         let mut app = TuiApp::new(None);
         app.begin_attach_hydration("session-alpha", "sub-a");
@@ -19182,7 +19298,7 @@ mod tests {
         assert!(source.contains("use botster_hub_client"));
         for required in [
             "connect_and_hello_with_terminal_requirement",
-            "read_unix_mux_frame_from_reader",
+            "parse_unix_mux_value",
             "subscribe_session_entities",
             "DaemonEntityFrame",
             "DaemonEndpoint",
@@ -21307,9 +21423,12 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // Authentic write-budget close: flood output, stall mux reads, then
-        // observe TerminalSubscriptionClosed { reason: core_adapter_closed }.
+        // Stall this Unix connection to prove a sibling connection stays readable.
+        // This is host-egress isolation, not Core 512-tick core_adapter_closed.
+        // Authentic core_adapter_closed while host mux stays readable is Hub ticket
+        // ticket_1786716545_417854.
         let flood_id = format!("btui-flood-{}", short_suffix());
+        let sibling_id = format!("btui-sib-{}", short_suffix());
         app.reset_attach_campaign();
         app.pending_sessions
             .insert(flood_id.clone(), SessionRow::pending(flood_id.clone()));
@@ -21322,7 +21441,16 @@ mod tests {
             Ok(response) => app.apply_response(response),
             Err(error) => panic!("flood spawn failed: {error}"),
         }
+        match app.request(DaemonRequest::Spawn {
+            session_id: sibling_id.clone(),
+            command: "i=0; while true; do printf 'SIB-%s\\n' \"$i\"; i=$((i+1)); sleep 0.2; done"
+                .to_string(),
+        }) {
+            Ok(response) => app.apply_response(response),
+            Err(error) => panic!("sibling spawn failed: {error}"),
+        }
         wait_for_authoritative_session(&mut app, &flood_id).expect("flood session ready");
+        wait_for_authoritative_session(&mut app, &sibling_id).expect("sibling session ready");
         app.selected_session = Some(flood_id.clone());
         app.attach_selected_or_first();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -21338,19 +21466,37 @@ mod tests {
             .attached_subscription_id
             .clone()
             .expect("flood subscription");
-        // Stall mux reads so the Unix adapter write budget expires.
-        thread::sleep(Duration::from_secs(20));
+
+        let mut sibling = HubConnection::connect(hub.endpoint()).expect("sibling connection");
+        let sibling_sub = format!("sib-sub-{}", short_suffix());
+        sibling
+            .request(&DaemonRequest::Attach {
+                session_id: sibling_id.clone(),
+                subscription_id: sibling_sub.clone(),
+            })
+            .expect("sibling attach");
+        let stall_deadline = Instant::now() + Duration::from_secs(20);
+        let mut sibling_terminal_frames = 0_usize;
+        while Instant::now() < stall_deadline {
+            let frames = sibling
+                .poll_mux_frames()
+                .expect("sibling mux stays readable");
+            sibling_terminal_frames += frames
+                .iter()
+                .filter(|frame| matches!(frame, DaemonUnixMuxFrame::Terminal(_)))
+                .count();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            sibling_terminal_frames > 0,
+            "sibling subscription must keep receiving terminal frames while the flood connection is stalled"
+        );
+        println!("ghostty-live-sibling: terminal_frames={sibling_terminal_frames}");
+
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             app.poll_hub();
-            if app
-                .terminal_close_evidence
-                .as_ref()
-                .is_some_and(|(_, reason)| {
-                    reason == TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
-                        || reason == TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
-                })
-            {
+            if app.terminal_close_evidence.is_some() {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -21360,12 +21506,8 @@ mod tests {
             .as_ref()
             .map(|(_, reason)| reason.as_str());
         assert!(
-            matches!(
-                close_reason,
-                Some(TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER)
-                    | Some(TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER)
-            ),
-            "stalled mux reads must yield TerminalSubscriptionClosed; evidence={:?}",
+            app.terminal_close_evidence.is_some(),
+            "stalled flood attach must yield TerminalSubscriptionClosed; evidence={:?}",
             app.terminal_close_evidence
         );
         assert!(
@@ -21382,7 +21524,7 @@ mod tests {
         );
 
         println!(
-            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} flood={flood_id} kitty={} mouse={}",
+            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
             shadow.kitty_enabled, shadow.mouse_mode
         );
     }
