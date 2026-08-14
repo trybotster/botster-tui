@@ -201,7 +201,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79#3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=4f30d6952f9a29541ab3a670a54bf5e136b8eb8e#4f30d6952f9a29541ab3a670a54bf5e136b8eb8e"
 dependencies = [
  "base64",
  "botster-terminal-protocol",
@@ -213,7 +213,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79#3bee3a57cc7a031b93c6c63d8e9f267d6a9e0c79"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=4f30d6952f9a29541ab3a670a54bf5e136b8eb8e#4f30d6952f9a29541ab3a670a54bf5e136b8eb8e"
 dependencies = [
  "botster-core",
  "botster-hub-client",
