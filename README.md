@@ -50,8 +50,10 @@ through a TUI-owned `ProjectionWidget` after kit `TerminalView` chrome
 Ghostty truth. Kitty keyboard and mouse encodings use Hub
 `ModeGatedInput` with `ReadModeFlags` freshness (`mode_generation` /
 `mode_revision`). ReadScreen remains optional diagnostic text only.
-Host Hello requires protocol **7**, conformance floor **40**, and host features
-including `unix_terminal_adapter` and `terminal_subscription_closed`. Terminal
+Host Hello requires protocol **7**, conformance floor **40**, and host-plane
+features only, including `unix_terminal_adapter` and
+`terminal_subscription_closed`. `terminal_streaming`, `resize`, and
+`snapshot_delivery=ready_then_history` live on `terminal_compatibility`. Terminal
 Hello uses `TerminalCompatibilityRequirement::for_ready_then_history_attach()`
 with `client_name = "botster-tui"` and `ensure_terminal_compatible` before
 Attach. Production connect is `connect_and_hello_with_terminal_requirement`.
