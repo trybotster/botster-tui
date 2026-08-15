@@ -28,16 +28,17 @@ use botster_hub_client::{
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
     DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_MODE_GATED_INPUT,
     FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
-    FEATURE_RESIZE, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS,
-    FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, FEATURE_TERMINAL_READBACK,
-    FEATURE_TERMINAL_STREAMING, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
     FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
     connect_and_hello_with_terminal_requirement, ensure_terminal_compatible, parse_unix_mux_value,
     subscribe_entities, subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
-use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
+use botster_hub_client::{
+    DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload, FEATURE_RESIZE,
+    FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, FEATURE_TERMINAL_STREAMING,
+};
 #[cfg(test)]
 use botster_hub_client::{TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TerminalCompatibility};
 use botster_terminal_ghostty::{
@@ -8504,11 +8505,12 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
         assert!(!compatibility.features.is_empty());
         for required_feature in [
             FEATURE_SESSIONS,
-            FEATURE_TERMINAL_STREAMING,
-            FEATURE_RESIZE,
             FEATURE_PACKAGE_NAVIGATION,
+            FEATURE_PLUGIN_SURFACE_RENDER,
+            FEATURE_PLUGIN_SURFACE_ACTION,
             FEATURE_TERMINAL_READBACK,
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+            FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
         ] {
@@ -8922,15 +8924,12 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
         protocol_version: botster_hub_client::PROTOCOL_VERSION,
         required_features: vec![
             FEATURE_SESSIONS.to_string(),
-            FEATURE_TERMINAL_STREAMING.to_string(),
-            FEATURE_RESIZE.to_string(),
             FEATURE_PACKAGE_NAVIGATION.to_string(),
             FEATURE_PLUGIN_SURFACE_RENDER.to_string(),
             FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
             FEATURE_TERMINAL_READBACK.to_string(),
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
             FEATURE_MODE_GATED_INPUT.to_string(),
-            FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string(),
             FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
         ],
@@ -11955,22 +11954,40 @@ mod tests {
         assert!(rendered.contains(PROTOCOL));
     }
 
+    fn host_compatibility_omitting_terminal_mechanism_tokens() -> DaemonCompatibility {
+        let mut compatibility = DaemonCompatibility::current();
+        compatibility.features.retain(|feature| {
+            feature != botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING
+                && feature != botster_terminal_protocol_client::FEATURE_RESIZE
+                && feature
+                    != botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
+        });
+        for required in [
+            FEATURE_SESSIONS,
+            FEATURE_PACKAGE_NAVIGATION,
+            FEATURE_PLUGIN_SURFACE_RENDER,
+            FEATURE_PLUGIN_SURFACE_ACTION,
+            FEATURE_TERMINAL_READBACK,
+            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+            FEATURE_MODE_GATED_INPUT,
+            FEATURE_UNIX_TERMINAL_ADAPTER,
+            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+        ] {
+            if !compatibility
+                .features
+                .iter()
+                .any(|feature| feature == required)
+            {
+                compatibility.features.push(required.to_string());
+            }
+        }
+        compatibility
+    }
+
     #[test]
     fn tui_requires_protocol_7_revision_40_and_split_terminal_hello() {
         let requirement = tui_compatibility_requirement();
-        let compatible_hub = || {
-            let mut compatibility = DaemonCompatibility::current();
-            compatibility
-                .features
-                .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
-            compatibility
-                .features
-                .push(FEATURE_UNIX_TERMINAL_ADAPTER.to_string());
-            compatibility
-                .features
-                .push(FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string());
-            compatibility
-        };
+        let compatible_hub = host_compatibility_omitting_terminal_mechanism_tokens;
 
         assert_eq!(
             requirement.minimum_conformance_fixture_revision,
@@ -11982,42 +11999,38 @@ mod tests {
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
         assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
-        assert!(
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY)
-        );
-        assert!(
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_UNIX_TERMINAL_ADAPTER)
-        );
-        assert!(
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
-        );
-        assert!(
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_TERMINAL_READBACK)
-        );
-        assert!(
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_SESSION_ENTITY_SUBSCRIPTIONS)
-        );
-        assert!(
-            requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_MODE_GATED_INPUT)
-        );
+        for host_feature in [
+            FEATURE_SESSIONS,
+            FEATURE_PACKAGE_NAVIGATION,
+            FEATURE_PLUGIN_SURFACE_RENDER,
+            FEATURE_PLUGIN_SURFACE_ACTION,
+            FEATURE_TERMINAL_READBACK,
+            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+            FEATURE_MODE_GATED_INPUT,
+            FEATURE_UNIX_TERMINAL_ADAPTER,
+            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+        ] {
+            assert!(
+                requirement
+                    .required_features
+                    .iter()
+                    .any(|feature| feature == host_feature),
+                "host Hello must require {host_feature}"
+            );
+        }
+        for terminal_feature in [
+            botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING,
+            botster_terminal_protocol_client::FEATURE_RESIZE,
+            botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+        ] {
+            assert!(
+                !requirement
+                    .required_features
+                    .iter()
+                    .any(|feature| feature == terminal_feature),
+                "host Hello must not require terminal token {terminal_feature}"
+            );
+        }
 
         for revision in 16..40 {
             let mut older_hub = compatible_hub();
@@ -12049,6 +12062,46 @@ mod tests {
         future_hub.conformance_fixture_revision = 41;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
             .expect("runtime compatibility must preserve minimum semantics for revision 41");
+    }
+
+    #[test]
+    fn host_hello_accepts_fixture_that_omits_terminal_mechanism_tokens() {
+        let requirement = tui_compatibility_requirement();
+        let host = host_compatibility_omitting_terminal_mechanism_tokens();
+        for terminal_feature in [
+            botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING,
+            botster_terminal_protocol_client::FEATURE_RESIZE,
+            botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+        ] {
+            assert!(
+                !host
+                    .features
+                    .iter()
+                    .any(|feature| feature == terminal_feature),
+                "host fixture must omit {terminal_feature}"
+            );
+        }
+        botster_hub_client::ensure_compatible(&requirement, &host).expect(
+            "host Hello must succeed when the advertised host features omit terminal mechanism tokens",
+        );
+    }
+
+    #[test]
+    fn terminal_hello_still_requires_core_mechanism_tokens() {
+        let requirement = tui_terminal_compatibility_requirement();
+        for terminal_feature in [
+            botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING,
+            botster_terminal_protocol_client::FEATURE_RESIZE,
+            botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
+        ] {
+            assert!(
+                requirement
+                    .required_features
+                    .iter()
+                    .any(|feature| feature == terminal_feature),
+                "terminal Hello must require {terminal_feature}"
+            );
+        }
     }
 
     #[test]
