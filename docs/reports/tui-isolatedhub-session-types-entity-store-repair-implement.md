@@ -8,7 +8,7 @@
 | Target id | `tgt_c3d470bab78549df920a41e8fb0e58d8` |
 | Ticket | `ticket_1786912267_788084` |
 | Run | `run_1786914336_386503` |
-| Run step | `run_step_1786916556_546084` (`botster_stack_implement`) |
+| Run step | `run_step_1786918793_577491` (`botster_stack_implement`, visit 2 after merge rejection) |
 | Base | TUI `8b4df69e27b65071aa94b7e5d6b31d0990c041fc` |
 | Runtime-teardown class | **Does not apply** |
 | Merge policy | `direct` (no PR link required) |
@@ -55,7 +55,7 @@ Not used as an edit charter: [[botster-hub-playbook]], [[botster runtime teardow
 | Path | Change |
 | --- | --- |
 | `crates/botster-tui/src/app.rs` | `#[cfg(test)]` `refresh_session_type_subscription_for_test` plus exact-id wait; IsolatedHub session-types waits call it after Create/accessory/service/launch-type ensure/Delete. `submit_session_type_form` unchanged. Hermetic source-scan and stop-before-start tests. |
-| `README.md` | Session-types pin text matches Foundation Hub `c72712e` / Core `fc541a59`. IsolatedHub refresh is a test subscribe snapshot, not a longer poll. |
+| `README.md` | Session-types pin text matches Foundation Hub `c72712e` / Core `fc541a59`. IsolatedHub refresh is a test subscribe snapshot after Create, harness launch-type creation, and Delete, not after authoring Update. |
 | `docs/plans/tui-isolatedhub-session-types-entity-store-repair-plan.md` | Approved plan (pass 3). |
 | `docs/reports/tui-isolatedhub-session-types-entity-store-repair-implement.md` | This report. |
 
@@ -78,6 +78,12 @@ Not used as an edit charter: [[botster-hub-playbook]], [[botster runtime teardow
 
 None. README conformance copy in the session-types live paragraph now says fail-closed below 33, matching the live profile and plan. That is documentation alignment required by the pin paragraph, not a behavior change.
 
+## Merge rejection disposition (Implement visit 2)
+
+| Finding | Severity | Disposition |
+| --- | --- | --- |
+| `finding_1786918174_551379` — README overstates the subscription refresh coverage | low | **Fixed.** README no longer says "after each mutation". It names Create (agent, accessory, service), harness launch-type creation, and Delete. Authoring Update stays `ShowSessionTypeDefinition` proof only. |
+
 ## Tests and downstream proof
 
 Hermetic, from the ticket worktree:
@@ -97,6 +103,8 @@ git diff --check
 | `git diff --check` | pass |
 | `script/test-live-hub session-types` | pass; `session-types-live: complete conformance=43 features_has_session_type=true cases=agent,accessory,service,authoring,launch,delete,reconnect` |
 
+Visit 2 reran the same hermetic wrappers and the live session-types profile after the README wording fix. Live result unchanged: `session-types-live: complete conformance=43`.
+
 Kept no-`target_id`-equality spawn-picker scan.
 
 ### Live binary provenance
@@ -112,7 +120,7 @@ Handshake: conformance **43** (>= 33) and `session_type_entity_subscriptions` pr
 
 Production Create / Update / Delete is unchanged. The IsolatedHub profile is the required proof that the store holds the created type:
 
-1. After each in-scope mutation, the harness stops the old pump (`invalidate_session_type_generation`, fail on 750 ms timeout).
+1. After Create (agent, accessory, service), harness launch-type ensure, and Delete, the harness stops the old pump (`invalidate_session_type_generation`, fail on 750 ms timeout). Authoring Update does not refresh.
 2. It starts a new production `subscribe_entities` / `start_session_type_subscription`.
 3. It `poll_hub`s for at most 2 s until the exact `device/{id}` is present, or for Delete until it is absent and `has_snapshot` is true.
 4. Option A remains: keyboard list-for-target + spawn `target_id = T`.

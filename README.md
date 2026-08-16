@@ -282,12 +282,14 @@ export BOTSTER_SESSION_WORKER_BIN=/path/to/pin-matched/botster-session-worker
 script/test-live-hub session-types
 ```
 
-The IsolatedHub session-types profile refreshes `SubscribeEntities` after each
-mutation so the store receives a request-path snapshot. It does not wait through
-the owner-loop cadence. The profile fail-closes when the live handshake reports
-conformance &lt; 33 or missing `session_type_entity_subscriptions`. It proves
-product launch through list-for-target for a real admitted spawn point `T` (not
-`device:local`).
+The IsolatedHub session-types profile refreshes `SubscribeEntities` after
+Create (agent, accessory, and service), harness launch-type creation, and
+Delete, so the store receives a request-path snapshot for those asserted ids.
+It does not wait through the owner-loop cadence. Authoring Update is
+`ShowSessionTypeDefinition` proof only; it does not refresh subscribe. The
+profile fail-closes when the live handshake reports conformance &lt; 33 or
+missing `session_type_entity_subscriptions`. It proves product launch through
+list-for-target for a real admitted spawn point `T` (not `device:local`).
 
 ### Workspaces live-acceptance lanes
 
