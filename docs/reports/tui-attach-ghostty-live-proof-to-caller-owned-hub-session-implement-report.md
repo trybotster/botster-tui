@@ -52,7 +52,7 @@ Targeted notes:
 
 Not loaded: [[project-pipelines-playbook]] (no Project Pipelines package or plugin paths).
 
-Convention conflicts: none. TUI Hello requires `attach_occupancy` as an occupancy-specific client. The hub-client default required-feature list is unchanged.
+Convention conflicts: none. Default TUI Hello stays floor 40 without `attach_occupancy`. Occupancy Hello is `ghostty-shared` only. The hub-client default required-feature list is unchanged.
 
 ## Files changed
 
@@ -60,7 +60,7 @@ Convention conflicts: none. TUI Hello requires `attach_occupancy` as an occupanc
 - `Cargo.lock` — lock Hub `c72712e` and one Core identity at `fc541a`. UI contract stays on tag `botster-ui-contract-v0.3.2`.
 - `crates/botster-tui/src/app.rs` — default host Hello stays floor 40 without occupancy; `ghostty-shared` uses `tui_attach_occupancy_requirement()`; bounded `request_with_deadline` (write then read); Detach-if-writable on `force_reconnect`, cancel, recovery, and `record_transport_error`; shared-profile fail-closed parsers; stub bound tests; `ghostty-shared` and `ghostty-shared-exit` live tests; IsolatedHub flood Status taken before the poll loop.
 - `script/test-live-hub` — `ghostty-shared` and `ghostty-shared-exit`; skip Hub/worker binary resolution; wrapper fail-closed on connection + session id; stream cargo output for shared profiles.
-- `README.md` — occupancy pin, floor 43, caller injectors, two wrapper modes, caller end-session step.
+- `README.md` — occupancy pin, default Hello floor 40, `ghostty-shared` occupancy Hello, caller injectors, two wrapper modes, caller end-session step.
 - `docs/plans/tui-attach-ghostty-live-proof-to-caller-owned-hub-session-plan.md` — approved plan plus Implement adaptations.
 - `docs/reports/tui-attach-ghostty-live-proof-to-caller-owned-hub-session-implement-report.md` — this report.
 
@@ -90,7 +90,7 @@ Repo gates:
 
 - `script/fmt`
 - `script/clippy`
-- `script/test` — 249 unit tests + package manifest, all ok
+- `script/test` — 250 unit tests + package manifest, all ok
 
 Bounded Detach stubs (no live Hub):
 
@@ -114,7 +114,8 @@ IsolatedHub profile:
 
 Production entry points:
 
-- `HubConnection::connect` → `tui_compatibility_requirement()` now requires `attach_occupancy` and floor 43
+- `HubConnection::connect` → `tui_compatibility_requirement()` stays floor 40 without `attach_occupancy`
+- `ghostty-shared` connects through `tui_attach_occupancy_requirement()` (`for_attach_occupancy()` plus TUI host tokens)
 - `detach_attached`, `recover_current_subscription`, `force_reconnect`, and `record_transport_error` use `request_with_deadline` / Detach-if-writable
 - `poll_hub` still maps readable EOF to `ClientDisconnected` → `record_transport_error`
 
@@ -139,5 +140,5 @@ Every lens from [[botster runtime teardown lenses]] is implemented:
 
 ## Missing vault guidance
 
-- [[first-party clients put terminal mechanism tokens only in terminal compatibility]] still says floor 40 and nine host-plane tokens. This ticket raises the TUI floor to 43 and adds `attach_occupancy` as a tenth host-plane token.
+- [[first-party clients put terminal mechanism tokens only in terminal compatibility]] still says floor 40 and nine host-plane tokens. That remains the default TUI Hello. `attach_occupancy` is a tenth host-plane token only on `ghostty-shared`.
 - Captured after proof: inbox `tui-live-ghostty-has-isolatedhub-and-caller-owned-shared-profiles.md`.
