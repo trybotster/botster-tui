@@ -27,17 +27,18 @@ use botster_hub_client::{
     DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
-    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_ATTACH_OCCUPANCY,
-    FEATURE_MODE_GATED_INPUT, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
-    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL,
-    TerminalCompatibilityRequirement, connect_and_hello_with_terminal_requirement,
-    ensure_terminal_compatible, parse_unix_mux_value, subscribe_entities,
-    subscribe_session_entities, write_frame,
+    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_MODE_GATED_INPUT,
+    FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
+    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+    FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
+    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible, parse_unix_mux_value,
+    subscribe_entities, subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
-use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
+use botster_hub_client::{
+    DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload, FEATURE_ATTACH_OCCUPANCY,
+};
 #[cfg(test)]
 use botster_hub_client::{TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TerminalCompatibility};
 use botster_terminal_ghostty::{
@@ -86,7 +87,7 @@ const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 43;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 40;
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 const MUX_POLL_BATCH_FRAMES: usize = 32;
@@ -1348,6 +1349,7 @@ fn should_quit(key: KeyEvent) -> bool {
 
 struct TuiApp {
     endpoint: Option<DaemonEndpoint>,
+    host_requirement: DaemonCompatibilityRequirement,
     client: Option<HubConnection>,
     status: String,
     connection_error: Option<String>,
@@ -1451,13 +1453,38 @@ impl TuiApp {
         Self::new_with_runtime_context(endpoint, connection_error, false)
     }
 
+    #[cfg(test)]
+    fn new_for_attach_occupancy(endpoint: Option<DaemonEndpoint>) -> Self {
+        Self::new_with_runtime_context_and_requirement(
+            endpoint,
+            None,
+            true,
+            tui_attach_occupancy_requirement(),
+        )
+    }
+
     fn new_with_runtime_context(
         endpoint: Option<DaemonEndpoint>,
         connection_error: Option<String>,
         package_storage_context_configured: bool,
     ) -> Self {
+        Self::new_with_runtime_context_and_requirement(
+            endpoint,
+            connection_error,
+            package_storage_context_configured,
+            tui_compatibility_requirement(),
+        )
+    }
+
+    fn new_with_runtime_context_and_requirement(
+        endpoint: Option<DaemonEndpoint>,
+        connection_error: Option<String>,
+        package_storage_context_configured: bool,
+        host_requirement: DaemonCompatibilityRequirement,
+    ) -> Self {
         let mut app = Self {
             endpoint,
+            host_requirement,
             client: None,
             status: "disconnected".to_string(),
             connection_error,
@@ -2142,7 +2169,7 @@ impl TuiApp {
             }
             return;
         };
-        match HubConnection::connect(endpoint) {
+        match HubConnection::connect_with_host_requirement(endpoint, &self.host_requirement) {
             Ok(client) => {
                 self.client = Some(client);
                 self.status = "connected".to_string();
@@ -8823,10 +8850,18 @@ struct HubConnection {
 }
 
 impl HubConnection {
+    #[cfg(test)]
     fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
+        Self::connect_with_host_requirement(endpoint, &tui_compatibility_requirement())
+    }
+
+    fn connect_with_host_requirement(
+        endpoint: &DaemonEndpoint,
+        host_requirement: &DaemonCompatibilityRequirement,
+    ) -> DaemonTransportResult<Self> {
         let (stream, ack) = connect_and_hello_with_terminal_requirement(
             endpoint,
-            &tui_compatibility_requirement(),
+            host_requirement,
             Some(&tui_terminal_compatibility_requirement()),
         )?;
         admit_terminal_hello(&ack)?;
@@ -9125,11 +9160,26 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_MODE_GATED_INPUT.to_string(),
             FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
-            FEATURE_ATTACH_OCCUPANCY.to_string(),
         ],
         minimum_conformance_fixture_revision: MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
     }
+}
+
+#[cfg(test)]
+fn tui_attach_occupancy_requirement() -> DaemonCompatibilityRequirement {
+    let mut requirement = DaemonCompatibilityRequirement::for_attach_occupancy();
+    requirement.client_name = "botster-tui".to_string();
+    for feature in tui_compatibility_requirement().required_features {
+        if !requirement
+            .required_features
+            .iter()
+            .any(|existing| existing == &feature)
+        {
+            requirement.required_features.push(feature);
+        }
+    }
+    requirement
 }
 
 fn detach_deadline_error() -> DaemonTransportError {
@@ -12220,7 +12270,6 @@ mod tests {
             FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-            FEATURE_ATTACH_OCCUPANCY,
         ] {
             if !compatibility
                 .features
@@ -12233,8 +12282,17 @@ mod tests {
         compatibility
     }
 
+    fn previous_hub_descriptor_without_occupancy() -> DaemonCompatibility {
+        let mut compatibility = host_compatibility_omitting_terminal_mechanism_tokens();
+        compatibility
+            .features
+            .retain(|feature| feature != FEATURE_ATTACH_OCCUPANCY);
+        compatibility.conformance_fixture_revision = MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        compatibility
+    }
+
     #[test]
-    fn tui_requires_protocol_7_revision_43_and_split_terminal_hello() {
+    fn tui_requires_protocol_7_revision_40_and_split_terminal_hello() {
         let requirement = tui_compatibility_requirement();
         let compatible_hub = host_compatibility_omitting_terminal_mechanism_tokens;
 
@@ -12247,7 +12305,14 @@ mod tests {
             botster_hub_client::PROTOCOL_VERSION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 43);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
+        assert!(
+            !requirement
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY),
+            "default Hello must not require proof-only attach_occupancy"
+        );
         for host_feature in [
             FEATURE_SESSIONS,
             FEATURE_PACKAGE_NAVIGATION,
@@ -12258,7 +12323,6 @@ mod tests {
             FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-            FEATURE_ATTACH_OCCUPANCY,
         ] {
             assert!(
                 requirement
@@ -12282,13 +12346,13 @@ mod tests {
             );
         }
 
-        for revision in 16..43 {
+        for revision in 16..40 {
             let mut older_hub = compatible_hub();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-mux-contract fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 43"));
+            assert!(error.diagnostic.contains("requires at least 40"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
@@ -12307,11 +12371,41 @@ mod tests {
             assert!(error.diagnostic.contains("client requires 7"));
         }
         botster_hub_client::ensure_compatible(&requirement, &compatible_hub())
-            .expect("protocol 7 fixture revision 43 hub should connect");
+            .expect("protocol 7 fixture revision 40 hub should connect");
+        botster_hub_client::ensure_compatible(
+            &requirement,
+            &previous_hub_descriptor_without_occupancy(),
+        )
+        .expect("default Hello must accept the previous Hub descriptor without attach_occupancy");
         let mut future_hub = compatible_hub();
-        future_hub.conformance_fixture_revision = 44;
+        future_hub.conformance_fixture_revision = 41;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 44");
+            .expect("runtime compatibility must preserve minimum semantics for revision 41");
+    }
+
+    #[test]
+    fn attach_occupancy_requirement_is_shared_profile_only() {
+        let occupancy = tui_attach_occupancy_requirement();
+        assert_eq!(
+            occupancy.minimum_conformance_fixture_revision,
+            botster_hub_client::CONFORMANCE_FIXTURE_REVISION
+        );
+        assert!(
+            occupancy
+                .required_features
+                .iter()
+                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY)
+        );
+        botster_hub_client::ensure_compatible(
+            &occupancy,
+            &previous_hub_descriptor_without_occupancy(),
+        )
+        .expect_err("shared occupancy Hello must reject the previous Hub descriptor");
+        botster_hub_client::ensure_compatible(
+            &occupancy,
+            &host_compatibility_omitting_terminal_mechanism_tokens(),
+        )
+        .expect("shared occupancy Hello must accept a current occupancy Hub");
     }
 
     #[test]
@@ -21302,7 +21396,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub c72712e and Core f4f6bf5b. Export
+        // Build matching binaries from Hub c72712e and Core fc541a59. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -21323,7 +21417,7 @@ mod tests {
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
             .unwrap_or_else(|_| "c72712e2606b8abe77e1b91c2a736791036fadd8".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "f4f6bf5babe92dfb9241a760c414187f711c2c42".to_string());
+            .unwrap_or_else(|_| "fc541a59338d0591ba4fb3fa522a030d212d26d0".to_string());
         let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
         let worker_real = std::fs::canonicalize(&worker_path).expect("canonicalize worker bin");
         assert_ne!(
@@ -22255,7 +22349,11 @@ mod tests {
             "ghostty-shared must not inherit BOTSTER_SESSION_WORKER_BIN"
         );
 
-        let mut sibling = HubConnection::connect(&endpoint).expect("sibling hello");
+        let mut sibling = HubConnection::connect_with_host_requirement(
+            &endpoint,
+            &tui_attach_occupancy_requirement(),
+        )
+        .expect("sibling hello");
         let sibling_sub = format!("sib-sub-{}", short_suffix());
         sibling
             .request(&DaemonRequest::Attach {
@@ -22264,7 +22362,7 @@ mod tests {
             })
             .expect("sibling attach");
 
-        let mut app = TuiApp::new(Some(endpoint.clone()));
+        let mut app = TuiApp::new_for_attach_occupancy(Some(endpoint.clone()));
         app.workspace_test_mode = true;
         wait_for_authoritative_session(&mut app, &session_id)
             .expect("exact shared session becomes attachable");
@@ -27173,7 +27271,7 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 43);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
     }
 
     #[test]

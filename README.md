@@ -35,7 +35,7 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.2` |
 | `botster-hub-test-support` package | `@trybotster/hub-test-support@0.1.35` |
 | `botster-tui-kit` | `c83ba6c518e2324e34ce24c7abe5a8a05e56293c` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `f4f6bf5babe92dfb9241a760c414187f711c2c42` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `fc541a59338d0591ba4fb3fa522a030d212d26d0` with `libghostty-vt` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
 viewport projection, scrollbar, and color profile. The TUI passes opaque mux
@@ -50,9 +50,11 @@ through a TUI-owned `ProjectionWidget` after kit `TerminalView` chrome
 Ghostty truth. Kitty keyboard and mouse encodings use Hub
 `ModeGatedInput` with `ReadModeFlags` freshness (`mode_generation` /
 `mode_revision`). ReadScreen remains optional diagnostic text only.
-Host Hello requires protocol **7**, conformance floor **43**, and host-plane
-features only, including `unix_terminal_adapter`,
-`terminal_subscription_closed`, and `attach_occupancy`. `terminal_streaming`,
+Host Hello requires protocol **7**, conformance floor **40**, and host-plane
+features only, including `unix_terminal_adapter` and
+`terminal_subscription_closed`. `attach_occupancy` is required only on
+`ghostty-shared` connections through
+`DaemonCompatibilityRequirement::for_attach_occupancy()`. `terminal_streaming`,
 `resize`, and `snapshot_delivery=ready_then_history` live on
 `terminal_compatibility`. Terminal Hello uses
 `TerminalCompatibilityRequirement::for_ready_then_history_attach()` with
@@ -187,16 +189,16 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
   cargo run -p botster-tui -- --headless-live-runtime
 ```
 
-Incremental Ghostty live proof (protocol 7 / floor 43). Build Hub
+Incremental Ghostty live proof (protocol 7 / default floor 40). Build Hub
 `c72712e2606b8abe77e1b91c2a736791036fadd8` and Core worker
-`f4f6bf5babe92dfb9241a760c414187f711c2c42` into a fresh target directory,
+`fc541a59338d0591ba4fb3fa522a030d212d26d0` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
 export BOTSTER_HUB_BIN_REV=c72712e2606b8abe77e1b91c2a736791036fadd8
-export BOTSTER_SESSION_WORKER_BIN_REV=f4f6bf5babe92dfb9241a760c414187f711c2c42
+export BOTSTER_SESSION_WORKER_BIN_REV=fc541a59338d0591ba4fb3fa522a030d212d26d0
 script/test-live-hub ghostty
 ```
 
@@ -206,10 +208,12 @@ Missing binaries fail `script/test-live-hub ghostty` closed.
 Caller-owned attach proof joins a Hub session the TUI does not create. The
 caller supplies only `BOTSTER_HUB_CONNECTION` and `BOTSTER_SHARED_SESSION_ID`
 (default parent id `north-star-shared`). Do not set `BOTSTER_HUB_BIN` or
-`BOTSTER_SESSION_WORKER_BIN`. The host Hello requires `attach_occupancy`;
-empty `Status.live_attach_occupancy` without that advertised token is not
-release proof. Write `NORTH_STAR_HISTORY` before the first TUI attach and
-echo TUI `NORTH_STAR_TUI_<suffix>` input.
+`BOTSTER_SESSION_WORKER_BIN`. Only `ghostty-shared` Hello requires
+`attach_occupancy`; empty `Status.live_attach_occupancy` without that
+advertised token is not release proof. Default TUI Hello stays at floor 40
+so session-types and Workspaces lanes still reach older Hubs. Write
+`NORTH_STAR_HISTORY` before the first TUI attach and echo TUI
+`NORTH_STAR_TUI_<suffix>` input.
 
 ```sh
 export BOTSTER_HUB_CONNECTION='{"transport":{"type":"unix_socket","path":"<hub.sock>"}}'
