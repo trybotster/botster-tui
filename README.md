@@ -266,15 +266,15 @@ Session types are authoritative Hub descriptors consumed through the
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 40` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`, Core crates
-  `f4f6bf5babe92dfb9241a760c414187f711c2c42`, UI contract tag
+- Pins: Hub crates `c72712e2606b8abe77e1b91c2a736791036fadd8`, Core crates
+  `fc541a59338d0591ba4fb3fa522a030d212d26d0`, UI contract tag
   `botster-ui-contract-v0.3.2`, and kit
   `c83ba6c518e2324e34ce24c7abe5a8a05e56293c`.
 
 Live proof (independent of contract-matrix):
 
 ```sh
-# Use Hub 4f30d695 and Core f4f6bf5b binaries.
+# Use Hub c72712e and Core fc541a59 binaries (same pins as Foundation).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -282,9 +282,12 @@ export BOTSTER_SESSION_WORKER_BIN=/path/to/pin-matched/botster-session-worker
 script/test-live-hub session-types
 ```
 
-The profile fail-closes when the live handshake reports conformance &lt; 36 or
-missing `session_type_entity_subscriptions`. It proves product launch through
-list-for-target for a real admitted spawn point `T` (not `device:local`).
+The IsolatedHub session-types profile refreshes `SubscribeEntities` after each
+mutation so the store receives a request-path snapshot. It does not wait through
+the owner-loop cadence. The profile fail-closes when the live handshake reports
+conformance &lt; 33 or missing `session_type_entity_subscriptions`. It proves
+product launch through list-for-target for a real admitted spawn point `T` (not
+`device:local`).
 
 ### Workspaces live-acceptance lanes
 
