@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read, Stdout},
+    net::Shutdown,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
@@ -26,19 +27,17 @@ use botster_hub_client::{
     DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
-    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_MODE_GATED_INPUT,
-    FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
-    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-    FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
-    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible, parse_unix_mux_value,
-    subscribe_entities, subscribe_session_entities, write_frame,
+    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_ATTACH_OCCUPANCY,
+    FEATURE_MODE_GATED_INPUT, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL,
+    TerminalCompatibilityRequirement, connect_and_hello_with_terminal_requirement,
+    ensure_terminal_compatible, parse_unix_mux_value, subscribe_entities,
+    subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
-use botster_hub_client::{
-    DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload, FEATURE_RESIZE,
-    FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, FEATURE_TERMINAL_STREAMING,
-};
+use botster_hub_client::{DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload};
 #[cfg(test)]
 use botster_hub_client::{TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TerminalCompatibility};
 use botster_terminal_ghostty::{
@@ -87,7 +86,8 @@ const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 40;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 43;
+const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 const MUX_POLL_BATCH_FRAMES: usize = 32;
 const GHOSTTY_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
@@ -184,6 +184,21 @@ fn parse_hub_connection(
         );
     }
     (Some(connection), None)
+}
+
+#[cfg(test)]
+fn parse_shared_session_id(value: Option<std::ffi::OsString>) -> Result<String, String> {
+    let Some(value) = value else {
+        return Err("BOTSTER_SHARED_SESSION_ID is required".to_string());
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "BOTSTER_SHARED_SESSION_ID must contain UTF-8".to_string())?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("BOTSTER_SHARED_SESSION_ID is required".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 pub fn smoke_message() -> &'static str {
@@ -2100,6 +2115,7 @@ impl TuiApp {
     }
 
     fn force_reconnect(&mut self) {
+        self.detach_owner_if_writable();
         self.client = None;
         self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
@@ -3385,10 +3401,7 @@ impl TuiApp {
         if let Some(client) = self.client.as_mut() {
             client.drop_terminal_frames_for(&session_id, &subscription_id);
         }
-        self.request_and_apply(DaemonRequest::Detach {
-            session_id,
-            subscription_id,
-        });
+        self.send_bounded_detach(session_id, subscription_id);
     }
 
     fn submit_package_configuration(&mut self, package_name: &str, values: Option<&UiFormValues>) {
@@ -3448,6 +3461,77 @@ impl TuiApp {
         match &mut self.client {
             Some(client) => client.request(&request),
             None => Err(DaemonTransportError::NotRunning),
+        }
+    }
+
+    fn request_with_deadline(
+        &mut self,
+        request: DaemonRequest,
+        deadline: Instant,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        if let Some(audit) = &mut self.acceptance_audit {
+            audit.record(&request);
+        }
+        #[cfg(test)]
+        self.record_request(&request);
+        match &mut self.client {
+            Some(client) => client.request_with_deadline(&request, deadline),
+            None => Err(DaemonTransportError::NotRunning),
+        }
+    }
+
+    fn send_bounded_detach(&mut self, session_id: String, subscription_id: String) {
+        let deadline = Instant::now() + DETACH_ON_DISCONNECT_BOUND;
+        match self.request_with_deadline(
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id,
+            },
+            deadline,
+        ) {
+            Ok(response) => {
+                self.apply_response(response);
+                self.apply_pending_mux_frames();
+            }
+            Err(error) => {
+                if let Some(client) = self.client.as_mut() {
+                    client.hard_close();
+                }
+                self.apply_transport_failure(error);
+            }
+        }
+    }
+
+    fn detach_owner_if_writable(&mut self) {
+        let Some((session_id, subscription_id)) = self.current_owner_pair() else {
+            return;
+        };
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.retire_subscription(&subscription_id);
+        if let Some(client) = self.client.as_mut() {
+            client.drop_terminal_frames_for(&session_id, &subscription_id);
+        }
+        if self.client.is_none() {
+            return;
+        }
+        let deadline = Instant::now() + DETACH_ON_DISCONNECT_BOUND;
+        match self.request_with_deadline(
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id,
+            },
+            deadline,
+        ) {
+            Ok(response) => {
+                self.apply_response(response);
+            }
+            Err(_) => {
+                if let Some(client) = self.client.as_mut() {
+                    client.hard_close();
+                }
+            }
         }
     }
 
@@ -3673,10 +3757,26 @@ impl TuiApp {
             client.drop_terminal_frames_for(session_id, subscription_id);
         }
         if self.client.is_some() {
-            self.request_and_apply(DaemonRequest::Detach {
-                session_id: session_id.to_string(),
-                subscription_id: subscription_id.to_string(),
-            });
+            let deadline = Instant::now() + DETACH_ON_DISCONNECT_BOUND;
+            match self.request_with_deadline(
+                DaemonRequest::Detach {
+                    session_id: session_id.to_string(),
+                    subscription_id: subscription_id.to_string(),
+                },
+                deadline,
+            ) {
+                Ok(response) => {
+                    self.apply_response(response);
+                    self.apply_pending_mux_frames();
+                }
+                Err(error) => {
+                    if let Some(client) = self.client.as_mut() {
+                        client.hard_close();
+                    }
+                    self.apply_transport_failure(error);
+                    return;
+                }
+            }
         }
         if self.attach_recovery_used {
             self.error = Some(format!(
@@ -3986,6 +4086,11 @@ impl TuiApp {
     }
 
     fn record_transport_error(&mut self, error: DaemonTransportError) {
+        self.detach_owner_if_writable();
+        self.apply_transport_failure(error);
+    }
+
+    fn apply_transport_failure(&mut self, error: DaemonTransportError) {
         self.client = None;
         self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
@@ -8764,6 +8869,94 @@ impl HubConnection {
         }
     }
 
+    fn request_with_deadline(
+        &mut self,
+        request: &DaemonRequest,
+        deadline: Instant,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.hard_close();
+            return Err(detach_deadline_error());
+        }
+        if let Err(error) = self.stream.set_write_timeout(Some(remaining)) {
+            self.hard_close();
+            return Err(DaemonTransportError::Io(error));
+        }
+        if let Err(error) = write_frame(&mut self.stream, request) {
+            self.hard_close();
+            return Err(map_detach_timeout(error));
+        }
+        loop {
+            if let Some(response) = self.take_pending_response() {
+                let _ = self.stream.set_write_timeout(None);
+                let _ = self.stream.set_read_timeout(None);
+                return Ok(response);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.hard_close();
+                return Err(detach_deadline_error());
+            }
+            if let Err(error) = self.stream.set_read_timeout(Some(remaining)) {
+                self.hard_close();
+                return Err(DaemonTransportError::Io(error));
+            }
+            match self.fill_mux_buf() {
+                Ok(true) => {
+                    if let Err(error) = self.decode_ready_mux_frames() {
+                        self.hard_close();
+                        return Err(error);
+                    }
+                }
+                Ok(false) => {
+                    if Instant::now() >= deadline {
+                        self.hard_close();
+                        return Err(detach_deadline_error());
+                    }
+                }
+                Err(error) => {
+                    self.hard_close();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn hard_close(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+        let _ = self.stream.set_write_timeout(None);
+        let _ = self.stream.set_read_timeout(None);
+    }
+
+    #[cfg(test)]
+    fn fill_send_buffer_until_blocked(&mut self) {
+        use std::io::Write;
+        let mut writer = self
+            .stream
+            .try_clone()
+            .expect("clone stream to fill send buffer");
+        writer
+            .set_nonblocking(true)
+            .expect("nonblocking fill of send buffer");
+        let junk = [0_u8; 65536];
+        let fill_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < fill_deadline {
+            match writer.write(&junk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(error) => panic!("fill send buffer failed: {error}"),
+            }
+        }
+        let _ = writer.set_nonblocking(false);
+    }
+
     fn poll_mux_frames(&mut self) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
         let mut frames = self.take_pending_mux_frames();
         if !frames.is_empty() {
@@ -8932,9 +9125,29 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_MODE_GATED_INPUT.to_string(),
             FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
+            FEATURE_ATTACH_OCCUPANCY.to_string(),
         ],
         minimum_conformance_fixture_revision: MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
+    }
+}
+
+fn detach_deadline_error() -> DaemonTransportError {
+    DaemonTransportError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "detach deadline exceeded",
+    ))
+}
+
+fn map_detach_timeout(error: DaemonTransportError) -> DaemonTransportError {
+    match error {
+        DaemonTransportError::Io(io_error)
+            if io_error.kind() == io::ErrorKind::TimedOut
+                || io_error.kind() == io::ErrorKind::WouldBlock =>
+        {
+            detach_deadline_error()
+        }
+        other => other,
     }
 }
 
@@ -11954,6 +12167,41 @@ mod tests {
         assert!(rendered.contains(PROTOCOL));
     }
 
+    #[test]
+    fn missing_hub_connection_fails_closed_for_shared_profile() {
+        let (connection, error) = parse_hub_connection(None);
+        assert_eq!(connection, None);
+        assert_eq!(error.as_deref(), Some("BOTSTER_HUB_CONNECTION is required"));
+    }
+
+    #[test]
+    fn malformed_hub_connection_json_fails_closed() {
+        let (connection, error) = parse_hub_connection(Some("not-json".into()));
+        assert_eq!(connection, None);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("BOTSTER_HUB_CONNECTION is malformed")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn missing_shared_session_id_fails_closed() {
+        assert_eq!(
+            parse_shared_session_id(None).unwrap_err(),
+            "BOTSTER_SHARED_SESSION_ID is required"
+        );
+        assert_eq!(
+            parse_shared_session_id(Some("".into())).unwrap_err(),
+            "BOTSTER_SHARED_SESSION_ID is required"
+        );
+        assert_eq!(
+            parse_shared_session_id(Some("   ".into())).unwrap_err(),
+            "BOTSTER_SHARED_SESSION_ID is required"
+        );
+    }
+
     fn host_compatibility_omitting_terminal_mechanism_tokens() -> DaemonCompatibility {
         let mut compatibility = DaemonCompatibility::current();
         compatibility.features.retain(|feature| {
@@ -11972,6 +12220,7 @@ mod tests {
             FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+            FEATURE_ATTACH_OCCUPANCY,
         ] {
             if !compatibility
                 .features
@@ -11985,7 +12234,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_7_revision_40_and_split_terminal_hello() {
+    fn tui_requires_protocol_7_revision_43_and_split_terminal_hello() {
         let requirement = tui_compatibility_requirement();
         let compatible_hub = host_compatibility_omitting_terminal_mechanism_tokens;
 
@@ -11998,7 +12247,7 @@ mod tests {
             botster_hub_client::PROTOCOL_VERSION
         );
         assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 43);
         for host_feature in [
             FEATURE_SESSIONS,
             FEATURE_PACKAGE_NAVIGATION,
@@ -12009,6 +12258,7 @@ mod tests {
             FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+            FEATURE_ATTACH_OCCUPANCY,
         ] {
             assert!(
                 requirement
@@ -12032,13 +12282,13 @@ mod tests {
             );
         }
 
-        for revision in 16..40 {
+        for revision in 16..43 {
             let mut older_hub = compatible_hub();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-mux-contract fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 40"));
+            assert!(error.diagnostic.contains("requires at least 43"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
@@ -12057,11 +12307,11 @@ mod tests {
             assert!(error.diagnostic.contains("client requires 7"));
         }
         botster_hub_client::ensure_compatible(&requirement, &compatible_hub())
-            .expect("protocol 7 fixture revision 40 hub should connect");
+            .expect("protocol 7 fixture revision 43 hub should connect");
         let mut future_hub = compatible_hub();
-        future_hub.conformance_fixture_revision = 41;
+        future_hub.conformance_fixture_revision = 44;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 41");
+            .expect("runtime compatibility must preserve minimum semantics for revision 44");
     }
 
     #[test]
@@ -14256,9 +14506,10 @@ mod tests {
             .required_features
             .push("botster-tui-future-feature".to_string());
         let mut compatibility = DaemonCompatibility::current();
-        compatibility
-            .features
-            .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+        compatibility.features.push(
+            botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
+                .to_string(),
+        );
         let error = botster_hub_client::ensure_compatible(&requirement, &compatibility)
             .expect_err("unsatisfied requirement should produce compatibility error");
 
@@ -17890,8 +18141,10 @@ mod tests {
             protocol: PROTOCOL.to_string(),
             compatibility: {
                 let mut host = DaemonCompatibility::current();
-                host.features
-                    .push(FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY.to_string());
+                host.features.push(
+                    botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
+                        .to_string(),
+                );
                 host.features
                     .push(FEATURE_UNIX_TERMINAL_ADAPTER.to_string());
                 host.features
@@ -18168,6 +18421,151 @@ mod tests {
         );
         drop(connection);
         let _ = writer_thread.join();
+    }
+
+    #[derive(Clone, Copy)]
+    enum DetachStubMode {
+        WithholdResponse,
+        StopReadingAfterAttach,
+    }
+
+    fn spawn_detach_bound_stub(mode: DetachStubMode) -> (DaemonEndpoint, PathBuf) {
+        use std::os::unix::net::UnixListener;
+
+        let root = PathBuf::from(format!(
+            "/tmp/bt-detach-stub-{}",
+            short_suffix() % 1_000_000
+        ));
+        std::fs::create_dir_all(&root).expect("stub dir");
+        let socket = root.join("hub.sock");
+        let listener = UnixListener::bind(&socket).expect("bind detach stub");
+        thread::spawn(move || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            let _hello: botster_hub_client::DaemonHello =
+                match botster_hub_client::read_frame(&mut stream) {
+                    Ok(hello) => hello,
+                    Err(_) => return,
+                };
+            let ack = DaemonHelloAck {
+                protocol: PROTOCOL.to_string(),
+                compatibility: DaemonCompatibility::current(),
+                terminal_compatibility: Some(TerminalCompatibility::current()),
+                diagnostics: Vec::new(),
+            };
+            if write_frame(&mut stream, &ack).is_err() {
+                return;
+            }
+            loop {
+                let request: DaemonRequest = match botster_hub_client::read_frame(&mut stream) {
+                    Ok(request) => request,
+                    Err(_) => return,
+                };
+                match request {
+                    DaemonRequest::Attach { .. } => {
+                        if write_frame(&mut stream, &base_response(DaemonResponseKind::Shutdown))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if matches!(mode, DetachStubMode::StopReadingAfterAttach) {
+                            thread::sleep(Duration::from_secs(8));
+                            return;
+                        }
+                    }
+                    DaemonRequest::Detach { .. } => {
+                        if matches!(mode, DetachStubMode::WithholdResponse) {
+                            thread::sleep(Duration::from_secs(8));
+                            return;
+                        }
+                        if write_frame(&mut stream, &base_response(DaemonResponseKind::Shutdown))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    _ => {
+                        if write_frame(&mut stream, &base_response(DaemonResponseKind::Shutdown))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        (DaemonEndpoint::new(socket), root)
+    }
+
+    fn assert_no_shutdown_session(app: &TuiApp) {
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::ShutdownSession(_))),
+            "shared teardown must never send ShutdownSession: {:?}",
+            app.observed_requests
+        );
+    }
+
+    #[test]
+    fn bounded_detach_returns_when_hub_withholds_the_response() {
+        let (endpoint, root) = spawn_detach_bound_stub(DetachStubMode::WithholdResponse);
+        let client = HubConnection::connect(&endpoint).expect("hello");
+        let mut connected = client;
+        connected
+            .request(&DaemonRequest::Attach {
+                session_id: "shared-session".to_string(),
+                subscription_id: "sub-a".to_string(),
+            })
+            .expect("attach");
+        let mut app = TuiApp::new(None);
+        app.client = Some(connected);
+        app.begin_attach_hydration("shared-session", "sub-a");
+        app.attached_session = Some("shared-session".to_string());
+        app.attached_subscription_id = Some("sub-a".to_string());
+        app.observed_requests.clear();
+        let started = Instant::now();
+        app.force_reconnect();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "withheld Detach response must return in under 3s; elapsed={:?}",
+            started.elapsed()
+        );
+        assert_no_shutdown_session(&app);
+        assert!(app.client.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_detach_returns_when_peer_stops_reading() {
+        let (endpoint, root) = spawn_detach_bound_stub(DetachStubMode::StopReadingAfterAttach);
+        let client = HubConnection::connect(&endpoint).expect("hello");
+        let mut connected = client;
+        connected
+            .request(&DaemonRequest::Attach {
+                session_id: "shared-session".to_string(),
+                subscription_id: "sub-a".to_string(),
+            })
+            .expect("attach");
+        connected.fill_send_buffer_until_blocked();
+        let mut app = TuiApp::new(None);
+        app.client = Some(connected);
+        app.begin_attach_hydration("shared-session", "sub-a");
+        app.attached_session = Some("shared-session".to_string());
+        app.attached_subscription_id = Some("sub-a".to_string());
+        app.observed_requests.clear();
+        let started = Instant::now();
+        app.force_reconnect();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "saturated Detach write must return in under 3s; elapsed={:?}",
+            started.elapsed()
+        );
+        assert_no_shutdown_session(&app);
+        assert!(app.client.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -20904,7 +21302,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub 4f30d695 and Core f4f6bf5b. Export
+        // Build matching binaries from Hub c72712e and Core f4f6bf5b. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -20923,7 +21321,7 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "4f30d6952f9a29541ab3a670a54bf5e136b8eb8e".to_string());
+            .unwrap_or_else(|_| "c72712e2606b8abe77e1b91c2a736791036fadd8".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
             .unwrap_or_else(|_| "f4f6bf5babe92dfb9241a760c414187f711c2c42".to_string());
         let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
@@ -21655,7 +22053,20 @@ mod tests {
             })
             .expect("sibling attach");
 
-        let mut saw_pre_close_status = false;
+        // Status before the flood poll loop. Hub c72712e can emit
+        // core_adapter_closed on the first poll, which skipped this oracle.
+        match app.request(DaemonRequest::Status) {
+            Ok(response) => {
+                assert_ne!(
+                    response.kind,
+                    botster_hub_client::DaemonResponseKind::OperatorError,
+                    "host Status must stay readable before core_adapter_closed: {:?}",
+                    response.error
+                );
+                app.apply_response(response);
+            }
+            Err(error) => panic!("pre-close Status failed: {error}"),
+        }
         let mut sibling_terminal_frames = 0_usize;
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
@@ -21667,30 +22078,11 @@ mod tests {
                 .iter()
                 .filter(|frame| matches!(frame, DaemonUnixMuxFrame::Terminal(_)))
                 .count();
-            if !saw_pre_close_status && app.terminal_close_evidence.is_none() {
-                match app.request(DaemonRequest::Status) {
-                    Ok(response) => {
-                        assert_ne!(
-                            response.kind,
-                            botster_hub_client::DaemonResponseKind::OperatorError,
-                            "host Status must stay readable before core_adapter_closed: {:?}",
-                            response.error
-                        );
-                        app.apply_response(response);
-                        saw_pre_close_status = true;
-                    }
-                    Err(error) => panic!("pre-close Status failed: {error}"),
-                }
-            }
             if app.terminal_close_evidence.is_some() {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            saw_pre_close_status,
-            "must read a host Status on the flood connection before close"
-        );
         let close_reason = app
             .terminal_close_evidence
             .as_ref()
@@ -21760,6 +22152,385 @@ mod tests {
             "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
             shadow.kitty_enabled, shadow.mouse_mode
         );
+    }
+
+    fn require_shared_ghostty_injectors() -> Option<(DaemonEndpoint, String)> {
+        let connection_raw = match std::env::var_os("BOTSTER_HUB_CONNECTION") {
+            Some(value) => value,
+            None => {
+                skip_or_panic("BOTSTER_HUB_CONNECTION");
+                return None;
+            }
+        };
+        let session_raw = match std::env::var_os("BOTSTER_SHARED_SESSION_ID") {
+            Some(value) => value,
+            None => {
+                skip_or_panic("BOTSTER_SHARED_SESSION_ID");
+                return None;
+            }
+        };
+        let (connection, error) = parse_hub_connection(Some(connection_raw));
+        let connection = connection.unwrap_or_else(|| {
+            panic!(
+                "{}",
+                error.unwrap_or_else(|| "BOTSTER_HUB_CONNECTION is required".to_string())
+            )
+        });
+        let session_id =
+            parse_shared_session_id(Some(session_raw)).unwrap_or_else(|error| panic!("{error}"));
+        let endpoint = match connection.transport {
+            RunnableEntrypointHubConnectionTransport::UnixSocket { path } => {
+                DaemonEndpoint::new(path)
+            }
+        };
+        Some((endpoint, session_id))
+    }
+
+    fn occupancy_has_pair(
+        occupancy: &[botster_hub_client::DaemonAttachOccupancy],
+        session_id: &str,
+        subscription_id: &str,
+    ) -> bool {
+        occupancy
+            .iter()
+            .any(|row| row.session_id == session_id && row.subscription_id == subscription_id)
+    }
+
+    fn sibling_frames_contain(frames: &[DaemonUnixMuxFrame], needle: &str) -> bool {
+        frames.iter().any(|frame| {
+            let DaemonUnixMuxFrame::Terminal(envelope) = frame else {
+                return false;
+            };
+            let Ok(bytes) = envelope.payload_bytes() else {
+                return false;
+            };
+            let Ok(term) = TerminalFrame::from_bytes(&bytes) else {
+                return false;
+            };
+            let Ok(event) = TerminalEvent::from_frame(&term) else {
+                return false;
+            };
+            match event {
+                TerminalEvent::TerminalOutput(output) => {
+                    output.decoded_bytes().ok().is_some_and(|payload| {
+                        payload
+                            .windows(needle.len())
+                            .any(|window| window == needle.as_bytes())
+                    })
+                }
+                _ => false,
+            }
+        })
+    }
+
+    fn wait_for_shared_marker(app: &mut TuiApp, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            if app.applied_live_payloads.iter().any(|payload| {
+                payload
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+            }) || viewport_cache_contains(app, needle)
+                || viewport_cache_contains(app, &format!("echo:{needle}"))
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn ghostty_shared_attaches_to_caller_owned_hub_session() {
+        let Some((endpoint, session_id)) = require_shared_ghostty_injectors() else {
+            return;
+        };
+        assert!(
+            std::env::var_os("BOTSTER_HUB_BIN").is_none(),
+            "ghostty-shared must not inherit BOTSTER_HUB_BIN"
+        );
+        assert!(
+            std::env::var_os("BOTSTER_SESSION_WORKER_BIN").is_none(),
+            "ghostty-shared must not inherit BOTSTER_SESSION_WORKER_BIN"
+        );
+
+        let mut sibling = HubConnection::connect(&endpoint).expect("sibling hello");
+        let sibling_sub = format!("sib-sub-{}", short_suffix());
+        sibling
+            .request(&DaemonRequest::Attach {
+                session_id: session_id.clone(),
+                subscription_id: sibling_sub.clone(),
+            })
+            .expect("sibling attach");
+
+        let mut app = TuiApp::new(Some(endpoint.clone()));
+        app.workspace_test_mode = true;
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("exact shared session becomes attachable");
+        app.selected_session = Some(session_id.clone());
+        app.observed_requests.clear();
+        app.attach_selected_or_first();
+        wait_for_attached_projection(&mut app, &session_id);
+        let ready = app
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready)
+            || app.ghostty_projection.is_some();
+        let finished = app
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_finished)
+            || app.attached_session.as_deref() == Some(session_id.as_str());
+        assert!(ready, "shared attach must observe READY");
+        assert!(
+            finished,
+            "shared attach must observe FINISH or snapshot_history_incomplete then attached"
+        );
+        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
+        assert!(app.ghostty_projection.is_some(), "one Ghostty decoder");
+        let tui_sub = app
+            .attached_subscription_id
+            .clone()
+            .expect("attached subscription");
+
+        app.scroll_projection(ScrollOp::Top);
+        app.refresh_ghostty_viewport_cache();
+        assert!(
+            viewport_cache_contains(&app, "NORTH_STAR_HISTORY"),
+            "late attach must show NORTH_STAR_HISTORY"
+        );
+
+        let suffix = short_suffix();
+        let marker = format!("NORTH_STAR_TUI_{suffix}");
+        app.applied_live_payloads.clear();
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: format!("{marker}\n"),
+        });
+        assert!(
+            wait_for_shared_marker(&mut app, &marker),
+            "exact TUI marker bytes must appear; applied={:?}",
+            app.applied_live_payloads
+        );
+        assert!(
+            app.applied_live_payloads.iter().all(|payload| !payload
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD])),
+            "shared input must not UTF-8-repair; applied={:?}",
+            app.applied_live_payloads
+        );
+
+        app.error = None;
+        app.handle_dispatch(InputDispatch::TerminalResize {
+            node_id: "tui-terminal".to_string(),
+            rows: 30,
+            cols: 100,
+        });
+        assert_eq!(app.terminal_viewport_size.rows, 30);
+        assert_eq!(app.terminal_viewport_size.cols, 100);
+        assert!(app.error.is_none(), "resize must succeed: {:?}", app.error);
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::Resize {
+                    rows: 30,
+                    cols: 100,
+                    ..
+                }
+            )),
+            "production TerminalResize must send DaemonRequest::Resize"
+        );
+
+        app.observed_requests.clear();
+        app.detach_attached();
+        assert!(
+            app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::Detach { .. })),
+            "cancel must send Detach: {:?}",
+            app.observed_requests
+        );
+        assert_no_shutdown_session(&app);
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("session stays running after cancel");
+        app.selected_session = Some(session_id.clone());
+        app.attach_selected_or_first();
+        wait_for_attached_projection(&mut app, &session_id);
+        let cancel_sub = app
+            .attached_subscription_id
+            .clone()
+            .expect("reattach after cancel");
+        assert_ne!(
+            cancel_sub, tui_sub,
+            "cancel reattach mints a new subscription"
+        );
+
+        let dead_sub = cancel_sub.clone();
+        if let Some(client) = app.client.as_mut() {
+            client.hard_close();
+        }
+        let cut_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < cut_deadline {
+            app.poll_hub();
+            if app.client.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            app.client.is_none(),
+            "poll_hub must drive ClientDisconnected after the TUI socket is cut"
+        );
+        assert_no_shutdown_session(&app);
+
+        let occupancy_deadline = Instant::now() + Duration::from_secs(5);
+        let mut occupancy_status = None;
+        while Instant::now() < occupancy_deadline {
+            let status = sibling
+                .request(&DaemonRequest::Status)
+                .expect("sibling Status after TUI EOF");
+            let body = status.status.expect("Status body");
+            if body
+                .compatibility
+                .features
+                .iter()
+                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY)
+                && !occupancy_has_pair(&body.live_attach_occupancy, &session_id, &dead_sub)
+                && occupancy_has_pair(&body.live_attach_occupancy, &session_id, &sibling_sub)
+            {
+                occupancy_status = Some(body);
+                break;
+            }
+            occupancy_status = Some(body);
+            thread::sleep(Duration::from_millis(50));
+        }
+        let status = occupancy_status.expect("sibling Status");
+        assert!(
+            status
+                .compatibility
+                .features
+                .iter()
+                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY),
+            "empty occupancy without attach_occupancy is not absence proof: {:?}",
+            status.compatibility.features
+        );
+        assert!(
+            !occupancy_has_pair(&status.live_attach_occupancy, &session_id, &dead_sub),
+            "dead TUI pair must be absent: {:?}",
+            status.live_attach_occupancy
+        );
+        assert!(
+            occupancy_has_pair(&status.live_attach_occupancy, &session_id, &sibling_sub),
+            "sibling pair must remain: {:?}",
+            status.live_attach_occupancy
+        );
+
+        let sibling_marker = format!("SIB_{suffix}");
+        sibling
+            .request(&DaemonRequest::SendInput {
+                session_id: session_id.clone(),
+                data: format!("{sibling_marker}\n"),
+            })
+            .expect("sibling SendInput after cut");
+        let echo_deadline = Instant::now() + Duration::from_secs(8);
+        let mut sibling_echoed = false;
+        while Instant::now() < echo_deadline {
+            let frames = sibling.poll_mux_frames().expect("sibling mux after cut");
+            if sibling_frames_contain(&frames, &sibling_marker)
+                || sibling_frames_contain(&frames, &format!("echo:{sibling_marker}"))
+            {
+                sibling_echoed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sibling_echoed, "sibling must echo after TUI socket cut");
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("exact session still running after TUI cut");
+        assert_no_shutdown_session(&app);
+
+        app.try_connect();
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("session still attachable after reconnect");
+        app.selected_session = Some(session_id.clone());
+        app.attach_selected_or_first();
+        wait_for_attached_projection(&mut app, &session_id);
+        let replacement = app
+            .attached_subscription_id
+            .clone()
+            .expect("replacement attach");
+        assert_ne!(
+            replacement, dead_sub,
+            "reconnect attach mints a new subscription id"
+        );
+        app.scroll_projection(ScrollOp::Top);
+        app.refresh_ghostty_viewport_cache();
+        assert!(
+            viewport_cache_contains(&app, "NORTH_STAR_HISTORY"),
+            "reconnect must still show NORTH_STAR_HISTORY"
+        );
+        let live_marker = format!("NORTH_STAR_LIVE_{suffix}");
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: session_id.clone(),
+            data: format!("{live_marker}\n"),
+        });
+        assert!(
+            wait_for_shared_marker(&mut app, &live_marker),
+            "reconnect must show a later live marker"
+        );
+        assert_no_shutdown_session(&app);
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("run 1 leaves the host session running");
+        println!("ghostty-shared-complete");
+    }
+
+    #[test]
+    fn ghostty_shared_exit_observes_caller_ended_session() {
+        let Some((endpoint, session_id)) = require_shared_ghostty_injectors() else {
+            return;
+        };
+        assert!(
+            std::env::var_os("BOTSTER_HUB_BIN").is_none(),
+            "ghostty-shared-exit must not inherit BOTSTER_HUB_BIN"
+        );
+
+        let mut app = TuiApp::new(Some(endpoint));
+        app.workspace_test_mode = true;
+        wait_for_authoritative_session(&mut app, &session_id)
+            .expect("exact shared session becomes attachable");
+        app.selected_session = Some(session_id.clone());
+        app.observed_requests.clear();
+        app.attach_selected_or_first();
+        wait_for_attached_projection(&mut app, &session_id);
+        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
+        println!("ghostty-shared-exit-attached");
+
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut observed_exit = false;
+        while Instant::now() < deadline {
+            app.poll_hub();
+            let entity_ended = app.sessions.iter().any(|session| {
+                session.session_id == session_id
+                    && (session.lifecycle == "exited" || session.lifecycle == "failed")
+            });
+            if app.status.contains("process exited") || entity_ended {
+                observed_exit = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            observed_exit,
+            "ghostty-shared-exit must observe ProcessExited or exact entity exited/failed; status={} sessions={:?}",
+            app.status,
+            app.sessions
+                .iter()
+                .map(|session| format!("{}:{}", session.session_id, session.lifecycle))
+                .collect::<Vec<_>>()
+        );
+        assert_no_shutdown_session(&app);
+        println!("ghostty-shared-exit-complete");
     }
 
     #[test]
@@ -21974,6 +22745,59 @@ mod tests {
         assert!(
             stderr.contains("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required"),
             "contract-matrix must reach its own validation; stderr was: {stderr}"
+        );
+    }
+
+    #[test]
+    fn ghostty_shared_wrapper_fails_closed_without_caller_injectors() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../script/test-live-hub");
+        let missing_connection = std::process::Command::new(&script)
+            .arg("ghostty-shared")
+            .env_remove("BOTSTER_HUB_CONNECTION")
+            .env_remove("BOTSTER_HUB_BIN")
+            .env("BOTSTER_SHARED_SESSION_ID", "north-star-shared")
+            .output()
+            .expect("ghostty-shared missing connection");
+        let stderr = String::from_utf8_lossy(&missing_connection.stderr);
+        assert!(!missing_connection.status.success());
+        assert!(
+            stderr.contains("BOTSTER_HUB_CONNECTION is required"),
+            "stderr was: {stderr}"
+        );
+        assert!(
+            !stderr.contains("BOTSTER_HUB_BIN"),
+            "shared wrapper must not require Hub binaries; stderr was: {stderr}"
+        );
+
+        let missing_session = std::process::Command::new(&script)
+            .arg("ghostty-shared-exit")
+            .env(
+                "BOTSTER_HUB_CONNECTION",
+                r#"{"transport":{"type":"unix_socket","path":"/tmp/hub.sock"}}"#,
+            )
+            .env_remove("BOTSTER_SHARED_SESSION_ID")
+            .env_remove("BOTSTER_HUB_BIN")
+            .output()
+            .expect("ghostty-shared-exit missing session");
+        let stderr = String::from_utf8_lossy(&missing_session.stderr);
+        assert!(!missing_session.status.success());
+        assert!(
+            stderr.contains("BOTSTER_SHARED_SESSION_ID is required"),
+            "stderr was: {stderr}"
+        );
+
+        let malformed = std::process::Command::new(&script)
+            .arg("ghostty-shared")
+            .env("BOTSTER_HUB_CONNECTION", "not-json")
+            .env("BOTSTER_SHARED_SESSION_ID", "north-star-shared")
+            .env_remove("BOTSTER_HUB_BIN")
+            .output()
+            .expect("ghostty-shared malformed connection");
+        let stderr = String::from_utf8_lossy(&malformed.stderr);
+        assert!(!malformed.status.success());
+        assert!(
+            stderr.contains("BOTSTER_HUB_CONNECTION is malformed"),
+            "stderr was: {stderr}"
         );
     }
 
@@ -24659,8 +25483,8 @@ mod tests {
                 protocol_version: 1,
                 features: vec![
                     FEATURE_SESSIONS.to_string(),
-                    FEATURE_TERMINAL_STREAMING.to_string(),
-                    FEATURE_RESIZE.to_string(),
+                    botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING.to_string(),
+                    botster_terminal_protocol_client::FEATURE_RESIZE.to_string(),
                     FEATURE_PACKAGE_NAVIGATION.to_string(),
                     FEATURE_TERMINAL_READBACK.to_string(),
                 ],
@@ -24693,6 +25517,7 @@ mod tests {
             recovered_sessions: Vec::new(),
             stale_sessions: Vec::new(),
             lifecycle_counters: botster_hub_client::DaemonLifecycleCounters::default(),
+            live_attach_occupancy: Vec::new(),
             diagnostics: Vec::new(),
         });
         response
@@ -26283,8 +27108,8 @@ mod tests {
     fn pinned_session_plugin_binding_fixture_is_conformance_40() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 40,
-            "hub-test-support pin must publish fixture revision 40"
+            scenario.conformance_fixture_revision, 43,
+            "hub-test-support pin must publish fixture revision 43"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -26348,7 +27173,7 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 40);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 43);
     }
 
     #[test]
