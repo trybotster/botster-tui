@@ -7,6 +7,8 @@
 - **Target repository:** `botster-tui` (`trybotster/botster-tui`)
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
 - **Base:** `origin/main` `fc1ff6238ae707c355febbc03eeab5130cccf91c`
+- **First Implement commit:** `9cff7dda067f03120d494be660a051fb6c9ad279`
+- **Review-revisit commit:** `92cf518a53f43540d24d1f8eaa290f1207397f97`
 - **teardown_class_applies:** yes
 - **Plan revision:** 4 (`artifact_1786900493_408949`)
 - **Hub occupancy dependency:** `ticket_1786870433_515008` closed at `c72712e2606b8abe77e1b91c2a736791036fadd8`
@@ -55,8 +57,8 @@ Convention conflicts: none. TUI Hello requires `attach_occupancy` as an occupanc
 ## Files changed
 
 - `crates/botster-tui/Cargo.toml` — pin `botster-hub-client` and `botster-hub-test-support` to Hub `c72712e2606b8abe77e1b91c2a736791036fadd8`.
-- `Cargo.lock` — lock the pin. UI contract stays on tag `botster-ui-contract-v0.3.2`. Core / Ghostty stay on `f4f6bf5`.
-- `crates/botster-tui/src/app.rs` — host Hello adds `FEATURE_ATTACH_OCCUPANCY` and floor 43; bounded `request_with_deadline` (write then read); Detach-if-writable on `force_reconnect`, cancel, recovery, and `record_transport_error`; shared-profile fail-closed parsers; stub bound tests; `ghostty-shared` and `ghostty-shared-exit` live tests; IsolatedHub flood Status taken before the poll loop.
+- `Cargo.lock` — lock Hub `c72712e` and one Core identity at `fc541a`. UI contract stays on tag `botster-ui-contract-v0.3.2`.
+- `crates/botster-tui/src/app.rs` — default host Hello stays floor 40 without occupancy; `ghostty-shared` uses `tui_attach_occupancy_requirement()`; bounded `request_with_deadline` (write then read); Detach-if-writable on `force_reconnect`, cancel, recovery, and `record_transport_error`; shared-profile fail-closed parsers; stub bound tests; `ghostty-shared` and `ghostty-shared-exit` live tests; IsolatedHub flood Status taken before the poll loop.
 - `script/test-live-hub` — `ghostty-shared` and `ghostty-shared-exit`; skip Hub/worker binary resolution; wrapper fail-closed on connection + session id; stream cargo output for shared profiles.
 - `README.md` — occupancy pin, floor 43, caller injectors, two wrapper modes, caller end-session step.
 - `docs/plans/tui-attach-ghostty-live-proof-to-caller-owned-hub-session-plan.md` — approved plan plus Implement adaptations.
@@ -79,6 +81,8 @@ Work stayed in `botster-tui`. No Hub, Web, kit, or Ghostty crate edits. Occupanc
 - IsolatedHub `ghostty` flood Status is issued immediately after sibling attach. Hub `c72712e` can emit `core_adapter_closed` on the first `poll_hub`, which skipped the host-Status oracle. Flood/write-budget assertions are otherwise unchanged. Recorded in the committed plan.
 - Shared wrapper streams cargo test output. Buffering until process exit hid `ghostty-shared-exit-attached` and deadlocked run 2. Recorded in the committed plan.
 - Hub client `c72712e` no longer re-exports terminal mechanism tokens. Tests import them from `botster-terminal-protocol-client`.
+- Review required restoring default Hello to floor 40 without `attach_occupancy`. Occupancy is `tui_attach_occupancy_requirement()` on `ghostty-shared` only. This supersedes plan rev 4's default Hello bump.
+- Review required aligning Core-family pins to Hub `c72712e`'s Core `fc541a`. This supersedes plan rev 4's "keep f4f6bf5 unless compile break".
 
 ## Tests and downstream proof
 
@@ -106,7 +110,7 @@ Live caller-owned Hub (caller IsolatedHub outside the profile, session `north-st
 
 IsolatedHub profile:
 
-- `script/test-live-hub ghostty` printed `ghostty-live-complete` against Hub `c72712e` / worker `f4f6bf5`
+- `script/test-live-hub ghostty` printed `ghostty-live-complete` against Hub `c72712e` / worker `fc541a`
 
 Production entry points:
 

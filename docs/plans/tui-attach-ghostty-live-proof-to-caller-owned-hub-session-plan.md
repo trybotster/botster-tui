@@ -465,3 +465,5 @@ Downstream:
 - IsolatedHub `ghostty` flood Status is issued immediately after sibling attach, before the poll loop. Hub `c72712e` can emit `core_adapter_closed` on the first `poll_hub`, which skipped the host-Status oracle when it lived inside the loop. Flood/write-budget assertions are otherwise unchanged.
 - `script/test-live-hub ghostty-shared` and `ghostty-shared-exit` stream cargo test output. Buffering until process exit hid `ghostty-shared-exit-attached` from the caller and deadlocked run 2.
 - Hub client `c72712e` no longer re-exports terminal mechanism tokens. TUI tests import those tokens from `botster-terminal-protocol-client`.
+- Review `finding_1786903176_400188`: default host Hello stays floor 40 without `attach_occupancy`. Occupancy Hello is only `tui_attach_occupancy_requirement()` on `ghostty-shared` connections.
+- Review `finding_1786903176_937323`: Core / Ghostty / protocol-client / core-test-support pin Hub `c72712e`'s Core revision `fc541a59338d0591ba4fb3fa522a030d212d26d0`.
