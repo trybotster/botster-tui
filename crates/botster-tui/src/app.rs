@@ -87,6 +87,8 @@ const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(test)]
+const SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 40;
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
@@ -2831,6 +2833,82 @@ impl TuiApp {
         self.session_type_entities = SessionTypeEntityState::default();
         self.session_type_subscription_error = None;
         stopped
+    }
+
+    /// IsolatedHub session-types live harness only. Stop the current pump, then
+    /// start a new production `subscribe_entities` so Hub sends a request-path
+    /// snapshot. Production Create / Update / Delete must not call this.
+    #[cfg(test)]
+    fn refresh_session_type_subscription_for_test(&mut self) -> Result<(), String> {
+        let previous_subscription_id = self.session_type_entities.subscription_id.clone();
+        if !self.invalidate_session_type_generation() {
+            return Err(format!(
+                "session type subscription stop timed out; previous_subscription_id={previous_subscription_id:?}"
+            ));
+        }
+        self.start_session_type_subscription()
+            .map_err(|error| format!("session type subscribe after stop failed: {error}"))?;
+        let new_id = self.session_type_entities.subscription_id.clone();
+        if self.session_type_subscription.is_none() {
+            return Err("refresh must leave one live session_type pump".to_string());
+        }
+        if new_id == previous_subscription_id {
+            return Err(format!(
+                "refresh must start a new subscription_id; previous={previous_subscription_id:?} new={new_id:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_for_session_type_after_subscribe_refresh(
+        &mut self,
+        expected_id: &str,
+        expect_present: bool,
+    ) {
+        if let Err(error) = self.refresh_session_type_subscription_for_test() {
+            panic!(
+                "{error}; expected_id={expected_id} expect_present={expect_present} keys={:?} has_snapshot={} snapshot_seq={:?} subscription_id={:?} error={:?} session_type_subscription_error={:?}",
+                self.session_type_entities
+                    .entities
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                self.session_type_entities.has_snapshot,
+                self.session_type_entities.snapshot_seq,
+                self.session_type_entities.subscription_id,
+                self.error,
+                self.session_type_subscription_error,
+            );
+        }
+        let deadline = Instant::now() + SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE;
+        while Instant::now() < deadline {
+            self.poll_hub();
+            let present = self
+                .session_type_entities
+                .entities
+                .contains_key(expected_id);
+            if expect_present && present {
+                return;
+            }
+            if !expect_present && !present && self.session_type_entities.has_snapshot {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "session type subscribe snapshot missed expected_id={expected_id} expect_present={expect_present} keys={:?} has_snapshot={} snapshot_seq={:?} subscription_id={:?} error={:?} session_type_subscription_error={:?}",
+            self.session_type_entities
+                .entities
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            self.session_type_entities.has_snapshot,
+            self.session_type_entities.snapshot_seq,
+            self.session_type_entities.subscription_id,
+            self.error,
+            self.session_type_subscription_error,
+        );
     }
 
     /// Build the multi-family store for shared projection, injecting process-wide
@@ -27683,6 +27761,104 @@ mod tests {
         );
     }
 
+    fn rust_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("source is missing {signature}"));
+        let brace = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature} has no body"));
+        let body_start = start + brace;
+        let mut depth = 0usize;
+        for (offset, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .unwrap_or_else(|| panic!("{signature} brace underflow"));
+                    if depth == 0 {
+                        return &source[body_start..=body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{signature} body did not close");
+    }
+
+    #[test]
+    fn submit_session_type_form_success_path_does_not_refresh_subscribe() {
+        let source = source_without_line_comments();
+        let body = rust_fn_body(&source, "fn submit_session_type_form(");
+        let refresh_helper = format!("{}{}", "refresh_session_type_subscription", "_for_test");
+        let invalidate = format!("{}{}", "invalidate_session_type", "_generation");
+        assert!(
+            !body.contains(&refresh_helper),
+            "production form submit must not call the IsolatedHub subscribe refresh helper"
+        );
+        assert!(
+            !body.contains(&invalidate),
+            "production form submit must not invalidate the session_type subscription"
+        );
+    }
+
+    #[test]
+    fn refresh_session_type_subscription_for_test_stops_before_start() {
+        let mut app = TuiApp::new(None);
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        let (_frame_sender, frame_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = cancel_receiver.recv();
+            let _ = stopped_sender.send(());
+        });
+        app.session_type_subscription = Some(SessionSubscriptionPump {
+            messages: frame_receiver,
+            cancel: Some(cancel_sender),
+            stopped: stopped_receiver,
+            stop_attempted: false,
+            stopped_confirmed: false,
+        });
+        app.session_type_entities
+            .begin_generation("old-session-type-sub".to_string());
+        app.session_type_entities.has_snapshot = true;
+
+        let error = app
+            .refresh_session_type_subscription_for_test()
+            .expect_err("start without a hub endpoint must fail after stop");
+        assert!(
+            error.contains("subscribe after stop failed"),
+            "helper must attempt start after stop: {error}"
+        );
+        assert!(
+            app.session_type_subscription.is_none(),
+            "failed start must not leave a pump"
+        );
+        assert_eq!(app.session_type_entities.subscription_id, None);
+        assert!(!app.session_type_entities.has_snapshot);
+
+        let source = source_without_line_comments();
+        let helper_body = rust_fn_body(&source, "fn refresh_session_type_subscription_for_test(");
+        let start_body = rust_fn_body(&source, "fn start_session_type_subscription(&mut self)");
+        let invalidate = format!("{}{}", "invalidate_session_type", "_generation");
+        let start_call = format!("{}{}", "start_session_type_subscription", "()");
+        let invalidate_at = helper_body
+            .find(&invalidate)
+            .expect("helper must stop through invalidate");
+        let start_at = helper_body
+            .find(&start_call)
+            .expect("helper must start a new subscribe");
+        assert!(
+            invalidate_at < start_at,
+            "helper contract is stop-before-start"
+        );
+        assert!(
+            !start_body.contains(&invalidate),
+            "a second start without stop is not the helper contract"
+        );
+    }
+
     #[test]
     fn session_type_real_input_create_button_dispatches_through_input_router() {
         let mut app = TuiApp::new(None);
@@ -27812,23 +27988,7 @@ mod tests {
             panic!("create agent session type failed: {error}");
         }
         let agent_type_id = format!("device/{create_id}");
-        for _ in 0..80 {
-            app.poll_hub();
-            if app
-                .session_type_entities
-                .entities
-                .contains_key(&agent_type_id)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            app.session_type_entities
-                .entities
-                .contains_key(&agent_type_id),
-            "created agent type missing from entity store"
-        );
+        app.wait_for_session_type_after_subscribe_refresh(&agent_type_id, true);
 
         // Accessory interactive + service types.
         for (suffix, interaction, role) in [
@@ -27876,13 +28036,7 @@ exit 0
                 },
             });
             let effective = format!("device/{id}");
-            for _ in 0..80 {
-                app.poll_hub();
-                if app.session_type_entities.entities.contains_key(&effective) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+            app.wait_for_session_type_after_subscribe_refresh(&effective, true);
             let entity = app
                 .session_type_entities
                 .entities
@@ -27949,17 +28103,7 @@ exit 0
         let launch_type_id = app
             .ensure_headless_shell_session_type(hub.data_dir(), DEFAULT_COMMAND)
             .expect("launch session type");
-        for _ in 0..80 {
-            app.poll_hub();
-            if app
-                .session_type_entities
-                .entities
-                .contains_key(&launch_type_id)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+        app.wait_for_session_type_after_subscribe_refresh(&launch_type_id, true);
         let repo_root = root.join("spawn-point-repo");
         std::fs::create_dir_all(repo_root.join(".botster")).expect("spawn point repo");
         std::fs::write(repo_root.join("README.md"), "live spawn point\n").expect("seed repo file");
@@ -28076,23 +28220,7 @@ exit 0
 
         // Delete device type and observe remove.
         app.delete_session_type(&agent_type_id);
-        for _ in 0..80 {
-            app.poll_hub();
-            if !app
-                .session_type_entities
-                .entities
-                .contains_key(&agent_type_id)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            !app.session_type_entities
-                .entities
-                .contains_key(&agent_type_id),
-            "deleted session type should leave entity store"
-        );
+        app.wait_for_session_type_after_subscribe_refresh(&agent_type_id, false);
 
         // Reconnect projection: force reconnect and wait for exact id for remaining accessory.
         let remaining: Vec<String> = app.session_type_entities.entity_order.to_vec();
