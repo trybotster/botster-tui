@@ -31,7 +31,7 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e` |
+| `botster-hub-client` / live hub | Hub `c72712e2606b8abe77e1b91c2a736791036fadd8` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.2` |
 | `botster-hub-test-support` package | `@trybotster/hub-test-support@0.1.35` |
 | `botster-tui-kit` | `c83ba6c518e2324e34ce24c7abe5a8a05e56293c` |
@@ -50,21 +50,23 @@ through a TUI-owned `ProjectionWidget` after kit `TerminalView` chrome
 Ghostty truth. Kitty keyboard and mouse encodings use Hub
 `ModeGatedInput` with `ReadModeFlags` freshness (`mode_generation` /
 `mode_revision`). ReadScreen remains optional diagnostic text only.
-Host Hello requires protocol **7**, conformance floor **40**, and host-plane
-features only, including `unix_terminal_adapter` and
-`terminal_subscription_closed`. `terminal_streaming`, `resize`, and
-`snapshot_delivery=ready_then_history` live on `terminal_compatibility`. Terminal
-Hello uses `TerminalCompatibilityRequirement::for_ready_then_history_attach()`
-with `client_name = "botster-tui"` and `ensure_terminal_compatible` before
-Attach. Production connect is `connect_and_hello_with_terminal_requirement`.
+Host Hello requires protocol **7**, conformance floor **43**, and host-plane
+features only, including `unix_terminal_adapter`,
+`terminal_subscription_closed`, and `attach_occupancy`. `terminal_streaming`,
+`resize`, and `snapshot_delivery=ready_then_history` live on
+`terminal_compatibility`. Terminal Hello uses
+`TerminalCompatibilityRequirement::for_ready_then_history_attach()` with
+`client_name = "botster-tui"` and `ensure_terminal_compatible` before Attach.
+Production connect is `connect_and_hello_with_terminal_requirement`.
 The attach socket reads the Unix mux with a persistent byte buffer
 (`UnixStream::read`, `parse_unix_mux_value`) and emits each complete
 `Response` / `Event` / `Terminal` frame without waiting for the producer to
 go idle. It does not send terminal Drain. `TerminalSubscriptionClosed`
 for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
-`generation` is close-event evidence only. Live Ghostty proof is
-`script/test-live-hub ghostty`.
+`generation` is close-event evidence only. IsolatedHub Ghostty proof is
+`script/test-live-hub ghostty`. Caller-owned attach proof is
+`script/test-live-hub ghostty-shared` then `script/test-live-hub ghostty-shared-exit`.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -159,7 +161,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`4f30d6952f9a29541ab3a670a54bf5e136b8eb8e` (same Hub pin as Foundation above).
+`c72712e2606b8abe77e1b91c2a736791036fadd8` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, ModeGatedInput, resize, and mux Event/Terminal planes.
@@ -185,21 +187,51 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
   cargo run -p botster-tui -- --headless-live-runtime
 ```
 
-Incremental Ghostty live proof (protocol 7 / floor 40). Build Hub
-`4f30d6952f9a29541ab3a670a54bf5e136b8eb8e` and Core worker
+Incremental Ghostty live proof (protocol 7 / floor 43). Build Hub
+`c72712e2606b8abe77e1b91c2a736791036fadd8` and Core worker
 `f4f6bf5babe92dfb9241a760c414187f711c2c42` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=4f30d6952f9a29541ab3a670a54bf5e136b8eb8e
+export BOTSTER_HUB_BIN_REV=c72712e2606b8abe77e1b91c2a736791036fadd8
 export BOTSTER_SESSION_WORKER_BIN_REV=f4f6bf5babe92dfb9241a760c414187f711c2c42
 script/test-live-hub ghostty
 ```
 
-`script/test` does not forward arguments and is not the live gate. Missing
-binaries fail `script/test-live-hub ghostty` closed.
+`script/test` does not forward arguments and is not the live IsolatedHub gate.
+Missing binaries fail `script/test-live-hub ghostty` closed.
+
+Caller-owned attach proof joins a Hub session the TUI does not create. The
+caller supplies only `BOTSTER_HUB_CONNECTION` and `BOTSTER_SHARED_SESSION_ID`
+(default parent id `north-star-shared`). Do not set `BOTSTER_HUB_BIN` or
+`BOTSTER_SESSION_WORKER_BIN`. The host Hello requires `attach_occupancy`;
+empty `Status.live_attach_occupancy` without that advertised token is not
+release proof. Write `NORTH_STAR_HISTORY` before the first TUI attach and
+echo TUI `NORTH_STAR_TUI_<suffix>` input.
+
+```sh
+export BOTSTER_HUB_CONNECTION='{"transport":{"type":"unix_socket","path":"<hub.sock>"}}'
+export BOTSTER_SHARED_SESSION_ID=north-star-shared
+export BOTSTER_TUI_REQUIRE_HUB_TEST=1
+# Do not set BOTSTER_HUB_BIN or BOTSTER_SESSION_WORKER_BIN.
+
+script/test-live-hub ghostty-shared
+# session must still be running
+
+# Start the exit profile, wait for ghostty-shared-exit-attached, then
+# end the session from the caller Hub control plane (not from TUI).
+script/test-live-hub ghostty-shared-exit
+```
+
+`ghostty-shared` prints `ghostty-shared-complete` after attach, cancel,
+socket-cut occupancy release, and reconnect. `ghostty-shared-exit` streams
+`ghostty-shared-exit-attached` while the test stays connected so the caller
+can end the session, then prints `ghostty-shared-exit-complete` after
+observing ProcessExited or the exact session entity `exited`/`failed`. TUI
+sends no `ShutdownSession` on either profile. Missing or malformed injectors
+fail the wrapper closed.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.

@@ -56,12 +56,34 @@ resolve_workspaces_package() {
   printf '%s\n' "$configured"
 }
 
+require_shared_injectors() {
+  connection="${BOTSTER_HUB_CONNECTION:-}"
+  session_id="${BOTSTER_SHARED_SESSION_ID:-}"
+  if [ -z "$connection" ]; then
+    echo "BOTSTER_HUB_CONNECTION is required" >&2
+    exit 1
+  fi
+  if [ -z "$session_id" ]; then
+    echo "BOTSTER_SHARED_SESSION_ID is required" >&2
+    exit 1
+  fi
+  case "$connection" in
+    '{'*)
+      ;;
+    *)
+      echo "BOTSTER_HUB_CONNECTION is malformed" >&2
+      exit 1
+      ;;
+  esac
+}
+
 mode="${1:-contract-matrix}"
 profile="${2:-}"
+shared_profile=0
 case "$mode" in
   contract-matrix)
     if [ "$#" -gt 1 ]; then
-      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty" >&2
+      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty | ghostty-shared | ghostty-shared-exit" >&2
       exit 1
     fi
     contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
@@ -80,6 +102,24 @@ case "$mode" in
       exit 1
     fi
     test_filter="app::tests::headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input"
+    ;;
+  ghostty-shared)
+    if [ "$#" -gt 1 ]; then
+      echo "usage: script/test-live-hub ghostty-shared" >&2
+      exit 1
+    fi
+    require_shared_injectors
+    shared_profile=1
+    test_filter="app::tests::ghostty_shared_attaches_to_caller_owned_hub_session"
+    ;;
+  ghostty-shared-exit)
+    if [ "$#" -gt 1 ]; then
+      echo "usage: script/test-live-hub ghostty-shared-exit" >&2
+      exit 1
+    fi
+    require_shared_injectors
+    shared_profile=1
+    test_filter="app::tests::ghostty_shared_exit_observes_caller_ended_session"
     ;;
   workspaces)
     if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ] && [ "$profile" != "installed-driver" ] && [ "$profile" != "claim-driver" ]; }; then
@@ -105,7 +145,7 @@ case "$mode" in
     ;;
   *)
     echo "unknown live-Hub mode: $mode" >&2
-    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty" >&2
+    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty | ghostty-shared | ghostty-shared-exit" >&2
     exit 1
     ;;
 esac
@@ -119,7 +159,11 @@ fi
 
 claim_hub_build_target=""
 claim_build_receipt=""
-if [ "$profile" = "claim-driver" ]; then
+hub_bin=""
+session_worker_bin=""
+if [ "$shared_profile" -eq 1 ]; then
+  :
+elif [ "$profile" = "claim-driver" ]; then
   # Fresh locked Hub + session-worker builds from the recorded Hub checkout.
   # Do not reuse a stale shared target/release under the Hub source tree.
   # Canonicalize immediately so receipt commands match fs::canonicalize forms
@@ -168,7 +212,20 @@ if [ "$mode" = "contract-matrix" ] || [ "$profile" = "installed-driver" ] || [ "
 fi
 
 test_output="$target_dir/live-test-output"
-if BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
+if [ "$shared_profile" -eq 1 ]; then
+  set +e
+  set -o pipefail
+  BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
+    BOTSTER_ENV=test \
+    BOTSTER_HUB_CONNECTION="$BOTSTER_HUB_CONNECTION" \
+    BOTSTER_SHARED_SESSION_ID="$BOTSTER_SHARED_SESSION_ID" \
+    CARGO_TARGET_DIR="$target_dir" \
+    env -u BOTSTER_HUB_BIN -u BOTSTER_SESSION_WORKER_BIN \
+    cargo test -p botster-tui "$test_filter" -- --exact --nocapture 2>&1 | tee "$test_output"
+  test_status=$?
+  set +o pipefail
+  set -e
+elif BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
   BOTSTER_ENV=test \
   BOTSTER_HUB_BIN="$hub_bin" \
   BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
@@ -186,7 +243,9 @@ then
 else
   test_status=$?
 fi
-cat "$test_output"
+if [ "$shared_profile" -ne 1 ]; then
+  cat "$test_output"
+fi
 if [ "$test_status" -ne 0 ]; then
   exit "$test_status"
 fi
@@ -203,6 +262,18 @@ fi
 if [ "$mode" = "ghostty" ]; then
   if ! grep -F "ghostty-live-complete" "$test_output" >/dev/null; then
     echo "ghostty live profile did not complete" >&2
+    exit 1
+  fi
+fi
+if [ "$mode" = "ghostty-shared" ]; then
+  if ! grep -F "ghostty-shared-complete" "$test_output" >/dev/null; then
+    echo "ghostty-shared profile did not complete" >&2
+    exit 1
+  fi
+fi
+if [ "$mode" = "ghostty-shared-exit" ]; then
+  if ! grep -F "ghostty-shared-exit-complete" "$test_output" >/dev/null; then
+    echo "ghostty-shared-exit profile did not complete" >&2
     exit 1
   fi
 fi
