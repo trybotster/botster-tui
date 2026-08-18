@@ -21474,7 +21474,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub c72712e and Core fc541a59. Export
+        // Build matching binaries from Hub e864c3c and Core fd66efd. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -21493,9 +21493,19 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "c72712e2606b8abe77e1b91c2a736791036fadd8".to_string());
+            .unwrap_or_else(|_| "e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "fc541a59338d0591ba4fb3fa522a030d212d26d0".to_string());
+            .unwrap_or_else(|_| "fd66efdcb4769b2b3a75cbd580a5b98b82825790".to_string());
+        let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
+        let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
+        assert_eq!(
+            fixture_provenance.core_pin, worker_rev,
+            "Hub fixture Core pin must match the live session worker"
+        );
+        assert_eq!(
+            fixture_provenance.ghostty_pin, ghostty_rev,
+            "Hub fixture Ghostty pin must match the TUI Ghostty library"
+        );
         let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
         let worker_real = std::fs::canonicalize(&worker_path).expect("canonicalize worker bin");
         assert_ne!(
@@ -21503,7 +21513,7 @@ mod tests {
             "Hub and Core worker binaries must have distinct realpaths"
         );
         println!(
-            "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} hub_bin={} worker_bin={}",
+            "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} ghostty_rev={ghostty_rev} hub_bin={} worker_bin={}",
             hub_real.display(),
             worker_real.display()
         );
@@ -22321,7 +22331,7 @@ mod tests {
         );
 
         println!(
-            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
+            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} ghostty_rev={ghostty_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
             shadow.kitty_enabled, shadow.mouse_mode
         );
     }
