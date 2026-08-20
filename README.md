@@ -167,7 +167,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7` (same Hub pin as Foundation above).
+`7a09292cd518186e0def758c823c0841ee1cacf1` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, ModeGatedInput, resize, and mux Event/Terminal planes.
@@ -193,16 +193,16 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
   cargo run -p botster-tui -- --headless-live-runtime
 ```
 
-Incremental Ghostty live proof (protocol 7 / default floor 40). Build Hub
-`e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7` and Core worker
-`fd66efdcb4769b2b3a75cbd580a5b98b82825790` into a fresh target directory,
+Incremental Ghostty live proof (protocol 7 / default floor 44). Build Hub
+`7a09292cd518186e0def758c823c0841ee1cacf1` and Core worker
+`8fce2041b9fe742cb2a6df9e74cb262606672742` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7
-export BOTSTER_SESSION_WORKER_BIN_REV=fd66efdcb4769b2b3a75cbd580a5b98b82825790
+export BOTSTER_HUB_BIN_REV=7a09292cd518186e0def758c823c0841ee1cacf1
+export BOTSTER_SESSION_WORKER_BIN_REV=8fce2041b9fe742cb2a6df9e74cb262606672742
 script/test-live-hub ghostty
 ```
 
@@ -214,8 +214,9 @@ caller supplies only `BOTSTER_HUB_CONNECTION` and `BOTSTER_SHARED_SESSION_ID`
 (default parent id `north-star-shared`). Do not set `BOTSTER_HUB_BIN` or
 `BOTSTER_SESSION_WORKER_BIN`. Only `ghostty-shared` Hello requires
 `attach_occupancy`; empty `Status.live_attach_occupancy` without that
-advertised token is not release proof. Default TUI Hello stays at floor 40
-so session-types and Workspaces lanes still reach older Hubs. Write
+advertised token is not release proof. Default TUI Hello stays at floor 44
+and requires `package_event_subscriptions`. Shared live lanes need a caller
+Hub at `7a09292` or later. Write
 `NORTH_STAR_HISTORY` before the first TUI attach and echo TUI
 `NORTH_STAR_TUI_<suffix>` input.
 
@@ -267,11 +268,11 @@ Session types are authoritative Hub descriptors consumed through the
   the Hub effective `session_type_id` with `request.target_id = T`. Freeform
   `DaemonRequest::Spawn { command }` is not a product affordance (headless /
   Workspaces harness seeding may still use raw Spawn).
-- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 40` and does
+- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 44` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7`, Core crates
-  `fd66efdcb4769b2b3a75cbd580a5b98b82825790`, Ghostty
+- Pins: Hub crates `7a09292cd518186e0def758c823c0841ee1cacf1`, Core crates
+  `8fce2041b9fe742cb2a6df9e74cb262606672742`, Ghostty
   `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
   `botster-ui-contract-v0.3.2`, and kit
   `c83ba6c518e2324e34ce24c7abe5a8a05e56293c`.
@@ -279,7 +280,7 @@ Session types are authoritative Hub descriptors consumed through the
 Live proof (independent of contract-matrix):
 
 ```sh
-# Use Hub e864c3c and Core fd66efd binaries (same pins as Foundation).
+# Use Hub 7a09292 and Core 8fce204 binaries (same pins as Foundation).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
