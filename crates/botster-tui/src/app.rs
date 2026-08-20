@@ -21948,7 +21948,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub e864c3c and Core fd66efd. Export
+        // Build matching binaries from Hub 7a09292 and Core 8fce204. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -21967,9 +21967,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7".to_string());
+            .unwrap_or_else(|_| "7a09292cd518186e0def758c823c0841ee1cacf1".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "fd66efdcb4769b2b3a75cbd580a5b98b82825790".to_string());
+            .unwrap_or_else(|_| "8fce2041b9fe742cb2a6df9e74cb262606672742".to_string());
         let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
         let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
         assert_eq!(
@@ -29336,6 +29336,11 @@ exit 0
         rejected.reject_event_subscription_candidate(
             "cand-2",
             "event subscription was not accepted".to_string(),
+        );
+        assert_eq!(
+            rejected.client.as_ref().map(HubConnection::pending_mux_len),
+            Some(0),
+            "reject must drop parked frames before apply"
         );
         rejected.apply_pending_mux_frames();
         assert!(rejected.transient_notice.is_none());
