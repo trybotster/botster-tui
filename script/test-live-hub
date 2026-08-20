@@ -83,7 +83,7 @@ shared_profile=0
 case "$mode" in
   contract-matrix)
     if [ "$#" -gt 1 ]; then
-      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty | ghostty-shared | ghostty-shared-exit" >&2
+      echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty | ghostty-shared | ghostty-shared-exit | package-events" >&2
       exit 1
     fi
     contract_matrix_fixture="$(resolve_contract_matrix_fixture)"
@@ -121,6 +121,25 @@ case "$mode" in
     shared_profile=1
     test_filter="app::tests::ghostty_shared_exit_observes_caller_ended_session"
     ;;
+  package-events)
+    if [ "$#" -gt 1 ]; then
+      echo "usage: script/test-live-hub package-events" >&2
+      exit 1
+    fi
+    if [ -z "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH:-}" ]; then
+      echo "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH is required for package-events live proof" >&2
+      exit 1
+    fi
+    if [ ! -d "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}" ]; then
+      echo "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH is not a directory: ${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}" >&2
+      exit 1
+    fi
+    if [ ! -f "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}/botster-package.json" ] || [ ! -f "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}/plugin.lua" ]; then
+      echo "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH must contain botster-package.json and plugin.lua: ${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}" >&2
+      exit 1
+    fi
+    test_filter="app::tests::package_events_live_runtime_runs_against_isolated_hub_when_binaries_are_available"
+    ;;
   workspaces)
     if [ "$#" -ne 2 ] || { [ "$profile" != "plumbing" ] && [ "$profile" != "lifecycle" ] && [ "$profile" != "installed-driver" ] && [ "$profile" != "claim-driver" ]; }; then
       echo "usage: script/test-live-hub workspaces <plumbing|lifecycle|installed-driver|claim-driver>" >&2
@@ -145,7 +164,7 @@ case "$mode" in
     ;;
   *)
     echo "unknown live-Hub mode: $mode" >&2
-    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty | ghostty-shared | ghostty-shared-exit" >&2
+    echo "usage: script/test-live-hub [contract-matrix] | workspaces <plumbing|lifecycle|installed-driver|claim-driver> | session-types | ghostty | ghostty-shared | ghostty-shared-exit | package-events" >&2
     exit 1
     ;;
 esac
@@ -205,7 +224,13 @@ else
   session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
 fi
 
-cargo build -p botster-tui --target-dir "$target_dir" --locked
+if [ "$mode" = "package-events" ]; then
+  # Hub-test-support enables Core local-runtime. A bin-only build leaves
+  # engine/botster.rs compiling without IncrementalAttach at Core 8fce204.
+  cargo test -p botster-tui --no-run --locked --target-dir "$target_dir" "$test_filter"
+else
+  cargo build -p botster-tui --target-dir "$target_dir" --locked
+fi
 if [ "$mode" = "contract-matrix" ] || [ "$profile" = "installed-driver" ] || [ "$profile" = "claim-driver" ]; then
   mkdir -p target/debug
   cp "$target_dir/debug/botster-tui" target/debug/botster-tui
@@ -231,6 +256,7 @@ elif BOTSTER_TUI_REQUIRE_HUB_TEST=1 \
   BOTSTER_SESSION_WORKER_BIN="$session_worker_bin" \
   BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE="${contract_matrix_fixture:-}" \
   BOTSTER_WORKSPACES_PACKAGE_PATH="${workspaces_package:-}" \
+  BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH="${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH:-}" \
   BOTSTER_HUB_SOURCE_PATH="${BOTSTER_HUB_SOURCE_PATH:-}" \
   BOTSTER_HUB_BUILD_TARGET_DIR="${BOTSTER_HUB_BUILD_TARGET_DIR:-}" \
   BOTSTER_TUI_CLAIM_BUILD_RECEIPT="${BOTSTER_TUI_CLAIM_BUILD_RECEIPT:-}" \
@@ -274,6 +300,12 @@ fi
 if [ "$mode" = "ghostty-shared-exit" ]; then
   if ! grep -F "ghostty-shared-exit-complete" "$test_output" >/dev/null; then
     echo "ghostty-shared-exit profile did not complete" >&2
+    exit 1
+  fi
+fi
+if [ "$mode" = "package-events" ]; then
+  if ! grep -F "package-events-live: complete" "$test_output" >/dev/null; then
+    echo "package-events live profile did not complete" >&2
     exit 1
   fi
 fi
