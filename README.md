@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `e864c3c8bbfb74068de21bd2ae9b843dbf0ccda7` |
+| `botster-hub-client` / live hub | Hub `7a09292cd518186e0def758c823c0841ee1cacf1` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.2` |
-| `botster-hub-test-support` package | `@trybotster/hub-test-support@0.1.35` |
+| `botster-hub-test-support` package | `@trybotster/hub-test-support@0.1.39` |
 | `botster-tui-kit` | `c83ba6c518e2324e34ce24c7abe5a8a05e56293c` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `fd66efdcb4769b2b3a75cbd580a5b98b82825790` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `8fce2041b9fe742cb2a6df9e74cb262606672742` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -51,9 +51,9 @@ through a TUI-owned `ProjectionWidget` after kit `TerminalView` chrome
 Ghostty truth. Kitty keyboard and mouse encodings use Hub
 `ModeGatedInput` with `ReadModeFlags` freshness (`mode_generation` /
 `mode_revision`). ReadScreen remains optional diagnostic text only.
-Host Hello requires protocol **7**, conformance floor **40**, and host-plane
-features only, including `unix_terminal_adapter` and
-`terminal_subscription_closed`. `attach_occupancy` is required only on
+Host Hello requires protocol **7**, conformance floor **44**, and host-plane
+features only, including `unix_terminal_adapter`,
+`terminal_subscription_closed`, and `package_event_subscriptions`. `attach_occupancy` is required only on
 `ghostty-shared` connections through
 `DaemonCompatibilityRequirement::for_attach_occupancy()`. `terminal_streaming`,
 `resize`, and `snapshot_delivery=ready_then_history` live on
@@ -70,6 +70,9 @@ signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. IsolatedHub Ghostty proof is
 `script/test-live-hub ghostty`. Caller-owned attach proof is
 `script/test-live-hub ghostty-shared` then `script/test-live-hub ghostty-shared-exit`.
+Project Pipelines `question.opened` consumption is
+`script/test-live-hub package-events`. Shared live lanes need a caller Hub at
+`7a09292` or later.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -770,7 +773,7 @@ temporary target. In the default `contract-matrix` mode,
 contract-matrix fixture directory containing `botster-package.json` and
 `plugin.lua`; the parent acceptance run uses the extracted
 `package/fixtures/plugin-contract-matrix` directory from public
-`@trybotster/hub-test-support@0.1.18`. The wrapper fails before building when
+`@trybotster/hub-test-support@0.1.39`. The wrapper fails before building when
 the selected mode's fixture/package path or Workspaces profile is missing or
 invalid. Normal unit tests skip the isolated runtime when the required live
 inputs are absent; the wrapper sets
@@ -801,13 +804,14 @@ Included now:
 - Generic owner-routed plugin action execution, accepted presentation and
   replacement transitions, rejected form retention, and stable-shell `Esc`
   navigation.
+- Host-control `question.opened` consumption with a run-matched transient
+  notice, plus an entity-driven open-question attention count.
 - Deterministic format, test, and clippy scripts.
 
 Not included yet:
 
 - Pairing, remote auth, or hub provisioning inside this crate.
-- Plugin execution, Project Pipelines policy, browser surfaces, or hub/core
-  runtime policy.
+- Question workbench UI, browser surfaces, or hub/core runtime policy.
 
 ## License
 
