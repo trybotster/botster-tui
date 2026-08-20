@@ -11300,6 +11300,10 @@ mod tests {
         UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
     };
     use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     #[derive(Clone, Copy, Debug)]
     enum SessionEntityExpectation<'a> {
@@ -29555,6 +29559,82 @@ exit 0
         .unwrap_or_else(|error| panic!("{name} transport failed: {error}"))
     }
 
+    fn mux_event_frame_count(app: &TuiApp) -> usize {
+        app.client
+            .as_ref()
+            .map(|client| client.mux_event_frames)
+            .unwrap_or(0)
+    }
+
+    struct LiveQuestionFlood {
+        stop: Arc<AtomicBool>,
+        produced: Arc<AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl LiveQuestionFlood {
+        fn start(
+            endpoint: DaemonEndpoint,
+            tool: String,
+            run_id: String,
+            ticket_id: String,
+        ) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let produced = Arc::new(AtomicUsize::new(0));
+            let stop_thread = Arc::clone(&stop);
+            let produced_thread = Arc::clone(&produced);
+            let handle = thread::spawn(move || {
+                let mut index = 0_u64;
+                while !stop_thread.load(Ordering::Relaxed) {
+                    let asked = botster_hub_client::request(
+                        &endpoint,
+                        DaemonRequest::PluginMcpCallTool {
+                            name: tool.clone(),
+                            arguments: json!({
+                                "run_id": run_id,
+                                "ticket_id": ticket_id,
+                                "question": format!("flood-live {index}")
+                            }),
+                        },
+                    );
+                    if asked.is_ok() {
+                        produced_thread.fetch_add(1, Ordering::Relaxed);
+                    }
+                    index = index.saturating_add(1);
+                }
+            });
+            Self {
+                stop,
+                produced,
+                handle: Some(handle),
+            }
+        }
+
+        fn produced(&self) -> usize {
+            self.produced.load(Ordering::Relaxed)
+        }
+
+        fn wait_until_produced(&self, minimum: usize, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if self.produced() >= minimum {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            self.produced() >= minimum
+        }
+    }
+
+    impl Drop for LiveQuestionFlood {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     fn wait_for_condition(
         app: &mut TuiApp,
         timeout: Duration,
@@ -30189,17 +30269,17 @@ exit 0
                 .unwrap_or(0)
         );
         app.observed_requests.clear();
-        for index in 0..32 {
-            let _ = call_plugin_tool(
-                &hub,
-                &ask_human_tool,
-                json!({
-                    "run_id": run_id,
-                    "ticket_id": ticket_id,
-                    "question": format!("flood {index}")
-                }),
-            );
-        }
+        let flood = LiveQuestionFlood::start(
+            hub.endpoint().clone(),
+            ask_human_tool.clone(),
+            run_id.clone(),
+            ticket_id.clone(),
+        );
+        assert!(
+            flood.wait_until_produced(2, Duration::from_secs(8)),
+            "live flood producer must emit before measurements: produced={}",
+            flood.produced()
+        );
         assert!(
             !app.observed_requests.iter().any(|request| matches!(
                 request,
@@ -30213,12 +30293,19 @@ exit 0
         let tick_started = Instant::now();
         app.poll_and_apply_mux_frames();
         let tick_elapsed = tick_started.elapsed();
-        eprintln!("package-events flood tick_ms={}", tick_elapsed.as_millis());
+        eprintln!(
+            "package-events flood tick_ms={} produced={}",
+            tick_elapsed.as_millis(),
+            flood.produced()
+        );
         assert!(
             tick_elapsed < Duration::from_millis(200),
             "poll_and_apply_mux_frames under flood must stay under 200ms: {tick_elapsed:?}"
         );
+
         let flood_marker_id = format!("question-flood-marker-{}", short_suffix() % 1_000_000);
+        let produced_before_entity = flood.produced();
+        let events_before_entity = mux_event_frame_count(&app);
         let flood_entity_started = Instant::now();
         let marker = call_plugin_tool(
             &hub,
@@ -30234,12 +30321,23 @@ exit 0
         assert!(
             wait_for_condition(&mut app, Duration::from_secs(3), |app| {
                 live_question_is_open(app, &flood_marker_id)
+                    && flood.produced() > produced_before_entity
+                    && mux_event_frame_count(app) > events_before_entity
             }),
-            "exact flood marker row must converge within 3000ms: {:?}",
+            "exact flood marker row must converge while events keep arriving: produced {}->{} events {}->{} error={:?}",
+            produced_before_entity,
+            flood.produced(),
+            events_before_entity,
+            mux_event_frame_count(&app),
             app.error
         );
         let entity_elapsed = flood_entity_started.elapsed();
-        eprintln!("package-events entity_ms={}", entity_elapsed.as_millis());
+        eprintln!(
+            "package-events entity_ms={} produced={} events={}",
+            entity_elapsed.as_millis(),
+            flood.produced(),
+            mux_event_frame_count(&app)
+        );
         assert!(
             entity_elapsed <= Duration::from_millis(3000),
             "entity exact-row convergence under flood must stay within 3000ms: {entity_elapsed:?}"
@@ -30256,6 +30354,8 @@ exit 0
             .as_ref()
             .map(|client| client.mux_terminal_frames)
             .unwrap_or(0);
+        let produced_before_echo = flood.produced();
+        let events_before_echo = mux_event_frame_count(&app);
         let echo_started = Instant::now();
         app.request_and_apply(DaemonRequest::SendInput {
             session_id: bound_session.clone(),
@@ -30264,9 +30364,15 @@ exit 0
         assert!(
             wait_for_condition(&mut app, Duration::from_secs(3), |app| {
                 live_applied_output(app).contains("echo:flood-echo")
+                    && flood.produced() > produced_before_echo
+                    && mux_event_frame_count(app) > events_before_echo
             }),
-            "terminal echo under flood: live={:?} ghostty={} mux_term={} error={:?}",
+            "terminal echo under flood: live={:?} produced {}->{} events {}->{} ghostty={} mux_term={} error={:?}",
             live_applied_output(&app),
+            produced_before_echo,
+            flood.produced(),
+            events_before_echo,
+            mux_event_frame_count(&app),
             app.ghostty_projection.is_some(),
             app.client
                 .as_ref()
@@ -30275,11 +30381,17 @@ exit 0
             app.error
         );
         let echo_elapsed = echo_started.elapsed();
-        eprintln!("package-events echo_ms={}", echo_elapsed.as_millis());
+        eprintln!(
+            "package-events echo_ms={} produced={}",
+            echo_elapsed.as_millis(),
+            flood.produced()
+        );
         assert!(
             echo_elapsed <= Duration::from_millis(3000),
             "terminal input echo under flood must stay within 3000ms: {echo_elapsed:?}"
         );
+        let produced_before_output = flood.produced();
+        let events_before_output = mux_event_frame_count(&app);
         let output_started = Instant::now();
         app.request_and_apply(DaemonRequest::SendInput {
             session_id: bound_session.clone(),
@@ -30293,17 +30405,28 @@ exit 0
                         .as_ref()
                         .is_some_and(|client| client.mux_terminal_frames > terminal_frames_before)
                     && live_applied_output(app).contains("echo:flood-out")
+                    && flood.produced() > produced_before_output
+                    && mux_event_frame_count(app) > events_before_output
             }),
-            "terminal output must advance under flood: live={:?} mux_term={:?}",
+            "terminal output must advance under flood: live={:?} produced {}->{} events {}->{} mux_term={:?}",
             live_applied_output(&app),
+            produced_before_output,
+            flood.produced(),
+            events_before_output,
+            mux_event_frame_count(&app),
             app.client.as_ref().map(|client| client.mux_terminal_frames)
         );
         let output_elapsed = output_started.elapsed();
-        eprintln!("package-events output_ms={}", output_elapsed.as_millis());
+        eprintln!(
+            "package-events output_ms={} produced={}",
+            output_elapsed.as_millis(),
+            flood.produced()
+        );
         assert!(
             output_elapsed <= Duration::from_millis(3000),
             "terminal output progress under flood must stay within 3000ms: {output_elapsed:?}"
         );
+        drop(flood);
 
         set_event_flush_stall(&stall_path, false);
         println!("package-events-live: complete");
