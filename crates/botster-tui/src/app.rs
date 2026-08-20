@@ -12835,7 +12835,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_7_revision_40_and_split_terminal_hello() {
+    fn tui_requires_protocol_7_revision_44_and_split_terminal_hello() {
         let requirement = tui_compatibility_requirement();
         let compatible_hub = host_compatibility_omitting_terminal_mechanism_tokens;
 
@@ -29502,6 +29502,59 @@ exit 0
             .or_else(|| json_find_str(&response.plugin_tool_result, "id"))
     }
 
+    fn live_question_is_open(app: &TuiApp, question_id: &str) -> bool {
+        app.entity_options
+            .family("project-pipelines.question")
+            .and_then(|family| family.records.get(question_id))
+            .and_then(|record| record.get("status"))
+            .and_then(Value::as_str)
+            == Some("open")
+    }
+
+    fn live_session_id_for_run(app: &TuiApp, run_id: &str) -> Option<String> {
+        app.entity_options
+            .family("project-pipelines.session_request")?
+            .records
+            .values()
+            .find_map(|record| {
+                if record.get("run_id").and_then(Value::as_str) != Some(run_id) {
+                    return None;
+                }
+                record
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+    }
+
+    fn set_event_flush_stall(path: &Path, stalled: bool) {
+        if stalled {
+            std::fs::write(path, b"stall").expect("create event flush stall");
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn live_applied_output(app: &TuiApp) -> String {
+        String::from_utf8_lossy(&app.applied_live_payloads.concat()).into_owned()
+    }
+
+    fn call_plugin_tool(
+        hub: &botster_hub_test_support::IsolatedHub,
+        name: &str,
+        arguments: Value,
+    ) -> DaemonResponse {
+        botster_hub_client::request(
+            hub.endpoint(),
+            DaemonRequest::PluginMcpCallTool {
+                name: name.to_string(),
+                arguments,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{name} transport failed: {error}"))
+    }
+
     fn wait_for_condition(
         app: &mut TuiApp,
         timeout: Duration,
@@ -29536,12 +29589,19 @@ exit 0
         assert_project_pipelines_pin_floor(&package_path);
 
         let root = PathBuf::from(format!("/tmp/bt-pe{}", short_suffix() % 1_000_000));
+        let stall_path = root.join("event-flush.stall");
+        set_event_flush_stall(&stall_path, false);
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
             .hub_bin(&hub_bin)
             .session_worker_bin(session_worker_bin)
             .root(&root)
             .name("botster-tui-package-events-live")
             .env("BOTSTER_ENV", "test")
+            .env("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX", "2")
+            .env(
+                "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
+                stall_path.to_string_lossy().into_owned(),
+            )
             .start()
             .expect("isolated hub starts");
 
@@ -29571,6 +29631,12 @@ exit 0
             if listed_tools
                 .iter()
                 .any(|name| name.contains("create_project"))
+                && listed_tools
+                    .iter()
+                    .any(|name| name.ends_with("create_pipeline"))
+                && listed_tools
+                    .iter()
+                    .any(|name| name.contains("spawn_ticket_session"))
             {
                 break;
             }
@@ -29603,11 +29669,16 @@ exit 0
             .find(|name| name.contains("answer_question"))
             .cloned()
             .expect("answer_question tool");
-        let list_pipelines_tool = listed_tools
+        let create_pipeline_tool = listed_tools
             .iter()
-            .find(|name| name.contains("list_pipelines"))
+            .find(|name| name.ends_with("create_pipeline"))
             .cloned()
-            .expect("list_pipelines tool");
+            .expect("create_pipeline tool");
+        let spawn_ticket_session_tool = listed_tools
+            .iter()
+            .find(|name| name.contains("spawn_ticket_session"))
+            .cloned()
+            .expect("spawn_ticket_session tool");
 
         let mut app = TuiApp::new(Some(hub.endpoint().clone()));
         app.workspace_test_mode = true;
@@ -29648,170 +29719,218 @@ exit 0
             .family("project-pipelines.question")
             .and_then(|family| family.snapshot_seq);
 
-        let spawned_session_id = format!("btui-pe-{}", short_suffix());
-        app.request_and_apply(DaemonRequest::Spawn {
-            session_id: spawned_session_id.clone(),
-            command: DEFAULT_COMMAND.to_string(),
-        });
-        wait_for_authoritative_session(&mut app, &spawned_session_id)
-            .expect("spawned session becomes authoritative");
-        app.selected_session = Some(spawned_session_id);
-
-        let targets = botster_hub_client::request(hub.endpoint(), DaemonRequest::ListSpawnTargets)
-            .expect("list spawn targets");
-        let target_id = targets
-            .spawn_targets
-            .first()
-            .map(|target| target.target_id.clone())
-            .unwrap_or_else(|| "device:local".to_string());
-
-        let project = botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: create_project_tool.clone(),
-                arguments: json!({ "name": "tui-package-events", "target_id": target_id }),
-            },
+        let repo_root = root.join("spawn-point-repo");
+        std::fs::create_dir_all(repo_root.join(".botster")).expect("spawn point repo");
+        std::fs::write(repo_root.join("README.md"), "live spawn point\n").expect("seed repo file");
+        std::fs::write(
+            repo_root.join("echo-loop.sh"),
+            format!("#!/bin/sh\n{DEFAULT_COMMAND}\n"),
         )
-        .expect("create project");
+        .expect("echo loop script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(repo_root.join("echo-loop.sh"))
+                .expect("echo loop metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(repo_root.join("echo-loop.sh"), permissions)
+                .expect("echo loop executable");
+        }
+        run_fixture_command(&repo_root, "git", &["init", "-b", "main"]);
+        run_fixture_command(
+            &repo_root,
+            "git",
+            &["config", "user.email", "live@botster.dev"],
+        );
+        run_fixture_command(&repo_root, "git", &["config", "user.name", "Botster Live"]);
+        run_fixture_command(&repo_root, "git", &["add", "."]);
+        run_fixture_command(&repo_root, "git", &["commit", "-m", "live spawn point"]);
+        let branch = format!("ticket/pe-{}", short_suffix() % 1_000_000);
+        run_fixture_command(&repo_root, "git", &["branch", &branch]);
+        let target_id = format!("btui-pe-target-{}", short_suffix() % 1_000_000);
+        app.request_and_apply(DaemonRequest::CreateSpawnTarget {
+            target_id: Some(target_id.clone()),
+            label: Some("Live package-events spawn point".to_string()),
+            root: repo_root.clone(),
+            enabled: true,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
+            metadata: BTreeMap::new(),
+        });
+        if let Some(error) = &app.error {
+            panic!("create spawn target failed: {error}");
+        }
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                app.spawn_targets
+                    .iter()
+                    .any(|target| target.target_id == target_id && target.enabled)
+            }),
+            "admitted spawn target must be present: {:?}",
+            app.spawn_targets
+        );
+
+        let session_type_local_id = format!("btui-shell-{}", short_suffix() % 1_000_000);
+        let session_type_definition = DaemonSessionTypeDefinition {
+            id: session_type_local_id.clone(),
+            label: "Botster TUI package-events shell".to_string(),
+            description: None,
+            icon: None,
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: Vec::new(),
+            lifecycle: "task".to_string(),
+            execution: DaemonSessionTypeExecution::ShellCommand,
+            command: DEFAULT_COMMAND.to_string(),
+            args: Vec::new(),
+            working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
+            environment: BTreeMap::new(),
+            allowed_environment_overrides: Vec::new(),
+            context: Vec::new(),
+            target_id: None,
+        };
+        app.request_and_apply(DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: session_type_definition,
+        });
+        if let Some(error) = &app.error {
+            panic!("create session type failed: {error}");
+        }
+        let session_type_id = format!("device/{session_type_local_id}");
+        app.wait_for_session_type_after_subscribe_refresh(&session_type_id, true);
+
+        let project = call_plugin_tool(
+            &hub,
+            &create_project_tool,
+            json!({ "name": "tui-package-events", "target_id": target_id }),
+        );
         let project_id = plugin_tool_id(&project, "project_id").unwrap_or_else(|| {
             panic!(
                 "create project failed: kind={:?} error={:?} result={}",
                 project.kind, project.error, project.plugin_tool_result
             )
         });
-        let ticket = botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: create_ticket_tool.clone(),
-                arguments: json!({
-                    "title": "live question",
-                    "project_id": project_id,
-                    "target_id": target_id
-                }),
-            },
-        )
-        .expect("create ticket");
+        let ticket = call_plugin_tool(
+            &hub,
+            &create_ticket_tool,
+            json!({
+                "title": "live question",
+                "project_id": project_id,
+                "target_id": target_id
+            }),
+        );
         let ticket_id = plugin_tool_id(&ticket, "ticket_id").unwrap_or_else(|| {
             panic!(
                 "create ticket failed: kind={:?} error={:?} result={}",
                 ticket.kind, ticket.error, ticket.plugin_tool_result
             )
         });
-        let pipeline_deadline = Instant::now() + Duration::from_secs(8);
-        let mut pipeline_id = None;
-        let mut last_pipelines = Value::Null;
-        while Instant::now() < pipeline_deadline {
-            let pipelines = botster_hub_client::request(
-                hub.endpoint(),
-                DaemonRequest::PluginMcpCallTool {
-                    name: list_pipelines_tool.clone(),
-                    arguments: json!({}),
-                },
+        let pipeline = call_plugin_tool(
+            &hub,
+            &create_pipeline_tool,
+            json!({
+                "name": "tui-live-session",
+                "steps": [{
+                    "id": "implement",
+                    "name": "Implement",
+                    "kind": "pty",
+                    "session_type_id": session_type_id
+                }]
+            }),
+        );
+        let pipeline_id = plugin_tool_id(&pipeline, "pipeline_id").unwrap_or_else(|| {
+            panic!(
+                "create pipeline failed: kind={:?} error={:?} result={}",
+                pipeline.kind, pipeline.error, pipeline.plugin_tool_result
             )
-            .expect("list pipelines");
-            last_pipelines = pipelines.plugin_tool_result.clone();
-            pipeline_id = plugin_tool_id(&pipelines, "id");
-            if pipeline_id.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let pipeline_id = pipeline_id.unwrap_or_else(|| {
-            panic!("project-pipelines has no pipeline definitions: {last_pipelines}")
         });
-        let run = botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: start_run_tool.clone(),
-                arguments: json!({ "ticket_id": ticket_id, "pipeline_id": pipeline_id }),
-            },
-        )
-        .expect("start run");
+        let run = call_plugin_tool(
+            &hub,
+            &start_run_tool,
+            json!({
+                "ticket_id": ticket_id,
+                "pipeline_id": pipeline_id,
+                "spawn_target_id": target_id,
+                "branch": branch
+            }),
+        );
         let run_id = plugin_tool_id(&run, "run_id").unwrap_or_else(|| {
             panic!(
                 "start run failed: kind={:?} error={:?} result={}",
                 run.kind, run.error, run.plugin_tool_result
             )
         });
-        let _ = wait_for_condition(&mut app, Duration::from_secs(2), |app| {
+        let spawned = call_plugin_tool(
+            &hub,
+            &spawn_ticket_session_tool,
+            json!({
+                "run_id": run_id,
+                "session_type_id": session_type_id,
+                "spawn_target_id": target_id,
+                "branch": branch
+            }),
+        );
+        let spawned_session_id = plugin_tool_id(&spawned, "session_id").unwrap_or_else(|| {
+            panic!(
+                "spawn_ticket_session failed: kind={:?} error={:?} result={}",
+                spawned.kind, spawned.error, spawned.plugin_tool_result
+            )
+        });
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(12), |app| {
+                live_session_id_for_run(app, &run_id).as_deref()
+                    == Some(spawned_session_id.as_str())
+            }),
+            "session_request must publish the spawned session_id: spawned={spawned_session_id} error={:?} records={:?}",
+            app.error,
             app.entity_options
                 .family("project-pipelines.session_request")
-                .is_some_and(|family| !family.records.is_empty())
-        });
-        if let Some(bound_session) = app
-            .entity_options
-            .family("project-pipelines.session_request")
-            .and_then(|family| {
-                family.records.values().find_map(|record| {
-                    if record.get("run_id").and_then(Value::as_str) == Some(run_id.as_str()) {
-                        record
-                            .get("session_id")
-                            .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())
-                            .map(ToOwned::to_owned)
-                    } else {
-                        None
-                    }
-                })
-            })
-        {
-            wait_for_authoritative_session(&mut app, &bound_session)
-                .expect("session_request session becomes authoritative");
-            app.selected_session = Some(bound_session.clone());
-            assert_eq!(
-                bound_session,
-                app.selected_session.clone().expect("focused session")
-            );
-        }
+                .map(|family| family.records.values().cloned().collect::<Vec<_>>())
+        );
+        let bound_session = live_session_id_for_run(&app, &run_id).expect("bound session_id");
+        assert_eq!(bound_session, spawned_session_id);
+        wait_for_authoritative_session(&mut app, &bound_session)
+            .expect("pipeline session becomes authoritative");
+        app.selected_session = Some(bound_session.clone());
+        assert_eq!(
+            live_session_id_for_run(&app, &run_id).as_deref(),
+            app.selected_session.as_deref()
+        );
+        assert!(matches!(
+            app.active_workflow_run(),
+            ActiveWorkflowRun::Run(id) if id == run_id
+        ));
 
         let events_before = app
             .client
             .as_ref()
             .map(|client| client.mux_event_frames)
             .unwrap_or(0);
-        let asked = botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: ask_human_tool.clone(),
-                arguments: json!({
-                    "run_id": run_id,
-                    "ticket_id": ticket_id,
-                    "question": "live notice"
-                }),
-            },
-        )
-        .expect("ask human");
-        let question_id = plugin_tool_id(&asked, "question_id").unwrap_or_default();
-        let has_active_run = matches!(app.active_workflow_run(), ActiveWorkflowRun::Run(_));
+        let asked = call_plugin_tool(
+            &hub,
+            &ask_human_tool,
+            json!({
+                "run_id": run_id,
+                "ticket_id": ticket_id,
+                "question": "live notice"
+            }),
+        );
+        let question_id = plugin_tool_id(&asked, "question_id").unwrap_or_else(|| {
+            panic!(
+                "ask_human must return question_id: kind={:?} error={:?} result={}",
+                asked.kind, asked.error, asked.plugin_tool_result
+            )
+        });
+        assert!(!question_id.is_empty(), "question_id must be nonempty");
         assert!(
             wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                let question_arrived = app
-                    .entity_options
-                    .family("project-pipelines.question")
-                    .is_some_and(|family| {
-                        family.records.values().any(|record| {
-                            (question_id.is_empty()
-                                || record.get("id").and_then(Value::as_str)
-                                    == Some(question_id.as_str()))
-                                && record.get("status").and_then(Value::as_str) == Some("open")
-                        })
-                    });
-                let events_arrived = app
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.mux_event_frames > events_before);
-                let notice_ok = if has_active_run {
-                    app.transient_notice
-                        .as_ref()
-                        .is_some_and(|notice| notice.text.contains("live notice"))
-                } else {
-                    app.transient_notice
-                        .as_ref()
-                        .is_none_or(|notice| !notice.text.contains("live notice"))
-                };
-                question_arrived && (events_arrived || notice_ok)
+                live_question_is_open(app, &question_id)
+                    && app.transient_notice.as_ref().is_some_and(|notice| {
+                        notice.text.contains("live notice") && notice.question_id == question_id
+                    })
             }),
-            "question.opened must converge the exact open row through the production subscription: notice={:?} error={:?} questions={:?} events={} has_active_run={has_active_run}",
+            "question.opened must show one matching notice and the exact open row: notice={:?} error={:?} questions={:?} events={}",
             app.transient_notice,
             app.error,
             app.entity_options
@@ -29821,6 +29940,17 @@ exit 0
                 .as_ref()
                 .map(|client| client.mux_event_frames)
                 .unwrap_or(0)
+        );
+        let rendered = rendered_workspace(&app);
+        assert!(
+            rendered.contains("live notice"),
+            "transient notice must render: {rendered}"
+        );
+        assert!(
+            app.client
+                .as_ref()
+                .is_some_and(|client| client.mux_event_frames > events_before),
+            "matching notice must arrive on the event plane"
         );
         let question_seq_after_create = app
             .entity_options
@@ -29835,22 +29965,149 @@ exit 0
             );
         }
 
-        let mismatched = botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: ask_human_tool.clone(),
-                arguments: json!({
-                    "run_id": "run_other",
-                    "question": "foreign notice"
-                }),
-            },
+        let foreign_ticket = call_plugin_tool(
+            &hub,
+            &create_ticket_tool,
+            json!({
+                "title": "foreign question",
+                "project_id": project_id,
+                "target_id": target_id
+            }),
         );
-        let _ = mismatched;
-        app.poll_hub();
+        let foreign_ticket_id =
+            plugin_tool_id(&foreign_ticket, "ticket_id").expect("foreign ticket_id");
+        let foreign_run = call_plugin_tool(
+            &hub,
+            &start_run_tool,
+            json!({
+                "ticket_id": foreign_ticket_id,
+                "pipeline_id": pipeline_id,
+                "spawn_target_id": target_id,
+                "branch": branch
+            }),
+        );
+        let foreign_run_id = plugin_tool_id(&foreign_run, "run_id").expect("foreign run_id");
+        let foreign_asked = call_plugin_tool(
+            &hub,
+            &ask_human_tool,
+            json!({
+                "run_id": foreign_run_id,
+                "ticket_id": foreign_ticket_id,
+                "question": "foreign notice"
+            }),
+        );
+        let foreign_question_id =
+            plugin_tool_id(&foreign_asked, "question_id").expect("foreign question_id");
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                live_question_is_open(app, &foreign_question_id)
+            }),
+            "foreign question row must still converge: {:?}",
+            app.error
+        );
         assert!(
             app.transient_notice
                 .as_ref()
-                .is_none_or(|notice| !notice.text.contains("foreign notice"))
+                .is_none_or(|notice| !notice.text.contains("foreign notice")
+                    && notice.question_id != foreign_question_id),
+            "non-matching run must not replace the matching notice: {:?}",
+            app.transient_notice
+        );
+
+        assert!(
+            app.transient_notice.is_some(),
+            "matching notice must still be visible before EventGap"
+        );
+        set_event_flush_stall(&stall_path, true);
+        let mut gap_question_ids = Vec::new();
+        for index in 0..4 {
+            let gap_asked = call_plugin_tool(
+                &hub,
+                &ask_human_tool,
+                json!({
+                    "run_id": run_id,
+                    "ticket_id": ticket_id,
+                    "question": format!("gap {index}")
+                }),
+            );
+            let gap_question_id =
+                plugin_tool_id(&gap_asked, "question_id").expect("gap question_id");
+            assert!(!gap_question_id.is_empty());
+            gap_question_ids.push(gap_question_id);
+        }
+        set_event_flush_stall(&stall_path, false);
+        let gap_deadline = Instant::now() + Duration::from_secs(8);
+        let mut saw_event_gap = false;
+        while Instant::now() < gap_deadline && !saw_event_gap {
+            let frames = app
+                .client
+                .as_mut()
+                .expect("client")
+                .poll_mux_frames()
+                .expect("poll mux after shed");
+            if frames.is_empty() {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            for frame in frames {
+                let is_gap = matches!(
+                    &frame,
+                    DaemonUnixMuxFrame::Event(DaemonEvent::EventGap {
+                        owner,
+                        name,
+                        ..
+                    }) if owner == QUESTION_OPENED_OWNER && name == QUESTION_OPENED_NAME
+                );
+                app.apply_mux_frames(vec![frame]);
+                if is_gap {
+                    saw_event_gap = true;
+                    assert!(
+                        app.transient_notice.is_none(),
+                        "EventGap must clear the matching notice: {:?}",
+                        app.transient_notice
+                    );
+                    assert!(
+                        live_question_is_open(&app, &question_id),
+                        "durable question must survive EventGap"
+                    );
+                    assert!(
+                        app.question_attention_band().is_some(),
+                        "attention band must remain from entity state"
+                    );
+                    let rendered = rendered_workspace(&app);
+                    assert!(
+                        rendered.contains("Open questions:"),
+                        "workspace-question-attention must render: {rendered}"
+                    );
+                    assert!(
+                        app.error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("event gap")),
+                        "gap diagnostic: {:?}",
+                        app.error
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_event_gap,
+            "live EventGap must arrive after BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX shed"
+        );
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                live_question_is_open(app, &question_id)
+                    && gap_question_ids.iter().all(|id| {
+                        live_question_is_open(app, id)
+                            || app
+                                .entity_options
+                                .family("project-pipelines.question")
+                                .is_some_and(|family| family.records.contains_key(id))
+                    })
+            }),
+            "gap questions must still converge as durable rows: {:?}",
+            app.entity_options
+                .family("project-pipelines.question")
+                .map(|family| family.records.keys().cloned().collect::<Vec<_>>())
         );
 
         let before_reconnect_id = app
@@ -29860,63 +30117,99 @@ exit 0
             .expect("active event subscription");
         app.force_reconnect();
         assert!(app.transient_notice.is_none());
-        let _ = wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-            matches!(app.event_subscription, EventSubscriptionState::Active(_))
-                && app.event_subscription.active_id() != Some(before_reconnect_id.as_str())
-        });
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                matches!(app.event_subscription, EventSubscriptionState::Active(_))
+                    && app.event_subscription.active_id() != Some(before_reconnect_id.as_str())
+            }),
+            "reconnect must mint a fresh SubscribeEvents id"
+        );
         assert!(
             app.transient_notice.is_none(),
             "reconnect must not replay notices"
         );
-        let _ = wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-            app.entity_options
-                .family("project-pipelines.question")
-                .is_some_and(|family| family.has_snapshot && !family.records.is_empty())
-        });
-
-        if !question_id.is_empty() {
-            let _ = botster_hub_client::request(
-                hub.endpoint(),
-                DaemonRequest::PluginMcpCallTool {
-                    name: answer_question_tool.clone(),
-                    arguments: json!({
-                        "question_id": question_id,
-                        "answer": "done"
-                    }),
-                },
-            );
-            assert!(
-                wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                    app.entity_options
-                        .family("project-pipelines.question")
-                        .is_some_and(|family| {
-                            family.records.get(&question_id).is_some_and(|record| {
-                                record.get("status").and_then(Value::as_str) != Some("open")
-                            })
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                app.entity_options
+                    .family("project-pipelines.question")
+                    .is_some_and(|family| family.has_snapshot)
+                    && live_question_is_open(app, &question_id)
+            }),
+            "durable question must recover from the production entity baseline"
+        );
+        app.selected_session = Some(bound_session.clone());
+        let _ = call_plugin_tool(
+            &hub,
+            &answer_question_tool,
+            json!({
+                "question_id": question_id,
+                "answer": "done"
+            }),
+        );
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                app.entity_options
+                    .family("project-pipelines.question")
+                    .is_some_and(|family| {
+                        family.records.get(&question_id).is_some_and(|record| {
+                            record.get("status").and_then(Value::as_str) != Some("open")
                         })
-                }),
-                "answer must converge through the published upsert"
-            );
-        }
+                    })
+            }),
+            "answer must converge through the published upsert"
+        );
 
-        let terminal_frames_before = app
-            .client
-            .as_ref()
-            .map(|client| client.mux_terminal_frames)
-            .unwrap_or(0);
-        let flood_started = Instant::now();
+        wait_for_authoritative_session(&mut app, &bound_session)
+            .expect("session remains authoritative after reconnect");
+        app.selected_session = Some(bound_session.clone());
+        app.attach_selected_or_first();
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(12), |app| {
+                app.attached_session.as_deref() == Some(bound_session.as_str())
+                    && app.attach_hydration.is_none()
+            }),
+            "live attach must finish: error={:?} attached={:?} hydration={:?} sessions={:?} mux_term={}",
+            app.error,
+            app.attached_session,
+            app.attach_hydration
+                .as_ref()
+                .map(|hydration| { (hydration.snapshot_ready, hydration.snapshot_finished) }),
+            app.sessions
+                .iter()
+                .map(|session| {
+                    format!(
+                        "{}:{}:pending={}",
+                        session.session_id, session.lifecycle, session.pending
+                    )
+                })
+                .collect::<Vec<_>>(),
+            app.client
+                .as_ref()
+                .map(|client| client.mux_terminal_frames)
+                .unwrap_or(0)
+        );
+        app.observed_requests.clear();
         for index in 0..32 {
-            let _ = botster_hub_client::request(
-                hub.endpoint(),
-                DaemonRequest::PluginMcpCallTool {
-                    name: ask_human_tool.clone(),
-                    arguments: json!({
-                        "run_id": run_id,
-                        "question": format!("flood {index}")
-                    }),
-                },
+            let _ = call_plugin_tool(
+                &hub,
+                &ask_human_tool,
+                json!({
+                    "run_id": run_id,
+                    "ticket_id": ticket_id,
+                    "question": format!("flood {index}")
+                }),
             );
         }
+        assert!(
+            !app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::SendInput { .. }
+                    | ObservedRequest::Resize { .. }
+                    | ObservedRequest::Attach { .. }
+            )),
+            "event flood must not emit terminal-plane requests: {:?}",
+            app.observed_requests
+        );
         let tick_started = Instant::now();
         app.poll_and_apply_mux_frames();
         let tick_elapsed = tick_started.elapsed();
@@ -29925,17 +30218,94 @@ exit 0
             tick_elapsed < Duration::from_millis(200),
             "poll_and_apply_mux_frames under flood must stay under 200ms: {tick_elapsed:?}"
         );
-        let terminal_frames_after = app
+        let flood_marker_id = format!("question-flood-marker-{}", short_suffix() % 1_000_000);
+        let flood_entity_started = Instant::now();
+        let marker = call_plugin_tool(
+            &hub,
+            &ask_human_tool,
+            json!({
+                "id": flood_marker_id,
+                "run_id": run_id,
+                "ticket_id": ticket_id,
+                "question": "flood marker"
+            }),
+        );
+        let flood_marker_id = plugin_tool_id(&marker, "question_id").expect("flood marker id");
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(3), |app| {
+                live_question_is_open(app, &flood_marker_id)
+            }),
+            "exact flood marker row must converge within 3000ms: {:?}",
+            app.error
+        );
+        let entity_elapsed = flood_entity_started.elapsed();
+        eprintln!("package-events entity_ms={}", entity_elapsed.as_millis());
+        assert!(
+            entity_elapsed <= Duration::from_millis(3000),
+            "entity exact-row convergence under flood must stay within 3000ms: {entity_elapsed:?}"
+        );
+
+        app.request_and_apply(DaemonRequest::Resize {
+            session_id: bound_session.clone(),
+            rows: 24,
+            cols: 80,
+        });
+        let live_bytes_before = app.applied_live_payloads.concat().len();
+        let terminal_frames_before = app
             .client
             .as_ref()
             .map(|client| client.mux_terminal_frames)
             .unwrap_or(0);
-        assert_eq!(
-            terminal_frames_after, terminal_frames_before,
-            "event flood must not enter the terminal plane"
+        let echo_started = Instant::now();
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: bound_session.clone(),
+            data: "flood-echo\n".to_string(),
+        });
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(3), |app| {
+                live_applied_output(app).contains("echo:flood-echo")
+            }),
+            "terminal echo under flood: live={:?} ghostty={} mux_term={} error={:?}",
+            live_applied_output(&app),
+            app.ghostty_projection.is_some(),
+            app.client
+                .as_ref()
+                .map(|client| client.mux_terminal_frames)
+                .unwrap_or(0),
+            app.error
         );
-        let _ = flood_started;
+        let echo_elapsed = echo_started.elapsed();
+        eprintln!("package-events echo_ms={}", echo_elapsed.as_millis());
+        assert!(
+            echo_elapsed <= Duration::from_millis(3000),
+            "terminal input echo under flood must stay within 3000ms: {echo_elapsed:?}"
+        );
+        let output_started = Instant::now();
+        app.request_and_apply(DaemonRequest::SendInput {
+            session_id: bound_session.clone(),
+            data: "flood-out\n".to_string(),
+        });
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(3), |app| {
+                app.applied_live_payloads.concat().len() > live_bytes_before
+                    && app
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client.mux_terminal_frames > terminal_frames_before)
+                    && live_applied_output(app).contains("echo:flood-out")
+            }),
+            "terminal output must advance under flood: live={:?} mux_term={:?}",
+            live_applied_output(&app),
+            app.client.as_ref().map(|client| client.mux_terminal_frames)
+        );
+        let output_elapsed = output_started.elapsed();
+        eprintln!("package-events output_ms={}", output_elapsed.as_millis());
+        assert!(
+            output_elapsed <= Duration::from_millis(3000),
+            "terminal output progress under flood must stay within 3000ms: {output_elapsed:?}"
+        );
 
+        set_event_flush_stall(&stall_path, false);
         println!("package-events-live: complete");
     }
 
