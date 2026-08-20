@@ -224,13 +224,7 @@ else
   session_worker_bin="$(resolve_binary BOTSTER_SESSION_WORKER_BIN botster-session-worker)"
 fi
 
-if [ "$mode" = "package-events" ]; then
-  # Hub-test-support enables Core local-runtime. A bin-only build leaves
-  # engine/botster.rs compiling without IncrementalAttach at Core 8fce204.
-  cargo test -p botster-tui --no-run --locked --target-dir "$target_dir" "$test_filter"
-else
-  cargo build -p botster-tui --target-dir "$target_dir" --locked
-fi
+cargo build -p botster-tui --target-dir "$target_dir" --locked
 if [ "$mode" = "contract-matrix" ] || [ "$profile" = "installed-driver" ] || [ "$profile" = "claim-driver" ]; then
   mkdir -p target/debug
   cp "$target_dir/debug/botster-tui" target/debug/botster-tui
