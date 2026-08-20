@@ -8,8 +8,8 @@
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
 - **Base:** `origin/main` `dc7d6002c90dc6c565168df6328a032b640e9b48`
 - **Plan revision:** 6 (`artifact_1787245720_425147`, commit `3db08b730d33bac9f7a7be646c5430297a6f13a0`)
-- **Implement commit:** `9f25c7b385f373004698a9aba7b50d230360f396` (live-lane Review fixes). Report SHA recorded in the follow-up commit.
-- **Review revisit:** sequence 13 (`run_step_1787248375_836424`) after Review `changes_required`
+- **Implement commit:** recorded after this commit
+- **Review revisit:** sequence 15 (`run_step_1787249950_414633`) after Review `changes_required` on flood overlap
 - **teardown_class_applies:** no
 
 ## Playbooks and notes applied
@@ -110,6 +110,7 @@ All source edits are in `botster-tui`. Hub, Core, Project Pipelines, and TUI Kit
 | --- | --- | --- |
 | `finding_1787248364_659392` live lane can pass without the transient notice | high | Live fixture now creates a PTY session-type pipeline, calls `spawn_ticket_session` with `run_id`, requires `session_request.session_id` equality, a nonempty `question_id`, and one rendered matching notice. Fail-closed fallback is gone. |
 | `finding_1787248364_569474` flood lane does not measure entity or terminal progress | high | Flood keeps event production active, then measures exact-row entity convergence, live-payload echo, and mux terminal-frame progress. Each published budget is printed. |
+| `finding_1787249940_721992` flood proof drains the event batch before entity and terminal measurements | high | A background PP `ask_human` producer stays running across tick, entity, echo, and output waits. Each wait requires `produced` and `mux_event_frames` to advance. |
 | `finding_1787248364_330620` live lane does not prove missed-event durable state | high | IsolatedHub sets `BOTSTER_ENV=test`, `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX=2`, and the Unix event-flush stall. The test applies EventGap before remaining frames, asserts the notice is cleared, and keeps the exact question row plus attention band. |
 | `finding_1787248364_303131` Hello test name still claims revision 40 | low | Test renamed to `tui_requires_protocol_7_revision_44_and_split_terminal_hello`. |
 | `finding_1787248364_910873` report leaks machine-local paths | medium | Live command fence uses `/path/to/botster-hub` and `/path/to/botster-project-pipelines`. |
@@ -117,7 +118,7 @@ All source edits are in `botster-tui`. Hub, Core, Project Pipelines, and TUI Kit
 ## Deviations from plan
 
 - `script/test-live-hub package-events` compiles with `cargo test --no-run` instead of `cargo build -p botster-tui`. A bin-only build of Core `8fce204` compiles `engine/botster.rs` without `local-runtime`, so `IncrementalAttach` is missing. Dev-dependency `botster-hub-test-support` enables that feature. This is R1 pin-roll fallout, not a TUI product change. See [[TUI bin only Core 8fce204 builds require local runtime feature unification]].
-- No synthetic event-plane producer fixture (U3). Flood uses repeated PP `ask_human` calls plus the Hub queue-max and flush-stall knobs.
+- No synthetic event-plane producer fixture (U3). Flood uses a live PP `ask_human` producer thread plus the Hub queue-max and flush-stall knobs.
 
 ## Tests and downstream proof
 
@@ -141,12 +142,12 @@ CARGO_TARGET_DIR=$PWD/target \
 
 Result: `package-events-live: complete`. Hub binaries from Hub checkout `7a09292`. PP checkout `cd7c2f926fcead78e15e7a9c713ad26dfe883914`.
 
-Live budgets:
+Live budgets with producer still running:
 
-- `poll_and_apply_mux_frames` under flood: `tick_ms=0` (limit < 200 ms)
-- exact-row entity convergence under flood: `entity_ms=456` (limit ≤ 3,000 ms)
-- terminal input echo under flood: `echo_ms=1002` (limit ≤ 3,000 ms)
-- terminal output progress under flood: `output_ms=1485` (limit ≤ 3,000 ms)
+- `poll_and_apply_mux_frames` under flood: `tick_ms=1` produced=2 (limit < 200 ms)
+- exact-row entity convergence under flood: `entity_ms=527` produced=4 events=5 (limit ≤ 3,000 ms)
+- terminal input echo under flood: `echo_ms=612` produced=8 (limit ≤ 3,000 ms)
+- terminal output progress under flood: `output_ms=563` produced=11 (limit ≤ 3,000 ms)
 
 Downstream proof: none required beyond this repository. TUI is the terminal consumer in this chain.
 
