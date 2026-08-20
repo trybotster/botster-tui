@@ -8,8 +8,8 @@
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
 - **Base:** `origin/main` `dc7d6002c90dc6c565168df6328a032b640e9b48`
 - **Plan revision:** 6 (`artifact_1787245720_425147`, commit `3db08b730d33bac9f7a7be646c5430297a6f13a0`)
-- **Implement commit:** `a9d5c9a62d1e5f026c7934069c966bec4c610631`. Report SHA recorded in the follow-up commit.
-- **Review revisit:** sequence 18 (`run_step_1787251262_532180`) after Review `changes_required` on production build, Ghostty pin prose, and the response-race test
+- **Implement commit:** recorded after this commit
+- **Review revisit:** sequence 18 (`run_step_1787251262_532180`) resumed after Hub `ticket_1787251447_191212` merged at `b3b54f1`
 - **teardown_class_applies:** no
 
 ## Playbooks and notes applied
@@ -27,6 +27,8 @@ Role / stack:
 - [[implementation steps must persist report artifacts for review]]
 - [[pipeline vault checklists must cite exact resolvable note titles]]
 - [[pipeline artifacts should use path neutral worktree references]]
+- [[pin rolls update live lane provenance defaults and README pin prose]]
+- [[Git-consumed Hub members pin Core protocol by exact revision]]
 - [[test script required for rust tests not cargo test]]
 - [[prefer framework and library components over custom solutions]]
 
@@ -74,11 +76,11 @@ Not loaded: [[botster runtime teardown lenses]] (plan `teardown_class_applies: n
 
 ## Files changed
 
-- `crates/botster-tui/Cargo.toml` — Hub `7a09292`, Core `8fce204` lockstep pin roll.
+- `crates/botster-tui/Cargo.toml` — Hub `b3b54f1`, Core `7eafa47` lockstep pin roll (after IncrementalAttach gate).
 - `Cargo.lock` — refreshed git pins.
-- `crates/botster-tui/src/app.rs` — Hello feature + floor 44, SubscribeEvents candidate/active state, PackageEvent/EventGap apply, run-only notice filter, always-on workflow-context families with backoff, bounded mux apply, transient notice + attention bands, reconnect hygiene, hermetic tests, IsolatedHub `package-events` live test that binds a PTY session-type run, requires the matching notice, forces EventGap, and measures flood budgets. Ghostty live provenance defaults rolled to Hub `7a09292` / Core `8fce204`. Response-race reject now asserts parked frames drop before apply.
-- `README.md` — live Hub verification, Ghostty proof, and session-types pin prose rolled to Hub `7a09292`, Core `8fce204`, and floor 44.
-- `script/test-live-hub` — `package-events` mode, PP path, sentinel, test-compile workaround for Core `8fce204` bin-only engine build.
+- `crates/botster-tui/src/app.rs` — Hello feature + floor 44, SubscribeEvents candidate/active state, PackageEvent/EventGap apply, run-only notice filter, always-on workflow-context families with backoff, bounded mux apply, transient notice + attention bands, reconnect hygiene, hermetic tests, IsolatedHub `package-events` live test. Ghostty live provenance defaults rolled to Hub `b3b54f1` / Core `7eafa47`.
+- `README.md` — live Hub verification, Ghostty proof, and session-types pin prose rolled to Hub `b3b54f1`, Core `7eafa47`, and floor 44.
+- `script/test-live-hub` — every mode uses `cargo build -p botster-tui --locked`.
 - `README.md` — pin table, floor 44, `package_event_subscriptions`, live lane, included/not-included scope.
 - `docs/reports/tui-consume-transient-package-events-through-the-hub-control-plane-implement-report.md` — this report.
 
@@ -90,9 +92,9 @@ All source edits are in `botster-tui`. Hub, Core, Project Pipelines, and TUI Kit
 
 | Repository | Stance |
 | --- | --- |
-| botster-hub `tgt_7e208a0c76a44980a83b63af976b1f22` | Consume `7a09292`. New pin-roll ticket `ticket_1787251447_191212` blocked on Core. |
+| botster-hub `tgt_7e208a0c76a44980a83b63af976b1f22` | Consume `b3b54f1` (closed `ticket_1787251447_191212`). |
 | botster-project-pipelines `tgt_a72ca1a83d504385b8648f71409119ab` | Consume `cd7c2f9` (closed `ticket_1787200699_360898`). No change. |
-| botster-core `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | Pin follows Hub lockstep `8fce204`. Blocker ticket `ticket_1787251441_640678` / run `run_1787251456_699480` registered for the IncrementalAttach feature-gate leak. |
+| botster-core `tgt_1f7bce66eb304881980f9b4a2a5ae3fe` | Pin follows Hub lockstep `7eafa47` (closed `ticket_1787251441_640678`). |
 | botster-tui-kit `tgt_3dfae49c02454037bf13554f552baf7f` | Unchanged. |
 
 ## Production entry point
@@ -114,15 +116,15 @@ All source edits are in `botster-tui`. Hub, Core, Project Pipelines, and TUI Kit
 | `finding_1787249940_721992` flood proof drains the event batch before entity and terminal measurements | high | A background PP `ask_human` producer stays running across tick, entity, echo, and output waits. Each wait requires `produced` and `mux_event_frames` to advance. |
 | `finding_1787251254_208627` response-race reject assertion cannot distinguish dropped parked frames | low | The rejected-candidate half now asserts `pending_mux_len() == Some(0)` immediately after `reject_event_subscription_candidate` and before `apply_pending_mux_frames`. |
 | `finding_1787251254_254316` Ghostty live-lane provenance defaults and README pin prose at old Hub/Core revs | medium | Ghostty test defaults and README live/session-types pin prose now use Hub `7a09292` and Core `8fce204`, floor 44. `git grep` for `e864c3c8`/`fd66efd` outside `Cargo.lock` and `docs/` is empty. |
-| `finding_1787251254_962248` production `cargo build -p botster-tui` broken by Core `8fce204` | blocker | Open. This is a Core feature-gate leak, not a TUI-local fix. Registered Core `ticket_1787251441_640678` (`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`, run `run_1787251456_699480`) and Hub `ticket_1787251447_191212` (`tgt_7e208a0c76a44980a83b63af976b1f22`). Hub depends on Core. This TUI ticket depends on Hub. Did not enable Core `local-runtime` in the TUI manifest ([[botster-core local process runtime is feature-gated from contract-only embeds]]). |
+| `finding_1787251254_962248` production `cargo build -p botster-tui` broken by Core `8fce204` | blocker | Closed Core `ticket_1787251441_640678` and Hub `ticket_1787251447_191212` (`b3b54f1`). TUI now pins Hub `b3b54f1` / Core `7eafa47`. `cargo build -p botster-tui --locked` exits 0. `script/test-live-hub` uses that production build for every mode. `script/test-live-hub ghostty` prints `ghostty-live-complete`. Did not enable Core `local-runtime` in the TUI. |
 | `finding_1787248364_330620` live lane does not prove missed-event durable state | high | IsolatedHub sets `BOTSTER_ENV=test`, `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX=2`, and the Unix event-flush stall. The test applies EventGap before remaining frames, asserts the notice is cleared, and keeps the exact question row plus attention band. |
 | `finding_1787248364_303131` Hello test name still claims revision 40 | low | Test renamed to `tui_requires_protocol_7_revision_44_and_split_terminal_hello`. |
 | `finding_1787248364_910873` report leaks machine-local paths | medium | Live command fence uses `/path/to/botster-hub` and `/path/to/botster-project-pipelines`. |
 
 ## Deviations from plan
 
-- `script/test-live-hub package-events` compiles with `cargo test --no-run` instead of `cargo build -p botster-tui`. A bin-only build of Core `8fce204` compiles `engine/botster.rs` without `local-runtime`, so `IncrementalAttach` is missing. Dev-dependency `botster-hub-test-support` enables that feature. This is R1 pin-roll fallout, not a TUI product change. See [[TUI bin only Core 8fce204 builds require local runtime feature unification]].
 - No synthetic event-plane producer fixture (U3). Flood uses a live PP `ask_human` producer thread plus the Hub queue-max and flush-stall knobs.
+- Hub and Core pins moved from `7a09292`/`8fce204` to `b3b54f1`/`7eafa47` after the IncrementalAttach gate. This is the R1 blocker path, not a TUI product change.
 
 ## Tests and downstream proof
 
@@ -130,6 +132,7 @@ Repository gates:
 
 - `./script/fmt` — pass.
 - `./script/clippy` (`-D warnings`) — pass.
+- `cargo build -p botster-tui --locked` — pass on Hub `b3b54f1` / Core `7eafa47`.
 - `BOTSTER_ENV=test ./script/test` (`cargo test --workspace --all-targets`) — pass, 267 bin tests + package manifest test.
 
 Hermetic unit tests in `app.rs` cover Hello composition, mux demux, bounded drain, run-only filter (including agreeing and disagreeing `session_id` rows in both insertion orders), admission backoff request bound, TTL clock boundary, response race, EventGap, foreign-id drop, always-on demand set, attention count, reconnect teardown.
@@ -144,21 +147,22 @@ CARGO_TARGET_DIR=$PWD/target \
   ./script/test-live-hub package-events
 ```
 
-Result: `package-events-live: complete`. Hub binaries from Hub checkout `7a09292`. PP checkout `cd7c2f926fcead78e15e7a9c713ad26dfe883914`.
+Result: `package-events-live: complete`. Hub binaries from Hub checkout `b3b54f1`. Core worker pin `7eafa47`. PP checkout `cd7c2f926fcead78e15e7a9c713ad26dfe883914`.
+
+`script/test-live-hub ghostty` result: `ghostty-live-complete` (hub_rev=`b3b54f1`, worker_rev=`7eafa47`).
 
 Live budgets with producer still running:
 
 - `poll_and_apply_mux_frames` under flood: `tick_ms=1` produced=2 (limit < 200 ms)
-- exact-row entity convergence under flood: `entity_ms=527` produced=4 events=5 (limit ≤ 3,000 ms)
-- terminal input echo under flood: `echo_ms=612` produced=8 (limit ≤ 3,000 ms)
-- terminal output progress under flood: `output_ms=563` produced=11 (limit ≤ 3,000 ms)
+- exact-row entity convergence under flood: `entity_ms=373` produced=4 events=5 (limit ≤ 3,000 ms)
+- terminal input echo under flood: `echo_ms=166` produced=6 (limit ≤ 3,000 ms)
+- terminal output progress under flood: `output_ms=347` produced=8 (limit ≤ 3,000 ms)
 
 Downstream proof: none required beyond this repository. TUI is the terminal consumer in this chain.
 
 ## Unverified behavior or residual risk
 
-- `cargo build -p botster-tui --locked` still fails at Core `8fce204` (`IncrementalAttach` in ungated `suppress_attach_terminal_output`). This run is blocked on `ticket_1787251441_640678` then `ticket_1787251447_191212`. After those close, roll the TUI Core/Hub pins and record `cargo build -p botster-tui --locked` plus `script/test-live-hub ghostty` (`ghostty-live-complete`).
-- Ghostty live attach was not re-run on this pass because the production bin build is the blocker. Shared live lanes need a caller Hub ≥ `7a09292` (A1).
+- Shared live lanes (`ghostty-shared`, `ghostty-shared-exit`) need a caller Hub ≥ `7a09292` for `package_event_subscriptions` (A1). This pass re-ran IsolatedHub Ghostty, not the caller-owned shared profiles.
 - Botster MCP in this Grok session failed handshake (`BOTSTER_SESSION_UUID` not expanded). Pipeline tools were invoked through `botster mcp-serve` with the real session UUID.
 
 ## Missing vault guidance discovered
