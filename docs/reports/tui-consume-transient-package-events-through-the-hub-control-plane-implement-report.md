@@ -8,7 +8,7 @@
 - **Target id:** `tgt_c3d470bab78549df920a41e8fb0e58d8`
 - **Base:** `origin/main` `dc7d6002c90dc6c565168df6328a032b640e9b48`
 - **Plan revision:** 6 (`artifact_1787245720_425147`, commit `3db08b730d33bac9f7a7be646c5430297a6f13a0`)
-- **Implement commit:** recorded after this commit
+- **Implement commit:** `9f25c7b385f373004698a9aba7b50d230360f396` (live-lane Review fixes). Report SHA recorded in the follow-up commit.
 - **Review revisit:** sequence 13 (`run_step_1787248375_836424`) after Review `changes_required`
 - **teardown_class_applies:** no
 
