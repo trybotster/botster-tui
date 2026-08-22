@@ -10,6 +10,7 @@
 - **Plan revision:** 3 (`artifact_1787369927_453206`, commit `34c5a0af05`)
 - **Plan Review:** `review_1787370123_136710` approved
 - **Implement commit:** `27e515c82041e337dffdce1b414cb435dd9bee36`. Report SHA recorded in the follow-up commit.
+- **Review revisit:** `review_1787372188_690274` (`changes_required`). Finding 2 fixed in this revisit. Finding 1 is parked on a Kit dependency.
 - **teardown_class_applies:** no
 
 ## Playbooks and notes applied
@@ -69,7 +70,7 @@ Convention conflicts: none on product behavior. Kit still pins tag `botster-ui-c
 - `botster-tui` owns client subscription, filtering, gap reaction, reconnect, and notice rendering. It reads `DaemonPackage.notice_reactions` and does not own event contracts.
 - `botster-hub` owns the descriptor projection. This run consumes pin `baeb04d` and does not change Hub.
 - `botster-project-pipelines` owns `question.opened` emission and durable question UI. This run deletes TUI durable attention rather than generalizing it.
-- `botster-tui-kit` stays policy-free. The path vendor only unifies Cargo identity.
+- `botster-tui-kit` stays policy-free. Kit pin work belongs to `ticket_1787372410_241977` on `tgt_3dfae49c02454037bf13554f552baf7f`.
 
 Production entry point: `TuiApp::try_connect` refreshes packages, then `sync_notice_subscriptions` on connect, package-list refresh, focus change including focus to none, and reconnect. `apply_mux_frames` is the host-control decode path that applies `PackageEvent` and `EventGap`. `draw_workspace_shell` / `TuiApp::surface` render `transient_notice_band`.
 
@@ -81,11 +82,17 @@ Closed dependencies consumed, not re-implemented:
 - `ticket_1787278658_151737` (botster-project-pipelines) — session subject emission
 - `ticket_1787349524_364728` (botster-hub) — UI contract v0.3.3 tag
 
-No new cross-repo tickets. Kit remaining on v0.3.2 is a consumer-side identity patch, not a kit policy change.
+Open dependency created for Review finding `finding_1787372188_404593`:
+
+- `ticket_1787372410_241977` (botster-tui-kit, `tgt_3dfae49c02454037bf13554f552baf7f`) — pin Kit to `botster-ui-contract-v0.3.3`
+- Edge: `dependency_1787372424_971579`
+- Child run: `run_1787372425_476748` started on Plan
+
+The TUI worktree still carries the path vendor until that Kit revision merges. This run does not edit Kit.
 
 ## Deviations from plan
 
-1. **UI-contract path vendor.** Plan one-source proof assumed rolling the TUI direct tag plus Hub client would yield one git tag source. Kit `c83ba6c` still pins `botster-ui-contract-v0.3.2`. Same-URL git `[patch]` is rejected. Path vendor of v0.3.3 is the one identity. `cargo tree -p botster-tui -i botster-ui-contract --locked` reports that single path crate.
+1. **UI-contract path vendor is temporary.** Review rejected treating it as the durable identity. The vendor remains only until Kit `ticket_1787372410_241977` merges. After that merge, Implement must delete `third_party/botster-ui-contract` and the root `[patch]`, pin the merged Kit revision, and prove one Git-tag identity including the wrong-tag red ablation.
 2. **Live emit overlay.** The published Hub `plugin-contract-matrix` fixture declares `contract.ready` but `plugin.lua` does not emit. The live lane copies the Hub-owned fixture and injects a `contract.emit_ready` tool, keeping package name `botster.plugin-contract-matrix`. Unit tests do not need that overlay.
 3. **Conformance floor stays 44.** Hub pin reports fixture revision 46. Hello still admits 44. The pin-publication assertion now expects 46. Relied-on Ghostty/session-plugin fixtures still satisfy `>= 44`.
 4. **No pull request.** Matches plan assumption 1.
@@ -97,7 +104,8 @@ Removing `question_attention_band` removes the open-question count from the TUI 
 - `cargo fmt --all -- --check` — pass
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — pass
 - `cargo build -p botster-tui --locked` — pass (production build gate)
-- `./test.sh` — 267 binary tests + 1 package-manifest + 1 ownership scan, zero failures
+- `./test.sh` — 268 binary tests + 1 package-manifest + 1 ownership scan, zero failures
+- Review finding `finding_1787372188_337775`: `rejected_notice_subscription_retries_on_later_sync` proves an Idle key resubscribes with a new id and that only the new id can activate.
 - `cargo tree -p botster-tui -i botster-ui-contract --locked` — one `botster-ui-contract` 0.3.3 path source
 - `./script/test-live-hub package-events` — `package-events-live: complete` against Hub binaries from checkout `baeb04d` and Core worker `7eafa47`
 
@@ -108,7 +116,7 @@ Live lane proved: descriptor-driven subscribe with session subject, matching not
 - Shared Ghostty lanes were not re-run. They stay terminal-only per [[current shared session client lanes do not prove package events]].
 - The live emit overlay is test-local. Until Hub's published matrix fixture emits `contract.ready`, a stock fixture install will subscribe and wait.
 - Durable open-question count is gone from the TUI by design.
-- Kit still names tag v0.3.2 in its own manifest. The path patch hides that split only in this consumer graph.
+- Kit still names tag v0.3.2. The path vendor remains until `ticket_1787372410_241977` merges. This parent run must not request Review while that edge is open.
 
 ## Missing vault guidance discovered
 

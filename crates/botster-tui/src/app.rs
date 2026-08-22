@@ -4019,8 +4019,15 @@ impl TuiApp {
                 entry.descriptor.name.clone(),
             );
             match self.notice_subscriptions.get(&key) {
-                Some(current) if current.subject != entry.subject => {
-                    self.unsubscribe_notice_entry(&key);
+                Some(current)
+                    if current.subject != entry.subject
+                        || matches!(current.state, EventSubscriptionState::Idle) =>
+                {
+                    if matches!(current.state, EventSubscriptionState::Idle) {
+                        self.notice_subscriptions.remove(&key);
+                    } else {
+                        self.unsubscribe_notice_entry(&key);
+                    }
                     self.subscribe_notice_entry(entry);
                 }
                 Some(_) => {
@@ -29339,6 +29346,78 @@ exit 0
             ),
         );
         assert!(app.transient_notice.is_none());
+    }
+
+    #[test]
+    fn rejected_notice_subscription_retries_on_later_sync() {
+        let mut app = workspace_fixture();
+        app.notice_subscriptions_local = true;
+        let _peer = install_dummy_hub_client(&mut app);
+        app.packages = vec![matrix_package(5_000)];
+        let key = (MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string());
+        app.notice_subscriptions.insert(
+            key.clone(),
+            NoticeSubscriptionEntry {
+                descriptor: matrix_descriptor(5_000),
+                subject: "session-alpha".to_string(),
+                state: EventSubscriptionState::Candidate("cand-reject".to_string()),
+            },
+        );
+        app.notice_subscription_by_id
+            .insert("cand-reject".to_string(), key.clone());
+        app.reject_event_subscription_candidate(
+            "cand-reject",
+            "event subscription was not accepted".to_string(),
+        );
+        assert!(
+            app.notice_subscriptions
+                .get(&key)
+                .is_some_and(|entry| entry.state == EventSubscriptionState::Idle)
+        );
+        assert!(!app.notice_subscription_by_id.contains_key("cand-reject"));
+        app.observed_requests.clear();
+        app.sync_notice_subscriptions();
+        let retry_id = app
+            .notice_subscriptions
+            .get(&key)
+            .and_then(|entry| entry.state.active_id())
+            .map(ToOwned::to_owned)
+            .expect("rejected key must subscribe again");
+        assert_ne!(retry_id, "cand-reject");
+        assert!(
+            app.observed_requests.iter().any(|request| matches!(
+                request,
+                ObservedRequest::SubscribeEvents { subscription_id, .. }
+                    if subscription_id == &retry_id
+            )),
+            "{:?}",
+            app.observed_requests
+        );
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "cand-reject",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "stale-reject" }),
+            ),
+        );
+        assert!(app.transient_notice.is_none());
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                &retry_id,
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "retry-ok" }),
+            ),
+        );
+        assert_eq!(
+            app.transient_notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some("retry-ok")
+        );
     }
 
     #[test]
