@@ -9,6 +9,7 @@
 - **Base:** `origin/main` `0032fe97c76bcaccb09e540247106a9a998c23c6`
 - **Plan revision:** 3 (`artifact_1787369927_453206`, commit `34c5a0af05`)
 - **Plan Review:** `review_1787370123_136710` approved
+- **Implement commit:** `27e515c82041e337dffdce1b414cb435dd9bee36`. Report SHA recorded in the follow-up commit.
 - **teardown_class_applies:** no
 
 ## Playbooks and notes applied
