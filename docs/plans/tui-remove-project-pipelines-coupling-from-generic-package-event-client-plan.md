@@ -9,7 +9,7 @@
 - Base: `origin/main` at `0032fe97c76bcaccb09e540247106a9a998c23c6`
 - Pipeline run: `run_1787278336_152073`
 - Repository charter: [[botster-tui-playbook]]
-- Revision: 2, after Plan Review `review_1787349566_913809`
+- Revision: 3, after Plan Review `review_1787369259_130753`
 
 The ticket target was resolved through `project_pipelines_current_context` and
 the Hub spawn-target registry. The ambient worktree was not used to infer
@@ -17,8 +17,23 @@ ownership.
 
 ## Plan verdict
 
-**Revision 2, after Plan Review `review_1787349566_913809` returned
-changes_required.** All three registered dependencies are now closed, so the
+**Revision 3, after Plan Review `review_1787369259_130753` returned
+changes_required.** Revision 2 cleared the pin, charter, artifact, and
+subject-oracle findings. Revision 3 answers five new ones, including a blocker
+where revision 2's ownership scan would have checked 38 of 30,499 lines of
+`app.rs`.
+
+Findings answered in revision 3:
+
+| Finding | Severity | Answered in |
+| --- | --- | --- |
+| `finding_1787369259_563731` ownership scan checks only the first 38 lines | blocker | Acceptance checks, Ownership scan |
+| `finding_1787369259_898279` multi-descriptor runtime not designed or bounded | high | Multi-descriptor subscription runtime, Acceptance checks |
+| `finding_1787369259_850438` mandatory live lane reintroduces a product dependency | high | Acceptance checks, Live product proof |
+| `finding_1787369259_541565` Hub revision unspecified | medium | Scope, Remaining assumptions |
+| `finding_1787369259_336200` stale dependency edge id | info, process | Dependencies |
+
+Revision 2 context, retained: All three registered dependencies are now closed, so the
 seam this plan waited for exists. This revision answers every open finding and
 replaces the parked verdict.
 
@@ -199,16 +214,21 @@ In scope for the deferred TUI implementation, after both dependencies merge:
 
 - Roll all four Git pins together, per `finding_1787349566_641878`:
   - `botster-hub-client` and `botster-hub-test-support` from rev
-    `b3b54f1f87e29867da4eb371e9b7f3b18160996a` to the Hub revision that carries
-    the descriptor and the published tag.
+    `b3b54f1f87e29867da4eb371e9b7f3b18160996a` to the exact reviewed revision
+    `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5`. This is a named pin, not "the
+    revision that carries the descriptor". A later unrelated Hub roll would make
+    the Core-pin, protocol, conformance-floor, README, and live-lane scope
+    indeterminate. If Implement finds that revision unusable, it must return the
+    plan rather than pick a newer one silently.
   - `botster-ui-contract` from tag `botster-ui-contract-v0.3.2` to tag
     `botster-ui-contract-v0.3.3`. This direct roll is required. Hub merge
     `12e0cc6` moved `botster-hub-client` onto the v0.3.3 tag, so leaving the
     TUI's direct pin at v0.3.2 would put two `botster-ui-contract` sources in
     one graph.
   - Update `Cargo.lock` in the same commit.
-- Read the descriptor from `DaemonPackage.notice_reactions` and subscribe once
-  per descriptor with the focused session subject.
+- Read descriptors from `DaemonPackage.notice_reactions` and maintain one
+  bounded per-descriptor subscription collection. The design is specified in
+  "Multi-descriptor subscription runtime" below; Implement does not derive it.
 - Resolve notice text through `botster_ui_contract::resolve_notice_text` with the
   descriptor's `text_pointer`. The TUI must not parse the pointer itself and must
   not read a payload field by name.
@@ -216,9 +236,11 @@ In scope for the deferred TUI implementation, after both dependencies merge:
   descriptor. Use the descriptor's `ttl_ms` instead of the local
   `TRANSIENT_NOTICE_TTL` constant.
 - Keep the generic mechanisms already present: the
-  `Idle`/`Candidate`/`Active` subscription state machine, parked multiplexed
-  frame replay after `EventSubscribed`, exact owner-plus-name admission,
-  `EventGap` handling, reconnect state clearing, and bounded notice lifetime.
+  `Idle`/`Candidate`/`Active` state vocabulary, parked multiplexed frame replay
+  after `EventSubscribed`, exact owner-plus-name admission, `EventGap` handling,
+  reconnect state clearing, and bounded notice lifetime. The single
+  `EventSubscriptionState` field at `app.rs:1474` becomes one state per
+  descriptor. The state vocabulary itself does not change.
 - Subscribe with the TUI's current session subject instead of `subjects: []`.
   Hub performs the subject match. The TUI must not read `payload.subject`.
 - Delete the Project Pipelines owner, event name, payload field names, and
@@ -242,6 +264,78 @@ Explicitly out of scope:
 - Implementing the Hub descriptor or the Project Pipelines declaration. Those
   belong to their own repositories.
 
+## Multi-descriptor subscription runtime
+
+Revision 2 said "subscribe once per descriptor" while keeping a singular
+`EventSubscriptionState`. That is not a design, and Plan Review was right to
+call it underplanned. This section is the design. Implement follows it.
+
+Production today holds one `EventSubscriptionState` field (`app.rs:1474`) and
+one subscription id. Descriptors are a set, so the state becomes a keyed
+collection.
+
+**Collection key.** `(owner, name)`. This is the only package-event
+subscription key, per
+[[exact owner plus name is the only package event subscription key]]. Hub
+admission rejects duplicate reactions inside one package, and `owner` is the
+admitted package name, so the pair is globally unique.
+
+**Per-entry state.** For each key: the descriptor fields (`text_pointer`,
+`ttl_ms`, `severity`), the `subject` the entry was minted for, and one
+`Idle` / `Candidate(id)` / `Active(id)` state.
+
+**Reverse index.** `subscription_id -> (owner, name)`. Inbound `PackageEvent`
+and `EventGap` frames carry a subscription id, so the client must resolve id to
+entry without scanning. This replaces the single-id equality checks at
+`app.rs:4044` and `app.rs:4076`.
+
+**Desired set.** One deterministic function computes it:
+
+- If no session is focused, the desired set is empty.
+- Otherwise, for every package in the `ListPackages` result and every entry in
+  its `notice_reactions`, the desired entry is that descriptor with
+  `subject` equal to the focused session id.
+- Order deterministically by `(owner, name)`.
+
+**No-focus policy, decided here.** With no focused session the TUI holds no
+notice subscriptions. `subject_scope` is session-only, so with no session there
+is no subject. Subscribing with an empty subject set instead would receive every
+package's notices unfiltered, which is the pre-ticket behavior this work removes.
+This follows from the merged contract, so it does not need a human question.
+
+**Reconciliation.** One `sync_notice_subscriptions` function owns every
+transition. It diffs desired against current:
+
+| Case | Action |
+| --- | --- |
+| Key in current, absent from desired | Unsubscribe, drop parked frames for that id, remove the entry and its reverse-index row |
+| Key in both, `subject` differs | Unsubscribe the old id, then subscribe a fresh id. Never mutate a live entry's subject in place |
+| Key in both, same `subject`, descriptor fields differ | Keep the subscription and update `text_pointer`, `ttl_ms`, `severity` locally. Owner, name, and subject are unchanged, so the Hub-side filter is unchanged and a resubscribe would create a needless gap |
+| Key in desired, absent from current | Subscribe a fresh id |
+
+**Triggers.** `sync_notice_subscriptions` runs on connect, on package-list
+refresh, on focus change including focus to none, and after reconnect. Reconnect
+clears the collection and the reverse index first, then syncs, so no identifier
+survives a connection.
+
+**Focus A to B.** Handled by the subject-differs row: unsubscribe A's id before
+minting B's. The old id leaves the reverse index at unsubscribe time, so an
+in-flight A frame arriving afterwards resolves to no entry and drops.
+
+**Late and stale responses.** Per-entry candidate promotion is unchanged. An
+entry becomes `Active` only on `EventSubscribed`, then parked frames apply. A
+response whose id is not that entry's current candidate is ignored and its
+frames dropped through `drop_event_frames_for`. A `PackageEvent` or `EventGap`
+whose id does not resolve to an `Active` entry drops silently. This generalizes
+the existing single-subscription behavior rather than replacing it.
+
+**Overflow policy.** Hub admits at most 64 package-event subscriptions per
+connection (`MAX_SUBSCRIPTIONS_PER_CONNECTION`,
+`src/daemon_event_subscriptions.rs:27`). The TUI subscribes in the deterministic
+`(owner, name)` order and stops at 64. It must not silently truncate: it records
+a bounded diagnostic naming how many descriptors it dropped. A silent cap would
+read as full coverage while notices went missing.
+
 ## Repository ownership boundaries and cross-repository dependencies
 
 Ownership:
@@ -255,7 +349,7 @@ Ownership:
 - `botster-tui-kit` stays policy-free and gains nothing from this work.
 
 Dependencies registered against this ticket
-(`dependency_1787278750_977041` and `dependency_1787278755_379534`):
+(`dependency_1787278750_977041` and `dependency_1787349143_516346`):
 
 1. `ticket_1787278643_145174` — botster-hub
    (`tgt_7e208a0c76a44980a83b63af976b1f22`): "Hub: publish a package-owned
@@ -364,21 +458,25 @@ Assumptions:
 
 Unknowns for Implement to resolve at its own base:
 
-1. Whether the Hub pin roll also moves the Core pin. If it does, the charter
-   requires a separate production build gate and README pin prose updates.
-2. Whether `MINIMUM_CONFORMANCE_FIXTURE_REVISION` in `app.rs` must change. The
-   TUI floor is 44 and the merged Hub reports 46, so the floor still admits.
-   Implement must confirm no fixture the TUI relies on moved between 44 and 46,
-   rather than assuming the inequality is sufficient.
-3. What the TUI does when no session is focused. Project Pipelines omits the
-   subject when no agent session context exists, and a nonempty subject filter
-   does not match a subject-less payload, so a focused-session subscription
-   receives nothing in that case. Implement must decide whether the TUI
-   subscribes at all with no focused session.
-4. Whether Project Pipelines republishes the durable open-question count through
+1. Whether `MINIMUM_CONFORMANCE_FIXTURE_REVISION` in `app.rs` must change. The
+   TUI floor is 44 and Hub `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` reports
+   46, so the floor still admits. Implement must confirm no fixture the TUI
+   relies on moved between 44 and 46, rather than assuming the inequality is
+   sufficient.
+2. Whether Project Pipelines republishes the durable open-question count through
    a package surface. `ticket_1787278658_151737` keeps durable question state
    package-owned but does not commit to a TUI-visible surface. Until it does,
    removing `question_attention_band` removes that count from the TUI.
+
+Resolved at revision 3, previously unknown:
+
+- **The Core pin does not move.** Hub `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5`
+  pins `botster-terminal-protocol` and, in `botster-hub-test-support`,
+  `botster-core` and `botster-terminal-ghostty` at
+  `7eafa470a18025895995bbedc20d34b58106a03b`. That is the revision the TUI
+  already pins. This roll is Hub-only, so no Core-pin cascade applies.
+- **The no-focus policy is decided in this plan**, not left to Implement. See
+  the subscription design below.
 
 ## Affected surfaces and files
 
@@ -401,6 +499,9 @@ Deferred implementation:
 - `README.md` — pin prose and any documented notice behavior.
 - `crates/botster-tui/src/acceptance.rs` — only if a live lane names the
   removed behavior.
+- `crates/botster-tui/tests/` — new home for any optional Project Pipelines
+  conformance lane moved out of `src`, alongside the existing
+  `package_manifest_test.rs`.
 
 ## Risks
 
@@ -439,7 +540,15 @@ Deferred implementation:
    symptom is a type mismatch on an identically named type, which reads as
    nonsense unless the split source is already suspected. The one-source proof
    below is what catches it.
-8. **Client re-implementing payload policy.** If the TUI parses `text_pointer`
+8. **A scan that reports coverage it does not have.** Revision 2 shipped one.
+   A range-limited or attribute-split scan over `app.rs` passes trivially while
+   the coupling remains, and it is more dangerous than no scan because it reads
+   as proof. The whole-directory rule exists to remove that class.
+9. **Unbounded subscription growth.** Descriptors come from installed packages,
+   so the desired set grows with package count. Without the 64 ceiling and the
+   deterministic order, the TUI could exceed the Hub limit and lose notices in
+   an order that varies per run.
+10. **Client re-implementing payload policy.** If the TUI parses `text_pointer`
    itself or reads `payload.subject`, it recreates package payload policy inside
    the generic client and re-earns this ticket. The canonical resolvers and Hub
    subject filtering are the boundary.
@@ -466,18 +575,36 @@ Each check names its authoritative production oracle, per
 
 **Ownership scan. Oracle: the TUI repository source tree.**
 
-- Production-only scan that excludes `cfg(test)` code. Revision 1 said "no hit
-  across production TUI source" and then permitted product strings in test-only
-  code in the same file, which is not executable. `finding_1787349566_857519`
-  is correct.
-- Exact rule: for each `crates/botster-tui/src/*.rs`, take the lines before the
-  first `#[cfg(test)]` attribute, and require zero matches for
-  `project-pipelines`, `project_pipelines`, or `question.opened`. Today the only
-  such boundary is `app.rs:11297`.
-- Implement adds this as a repository test, not a manual grep, so a later change
-  cannot silently reintroduce the coupling. The test must fail if a file gains a
-  second `#[cfg(test)]` boundary, so the scan cannot be defeated by moving code
-  below a later marker.
+Revision 2 proposed splitting each file at its first `#[cfg(test)]` attribute
+and claimed `app.rs` had one boundary near line 11297. That was wrong, and
+`finding_1787369259_563731` is correct. Measured on the current tree:
+
+| File | `#[cfg(test)]` attributes | First at line |
+| --- | --- | --- |
+| `app.rs` | 70 | 39 |
+| `acceptance.rs` | 5 | 37 |
+| `renderer.rs` | 4 | 1 |
+| `entity_options.rs` | 3 | 274 |
+
+A first-marker split would have scanned 38 of 30,499 lines of `app.rs`. The
+check would have passed while the entire coupling remained. It was worse than no
+check, because it would have reported coverage it did not have.
+
+Replacement rule, which cannot omit production items:
+
+- Zero occurrences of `project-pipelines`, `project_pipelines`, or
+  `question.opened` anywhere under `crates/botster-tui/src`. No line-range
+  split, no attribute parsing, no exceptions inside `src`.
+- Any optional Project Pipelines conformance test moves out of `src` and into
+  `crates/botster-tui/tests/`, which already exists and holds
+  `package_manifest_test.rs`. That directory is not production composition, so
+  an optional product conformance lane there satisfies the ticket's "only if it
+  does not affect production composition" condition.
+- Implement adds this as a repository test so a later change cannot reintroduce
+  the coupling silently.
+
+This rule is strictly stronger than the ticket's acceptance line and needs no
+item-aware scanner, so the plan takes it rather than building one.
 
 **Generic client mechanism. Oracle: the TUI client, driven through the public
 protocol decode boundary.**
@@ -530,16 +657,52 @@ protocol decode boundary.**
   repository. Update Ghostty live-lane defaults and README pin claims in the
   same commit.
 
-**Live product proof. Oracle: an isolated Hub with the real producer.**
+**Live product proof. Oracle: an isolated Hub with the Hub-owned neutral
+fixture.**
 
-- The charter requires downstream proof. An isolated-Hub live lane shows one real
-  notice from the real `project_pipelines_ask_human` producer, targeted by the
-  session subject. Soft residual evidence is not accepted.
+Revision 2 required the TUI live gate to call `project_pipelines_ask_human`.
+`finding_1787369259_850438` is correct that this contradicts
+[[event plane client proof uses library contract fixtures]], which assigns
+generic Web and TUI conformance to Hub ABI fixtures and assigns `question.opened`
+product proof to Project Pipelines. Revision 2 cited that note and then violated
+it in the same document.
+
+Corrected lanes:
+
+- **Required generic lane.** An isolated Hub installs the Hub-owned
+  `plugin-contract-matrix` fixture package, which declares a session notice for
+  event `contract.ready` with `text_pointer: "/notice"`. The fixture emits, and
+  the TUI shows one notice targeted by the session subject. This is the live gate.
+  It has no product dependency.
+- **Subject rejection, same lane.** The fixture emits with a subject the TUI did
+  not subscribe to, and the TUI receives no frame. Hub is the oracle, as recorded
+  above.
+- **Project Pipelines product proof is separate and already closed.** Project
+  Pipelines proves its own `question.opened` contract in its own repository at
+  `643c4d7`, through `script/test` and `script/test-hub-flow`. This TUI ticket
+  does not re-prove it and does not depend on it for conformance.
+- **Optional Project Pipelines TUI lane.** May remain, outside generic
+  conformance and outside production composition, under
+  `crates/botster-tui/tests/`. It is not a gate.
 - Shared Ghostty lanes stay terminal-only, per
   [[current shared session client lanes do not prove package events]].
-- The optional Project Pipelines conformance lane
-  (`package_events_live_runtime_runs_against_isolated_hub_when_binaries_are_available`)
-  may stay only if it does not enter production composition.
+
+**Subscription runtime proof. Oracle: the TUI client over the decode boundary.**
+
+Covers the design section above, which revision 2 omitted entirely:
+
+- Connect with two descriptors from two fixture packages produces two active
+  subscriptions with distinct ids.
+- Focus A to B unsubscribes A's id before subscribing B's, and a late A frame
+  arriving after the switch changes nothing.
+- Focus to none leaves zero notice subscriptions.
+- A package refresh that changes only `ttl_ms` keeps the subscription id and
+  changes the local lifetime, proving no needless resubscribe.
+- A package refresh that removes a descriptor unsubscribes exactly that key.
+- Reconnect clears the collection and reverse index, then re-syncs with fresh
+  ids.
+- A desired set above 64 subscribes exactly 64 in `(owner, name)` order and
+  records the dropped count. A silent truncation fails the gate.
 
 **Repository gates.**
 
@@ -571,6 +734,13 @@ with a third that revision 1 did not anticipate:
 
 Remaining gaps:
 
+0. **A production-ownership scan must be whole-directory, not marker-split.**
+   Revision 2's first-marker rule covered 38 of 30,499 lines of `app.rs` because
+   the file carries 70 `#[cfg(test)]` attributes. The durable rule is that
+   test-code exclusion by line range or first-attribute split is not a valid
+   ownership boundary in a repository that interleaves `cfg(test)` items through
+   a large file. Move optional product code to `tests/` and scan the whole
+   source directory instead. Capture this with the measured numbers.
 1. **A direct Git tag pin and a transitive pin of the same crate must roll
    together.** `finding_1787349566_641878` found a split
    `botster-ui-contract` graph that no existing note covers. The general rule is
