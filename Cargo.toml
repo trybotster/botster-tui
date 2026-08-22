@@ -2,6 +2,12 @@
 resolver = "3"
 members = ["crates/botster-tui"]
 
+# Kit still pins tag botster-ui-contract-v0.3.2 while this consumer and
+# hub-client pin v0.3.3. Cargo rejects a same-URL git patch, so the path
+# vendor is the one crate identity for both tags. Not kit policy.
+[patch."https://github.com/trybotster/botster-hub.git"]
+botster-ui-contract = { path = "third_party/botster-ui-contract" }
+
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"

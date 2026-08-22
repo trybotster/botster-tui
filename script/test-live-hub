@@ -126,18 +126,6 @@ case "$mode" in
       echo "usage: script/test-live-hub package-events" >&2
       exit 1
     fi
-    if [ -z "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH:-}" ]; then
-      echo "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH is required for package-events live proof" >&2
-      exit 1
-    fi
-    if [ ! -d "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}" ]; then
-      echo "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH is not a directory: ${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}" >&2
-      exit 1
-    fi
-    if [ ! -f "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}/botster-package.json" ] || [ ! -f "${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}/plugin.lua" ]; then
-      echo "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH must contain botster-package.json and plugin.lua: ${BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH}" >&2
-      exit 1
-    fi
     test_filter="app::tests::package_events_live_runtime_runs_against_isolated_hub_when_binaries_are_available"
     ;;
   workspaces)

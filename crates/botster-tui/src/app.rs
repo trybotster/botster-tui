@@ -52,9 +52,10 @@ use botster_terminal_protocol_client::{
     AttachStateKind, SnapshotPhase, TerminalEvent, TerminalFrame,
 };
 use botster_ui_contract::{
-    EntityFamilyStore, PackageSurfaceDescriptor, PackageSurfaceKind, PackageSurfaceOperation,
-    UiActionRequest, UiActionResult, UiAuthoredNodeId, UiChild, UiCondition, UiConditional,
-    UiFormValues, UiNode, UiNodeId, UiNodeKind, UiWidthClass, realize_bind_list_descendant_id,
+    EntityFamilyStore, PackageNoticeReactionDescriptor, PackageSurfaceDescriptor,
+    PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest, UiActionResult, UiAuthoredNodeId,
+    UiChild, UiCondition, UiConditional, UiFormValues, UiNode, UiNodeId, UiNodeKind, UiWidthClass,
+    realize_bind_list_descendant_id, resolve_notice_text,
 };
 use crossterm::{
     cursor::Show,
@@ -95,13 +96,7 @@ const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 const MUX_POLL_BATCH_FRAMES: usize = 32;
 const MUX_APPLY_BATCH_FRAMES: usize = 32;
-const TRANSIENT_NOTICE_TTL: Duration = Duration::from_secs(5);
-const QUESTION_OPENED_OWNER: &str = "project-pipelines";
-const QUESTION_OPENED_NAME: &str = "question.opened";
-const WORKFLOW_CONTEXT_ENTITY_FAMILIES: [&str; 2] = [
-    "project-pipelines.question",
-    "project-pipelines.session_request",
-];
+const MAX_NOTICE_SUBSCRIPTIONS: usize = 64;
 const ENTITY_OPTIONS_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
 const ENTITY_OPTIONS_BACKOFF_CAP: Duration = Duration::from_secs(30);
 const GHOSTTY_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
@@ -136,29 +131,22 @@ impl EventSubscriptionState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TransientNotice {
     text: String,
-    question_id: String,
-    kind: String,
     deadline: Instant,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoticeSubscriptionEntry {
+    descriptor: PackageNoticeReactionDescriptor,
+    subject: String,
+    state: EventSubscriptionState,
+}
+
+type NoticeSubscriptionKey = (String, String);
 
 #[derive(Clone, Debug)]
 struct EntityOptionsRetryState {
     consecutive_failures: u32,
     next_attempt_at: Instant,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ActiveWorkflowRun {
-    None,
-    Run(String),
-    Ambiguous,
-}
-
-fn workflow_context_entity_families() -> BTreeSet<String> {
-    WORKFLOW_CONTEXT_ENTITY_FAMILIES
-        .iter()
-        .map(|family| (*family).to_string())
-        .collect()
 }
 
 fn entity_options_backoff_delay(consecutive_failures: u32) -> Duration {
@@ -1243,7 +1231,6 @@ fn draw_workspace_shell(
     let width_class = renderer::viewport_for_area(area).width_class;
     let status = app.status_summary_node(width_class);
     let alert = app.connection_alert();
-    let attention = app.question_attention_band();
     let notice = app.transient_notice_band();
     let toolbar = app.workspace_toolbar();
     let navigator = app.session_navigator();
@@ -1251,7 +1238,6 @@ fn draw_workspace_shell(
     for node in [
         Some(&status),
         alert.as_ref(),
-        attention.as_ref(),
         notice.as_ref(),
         Some(&toolbar),
         Some(&navigator),
@@ -1278,10 +1264,7 @@ fn draw_workspace_shell(
     );
 
     let mut next_y = area.y.saturating_add(1);
-    for band in [alert.as_ref(), attention.as_ref(), notice.as_ref()]
-        .into_iter()
-        .flatten()
-    {
+    for band in [alert.as_ref(), notice.as_ref()].into_iter().flatten() {
         let band_area = Rect::new(area.x, next_y, area.width, 1);
         renderer::render_node_with_presentation_state(
             frame,
@@ -1467,13 +1450,14 @@ struct TuiApp {
     entity_options: EntityOptionsStore,
     /// Per-family SubscribeEntities pumps for entity-options demand.
     entity_options_subscriptions: BTreeMap<String, SessionSubscriptionPump>,
-    /// Per-family backoff for always-on workflow-context subscribe admission.
+    /// Per-family backoff for optional entity-options subscribe admission.
     entity_options_retry: BTreeMap<String, EntityOptionsRetryState>,
     /// Field names whose entity-backed selection was invalidated (visible error).
     entity_options_invalid_fields: BTreeSet<String>,
-    event_subscription: EventSubscriptionState,
+    notice_subscriptions: BTreeMap<NoticeSubscriptionKey, NoticeSubscriptionEntry>,
+    notice_subscription_by_id: BTreeMap<String, NoticeSubscriptionKey>,
+    notice_overflow_dropped: usize,
     transient_notice: Option<TransientNotice>,
-    ambiguous_workflow_context: bool,
     session_types_supported: bool,
     spawn_targets: Vec<DaemonSpawnTarget>,
     selected_session_type_id: Option<String>,
@@ -1525,6 +1509,9 @@ struct TuiApp {
     /// Senders for local entity-options pumps (test injection only).
     #[cfg(test)]
     entity_options_frame_injectors: BTreeMap<String, mpsc::Sender<SessionSubscriptionMessage>>,
+    /// Skip the socket for notice SubscribeEvents / UnsubscribeEvents (unit tests).
+    #[cfg(test)]
+    notice_subscriptions_local: bool,
     /// Exact live payloads passed to the Ghostty apply path (test observer only).
     #[cfg(test)]
     applied_live_payloads: Vec<Vec<u8>>,
@@ -1609,9 +1596,10 @@ impl TuiApp {
             entity_options_subscriptions: BTreeMap::new(),
             entity_options_retry: BTreeMap::new(),
             entity_options_invalid_fields: BTreeSet::new(),
-            event_subscription: EventSubscriptionState::Idle,
+            notice_subscriptions: BTreeMap::new(),
+            notice_subscription_by_id: BTreeMap::new(),
+            notice_overflow_dropped: 0,
             transient_notice: None,
-            ambiguous_workflow_context: false,
             session_types_supported: true,
             spawn_targets: Vec::new(),
             selected_session_type_id: None,
@@ -1659,6 +1647,8 @@ impl TuiApp {
             #[cfg(test)]
             entity_options_frame_injectors: BTreeMap::new(),
             #[cfg(test)]
+            notice_subscriptions_local: false,
+            #[cfg(test)]
             applied_live_payloads: Vec::new(),
             #[cfg(test)]
             entity_options_forced_subscribe_error: None,
@@ -1677,6 +1667,14 @@ impl TuiApp {
         self.reconcile_entity_option_drafts();
     }
 
+    fn set_selected_session(&mut self, session_id: Option<String>) {
+        if self.selected_session == session_id {
+            return;
+        }
+        self.selected_session = session_id;
+        self.sync_notice_subscriptions();
+    }
+
     fn sync_focused_session(&mut self, selected_row: Option<&Value>) {
         let Some(session_id) = selected_row.and_then(Value::as_str) else {
             return;
@@ -1686,7 +1684,7 @@ impl TuiApp {
             .iter()
             .any(|candidate| candidate.session_id == session_id)
         {
-            self.selected_session = Some(session_id.to_string());
+            self.set_selected_session(Some(session_id.to_string()));
         }
     }
 
@@ -1909,7 +1907,7 @@ impl TuiApp {
         self.plugin_presentation = renderer::PresentationState::default();
         self.plugin_action_result = None;
         self.pending_plugin_request = None;
-        self.drop_non_workflow_entity_options_subscriptions();
+        self.drop_entity_options_subscriptions();
         self.entity_options_invalid_fields.clear();
         if self.client.is_some() {
             self.sync_entity_options_subscriptions();
@@ -2012,7 +2010,7 @@ impl TuiApp {
                     .and_then(|value| value.get("session_id"))
                     .and_then(Value::as_str)
                 {
-                    self.selected_session = Some(session_id.to_string());
+                    self.set_selected_session(Some(session_id.to_string()));
                 }
                 self.attach_selected_or_first();
             }
@@ -2286,7 +2284,7 @@ impl TuiApp {
                     return;
                 }
                 self.start_session_type_subscription_if_supported();
-                self.subscribe_question_opened_events();
+                self.sync_notice_subscriptions();
                 self.sync_entity_options_subscriptions();
             }
             Err(error) => {
@@ -2453,10 +2451,11 @@ impl TuiApp {
                 .iter()
                 .any(|session| session.session_id == *selected)
         }) {
-            self.selected_session = self
-                .sessions
-                .first()
-                .map(|session| session.session_id.clone());
+            self.set_selected_session(
+                self.sessions
+                    .first()
+                    .map(|session| session.session_id.clone()),
+            );
         }
     }
 
@@ -2701,7 +2700,7 @@ impl TuiApp {
         let session_id = format!("btui-{}", short_suffix());
         self.pending_sessions
             .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
-        self.selected_session = Some(session_id.clone());
+        self.set_selected_session(Some(session_id.clone()));
         self.rebuild_session_rows();
         self.action_feedback = Some(format!("spawn pending: {session_id} via {session_type_id}"));
         let spawn_request = DaemonRequest::SpawnSessionType {
@@ -3050,10 +3049,6 @@ impl TuiApp {
         self.drop_entity_options_families(None);
     }
 
-    fn drop_non_workflow_entity_options_subscriptions(&mut self) {
-        self.drop_entity_options_families(Some(workflow_context_entity_families()));
-    }
-
     fn drop_entity_options_families(&mut self, keep: Option<BTreeSet<String>>) {
         let keep = keep.unwrap_or_default();
         let stale: Vec<String> = self
@@ -3082,11 +3077,7 @@ impl TuiApp {
     }
 
     fn demanded_entity_option_families_now(&self) -> BTreeSet<String> {
-        let mut owned = if self.client.is_some() {
-            workflow_context_entity_families()
-        } else {
-            BTreeSet::new()
-        };
+        let mut owned = BTreeSet::new();
         if let Some(surface) = self.plugin_surface.as_ref() {
             owned.extend(
                 demanded_entity_option_families(&surface.body)
@@ -3100,7 +3091,6 @@ impl TuiApp {
     /// Collect options_source families from the active plugin surface and ensure
     /// SubscribeEntities for non-process-wide families. Process-wide families
     /// (session / session_type) reuse the existing navigator subscriptions.
-    /// Workflow-context families stay subscribed whenever the Hub connection is up.
     fn sync_entity_options_subscriptions(&mut self) {
         let owned = self.demanded_entity_option_families_now();
 
@@ -3300,7 +3290,6 @@ impl TuiApp {
                 "entity options subscription failed for {family}: {error}"
             ));
         }
-        self.transient_notice = None;
     }
 
     fn family_still_demanded(&self, family: &str) -> bool {
@@ -3335,7 +3324,6 @@ impl TuiApp {
                                 #[cfg(test)]
                                 self.entity_options_frame_injectors.remove(&family);
                                 self.entity_options.drop_family(&family);
-                                self.transient_notice = None;
                                 let still_demanded = self.family_still_demanded(&family);
                                 if still_demanded
                                     && self.entity_options_retry_ready(&family)
@@ -3372,7 +3360,6 @@ impl TuiApp {
                             self.error = Some(format!(
                                 "entity options subscription disconnected ({family}): {error}"
                             ));
-                            self.transient_notice = None;
                             if self.family_still_demanded(&family)
                                 && self.entity_options_retry_ready(&family)
                                 && let Err(start_error) =
@@ -3589,7 +3576,7 @@ impl TuiApp {
             return;
         };
         self.error = None;
-        self.selected_session = Some(session_id.clone());
+        self.set_selected_session(Some(session_id.clone()));
         self.action_feedback = Some(format!("attach requested: {session_id}"));
         self.reset_attach_campaign();
         let subscription_id = self.mint_subscription_id();
@@ -3642,7 +3629,7 @@ impl TuiApp {
             self.error = Some("no session available to attach".to_string());
             return None;
         };
-        self.selected_session = Some(session_id.clone());
+        self.set_selected_session(Some(session_id.clone()));
 
         let Some(session) = self
             .sessions
@@ -3964,20 +3951,125 @@ impl TuiApp {
         }
     }
 
-    fn subscribe_question_opened_events(&mut self) {
-        let subscription_id = format!("btui-events-{}", short_suffix());
-        self.event_subscription = EventSubscriptionState::Candidate(subscription_id.clone());
+    fn desired_notice_subscriptions(&self) -> Vec<NoticeSubscriptionEntry> {
+        let Some(subject) = self.selected_session.clone() else {
+            return Vec::new();
+        };
+        let mut desired = BTreeMap::<NoticeSubscriptionKey, NoticeSubscriptionEntry>::new();
+        for package in &self.packages {
+            for descriptor in &package.notice_reactions {
+                let key = (descriptor.owner.clone(), descriptor.name.clone());
+                desired
+                    .entry(key)
+                    .or_insert_with(|| NoticeSubscriptionEntry {
+                        descriptor: descriptor.clone(),
+                        subject: subject.clone(),
+                        state: EventSubscriptionState::Idle,
+                    });
+            }
+        }
+        desired.into_values().collect()
+    }
+
+    fn sync_notice_subscriptions(&mut self) {
+        let mut desired = self.desired_notice_subscriptions();
+        desired.sort_by(|left, right| {
+            (
+                left.descriptor.owner.as_str(),
+                left.descriptor.name.as_str(),
+            )
+                .cmp(&(
+                    right.descriptor.owner.as_str(),
+                    right.descriptor.name.as_str(),
+                ))
+        });
+        let dropped = desired.len().saturating_sub(MAX_NOTICE_SUBSCRIPTIONS);
+        if dropped > 0 {
+            desired.truncate(MAX_NOTICE_SUBSCRIPTIONS);
+            self.notice_overflow_dropped = dropped;
+            self.error = Some(format!(
+                "notice subscriptions dropped {dropped} descriptors over the {MAX_NOTICE_SUBSCRIPTIONS} connection limit"
+            ));
+        } else {
+            self.notice_overflow_dropped = 0;
+        }
+        let desired_keys: BTreeSet<NoticeSubscriptionKey> = desired
+            .iter()
+            .map(|entry| {
+                (
+                    entry.descriptor.owner.clone(),
+                    entry.descriptor.name.clone(),
+                )
+            })
+            .collect();
+
+        let stale: Vec<NoticeSubscriptionKey> = self
+            .notice_subscriptions
+            .keys()
+            .filter(|key| !desired_keys.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.unsubscribe_notice_entry(&key);
+        }
+
+        for entry in desired {
+            let key = (
+                entry.descriptor.owner.clone(),
+                entry.descriptor.name.clone(),
+            );
+            match self.notice_subscriptions.get(&key) {
+                Some(current) if current.subject != entry.subject => {
+                    self.unsubscribe_notice_entry(&key);
+                    self.subscribe_notice_entry(entry);
+                }
+                Some(_) => {
+                    if let Some(current) = self.notice_subscriptions.get_mut(&key) {
+                        current.descriptor = entry.descriptor;
+                    }
+                }
+                None => self.subscribe_notice_entry(entry),
+            }
+        }
+    }
+
+    fn subscribe_notice_entry(&mut self, mut entry: NoticeSubscriptionEntry) {
+        let subscription_id = format!(
+            "btui-events-{}-{}",
+            short_suffix(),
+            entry.descriptor.name.replace('.', "-")
+        );
+        let key = (
+            entry.descriptor.owner.clone(),
+            entry.descriptor.name.clone(),
+        );
+        entry.state = EventSubscriptionState::Candidate(subscription_id.clone());
+        self.notice_subscription_by_id
+            .insert(subscription_id.clone(), key.clone());
+        self.notice_subscriptions.insert(key.clone(), entry.clone());
         let request = DaemonRequest::SubscribeEvents {
             subscription_id: subscription_id.clone(),
-            owner: QUESTION_OPENED_OWNER.to_string(),
-            name: QUESTION_OPENED_NAME.to_string(),
-            subjects: Vec::new(),
+            owner: entry.descriptor.owner.clone(),
+            name: entry.descriptor.name.clone(),
+            subjects: vec![entry.subject.clone()],
         };
         #[cfg(test)]
         self.record_request(&request);
+        #[cfg(test)]
+        if self.notice_subscriptions_local {
+            if let Some(current) = self.notice_subscriptions.get_mut(&key) {
+                current.state = EventSubscriptionState::Active(subscription_id);
+            }
+            self.apply_pending_mux_frames();
+            return;
+        }
         match self.request(request) {
             Ok(response) if response.kind == DaemonResponseKind::EventSubscribed => {
-                self.event_subscription = EventSubscriptionState::Active(subscription_id);
+                if let Some(current) = self.notice_subscriptions.get_mut(&key)
+                    && current.state.candidate_id() == Some(subscription_id.as_str())
+                {
+                    current.state = EventSubscriptionState::Active(subscription_id);
+                }
                 self.apply_pending_mux_frames();
             }
             Ok(response) => {
@@ -4008,9 +4100,43 @@ impl TuiApp {
         }
     }
 
+    fn unsubscribe_notice_entry(&mut self, key: &NoticeSubscriptionKey) {
+        let Some(entry) = self.notice_subscriptions.remove(key) else {
+            return;
+        };
+        let subscription_id = match &entry.state {
+            EventSubscriptionState::Idle => None,
+            EventSubscriptionState::Candidate(id) | EventSubscriptionState::Active(id) => {
+                Some(id.clone())
+            }
+        };
+        if let Some(subscription_id) = subscription_id {
+            self.notice_subscription_by_id.remove(&subscription_id);
+            if let Some(client) = self.client.as_mut() {
+                client.drop_event_frames_for(&subscription_id);
+            }
+            if !matches!(entry.state, EventSubscriptionState::Idle) {
+                let request = DaemonRequest::UnsubscribeEvents {
+                    subscription_id: subscription_id.clone(),
+                };
+                #[cfg(test)]
+                self.record_request(&request);
+                #[cfg(test)]
+                if self.notice_subscriptions_local {
+                    return;
+                }
+                let _ = self.request(request);
+            }
+        }
+    }
+
     fn reject_event_subscription_candidate(&mut self, subscription_id: &str, message: String) {
-        if self.event_subscription.candidate_id() == Some(subscription_id) {
-            self.event_subscription = EventSubscriptionState::Idle;
+        if let Some(key) = self.notice_subscription_by_id.get(subscription_id).cloned()
+            && let Some(entry) = self.notice_subscriptions.get_mut(&key)
+            && entry.state.candidate_id() == Some(subscription_id)
+        {
+            entry.state = EventSubscriptionState::Idle;
+            self.notice_subscription_by_id.remove(subscription_id);
         }
         if let Some(client) = self.client.as_mut() {
             client.drop_event_frames_for(subscription_id);
@@ -4019,9 +4145,10 @@ impl TuiApp {
     }
 
     fn clear_event_subscription_state(&mut self) {
-        self.event_subscription = EventSubscriptionState::Idle;
+        self.notice_subscriptions.clear();
+        self.notice_subscription_by_id.clear();
+        self.notice_overflow_dropped = 0;
         self.transient_notice = None;
-        self.ambiguous_workflow_context = false;
     }
 
     fn expire_transient_notice(&mut self) {
@@ -4034,6 +4161,16 @@ impl TuiApp {
         }
     }
 
+    fn active_notice_entry(&self, subscription_id: &str) -> Option<&NoticeSubscriptionEntry> {
+        let key = self.notice_subscription_by_id.get(subscription_id)?;
+        let entry = self.notice_subscriptions.get(key)?;
+        if entry.state.active_id() == Some(subscription_id) {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
     fn handle_package_event(
         &mut self,
         subscription_id: String,
@@ -4041,111 +4178,37 @@ impl TuiApp {
         name: String,
         payload: Value,
     ) {
-        if self.event_subscription.active_id() != Some(subscription_id.as_str()) {
-            return;
-        }
-        if owner != QUESTION_OPENED_OWNER || name != QUESTION_OPENED_NAME {
-            return;
-        }
-        let Some(notice) = payload.get("notice").and_then(Value::as_str) else {
-            self.error = Some("question.opened payload omitted notice".to_string());
+        let Some(entry) = self.active_notice_entry(&subscription_id) else {
             return;
         };
-        let question_id = payload
-            .get("question_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let kind = payload
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if !self.package_event_matches_active_run(payload.get("run_id").and_then(Value::as_str)) {
+        if entry.descriptor.owner != owner || entry.descriptor.name != name {
             return;
         }
-        self.transient_notice = Some(TransientNotice {
-            text: notice.to_string(),
-            question_id,
-            kind,
-            deadline: Instant::now() + TRANSIENT_NOTICE_TTL,
-        });
+        let text_pointer = entry.descriptor.text_pointer.clone();
+        let ttl_ms = entry.descriptor.ttl_ms;
+        match resolve_notice_text(&payload, &text_pointer) {
+            Ok(text) => {
+                self.transient_notice = Some(TransientNotice {
+                    text: text.to_string(),
+                    deadline: Instant::now() + Duration::from_millis(u64::from(ttl_ms)),
+                });
+            }
+            Err(error) => {
+                self.transient_notice = None;
+                self.error = Some(error.to_string());
+            }
+        }
     }
 
     fn handle_event_gap(&mut self, subscription_id: String, owner: String, name: String) {
-        if self.event_subscription.active_id() != Some(subscription_id.as_str()) {
+        let Some(entry) = self.active_notice_entry(&subscription_id) else {
             return;
-        }
-        if owner != QUESTION_OPENED_OWNER || name != QUESTION_OPENED_NAME {
+        };
+        if entry.descriptor.owner != owner || entry.descriptor.name != name {
             return;
         }
         self.transient_notice = None;
-        self.error =
-            Some("question.opened event gap; durable question state is unchanged".to_string());
-    }
-
-    fn package_event_matches_active_run(&mut self, payload_run_id: Option<&str>) -> bool {
-        match self.active_workflow_run() {
-            ActiveWorkflowRun::Run(run_id) => payload_run_id == Some(run_id.as_str()),
-            ActiveWorkflowRun::None => false,
-            ActiveWorkflowRun::Ambiguous => {
-                if !self.ambiguous_workflow_context {
-                    self.ambiguous_workflow_context = true;
-                    self.error = Some(
-                        "workflow context is ambiguous for the focused session; suppressing notices"
-                            .to_string(),
-                    );
-                }
-                false
-            }
-        }
-    }
-
-    fn active_workflow_run(&self) -> ActiveWorkflowRun {
-        let Some(session_id) = self.selected_session.as_deref() else {
-            return ActiveWorkflowRun::None;
-        };
-        let Some(family) = self
-            .entity_options
-            .family("project-pipelines.session_request")
-        else {
-            return ActiveWorkflowRun::None;
-        };
-        let mut run_ids = BTreeSet::new();
-        for record in family.records.values() {
-            if record.get("session_id").and_then(Value::as_str) != Some(session_id) {
-                continue;
-            }
-            if let Some(run_id) = record
-                .get("run_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
-                run_ids.insert(run_id.to_string());
-            }
-        }
-        match run_ids.len() {
-            0 => ActiveWorkflowRun::None,
-            1 => ActiveWorkflowRun::Run(run_ids.into_iter().next().expect("one run")),
-            _ => ActiveWorkflowRun::Ambiguous,
-        }
-    }
-
-    fn open_question_count_for_active_run(&self) -> Option<usize> {
-        let ActiveWorkflowRun::Run(run_id) = self.active_workflow_run() else {
-            return None;
-        };
-        let family = self.entity_options.family("project-pipelines.question")?;
-        Some(
-            family
-                .records
-                .values()
-                .filter(|record| {
-                    record.get("run_id").and_then(Value::as_str) == Some(run_id.as_str())
-                        && record.get("status").and_then(Value::as_str) == Some("open")
-                })
-                .count(),
-        )
+        self.error = Some("package event gap; durable package state is unchanged".to_string());
     }
 
     fn transient_notice_band(&self) -> Option<UiNode> {
@@ -4157,18 +4220,6 @@ impl TuiApp {
             UiNodeKind::Text,
             "workspace-transient-notice",
             json!({ "text": notice.text }),
-        ))
-    }
-
-    fn question_attention_band(&self) -> Option<UiNode> {
-        let count = self.open_question_count_for_active_run()?;
-        if count == 0 {
-            return None;
-        }
-        Some(node(
-            UiNodeKind::Text,
-            "workspace-question-attention",
-            json!({ "text": format!("Open questions: {count}") }),
         ))
     }
 
@@ -4611,6 +4662,12 @@ impl TuiApp {
                     name: name.clone(),
                     subjects: subjects.clone(),
                 }),
+            DaemonRequest::UnsubscribeEvents { subscription_id } => {
+                self.observed_requests
+                    .push(ObservedRequest::UnsubscribeEvents {
+                        subscription_id: subscription_id.clone(),
+                    })
+            }
             _ => {}
         }
     }
@@ -4717,6 +4774,7 @@ impl TuiApp {
             DaemonResponseKind::Packages | DaemonResponseKind::PackageDecision
         ) {
             self.packages = response.packages;
+            self.sync_notice_subscriptions();
         }
         if matches!(response.kind, DaemonResponseKind::Apps) {
             self.apps = response.apps;
@@ -4753,8 +4811,7 @@ impl TuiApp {
                         self.plugin_action_result = None;
                         self.pending_plugin_request = None;
                         // Surface replacement drops prior surface-demanded generations.
-                        // Workflow-context families stay always-on.
-                        self.drop_non_workflow_entity_options_subscriptions();
+                        self.drop_entity_options_subscriptions();
                         self.entity_options_invalid_fields.clear();
                     }
                     self.plugin_surface = Some(surface);
@@ -5471,9 +5528,6 @@ impl TuiApp {
         root.children = self.status_summary_children();
         if let Some(alert) = self.connection_alert() {
             root.children.push(child(alert));
-        }
-        if let Some(attention) = self.question_attention_band() {
-            root.children.push(child(attention));
         }
         if let Some(notice) = self.transient_notice_band() {
             root.children.push(child(notice));
@@ -7065,6 +7119,9 @@ enum ObservedRequest {
         owner: String,
         name: String,
         subjects: Vec<String>,
+    },
+    UnsubscribeEvents {
+        subscription_id: String,
     },
 }
 
@@ -11300,10 +11357,6 @@ mod tests {
         UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
     };
     use std::path::Path;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
 
     #[derive(Clone, Copy, Debug)]
     enum SessionEntityExpectation<'a> {
@@ -21948,7 +22001,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub b3b54f1 and Core 7eafa47. Export
+        // Build matching binaries from Hub baeb04d and Core 7eafa47. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -21967,7 +22020,7 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "b3b54f1f87e29867da4eb371e9b7f3b18160996a".to_string());
+            .unwrap_or_else(|_| "baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
             .unwrap_or_else(|_| "7eafa470a18025895995bbedc20d34b58106a03b".to_string());
         let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
@@ -26178,6 +26231,7 @@ mod tests {
             stale_sessions: Vec::new(),
             lifecycle_counters: botster_hub_client::DaemonLifecycleCounters::default(),
             live_attach_occupancy: Vec::new(),
+            observability: botster_hub_client::DaemonObservabilityCounters::default(),
             diagnostics: Vec::new(),
         });
         response
@@ -26829,6 +26883,7 @@ mod tests {
             state: state.to_string(),
             requested_capabilities,
             surfaces: Vec::new(),
+            notice_reactions: Vec::new(),
             routes: Vec::new(),
             runnable_entrypoints: Vec::new(),
             configuration: botster_hub_client::DaemonPackageConfiguration::default(),
@@ -27768,8 +27823,8 @@ mod tests {
     fn pinned_session_plugin_binding_fixture_is_conformance_40() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 44,
-            "hub-test-support pin must publish fixture revision 44"
+            scenario.conformance_fixture_revision, 46,
+            "hub-test-support pin must publish fixture revision 46"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -28738,127 +28793,120 @@ exit 0
         peer
     }
 
-    fn seed_session_request_row(
-        app: &mut TuiApp,
-        id: &str,
-        session_id: &str,
-        run_id: &str,
-        step_id: &str,
-        ticket_id: &str,
-        seq: u64,
-    ) {
-        if app
-            .entity_options
-            .family("project-pipelines.session_request")
-            .is_none()
-        {
-            app.entity_options
-                .begin_generation("project-pipelines.session_request", "sr-gen".to_string());
+    const MATRIX_OWNER: &str = "botster.plugin-contract-matrix";
+    const MATRIX_EVENT: &str = "contract.ready";
+
+    fn matrix_descriptor(ttl_ms: u32) -> PackageNoticeReactionDescriptor {
+        PackageNoticeReactionDescriptor {
+            owner: MATRIX_OWNER.to_string(),
+            name: MATRIX_EVENT.to_string(),
+            subject_scope: botster_ui_contract::PackageNoticeSubjectScope::Session,
+            text_pointer: "/notice".to_string(),
+            ttl_ms,
+            severity: botster_ui_contract::PackageNoticeSeverity::Info,
         }
-        let frame = if seq == 1 {
-            DaemonEntityFrame::Snapshot {
-                subscription_id: "sr-gen".to_string(),
-                entity_type: "project-pipelines.session_request".to_string(),
-                snapshot_seq: 1,
-                items: vec![json!({
-                    "id": id,
-                    "session_id": session_id,
-                    "run_id": run_id,
-                    "step_id": step_id,
-                    "ticket_id": ticket_id,
-                    "status": "active"
-                })],
-                resync_reason: None,
-            }
-        } else {
-            DaemonEntityFrame::Upsert {
-                subscription_id: "sr-gen".to_string(),
-                entity_type: "project-pipelines.session_request".to_string(),
-                snapshot_seq: seq,
-                id: id.to_string(),
-                entity: json!({
-                    "id": id,
-                    "session_id": session_id,
-                    "run_id": run_id,
-                    "step_id": step_id,
-                    "ticket_id": ticket_id,
-                    "status": "active"
-                }),
-            }
-        };
-        app.entity_options
-            .apply_daemon_frame(frame)
-            .expect("session_request row applies");
     }
 
-    fn seed_question_row(app: &mut TuiApp, id: &str, run_id: &str, status: &str, seq: u64) {
-        if app
-            .entity_options
-            .family("project-pipelines.question")
-            .is_none()
-        {
-            app.entity_options
-                .begin_generation("project-pipelines.question", "q-gen".to_string());
-        }
-        let frame = if seq == 1 {
-            DaemonEntityFrame::Snapshot {
-                subscription_id: "q-gen".to_string(),
-                entity_type: "project-pipelines.question".to_string(),
-                snapshot_seq: 1,
-                items: vec![json!({
-                    "id": id,
-                    "run_id": run_id,
-                    "status": status,
-                    "kind": "human"
-                })],
-                resync_reason: None,
-            }
-        } else {
-            DaemonEntityFrame::Upsert {
-                subscription_id: "q-gen".to_string(),
-                entity_type: "project-pipelines.question".to_string(),
-                snapshot_seq: seq,
-                id: id.to_string(),
-                entity: json!({
-                    "id": id,
-                    "run_id": run_id,
-                    "status": status,
-                    "kind": "human"
-                }),
-            }
-        };
-        app.entity_options
-            .apply_daemon_frame(frame)
-            .expect("question row applies");
+    fn matrix_package(ttl_ms: u32) -> DaemonPackage {
+        let mut pkg = package(MATRIX_OWNER, "1.0.0", "plugin", "enabled", Vec::new(), true);
+        pkg.notice_reactions = vec![matrix_descriptor(ttl_ms)];
+        pkg
     }
 
-    fn question_opened_event(
+    fn notice_package(owner: &str, name: &str, ttl_ms: u32) -> DaemonPackage {
+        let mut pkg = package(owner, "1.0.0", "plugin", "enabled", Vec::new(), true);
+        pkg.notice_reactions = vec![PackageNoticeReactionDescriptor {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            subject_scope: botster_ui_contract::PackageNoticeSubjectScope::Session,
+            text_pointer: "/notice".to_string(),
+            ttl_ms,
+            severity: botster_ui_contract::PackageNoticeSeverity::Info,
+        }];
+        pkg
+    }
+
+    fn activate_notice(app: &mut TuiApp, subscription_id: &str, ttl_ms: u32, subject: &str) {
+        let descriptor = matrix_descriptor(ttl_ms);
+        let key = (descriptor.owner.clone(), descriptor.name.clone());
+        app.notice_subscription_by_id
+            .insert(subscription_id.to_string(), key.clone());
+        app.notice_subscriptions.insert(
+            key,
+            NoticeSubscriptionEntry {
+                descriptor,
+                subject: subject.to_string(),
+                state: EventSubscriptionState::Active(subscription_id.to_string()),
+            },
+        );
+    }
+
+    fn apply_json_mux(app: &mut TuiApp, line: &str) {
+        let frames = decode_mux_line(line.as_bytes()).expect("decode mux line");
+        app.apply_mux_frames(frames);
+    }
+
+    fn package_event_line(
         subscription_id: &str,
-        run_id: Option<&str>,
-        notice: Option<&str>,
-        question_id: &str,
-    ) -> DaemonEvent {
-        let mut payload = serde_json::Map::new();
-        payload.insert("question_id".to_string(), json!(question_id));
-        payload.insert("kind".to_string(), json!("human"));
-        if let Some(notice) = notice {
-            payload.insert("notice".to_string(), json!(notice));
-        }
-        if let Some(run_id) = run_id {
-            payload.insert("run_id".to_string(), json!(run_id));
-        }
-        DaemonEvent::PackageEvent {
-            subscription_id: subscription_id.to_string(),
-            owner: QUESTION_OPENED_OWNER.to_string(),
-            name: QUESTION_OPENED_NAME.to_string(),
-            payload: Value::Object(payload),
-        }
+        owner: &str,
+        name: &str,
+        payload: Value,
+    ) -> String {
+        serde_json::to_string(&json!({
+            "type": "package_event",
+            "subscription_id": subscription_id,
+            "owner": owner,
+            "name": name,
+            "payload": payload,
+        }))
+        .expect("serialize package_event")
+    }
+
+    fn event_gap_line(subscription_id: &str, owner: &str, name: &str) -> String {
+        serde_json::to_string(&json!({
+            "type": "event_gap",
+            "subscription_id": subscription_id,
+            "owner": owner,
+            "name": name,
+        }))
+        .expect("serialize event_gap")
     }
 
     fn rendered_workspace(app: &TuiApp) -> String {
         render_app_to_lines(app, 140, 42, &RenderState::default())
             .0
             .join("\n")
+    }
+
+    fn entity_options_picker_surface() -> DaemonPluginSurface {
+        let body = ui_node(json!({
+            "type": "form",
+            "id": "entity-options-form",
+            "props": {
+                "action": { "id": "entity-options.submit" },
+                "submit_label": "Submit"
+            },
+            "children": [{
+                "type": "select",
+                "id": "entity-options-select",
+                "props": {
+                    "name": "option",
+                    "label": "Option",
+                    "options_source": {
+                        "$kind": "entity_options",
+                        "source": "/entity-options-reactive.item",
+                        "value_field": "value",
+                        "display_fields": ["label"],
+                        "order": ["value"]
+                    }
+                }
+            }]
+        }));
+        canonical_surface(
+            "entity-options-reactive",
+            "entity-options-reactive.picker",
+            body,
+        )
     }
 
     #[test]
@@ -28881,32 +28929,18 @@ exit 0
     }
 
     #[test]
-    fn package_event_and_event_gap_reach_apply_mux_event() {
+    fn package_event_and_event_gap_reach_apply_through_decode_boundary() {
         let mut app = workspace_fixture();
-        app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
+        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
+        apply_json_mux(
             &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "Need a human answer" }),
+            ),
         );
-        let event = question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("Need a human answer"),
-            "question_1",
-        );
-        let value = serde_json::to_value(&event).expect("serialize event");
-        let frame = parse_unix_mux_value(value).expect("parse package_event");
-        assert!(matches!(
-            frame,
-            DaemonUnixMuxFrame::Event(DaemonEvent::PackageEvent { .. })
-        ));
-        app.apply_mux_frames(vec![frame]);
         assert_eq!(
             app.transient_notice
                 .as_ref()
@@ -28914,14 +28948,10 @@ exit 0
             Some("Need a human answer")
         );
 
-        let gap = DaemonEvent::EventGap {
-            subscription_id: "btui-events-1".to_string(),
-            owner: QUESTION_OPENED_OWNER.to_string(),
-            name: QUESTION_OPENED_NAME.to_string(),
-        };
-        let gap_value = serde_json::to_value(&gap).expect("serialize gap");
-        let gap_frame = parse_unix_mux_value(gap_value).expect("parse event_gap");
-        app.apply_mux_frames(vec![gap_frame]);
+        apply_json_mux(
+            &mut app,
+            &event_gap_line("btui-events-1", MATRIX_OWNER, MATRIX_EVENT),
+        );
         assert!(app.transient_notice.is_none());
         assert!(
             app.error
@@ -28934,25 +28964,19 @@ exit 0
     fn mux_apply_drains_at_most_32_frames_and_retains_surplus_in_order() {
         let mut app = workspace_fixture();
         let _peer = install_dummy_hub_client(&mut app);
-        app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
-            &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
-        );
+        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
         let client = app.client.as_mut().expect("client");
         for index in 0..100 {
-            client.enqueue_pending_mux_frame(DaemonUnixMuxFrame::Event(question_opened_event(
+            let line = package_event_line(
                 "btui-events-1",
-                Some("run-1"),
-                Some(&format!("notice-{index}")),
-                &format!("question_{index}"),
-            )));
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": format!("notice-{index}") }),
+            );
+            let frames = decode_mux_line(line.as_bytes()).expect("decode");
+            for frame in frames {
+                client.enqueue_pending_mux_frame(frame);
+            }
         }
         assert_eq!(
             app.client.as_ref().map(HubConnection::pending_mux_len),
@@ -28993,158 +29017,64 @@ exit 0
     }
 
     #[test]
-    fn workflow_filter_is_run_matching_only_and_fail_closed() {
+    fn resolve_notice_text_errors_suppress_the_visible_notice() {
         let mut app = workspace_fixture();
-        app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
+        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
+        apply_json_mux(
             &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
-        );
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("match"),
-            "question_match",
-        ));
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("match")
-        );
-        app.transient_notice = None;
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-other"),
-            Some("mismatch"),
-            "question_mismatch",
-        ));
-        assert!(app.transient_notice.is_none());
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            None,
-            Some("missing-run"),
-            "question_missing",
-        ));
-        assert!(app.transient_notice.is_none());
-
-        let mut unmatched = workspace_fixture();
-        unmatched.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        unmatched.selected_session = Some("session-alpha".to_string());
-        unmatched.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("no-row"),
-            "question_norow",
-        ));
-        assert!(unmatched.transient_notice.is_none());
-
-        let mut unfocused = workspace_fixture();
-        unfocused.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        unfocused.selected_session = None;
-        seed_session_request_row(
-            &mut unfocused,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
-        );
-        unfocused.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("unfocused"),
-            "question_unfocused",
-        ));
-        assert!(unfocused.transient_notice.is_none());
-    }
-
-    #[test]
-    fn agreeing_session_request_rows_resolve_without_order() {
-        for ids in [["sr-a", "sr-b"], ["sr-b", "sr-a"]] {
-            let mut app = workspace_fixture();
-            app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-            app.selected_session = Some("session-alpha".to_string());
-            seed_session_request_row(
-                &mut app,
-                ids[0],
-                "session-alpha",
-                "run-1",
-                "step-1",
-                "ticket-1",
-                1,
-            );
-            seed_session_request_row(
-                &mut app,
-                ids[1],
-                "session-alpha",
-                "run-1",
-                "step-2",
-                "ticket-1",
-                2,
-            );
-            app.apply_mux_event(question_opened_event(
+            &package_event_line(
                 "btui-events-1",
-                Some("run-1"),
-                Some("agree"),
-                "question_agree",
-            ));
-            assert_eq!(
-                app.transient_notice
-                    .as_ref()
-                    .map(|notice| notice.text.as_str()),
-                Some("agree"),
-                "insertion order {ids:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn disagreeing_session_request_rows_fail_closed_without_order() {
-        for ids in [["sr-a", "sr-b"], ["sr-b", "sr-a"]] {
-            let mut app = workspace_fixture();
-            app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-            app.selected_session = Some("session-alpha".to_string());
-            seed_session_request_row(
-                &mut app,
-                ids[0],
-                "session-alpha",
-                "run-1",
-                "step-1",
-                "ticket-1",
-                1,
-            );
-            seed_session_request_row(
-                &mut app,
-                ids[1],
-                "session-alpha",
-                "run-2",
-                "step-1",
-                "ticket-1",
-                2,
-            );
-            app.apply_mux_event(question_opened_event(
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "ok" }),
+            ),
+        );
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
                 "btui-events-1",
-                Some("run-1"),
-                Some("ambiguous"),
-                "question_ambiguous",
-            ));
-            assert!(app.transient_notice.is_none(), "insertion order {ids:?}");
-            assert!(
-                app.error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("ambiguous")),
-                "{:?}",
-                app.error
-            );
-        }
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "other": "missing" }),
+            ),
+        );
+        assert!(app.transient_notice.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("missing"))
+        );
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": 12 }),
+            ),
+        );
+        assert!(app.transient_notice.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("not a string"))
+        );
+        let oversized = "a".repeat(botster_ui_contract::NOTICE_TEXT_MAX_BYTES + 1);
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": oversized }),
+            ),
+        );
+        assert!(app.transient_notice.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("maximum"))
+        );
     }
 
     #[test]
@@ -29152,15 +29082,10 @@ exit 0
         let mut app = workspace_fixture();
         let _peer = install_dummy_hub_client(&mut app);
         app.entity_options_forced_subscribe_error = Some("entity subscription was not accepted");
-        app.sync_entity_options_subscriptions();
+        app.apply_response(plugin_surface_response(entity_options_picker_surface()));
         let first = app.entity_options_subscribe_attempts.clone();
-        assert_eq!(first.get("project-pipelines.question").copied(), Some(1));
-        assert_eq!(
-            first.get("project-pipelines.session_request").copied(),
-            Some(1)
-        );
+        assert_eq!(first.get("entity-options-reactive.item").copied(), Some(1));
         assert!(app.transient_notice.is_none());
-        assert!(app.question_attention_band().is_none());
         for _ in 0..20 {
             app.poll_hub();
         }
@@ -29173,23 +29098,23 @@ exit 0
         app.heal_entity_options_subscriptions();
         assert!(
             app.entity_options_subscriptions
-                .contains_key("project-pipelines.question")
+                .contains_key("entity-options-reactive.item")
         );
         assert!(app.entity_options_retry.is_empty());
 
         let question_id = app
             .entity_options
-            .family("project-pipelines.question")
+            .family("entity-options-reactive.item")
             .and_then(|family| family.subscription_id.clone())
-            .expect("question generation");
+            .expect("item generation");
         app.entity_options_forced_subscribe_error = Some("entity subscription was not accepted");
         app.entity_options_frame_injectors
-            .get("project-pipelines.question")
+            .get("entity-options-reactive.item")
             .expect("injector")
             .send(SessionSubscriptionMessage::Frame(
                 DaemonEntityFrame::Error {
                     subscription_id: question_id,
-                    entity_type: "project-pipelines.question".to_string(),
+                    entity_type: "entity-options-reactive.item".to_string(),
                     code: "provider_failed".to_string(),
                     message: "boom".to_string(),
                 },
@@ -29197,13 +29122,13 @@ exit 0
             .expect("inject error");
         let before = app
             .entity_options_subscribe_attempts
-            .get("project-pipelines.question")
+            .get("entity-options-reactive.item")
             .copied()
             .unwrap_or(0);
         let _ = app.drain_entity_options_subscriptions();
         let after = app
             .entity_options_subscribe_attempts
-            .get("project-pipelines.question")
+            .get("entity-options-reactive.item")
             .copied()
             .unwrap_or(0);
         assert!(
@@ -29212,62 +29137,40 @@ exit 0
         );
         assert!(
             app.entity_options_retry
-                .contains_key("project-pipelines.question")
+                .contains_key("entity-options-reactive.item")
         );
     }
 
     #[test]
-    fn transient_notice_latest_wins_and_ttl_boundary_is_clock_controlled() {
+    fn transient_notice_latest_wins_and_ttl_follows_descriptor() {
         let mut app = workspace_fixture();
-        app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
+        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
+        apply_json_mux(
             &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "first" }),
+            ),
         );
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("first"),
-            "question_1",
-        ));
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("second"),
-            "question_2",
-        ));
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "second" }),
+            ),
+        );
         assert_eq!(
             app.transient_notice
                 .as_ref()
                 .map(|notice| notice.text.as_str()),
             Some("second")
         );
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            None,
-            "question_3",
-        ));
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("second")
-        );
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("omitted notice"))
-        );
-
         let notice = app.transient_notice.as_mut().expect("notice");
-        notice.deadline = Instant::now() + TRANSIENT_NOTICE_TTL;
+        notice.deadline = Instant::now() + Duration::from_secs(5);
         app.poll_hub();
         assert!(rendered_workspace(&app).contains("second"));
         let notice = app.transient_notice.as_mut().expect("notice");
@@ -29277,8 +29180,6 @@ exit 0
         assert!(!rendered_workspace(&app).contains("second"));
         app.transient_notice = Some(TransientNotice {
             text: "stale".to_string(),
-            question_id: "question_old".to_string(),
-            kind: "human".to_string(),
             deadline: Instant::now() - Duration::from_millis(1),
         });
         app.poll_hub();
@@ -29290,28 +29191,33 @@ exit 0
     fn event_subscribe_response_race_promotes_before_parked_apply() {
         let mut app = workspace_fixture();
         let _peer = install_dummy_hub_client(&mut app);
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
-            &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
+        activate_notice(&mut app, "cand-1", 5_000, "session-alpha");
+        if let Some(entry) = app
+            .notice_subscriptions
+            .get_mut(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
+        {
+            entry.state = EventSubscriptionState::Candidate("cand-1".to_string());
+        }
+        let line = package_event_line(
+            "cand-1",
+            MATRIX_OWNER,
+            MATRIX_EVENT,
+            json!({ "notice": "parked" }),
         );
-        app.event_subscription = EventSubscriptionState::Candidate("cand-1".to_string());
-        app.client
-            .as_mut()
-            .expect("client")
-            .enqueue_pending_mux_frame(DaemonUnixMuxFrame::Event(question_opened_event(
-                "cand-1",
-                Some("run-1"),
-                Some("parked"),
-                "question_parked",
-            )));
+        let frames = decode_mux_line(line.as_bytes()).expect("decode");
+        for frame in frames {
+            app.client
+                .as_mut()
+                .expect("client")
+                .enqueue_pending_mux_frame(frame);
+        }
         assert!(app.transient_notice.is_none());
-        app.event_subscription = EventSubscriptionState::Active("cand-1".to_string());
+        if let Some(entry) = app
+            .notice_subscriptions
+            .get_mut(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
+        {
+            entry.state = EventSubscriptionState::Active("cand-1".to_string());
+        }
         app.apply_pending_mux_frames();
         assert_eq!(
             app.transient_notice
@@ -29322,17 +29228,27 @@ exit 0
 
         let mut rejected = workspace_fixture();
         let _peer = install_dummy_hub_client(&mut rejected);
-        rejected.event_subscription = EventSubscriptionState::Candidate("cand-2".to_string());
-        rejected
-            .client
-            .as_mut()
-            .expect("client")
-            .enqueue_pending_mux_frame(DaemonUnixMuxFrame::Event(question_opened_event(
-                "cand-2",
-                Some("run-1"),
-                Some("dropped"),
-                "question_dropped",
-            )));
+        activate_notice(&mut rejected, "cand-2", 5_000, "session-alpha");
+        if let Some(entry) = rejected
+            .notice_subscriptions
+            .get_mut(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
+        {
+            entry.state = EventSubscriptionState::Candidate("cand-2".to_string());
+        }
+        let line = package_event_line(
+            "cand-2",
+            MATRIX_OWNER,
+            MATRIX_EVENT,
+            json!({ "notice": "dropped" }),
+        );
+        let frames = decode_mux_line(line.as_bytes()).expect("decode");
+        for frame in frames {
+            rejected
+                .client
+                .as_mut()
+                .expect("client")
+                .enqueue_pending_mux_frame(frame);
+        }
         rejected.reject_event_subscription_candidate(
             "cand-2",
             "event subscription was not accepted".to_string(),
@@ -29348,45 +29264,41 @@ exit 0
             rejected.client.as_ref().map(HubConnection::pending_mux_len),
             Some(0)
         );
-        assert_eq!(rejected.event_subscription, EventSubscriptionState::Idle);
+        let rejected_entry = rejected
+            .notice_subscriptions
+            .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()));
+        assert!(rejected_entry.is_some_and(|entry| entry.state == EventSubscriptionState::Idle));
     }
 
     #[test]
     fn event_gap_clears_notice_without_durable_or_request_side_effects() {
         let mut app = workspace_fixture();
-        app.event_subscription = EventSubscriptionState::Active("btui-events-1".to_string());
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
+        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
+        apply_json_mux(
             &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "live" }),
+            ),
         );
-        seed_question_row(&mut app, "question_1", "run-1", "open", 1);
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("live"),
-            "question_1",
-        ));
         app.observed_requests.clear();
-        app.apply_mux_event(DaemonEvent::EventGap {
-            subscription_id: "btui-events-1".to_string(),
-            owner: QUESTION_OPENED_OWNER.to_string(),
-            name: QUESTION_OPENED_NAME.to_string(),
-        });
+        apply_json_mux(
+            &mut app,
+            &event_gap_line("btui-events-1", MATRIX_OWNER, MATRIX_EVENT),
+        );
         assert!(app.transient_notice.is_none());
         assert!(app.observed_requests.is_empty());
-        assert_eq!(app.open_question_count_for_active_run(), Some(1));
-        app.apply_mux_event(question_opened_event(
-            "btui-events-1",
-            Some("run-1"),
-            Some("later"),
-            "question_2",
-        ));
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "btui-events-1",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "later" }),
+            ),
+        );
         assert_eq!(
             app.transient_notice
                 .as_ref()
@@ -29398,246 +29310,171 @@ exit 0
     #[test]
     fn foreign_and_stale_event_ids_drop_silently() {
         let mut app = workspace_fixture();
-        app.event_subscription = EventSubscriptionState::Active("active".to_string());
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
+        activate_notice(&mut app, "active", 5_000, "session-alpha");
+        apply_json_mux(
             &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
+            &package_event_line(
+                "cleared",
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "stale" }),
+            ),
         );
-        app.apply_mux_event(question_opened_event(
-            "cleared",
-            Some("run-1"),
-            Some("stale"),
-            "question_stale",
-        ));
-        app.apply_mux_event(DaemonEvent::PackageEvent {
-            subscription_id: "active".to_string(),
-            owner: "other-owner".to_string(),
-            name: QUESTION_OPENED_NAME.to_string(),
-            payload: json!({"notice": "foreign-owner", "run_id": "run-1", "question_id": "q"}),
-        });
-        app.apply_mux_event(DaemonEvent::PackageEvent {
-            subscription_id: "active".to_string(),
-            owner: QUESTION_OPENED_OWNER.to_string(),
-            name: "other.event".to_string(),
-            payload: json!({"notice": "foreign-name", "run_id": "run-1", "question_id": "q"}),
-        });
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "active",
+                "other-owner",
+                MATRIX_EVENT,
+                json!({ "notice": "foreign-owner" }),
+            ),
+        );
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                "active",
+                MATRIX_OWNER,
+                "other.event",
+                json!({ "notice": "foreign-name" }),
+            ),
+        );
         assert!(app.transient_notice.is_none());
     }
 
     #[test]
-    fn workflow_context_families_subscribe_without_a_plugin_surface() {
+    fn entity_options_do_not_subscribe_without_a_plugin_surface() {
         let mut app = workspace_fixture();
         let _peer = install_dummy_hub_client(&mut app);
         app.entity_options_local_pumps = true;
         app.plugin_surface = None;
         app.sync_entity_options_subscriptions();
+        assert!(app.entity_options_subscriptions.is_empty());
+    }
+
+    #[test]
+    fn notice_sync_subscribes_two_descriptors_and_clears_on_no_focus() {
+        let mut app = workspace_fixture();
+        app.notice_subscriptions_local = true;
+        let _peer = install_dummy_hub_client(&mut app);
+        app.packages = vec![
+            notice_package("owner-a", "alpha.ready", 5_000),
+            notice_package("owner-b", "beta.ready", 4_000),
+        ];
+        app.sync_notice_subscriptions();
+        assert_eq!(app.notice_subscriptions.len(), 2);
+        let ids: BTreeSet<_> = app.notice_subscription_by_id.keys().cloned().collect();
+        assert_eq!(ids.len(), 2);
         assert!(
-            app.entity_options_subscriptions
-                .contains_key("project-pipelines.question")
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::SubscribeEvents { .. }))
+                .count()
+                >= 2
+        );
+        app.set_selected_session(None);
+        assert!(app.notice_subscriptions.is_empty());
+        assert!(app.notice_subscription_by_id.is_empty());
+    }
+
+    #[test]
+    fn notice_sync_resubscribes_on_subject_change_and_keeps_id_for_ttl_only() {
+        let mut app = workspace_fixture();
+        app.notice_subscriptions_local = true;
+        let _peer = install_dummy_hub_client(&mut app);
+        app.packages = vec![matrix_package(5_000)];
+        app.sync_notice_subscriptions();
+        let key = (MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string());
+        let first_id = app
+            .notice_subscriptions
+            .get(&key)
+            .and_then(|entry| entry.state.active_id())
+            .unwrap()
+            .to_string();
+        app.observed_requests.clear();
+        app.set_selected_session(Some("session-beta".to_string()));
+        let second_id = app
+            .notice_subscriptions
+            .get(&key)
+            .and_then(|entry| entry.state.active_id())
+            .unwrap()
+            .to_string();
+        assert_ne!(first_id, second_id);
+        assert!(app.observed_requests.iter().any(|request| matches!(
+            request,
+            ObservedRequest::UnsubscribeEvents { subscription_id } if subscription_id == &first_id
+        )));
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                &first_id,
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "late-a" }),
+            ),
+        );
+        assert!(app.transient_notice.is_none());
+
+        app.observed_requests.clear();
+        app.packages = vec![matrix_package(10_000)];
+        app.sync_notice_subscriptions();
+        let third_id = app
+            .notice_subscriptions
+            .get(&key)
+            .and_then(|entry| entry.state.active_id())
+            .unwrap()
+            .to_string();
+        assert_eq!(third_id, second_id);
+        assert_eq!(
+            app.notice_subscriptions
+                .get(&key)
+                .map(|entry| entry.descriptor.ttl_ms),
+            Some(10_000)
         );
         assert!(
-            app.entity_options_subscriptions
-                .contains_key("project-pipelines.session_request")
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::SubscribeEvents { .. }))
         );
     }
 
     #[test]
-    fn attention_band_counts_open_questions_for_the_active_run() {
+    fn notice_sync_unsubscribes_removed_descriptor_and_caps_at_64() {
         let mut app = workspace_fixture();
-        app.selected_session = Some("session-alpha".to_string());
-        seed_session_request_row(
-            &mut app,
-            "sr-1",
-            "session-alpha",
-            "run-1",
-            "step-1",
-            "ticket-1",
-            1,
-        );
-        seed_question_row(&mut app, "question_1", "run-1", "open", 1);
-        seed_question_row(&mut app, "question_2", "run-1", "open", 2);
-        seed_question_row(&mut app, "question_3", "run-2", "open", 3);
-        seed_question_row(&mut app, "question_4", "run-1", "answered", 4);
-        assert_eq!(app.open_question_count_for_active_run(), Some(2));
-        let rendered = rendered_workspace(&app);
-        assert!(rendered.contains("Open questions: 2"), "{rendered}");
-        assert!(!rendered.contains("question_1"));
-        seed_question_row(&mut app, "question_2", "run-1", "answered", 5);
-        assert_eq!(app.open_question_count_for_active_run(), Some(1));
-        let rendered = rendered_workspace(&app);
-        assert!(rendered.contains("Open questions: 1"), "{rendered}");
-    }
-
-    const PP_MUTATION_PIN: &str = "cd7c2f926fcead78e15e7a9c713ad26dfe883914";
-
-    fn assert_project_pipelines_pin_floor(package_path: &Path) {
-        let status = std::process::Command::new("git")
-            .args(["merge-base", "--is-ancestor", PP_MUTATION_PIN, "HEAD"])
-            .current_dir(package_path)
-            .status()
-            .expect("git merge-base runs");
+        app.notice_subscriptions_local = true;
+        let _peer = install_dummy_hub_client(&mut app);
+        app.packages = vec![
+            notice_package("owner-a", "keep.ready", 5_000),
+            notice_package("owner-b", "drop.ready", 5_000),
+        ];
+        app.sync_notice_subscriptions();
+        assert_eq!(app.notice_subscriptions.len(), 2);
+        app.packages = vec![notice_package("owner-a", "keep.ready", 5_000)];
+        app.sync_notice_subscriptions();
+        assert_eq!(app.notice_subscriptions.len(), 1);
         assert!(
-            status.success(),
-            "BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH must contain {PP_MUTATION_PIN}"
+            app.notice_subscriptions
+                .contains_key(&("owner-a".to_string(), "keep.ready".to_string()))
         );
-    }
 
-    fn json_find_str(value: &Value, key: &str) -> Option<String> {
-        match value {
-            Value::Object(map) => {
-                if let Some(found) = map.get(key).and_then(Value::as_str) {
-                    return Some(found.to_string());
-                }
-                for nested in map.values() {
-                    if let Some(found) = json_find_str(nested, key) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            Value::Array(items) => items.iter().find_map(|item| json_find_str(item, key)),
-            _ => None,
-        }
-    }
-
-    fn plugin_tool_id(response: &DaemonResponse, key: &str) -> Option<String> {
-        json_find_str(&response.plugin_tool_result, key)
-            .or_else(|| json_find_str(&response.plugin_tool_result, "id"))
-    }
-
-    fn live_question_is_open(app: &TuiApp, question_id: &str) -> bool {
-        app.entity_options
-            .family("project-pipelines.question")
-            .and_then(|family| family.records.get(question_id))
-            .and_then(|record| record.get("status"))
-            .and_then(Value::as_str)
-            == Some("open")
-    }
-
-    fn live_session_id_for_run(app: &TuiApp, run_id: &str) -> Option<String> {
-        app.entity_options
-            .family("project-pipelines.session_request")?
-            .records
-            .values()
-            .find_map(|record| {
-                if record.get("run_id").and_then(Value::as_str) != Some(run_id) {
-                    return None;
-                }
-                record
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-    }
-
-    fn set_event_flush_stall(path: &Path, stalled: bool) {
-        if stalled {
-            std::fs::write(path, b"stall").expect("create event flush stall");
-        } else {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    fn live_applied_output(app: &TuiApp) -> String {
-        String::from_utf8_lossy(&app.applied_live_payloads.concat()).into_owned()
-    }
-
-    fn call_plugin_tool(
-        hub: &botster_hub_test_support::IsolatedHub,
-        name: &str,
-        arguments: Value,
-    ) -> DaemonResponse {
-        botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: name.to_string(),
-                arguments,
-            },
-        )
-        .unwrap_or_else(|error| panic!("{name} transport failed: {error}"))
-    }
-
-    fn mux_event_frame_count(app: &TuiApp) -> usize {
-        app.client
-            .as_ref()
-            .map(|client| client.mux_event_frames)
-            .unwrap_or(0)
-    }
-
-    struct LiveQuestionFlood {
-        stop: Arc<AtomicBool>,
-        produced: Arc<AtomicUsize>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl LiveQuestionFlood {
-        fn start(
-            endpoint: DaemonEndpoint,
-            tool: String,
-            run_id: String,
-            ticket_id: String,
-        ) -> Self {
-            let stop = Arc::new(AtomicBool::new(false));
-            let produced = Arc::new(AtomicUsize::new(0));
-            let stop_thread = Arc::clone(&stop);
-            let produced_thread = Arc::clone(&produced);
-            let handle = thread::spawn(move || {
-                let mut index = 0_u64;
-                while !stop_thread.load(Ordering::Relaxed) {
-                    let asked = botster_hub_client::request(
-                        &endpoint,
-                        DaemonRequest::PluginMcpCallTool {
-                            name: tool.clone(),
-                            arguments: json!({
-                                "run_id": run_id,
-                                "ticket_id": ticket_id,
-                                "question": format!("flood-live {index}")
-                            }),
-                        },
-                    );
-                    if asked.is_ok() {
-                        produced_thread.fetch_add(1, Ordering::Relaxed);
-                    }
-                    index = index.saturating_add(1);
-                }
-            });
-            Self {
-                stop,
-                produced,
-                handle: Some(handle),
-            }
-        }
-
-        fn produced(&self) -> usize {
-            self.produced.load(Ordering::Relaxed)
-        }
-
-        fn wait_until_produced(&self, minimum: usize, timeout: Duration) -> bool {
-            let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                if self.produced() >= minimum {
-                    return true;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            self.produced() >= minimum
-        }
-    }
-
-    impl Drop for LiveQuestionFlood {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
+        app.packages = (0..70)
+            .map(|index| notice_package("owner-cap", &format!("evt-{index:02}"), 1_000))
+            .collect();
+        app.sync_notice_subscriptions();
+        assert_eq!(app.notice_subscriptions.len(), 64);
+        assert_eq!(app.notice_overflow_dropped, 6);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("dropped 6"))
+        );
+        assert!(
+            app.notice_subscriptions
+                .contains_key(&("owner-cap".to_string(), "evt-00".to_string()))
+        );
+        assert!(
+            !app.notice_subscriptions
+                .contains_key(&("owner-cap".to_string(), "evt-69".to_string()))
+        );
     }
 
     fn wait_for_condition(
@@ -29656,6 +29493,76 @@ exit 0
         false
     }
 
+    fn overlay_contract_matrix_emit(root: &Path) -> PathBuf {
+        let package_dir = botster_hub_test_support::copy_plugin_contract_matrix_fixture(root)
+            .expect("copy hub-owned plugin-contract-matrix fixture");
+        let plugin_path = package_dir.join("plugin.lua");
+        let original = std::fs::read_to_string(&plugin_path).expect("read fixture plugin.lua");
+        let injected = original.replace(
+            "return botster.register({\n  handlers = {",
+            r#"return botster.register({
+  tools = {
+    {
+      name = "contract.emit_ready",
+      description = "Emit the declared contract.ready notice event.",
+      input_schema = {
+        type = "object",
+        additionalProperties = false,
+        properties = {
+          subject = { type = "string" },
+          notice = { type = "string" },
+        },
+      },
+      handler = "emit_ready",
+      call = function(args)
+        local payload = {
+          notice = args.notice or "ready",
+        }
+        if args.subject ~= nil then
+          payload.subject = args.subject
+        end
+        return events.emit("contract.ready", payload)
+      end,
+    },
+  },
+  handlers = {"#,
+        );
+        assert_ne!(
+            injected, original,
+            "fixture plugin.lua must still start its register table with handlers"
+        );
+        std::fs::write(&plugin_path, injected).expect("write emit overlay");
+        package_dir
+    }
+
+    fn emit_contract_ready(
+        hub: &botster_hub_test_support::IsolatedHub,
+        subject: Option<&str>,
+        notice: &str,
+    ) -> DaemonResponse {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("notice".to_string(), json!(notice));
+        if let Some(subject) = subject {
+            arguments.insert("subject".to_string(), json!(subject));
+        }
+        botster_hub_client::request(
+            hub.endpoint(),
+            DaemonRequest::PluginMcpCallTool {
+                name: "contract.emit_ready".to_string(),
+                arguments: Value::Object(arguments),
+            },
+        )
+        .unwrap_or_else(|error| panic!("contract.emit_ready failed: {error}"))
+    }
+
+    fn set_event_flush_stall(path: &Path, stalled: bool) {
+        if stalled {
+            std::fs::write(path, b"stall").expect("create event flush stall");
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     #[test]
     fn package_events_live_runtime_runs_against_isolated_hub_when_binaries_are_available() {
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -29666,16 +29573,11 @@ exit 0
             skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
             return;
         };
-        let Some(package_path) = std::env::var_os("BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH") else {
-            skip_or_panic("BOTSTER_PROJECT_PIPELINES_PACKAGE_PATH");
-            return;
-        };
-        let package_path = PathBuf::from(package_path);
-        assert_project_pipelines_pin_floor(&package_path);
 
         let root = PathBuf::from(format!("/tmp/bt-pe{}", short_suffix() % 1_000_000));
         let stall_path = root.join("event-flush.stall");
         set_event_flush_stall(&stall_path, false);
+        let package_path = overlay_contract_matrix_emit(&root);
         let hub = botster_hub_test_support::IsolatedHubBuilder::new()
             .hub_bin(&hub_bin)
             .session_worker_bin(session_worker_bin)
@@ -29696,77 +29598,31 @@ exit 0
                 path: package_path.clone(),
             },
         )
-        .expect("enable project-pipelines");
+        .expect("enable plugin-contract-matrix");
         assert_eq!(enable.kind, DaemonResponseKind::PackageDecision);
-        let tools_deadline = Instant::now() + Duration::from_secs(8);
-        let mut listed_tools = Vec::new();
-        while Instant::now() < tools_deadline {
-            let listed =
-                botster_hub_client::request(hub.endpoint(), DaemonRequest::PluginMcpListTools)
-                    .expect("list plugin tools");
-            listed_tools = listed
-                .plugin_tools
-                .iter()
-                .filter_map(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                })
-                .collect();
-            if listed_tools
-                .iter()
-                .any(|name| name.contains("create_project"))
-                && listed_tools
-                    .iter()
-                    .any(|name| name.ends_with("create_pipeline"))
-                && listed_tools
-                    .iter()
-                    .any(|name| name.contains("spawn_ticket_session"))
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let create_project_tool = listed_tools
-            .iter()
-            .find(|name| name.contains("create_project"))
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!("project-pipelines MCP tools must register: {listed_tools:?}")
-            });
-        let create_ticket_tool = listed_tools
-            .iter()
-            .find(|name| name.contains("create_ticket"))
-            .cloned()
-            .expect("create_ticket tool");
-        let start_run_tool = listed_tools
-            .iter()
-            .find(|name| name.contains("start_run"))
-            .cloned()
-            .expect("start_run tool");
-        let ask_human_tool = listed_tools
-            .iter()
-            .find(|name| name.contains("ask_human"))
-            .cloned()
-            .expect("ask_human tool");
-        let answer_question_tool = listed_tools
-            .iter()
-            .find(|name| name.contains("answer_question"))
-            .cloned()
-            .expect("answer_question tool");
-        let create_pipeline_tool = listed_tools
-            .iter()
-            .find(|name| name.ends_with("create_pipeline"))
-            .cloned()
-            .expect("create_pipeline tool");
-        let spawn_ticket_session_tool = listed_tools
-            .iter()
-            .find(|name| name.contains("spawn_ticket_session"))
-            .cloned()
-            .expect("spawn_ticket_session tool");
 
         let mut app = TuiApp::new(Some(hub.endpoint().clone()));
         app.workspace_test_mode = true;
+        app.request_and_apply(DaemonRequest::Spawn {
+            session_id: "sess-notice-live".to_string(),
+            command: DEFAULT_COMMAND.to_string(),
+        });
+        wait_for_authoritative_session(&mut app, "sess-notice-live")
+            .expect("spawned session becomes authoritative");
+        app.set_selected_session(Some("sess-notice-live".to_string()));
+        assert!(
+            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
+                app.notice_subscriptions
+                    .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
+                    .is_some_and(|entry| {
+                        matches!(entry.state, EventSubscriptionState::Active(_))
+                            && entry.subject == "sess-notice-live"
+                    })
+            }),
+            "descriptor-driven subscribe must become active: requests={:?} error={:?}",
+            app.observed_requests,
+            app.error
+        );
         assert!(
             app.observed_requests.iter().any(|request| matches!(
                 request,
@@ -29775,261 +29631,34 @@ exit 0
                     name,
                     subjects,
                     ..
-                } if owner == QUESTION_OPENED_OWNER
-                    && name == QUESTION_OPENED_NAME
-                    && subjects.is_empty()
+                } if owner == MATRIX_OWNER
+                    && name == MATRIX_EVENT
+                    && subjects.as_slice() == ["sess-notice-live"]
             )),
-            "try_connect must send SubscribeEvents: {:?}",
+            "subscribe must use the session subject: {:?}",
             app.observed_requests
         );
-        assert!(matches!(
-            app.event_subscription,
-            EventSubscriptionState::Active(_)
-        ));
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.entity_options
-                    .family("project-pipelines.question")
-                    .is_some_and(|family| family.has_snapshot)
-                    && app
-                        .entity_options
-                        .family("project-pipelines.session_request")
-                        .is_some_and(|family| family.has_snapshot)
-            }),
-            "workflow-context families must snapshot: {:?}",
-            app.error
-        );
-        let question_seq_after_baseline = app
-            .entity_options
-            .family("project-pipelines.question")
-            .and_then(|family| family.snapshot_seq);
-
-        let repo_root = root.join("spawn-point-repo");
-        std::fs::create_dir_all(repo_root.join(".botster")).expect("spawn point repo");
-        std::fs::write(repo_root.join("README.md"), "live spawn point\n").expect("seed repo file");
-        std::fs::write(
-            repo_root.join("echo-loop.sh"),
-            format!("#!/bin/sh\n{DEFAULT_COMMAND}\n"),
-        )
-        .expect("echo loop script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(repo_root.join("echo-loop.sh"))
-                .expect("echo loop metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(repo_root.join("echo-loop.sh"), permissions)
-                .expect("echo loop executable");
-        }
-        run_fixture_command(&repo_root, "git", &["init", "-b", "main"]);
-        run_fixture_command(
-            &repo_root,
-            "git",
-            &["config", "user.email", "live@botster.dev"],
-        );
-        run_fixture_command(&repo_root, "git", &["config", "user.name", "Botster Live"]);
-        run_fixture_command(&repo_root, "git", &["add", "."]);
-        run_fixture_command(&repo_root, "git", &["commit", "-m", "live spawn point"]);
-        let branch = format!("ticket/pe-{}", short_suffix() % 1_000_000);
-        run_fixture_command(&repo_root, "git", &["branch", &branch]);
-        let target_id = format!("btui-pe-target-{}", short_suffix() % 1_000_000);
-        app.request_and_apply(DaemonRequest::CreateSpawnTarget {
-            target_id: Some(target_id.clone()),
-            label: Some("Live package-events spawn point".to_string()),
-            root: repo_root.clone(),
-            enabled: true,
-            kind: Some("git".to_string()),
-            base_ref: Some("main".to_string()),
-            metadata: BTreeMap::new(),
-        });
-        if let Some(error) = &app.error {
-            panic!("create spawn target failed: {error}");
-        }
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.spawn_targets
-                    .iter()
-                    .any(|target| target.target_id == target_id && target.enabled)
-            }),
-            "admitted spawn target must be present: {:?}",
-            app.spawn_targets
-        );
-
-        let session_type_local_id = format!("btui-shell-{}", short_suffix() % 1_000_000);
-        let session_type_definition = DaemonSessionTypeDefinition {
-            id: session_type_local_id.clone(),
-            label: "Botster TUI package-events shell".to_string(),
-            description: None,
-            icon: None,
-            role: "botster.agent".to_string(),
-            interaction: "interactive".to_string(),
-            traits: Vec::new(),
-            lifecycle: "task".to_string(),
-            execution: DaemonSessionTypeExecution::ShellCommand,
-            command: DEFAULT_COMMAND.to_string(),
-            args: Vec::new(),
-            working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
-            environment: BTreeMap::new(),
-            allowed_environment_overrides: Vec::new(),
-            context: Vec::new(),
-            target_id: None,
-        };
-        app.request_and_apply(DaemonRequest::CreateSessionType {
-            source: DaemonSessionTypeMutationSource::Device,
-            definition: session_type_definition,
-        });
-        if let Some(error) = &app.error {
-            panic!("create session type failed: {error}");
-        }
-        let session_type_id = format!("device/{session_type_local_id}");
-        app.wait_for_session_type_after_subscribe_refresh(&session_type_id, true);
-
-        let project = call_plugin_tool(
-            &hub,
-            &create_project_tool,
-            json!({ "name": "tui-package-events", "target_id": target_id }),
-        );
-        let project_id = plugin_tool_id(&project, "project_id").unwrap_or_else(|| {
-            panic!(
-                "create project failed: kind={:?} error={:?} result={}",
-                project.kind, project.error, project.plugin_tool_result
-            )
-        });
-        let ticket = call_plugin_tool(
-            &hub,
-            &create_ticket_tool,
-            json!({
-                "title": "live question",
-                "project_id": project_id,
-                "target_id": target_id
-            }),
-        );
-        let ticket_id = plugin_tool_id(&ticket, "ticket_id").unwrap_or_else(|| {
-            panic!(
-                "create ticket failed: kind={:?} error={:?} result={}",
-                ticket.kind, ticket.error, ticket.plugin_tool_result
-            )
-        });
-        let pipeline = call_plugin_tool(
-            &hub,
-            &create_pipeline_tool,
-            json!({
-                "name": "tui-live-session",
-                "steps": [{
-                    "id": "implement",
-                    "name": "Implement",
-                    "kind": "pty",
-                    "session_type_id": session_type_id
-                }]
-            }),
-        );
-        let pipeline_id = plugin_tool_id(&pipeline, "pipeline_id").unwrap_or_else(|| {
-            panic!(
-                "create pipeline failed: kind={:?} error={:?} result={}",
-                pipeline.kind, pipeline.error, pipeline.plugin_tool_result
-            )
-        });
-        let run = call_plugin_tool(
-            &hub,
-            &start_run_tool,
-            json!({
-                "ticket_id": ticket_id,
-                "pipeline_id": pipeline_id,
-                "spawn_target_id": target_id,
-                "branch": branch
-            }),
-        );
-        let run_id = plugin_tool_id(&run, "run_id").unwrap_or_else(|| {
-            panic!(
-                "start run failed: kind={:?} error={:?} result={}",
-                run.kind, run.error, run.plugin_tool_result
-            )
-        });
-        let spawned = call_plugin_tool(
-            &hub,
-            &spawn_ticket_session_tool,
-            json!({
-                "run_id": run_id,
-                "session_type_id": session_type_id,
-                "spawn_target_id": target_id,
-                "branch": branch
-            }),
-        );
-        let spawned_session_id = plugin_tool_id(&spawned, "session_id").unwrap_or_else(|| {
-            panic!(
-                "spawn_ticket_session failed: kind={:?} error={:?} result={}",
-                spawned.kind, spawned.error, spawned.plugin_tool_result
-            )
-        });
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(12), |app| {
-                live_session_id_for_run(app, &run_id).as_deref()
-                    == Some(spawned_session_id.as_str())
-            }),
-            "session_request must publish the spawned session_id: spawned={spawned_session_id} error={:?} records={:?}",
-            app.error,
-            app.entity_options
-                .family("project-pipelines.session_request")
-                .map(|family| family.records.values().cloned().collect::<Vec<_>>())
-        );
-        let bound_session = live_session_id_for_run(&app, &run_id).expect("bound session_id");
-        assert_eq!(bound_session, spawned_session_id);
-        wait_for_authoritative_session(&mut app, &bound_session)
-            .expect("pipeline session becomes authoritative");
-        app.selected_session = Some(bound_session.clone());
-        assert_eq!(
-            live_session_id_for_run(&app, &run_id).as_deref(),
-            app.selected_session.as_deref()
-        );
-        assert!(matches!(
-            app.active_workflow_run(),
-            ActiveWorkflowRun::Run(id) if id == run_id
-        ));
 
         let events_before = app
             .client
             .as_ref()
             .map(|client| client.mux_event_frames)
             .unwrap_or(0);
-        let asked = call_plugin_tool(
-            &hub,
-            &ask_human_tool,
-            json!({
-                "run_id": run_id,
-                "ticket_id": ticket_id,
-                "question": "live notice"
-            }),
-        );
-        let question_id = plugin_tool_id(&asked, "question_id").unwrap_or_else(|| {
-            panic!(
-                "ask_human must return question_id: kind={:?} error={:?} result={}",
-                asked.kind, asked.error, asked.plugin_tool_result
-            )
-        });
-        assert!(!question_id.is_empty(), "question_id must be nonempty");
+        let emitted = emit_contract_ready(&hub, Some("sess-notice-live"), "live notice");
+        assert_eq!(emitted.plugin_tool_result["status"], "accepted");
         assert!(
             wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                live_question_is_open(app, &question_id)
-                    && app.transient_notice.as_ref().is_some_and(|notice| {
-                        notice.text.contains("live notice") && notice.question_id == question_id
-                    })
+                app.transient_notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.text.contains("live notice"))
             }),
-            "question.opened must show one matching notice and the exact open row: notice={:?} error={:?} questions={:?} events={}",
+            "matching session notice must render: notice={:?} error={:?}",
             app.transient_notice,
-            app.error,
-            app.entity_options
-                .family("project-pipelines.question")
-                .map(|family| family.records.keys().cloned().collect::<Vec<_>>()),
-            app.client
-                .as_ref()
-                .map(|client| client.mux_event_frames)
-                .unwrap_or(0)
+            app.error
         );
-        let rendered = rendered_workspace(&app);
         assert!(
-            rendered.contains("live notice"),
-            "transient notice must render: {rendered}"
+            rendered_workspace(&app).contains("live notice"),
+            "transient notice must render"
         );
         assert!(
             app.client
@@ -30037,88 +29666,35 @@ exit 0
                 .is_some_and(|client| client.mux_event_frames > events_before),
             "matching notice must arrive on the event plane"
         );
-        let question_seq_after_create = app
-            .entity_options
-            .family("project-pipelines.question")
-            .and_then(|family| family.snapshot_seq);
-        if let (Some(before), Some(after)) =
-            (question_seq_after_baseline, question_seq_after_create)
-        {
-            assert!(
-                after == before || after == before + 1,
-                "baseline to first delta must stay contiguous: before={before} after={after}"
-            );
-        }
 
-        let foreign_ticket = call_plugin_tool(
-            &hub,
-            &create_ticket_tool,
-            json!({
-                "title": "foreign question",
-                "project_id": project_id,
-                "target_id": target_id
-            }),
-        );
-        let foreign_ticket_id =
-            plugin_tool_id(&foreign_ticket, "ticket_id").expect("foreign ticket_id");
-        let foreign_run = call_plugin_tool(
-            &hub,
-            &start_run_tool,
-            json!({
-                "ticket_id": foreign_ticket_id,
-                "pipeline_id": pipeline_id,
-                "spawn_target_id": target_id,
-                "branch": branch
-            }),
-        );
-        let foreign_run_id = plugin_tool_id(&foreign_run, "run_id").expect("foreign run_id");
-        let foreign_asked = call_plugin_tool(
-            &hub,
-            &ask_human_tool,
-            json!({
-                "run_id": foreign_run_id,
-                "ticket_id": foreign_ticket_id,
-                "question": "foreign notice"
-            }),
-        );
-        let foreign_question_id =
-            plugin_tool_id(&foreign_asked, "question_id").expect("foreign question_id");
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                live_question_is_open(app, &foreign_question_id)
-            }),
-            "foreign question row must still converge: {:?}",
-            app.error
-        );
+        let events_after_match = app
+            .client
+            .as_ref()
+            .map(|client| client.mux_event_frames)
+            .unwrap_or(0);
+        let foreign = emit_contract_ready(&hub, Some("sess-other"), "foreign notice");
+        assert_eq!(foreign.plugin_tool_result["status"], "accepted");
+        thread::sleep(Duration::from_millis(250));
+        app.poll_hub();
         assert!(
             app.transient_notice
                 .as_ref()
-                .is_none_or(|notice| !notice.text.contains("foreign notice")
-                    && notice.question_id != foreign_question_id),
-            "non-matching run must not replace the matching notice: {:?}",
+                .is_none_or(|notice| !notice.text.contains("foreign notice")),
+            "foreign subject must not replace the matching notice: {:?}",
             app.transient_notice
         );
-
-        assert!(
-            app.transient_notice.is_some(),
-            "matching notice must still be visible before EventGap"
+        assert_eq!(
+            app.client
+                .as_ref()
+                .map(|client| client.mux_event_frames)
+                .unwrap_or(0),
+            events_after_match,
+            "Hub must not deliver a foreign-subject frame"
         );
+
         set_event_flush_stall(&stall_path, true);
-        let mut gap_question_ids = Vec::new();
         for index in 0..4 {
-            let gap_asked = call_plugin_tool(
-                &hub,
-                &ask_human_tool,
-                json!({
-                    "run_id": run_id,
-                    "ticket_id": ticket_id,
-                    "question": format!("gap {index}")
-                }),
-            );
-            let gap_question_id =
-                plugin_tool_id(&gap_asked, "question_id").expect("gap question_id");
-            assert!(!gap_question_id.is_empty());
-            gap_question_ids.push(gap_question_id);
+            let _ = emit_contract_ready(&hub, Some("sess-notice-live"), &format!("gap {index}"));
         }
         set_event_flush_stall(&stall_path, false);
         let gap_deadline = Instant::now() + Duration::from_secs(8);
@@ -30137,33 +29713,13 @@ exit 0
             for frame in frames {
                 let is_gap = matches!(
                     &frame,
-                    DaemonUnixMuxFrame::Event(DaemonEvent::EventGap {
-                        owner,
-                        name,
-                        ..
-                    }) if owner == QUESTION_OPENED_OWNER && name == QUESTION_OPENED_NAME
+                    DaemonUnixMuxFrame::Event(DaemonEvent::EventGap { owner, name, .. })
+                        if owner == MATRIX_OWNER && name == MATRIX_EVENT
                 );
                 app.apply_mux_frames(vec![frame]);
                 if is_gap {
                     saw_event_gap = true;
-                    assert!(
-                        app.transient_notice.is_none(),
-                        "EventGap must clear the matching notice: {:?}",
-                        app.transient_notice
-                    );
-                    assert!(
-                        live_question_is_open(&app, &question_id),
-                        "durable question must survive EventGap"
-                    );
-                    assert!(
-                        app.question_attention_band().is_some(),
-                        "attention band must remain from entity state"
-                    );
-                    let rendered = rendered_workspace(&app);
-                    assert!(
-                        rendered.contains("Open questions:"),
-                        "workspace-question-attention must render: {rendered}"
-                    );
+                    assert!(app.transient_notice.is_none());
                     assert!(
                         app.error
                             .as_deref()
@@ -30176,36 +29732,24 @@ exit 0
         }
         assert!(
             saw_event_gap,
-            "live EventGap must arrive after BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX shed"
-        );
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                live_question_is_open(app, &question_id)
-                    && gap_question_ids.iter().all(|id| {
-                        live_question_is_open(app, id)
-                            || app
-                                .entity_options
-                                .family("project-pipelines.question")
-                                .is_some_and(|family| family.records.contains_key(id))
-                    })
-            }),
-            "gap questions must still converge as durable rows: {:?}",
-            app.entity_options
-                .family("project-pipelines.question")
-                .map(|family| family.records.keys().cloned().collect::<Vec<_>>())
+            "live EventGap must arrive after mailbox shed"
         );
 
         let before_reconnect_id = app
-            .event_subscription
-            .active_id()
+            .notice_subscriptions
+            .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
+            .and_then(|entry| entry.state.active_id())
             .map(ToOwned::to_owned)
             .expect("active event subscription");
         app.force_reconnect();
         assert!(app.transient_notice.is_none());
+        app.set_selected_session(Some("sess-notice-live".to_string()));
         assert!(
             wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                matches!(app.event_subscription, EventSubscriptionState::Active(_))
-                    && app.event_subscription.active_id() != Some(before_reconnect_id.as_str())
+                app.notice_subscriptions
+                    .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
+                    .and_then(|entry| entry.state.active_id())
+                    .is_some_and(|id| id != before_reconnect_id)
             }),
             "reconnect must mint a fresh SubscribeEvents id"
         );
@@ -30213,225 +29757,6 @@ exit 0
             app.transient_notice.is_none(),
             "reconnect must not replay notices"
         );
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.entity_options
-                    .family("project-pipelines.question")
-                    .is_some_and(|family| family.has_snapshot)
-                    && live_question_is_open(app, &question_id)
-            }),
-            "durable question must recover from the production entity baseline"
-        );
-        app.selected_session = Some(bound_session.clone());
-        let _ = call_plugin_tool(
-            &hub,
-            &answer_question_tool,
-            json!({
-                "question_id": question_id,
-                "answer": "done"
-            }),
-        );
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.entity_options
-                    .family("project-pipelines.question")
-                    .is_some_and(|family| {
-                        family.records.get(&question_id).is_some_and(|record| {
-                            record.get("status").and_then(Value::as_str) != Some("open")
-                        })
-                    })
-            }),
-            "answer must converge through the published upsert"
-        );
-
-        wait_for_authoritative_session(&mut app, &bound_session)
-            .expect("session remains authoritative after reconnect");
-        app.selected_session = Some(bound_session.clone());
-        app.attach_selected_or_first();
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(12), |app| {
-                app.attached_session.as_deref() == Some(bound_session.as_str())
-                    && app.attach_hydration.is_none()
-            }),
-            "live attach must finish: error={:?} attached={:?} hydration={:?} sessions={:?} mux_term={}",
-            app.error,
-            app.attached_session,
-            app.attach_hydration
-                .as_ref()
-                .map(|hydration| { (hydration.snapshot_ready, hydration.snapshot_finished) }),
-            app.sessions
-                .iter()
-                .map(|session| {
-                    format!(
-                        "{}:{}:pending={}",
-                        session.session_id, session.lifecycle, session.pending
-                    )
-                })
-                .collect::<Vec<_>>(),
-            app.client
-                .as_ref()
-                .map(|client| client.mux_terminal_frames)
-                .unwrap_or(0)
-        );
-        app.observed_requests.clear();
-        let flood = LiveQuestionFlood::start(
-            hub.endpoint().clone(),
-            ask_human_tool.clone(),
-            run_id.clone(),
-            ticket_id.clone(),
-        );
-        assert!(
-            flood.wait_until_produced(2, Duration::from_secs(8)),
-            "live flood producer must emit before measurements: produced={}",
-            flood.produced()
-        );
-        assert!(
-            !app.observed_requests.iter().any(|request| matches!(
-                request,
-                ObservedRequest::SendInput { .. }
-                    | ObservedRequest::Resize { .. }
-                    | ObservedRequest::Attach { .. }
-            )),
-            "event flood must not emit terminal-plane requests: {:?}",
-            app.observed_requests
-        );
-        let tick_started = Instant::now();
-        app.poll_and_apply_mux_frames();
-        let tick_elapsed = tick_started.elapsed();
-        eprintln!(
-            "package-events flood tick_ms={} produced={}",
-            tick_elapsed.as_millis(),
-            flood.produced()
-        );
-        assert!(
-            tick_elapsed < Duration::from_millis(200),
-            "poll_and_apply_mux_frames under flood must stay under 200ms: {tick_elapsed:?}"
-        );
-
-        let flood_marker_id = format!("question-flood-marker-{}", short_suffix() % 1_000_000);
-        let produced_before_entity = flood.produced();
-        let events_before_entity = mux_event_frame_count(&app);
-        let flood_entity_started = Instant::now();
-        let marker = call_plugin_tool(
-            &hub,
-            &ask_human_tool,
-            json!({
-                "id": flood_marker_id,
-                "run_id": run_id,
-                "ticket_id": ticket_id,
-                "question": "flood marker"
-            }),
-        );
-        let flood_marker_id = plugin_tool_id(&marker, "question_id").expect("flood marker id");
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(3), |app| {
-                live_question_is_open(app, &flood_marker_id)
-                    && flood.produced() > produced_before_entity
-                    && mux_event_frame_count(app) > events_before_entity
-            }),
-            "exact flood marker row must converge while events keep arriving: produced {}->{} events {}->{} error={:?}",
-            produced_before_entity,
-            flood.produced(),
-            events_before_entity,
-            mux_event_frame_count(&app),
-            app.error
-        );
-        let entity_elapsed = flood_entity_started.elapsed();
-        eprintln!(
-            "package-events entity_ms={} produced={} events={}",
-            entity_elapsed.as_millis(),
-            flood.produced(),
-            mux_event_frame_count(&app)
-        );
-        assert!(
-            entity_elapsed <= Duration::from_millis(3000),
-            "entity exact-row convergence under flood must stay within 3000ms: {entity_elapsed:?}"
-        );
-
-        app.request_and_apply(DaemonRequest::Resize {
-            session_id: bound_session.clone(),
-            rows: 24,
-            cols: 80,
-        });
-        let live_bytes_before = app.applied_live_payloads.concat().len();
-        let terminal_frames_before = app
-            .client
-            .as_ref()
-            .map(|client| client.mux_terminal_frames)
-            .unwrap_or(0);
-        let produced_before_echo = flood.produced();
-        let events_before_echo = mux_event_frame_count(&app);
-        let echo_started = Instant::now();
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: bound_session.clone(),
-            data: "flood-echo\n".to_string(),
-        });
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(3), |app| {
-                live_applied_output(app).contains("echo:flood-echo")
-                    && flood.produced() > produced_before_echo
-                    && mux_event_frame_count(app) > events_before_echo
-            }),
-            "terminal echo under flood: live={:?} produced {}->{} events {}->{} ghostty={} mux_term={} error={:?}",
-            live_applied_output(&app),
-            produced_before_echo,
-            flood.produced(),
-            events_before_echo,
-            mux_event_frame_count(&app),
-            app.ghostty_projection.is_some(),
-            app.client
-                .as_ref()
-                .map(|client| client.mux_terminal_frames)
-                .unwrap_or(0),
-            app.error
-        );
-        let echo_elapsed = echo_started.elapsed();
-        eprintln!(
-            "package-events echo_ms={} produced={}",
-            echo_elapsed.as_millis(),
-            flood.produced()
-        );
-        assert!(
-            echo_elapsed <= Duration::from_millis(3000),
-            "terminal input echo under flood must stay within 3000ms: {echo_elapsed:?}"
-        );
-        let produced_before_output = flood.produced();
-        let events_before_output = mux_event_frame_count(&app);
-        let output_started = Instant::now();
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: bound_session.clone(),
-            data: "flood-out\n".to_string(),
-        });
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(3), |app| {
-                app.applied_live_payloads.concat().len() > live_bytes_before
-                    && app
-                        .client
-                        .as_ref()
-                        .is_some_and(|client| client.mux_terminal_frames > terminal_frames_before)
-                    && live_applied_output(app).contains("echo:flood-out")
-                    && flood.produced() > produced_before_output
-                    && mux_event_frame_count(app) > events_before_output
-            }),
-            "terminal output must advance under flood: live={:?} produced {}->{} events {}->{} mux_term={:?}",
-            live_applied_output(&app),
-            produced_before_output,
-            flood.produced(),
-            events_before_output,
-            mux_event_frame_count(&app),
-            app.client.as_ref().map(|client| client.mux_terminal_frames)
-        );
-        let output_elapsed = output_started.elapsed();
-        eprintln!(
-            "package-events output_ms={} produced={}",
-            output_elapsed.as_millis(),
-            flood.produced()
-        );
-        assert!(
-            output_elapsed <= Duration::from_millis(3000),
-            "terminal output progress under flood must stay within 3000ms: {output_elapsed:?}"
-        );
-        drop(flood);
 
         set_event_flush_stall(&stall_path, false);
         println!("package-events-live: complete");
@@ -30440,15 +29765,14 @@ exit 0
     #[test]
     fn reconnect_clears_transient_notice_and_event_subscription_state() {
         let mut app = workspace_fixture();
-        app.event_subscription = EventSubscriptionState::Active("old-sub".to_string());
+        activate_notice(&mut app, "old-sub", 5_000, "session-alpha");
         app.transient_notice = Some(TransientNotice {
             text: "old".to_string(),
-            question_id: "question_old".to_string(),
-            kind: "human".to_string(),
-            deadline: Instant::now() + TRANSIENT_NOTICE_TTL,
+            deadline: Instant::now() + Duration::from_secs(5),
         });
         app.force_reconnect();
-        assert_eq!(app.event_subscription, EventSubscriptionState::Idle);
+        assert!(app.notice_subscriptions.is_empty());
+        assert!(app.notice_subscription_by_id.is_empty());
         assert!(app.transient_notice.is_none());
         assert!(!rendered_workspace(&app).contains("old"));
     }

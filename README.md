@@ -31,9 +31,9 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `b3b54f1f87e29867da4eb371e9b7f3b18160996a` |
-| `botster-ui-contract` | tag `botster-ui-contract-v0.3.2` |
-| `botster-hub-test-support` package | `@trybotster/hub-test-support@0.1.39` |
+| `botster-hub-client` / live hub | Hub `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` |
+| `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` (path-patched through `third_party/botster-ui-contract` so kit's v0.3.2 tag shares one Cargo identity) |
+| `botster-hub-test-support` package | Hub git `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` (`@trybotster/hub-test-support@0.1.41`) |
 | `botster-tui-kit` | `c83ba6c518e2324e34ce24c7abe5a8a05e56293c` |
 | `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `7eafa470a18025895995bbedc20d34b58106a03b` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
@@ -70,9 +70,10 @@ signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. IsolatedHub Ghostty proof is
 `script/test-live-hub ghostty`. Caller-owned attach proof is
 `script/test-live-hub ghostty-shared` then `script/test-live-hub ghostty-shared-exit`.
-Project Pipelines `question.opened` consumption is
-`script/test-live-hub package-events`. Shared live lanes need a caller Hub at
-`7a09292` or later.
+Generic package-event notice consumption is
+`script/test-live-hub package-events` against the Hub-owned
+`plugin-contract-matrix` fixture. Shared live lanes need a caller Hub at
+`baeb04d` or later.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -167,7 +168,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`b3b54f1f87e29867da4eb371e9b7f3b18160996a` (same Hub pin as Foundation above).
+`baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, ModeGatedInput, resize, and mux Event/Terminal planes.
@@ -194,14 +195,14 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 ```
 
 Incremental Ghostty live proof (protocol 7 / default floor 44). Build Hub
-`b3b54f1f87e29867da4eb371e9b7f3b18160996a` and Core worker
+`baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` and Core worker
 `7eafa470a18025895995bbedc20d34b58106a03b` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=b3b54f1f87e29867da4eb371e9b7f3b18160996a
+export BOTSTER_HUB_BIN_REV=baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5
 export BOTSTER_SESSION_WORKER_BIN_REV=7eafa470a18025895995bbedc20d34b58106a03b
 script/test-live-hub ghostty
 ```
@@ -271,16 +272,16 @@ Session types are authoritative Hub descriptors consumed through the
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 44` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `b3b54f1f87e29867da4eb371e9b7f3b18160996a`, Core crates
+- Pins: Hub crates `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5`, Core crates
   `7eafa470a18025895995bbedc20d34b58106a03b`, Ghostty
   `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
-  `botster-ui-contract-v0.3.2`, and kit
+  `botster-ui-contract-v0.3.3`, and kit
   `c83ba6c518e2324e34ce24c7abe5a8a05e56293c`.
 
 Live proof (independent of contract-matrix):
 
 ```sh
-# Use Hub b3b54f1 and Core 7eafa47 binaries (same pins as Foundation).
+# Use Hub baeb04d and Core 7eafa47 binaries (same pins as Foundation).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -805,8 +806,9 @@ Included now:
 - Generic owner-routed plugin action execution, accepted presentation and
   replacement transitions, rejected form retention, and stable-shell `Esc`
   navigation.
-- Host-control `question.opened` consumption with a run-matched transient
-  notice, plus an entity-driven open-question attention count.
+- Host-control package-event notice consumption from package-declared
+  `notice_reactions`, session-subject scoped, with bounded transient
+  presentation. Durable question attention stays package-owned.
 - Deterministic format, test, and clippy scripts.
 
 Not included yet:
