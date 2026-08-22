@@ -32,9 +32,9 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 | Crate | Pin |
 | --- | --- |
 | `botster-hub-client` / live hub | Hub `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` |
-| `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` (path-patched through `third_party/botster-ui-contract` so kit's v0.3.2 tag shares one Cargo identity) |
+| `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
 | `botster-hub-test-support` package | Hub git `baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5` (`@trybotster/hub-test-support@0.1.41`) |
-| `botster-tui-kit` | `c83ba6c518e2324e34ce24c7abe5a8a05e56293c` |
+| `botster-tui-kit` | `7940306b0d7461a12575b3856a96c0fbb23784f3` |
 | `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `7eafa470a18025895995bbedc20d34b58106a03b` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
@@ -276,7 +276,7 @@ Session types are authoritative Hub descriptors consumed through the
   `7eafa470a18025895995bbedc20d34b58106a03b`, Ghostty
   `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
   `botster-ui-contract-v0.3.3`, and kit
-  `c83ba6c518e2324e34ce24c7abe5a8a05e56293c`.
+  `7940306b0d7461a12575b3856a96c0fbb23784f3`.
 
 Live proof (independent of contract-matrix):
 
