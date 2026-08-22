@@ -11,7 +11,8 @@
 - **Plan Review:** `review_1787370123_136710` approved
 - **Implement commit:** `27e515c82041e337dffdce1b414cb435dd9bee36`. Report SHA recorded in the follow-up commit.
 - **Review revisit:** `review_1787372188_690274` (`changes_required`). Finding `finding_1787372188_337775` (Idle retry) fixed in `c5ead25`. Finding `finding_1787372188_404593` (vendor identity) fixed in this visit by consuming Kit `7940306b0d7461a12575b3856a96c0fbb23784f3`.
-- **Vendor-delete commit:** `fa077ac153cb55540490a71aab90d11152b1ae78`. Pin and report SHA recorded in the follow-up commits.
+- **Vendor-delete commit:** `fa077ac153cb55540490a71aab90d11152b1ae78`
+- **Kit pin commit:** `fec5ef3447cdfc97ea1ae28311cde0d51b48e28a`. This report SHA is recorded in the follow-up commit.
 - **teardown_class_applies:** no
 
 ## Playbooks and notes applied
