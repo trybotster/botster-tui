@@ -9,6 +9,7 @@
 - Base: `origin/main` at `0032fe97c76bcaccb09e540247106a9a998c23c6`
 - Pipeline run: `run_1787278336_152073`
 - Repository charter: [[botster-tui-playbook]]
+- Revision: 2, after Plan Review `review_1787349566_913809`
 
 The ticket target was resolved through `project_pipelines_current_context` and
 the Hub spawn-target registry. The ambient worktree was not used to infer
@@ -16,12 +17,28 @@ ownership.
 
 ## Plan verdict
 
-**This ticket is blocked before Implement.** No current Hub or package contract
-can supply a generic notice reaction to a client. Human answer
-`question_1787278563_302595` selected the strict reading and directed this run
-to register shared cross-repository dependencies and park.
+**Revision 2, after Plan Review `review_1787349566_913809` returned
+changes_required.** All three registered dependencies are now closed, so the
+seam this plan waited for exists. This revision answers every open finding and
+replaces the parked verdict.
 
-No production TUI code changes in this run.
+Revision 1 recorded the original blocker: no Hub or package contract could
+supply a generic notice reaction to a client. Human answer
+`question_1787278563_302595` selected the strict reading and directed this run
+to register shared cross-repository dependencies and park. That park is now
+released.
+
+Findings answered in this revision:
+
+| Finding | Severity | Answered in |
+| --- | --- | --- |
+| `finding_1787349566_641878` UI-contract tag not consumable | blocker | Dependencies, Scope, Affected surfaces, Risks, Acceptance |
+| `finding_1787349566_501388` Project Pipelines charter omitted | medium | Context loaded, Ownership boundaries |
+| `finding_1787349566_857519` Two acceptance checks lack executable boundaries | medium | Acceptance checks |
+| `finding_1787349566_155433` Plan evidence omitted artifact_id | info, process | Gate evidence carries `artifact_id` on both submit_gate and request_step_advance |
+
+No production TUI code changes in this run. This run still produces a plan
+only. Implement performs the pin roll and the code change.
 
 ## Context loaded
 
@@ -46,8 +63,37 @@ Targeted atomic notes:
 - [[optional always on entity families back off admission retries independently]]
 - [[live context fields must belong to live published entity families]]
 
-[[project-pipelines-playbook]] was not loaded. No Project Pipelines package or
-plugin path is in scope for this repository-owned change.
+[[project-pipelines-playbook]] **is loaded** in this revision, per
+`finding_1787349566_501388`. Revision 1 excluded it on the reasoning that no
+Project Pipelines package path changes. That reasoning was wrong. This plan
+removes Project Pipelines durable attention policy from the TUI, changes
+`question.opened` targeting, and depends on package-owned emission behavior, so
+the charter applies.
+
+Applicable rules from that charter:
+
+- Project Pipelines owns durable workflow policy, package-owned entity frames,
+  surfaces, and its emitted event contracts. The TUI owns none of that.
+- [[question opened notices target the agent session subject]] is the current
+  targeting rule. It supersedes [[question opened clients subscribe with empty subjects]].
+- [[TUI transient notices use run only fail closed matching]] is recorded in the
+  charter as the superseded product policy that session-subject targeting
+  replaces. The human override in `question_1787278563_302595` and
+  `question_1787278509_823001` is the decision of record.
+- [[each acceptance condition names its authoritative production oracle]]
+  governs the acceptance checks below.
+- [[cross repo dependency registration must use dependency repo target]]
+  governs the dependency edges below.
+- [[a transient package event cannot be the sole authority for a durable close]]
+  keeps durable question state package-owned, which is why the TUI deletes its
+  durable attention logic instead of generalizing it.
+
+Additional notes loaded in this revision:
+
+- [[question opened notices target the agent session subject]]
+- [[published package owned notice reaction cutover is ui contract 0 3 3 and hub test support 0 1 41]]
+- [[each acceptance condition names its authoritative production oracle]]
+- [[Package-event subject filters are exact strings compiled at admission]]
 
 [[botster runtime teardown lenses]] was not loaded. See the runtime-teardown
 class section below.
@@ -83,9 +129,13 @@ production code:
 | `app.rs:4134-4161` | `open_question_count_for_active_run` counts `project-pipelines.question` rows |
 | `app.rs:4163-4173` | `question_attention_band` renders that durable count |
 
-## Contract evidence for the blocker
+## Contract evidence for the original blocker (historical)
 
-Verified against the exact revisions this repository pins.
+This section records why revision 1 parked. The seam it proves absent now
+exists. Keep it, because it is the justification for the three dependency edges
+and for the cost of this ticket.
+
+Verified against the revisions this repository pinned at revision 1.
 
 1. Hub declares package event contracts on `HubPackageManifest.events.emitted`
    (`botster-hub` `src/packages.rs:80-112`). `HubEmittedEvent` carries only
@@ -147,15 +197,30 @@ In scope for this Plan step:
 
 In scope for the deferred TUI implementation, after both dependencies merge:
 
-- Roll the `botster-hub` pin to the revision that ships the client-visible
-  notice reaction descriptor.
+- Roll all four Git pins together, per `finding_1787349566_641878`:
+  - `botster-hub-client` and `botster-hub-test-support` from rev
+    `b3b54f1f87e29867da4eb371e9b7f3b18160996a` to the Hub revision that carries
+    the descriptor and the published tag.
+  - `botster-ui-contract` from tag `botster-ui-contract-v0.3.2` to tag
+    `botster-ui-contract-v0.3.3`. This direct roll is required. Hub merge
+    `12e0cc6` moved `botster-hub-client` onto the v0.3.3 tag, so leaving the
+    TUI's direct pin at v0.3.2 would put two `botster-ui-contract` sources in
+    one graph.
+  - Update `Cargo.lock` in the same commit.
+- Read the descriptor from `DaemonPackage.notice_reactions` and subscribe once
+  per descriptor with the focused session subject.
+- Resolve notice text through `botster_ui_contract::resolve_notice_text` with the
+  descriptor's `text_pointer`. The TUI must not parse the pointer itself and must
+  not read a payload field by name.
 - Drive subscription, scoping, presentation, TTL, and severity from the
-  descriptor read through the public client contract.
+  descriptor. Use the descriptor's `ttl_ms` instead of the local
+  `TRANSIENT_NOTICE_TTL` constant.
 - Keep the generic mechanisms already present: the
   `Idle`/`Candidate`/`Active` subscription state machine, parked multiplexed
   frame replay after `EventSubscribed`, exact owner-plus-name admission,
   `EventGap` handling, reconnect state clearing, and bounded notice lifetime.
 - Subscribe with the TUI's current session subject instead of `subjects: []`.
+  Hub performs the subject match. The TUI must not read `payload.subject`.
 - Delete the Project Pipelines owner, event name, payload field names, and
   entity-family constants from production source.
 - Delete `WORKFLOW_CONTEXT_ENTITY_FAMILIES`, `workflow_context_entity_families`,
@@ -207,9 +272,25 @@ Dependencies registered against this ticket
    agent session uuid when that context exists, and omits the subject
    otherwise.
 
-Both tickets already existed. The Web run registered them from human decision
-`question_1787278509_823001` on `ticket_1787278327_274484`. This run reuses them
-and created no duplicate Hub or Project Pipelines ticket, as directed.
+3. `ticket_1787349524_364728` — botster-hub
+   (`tgt_7e208a0c76a44980a83b63af976b1f22`): "Hub: publish the
+   botster-ui-contract-v0.3.3 Git tag for Rust consumers". Plan Review created
+   this ticket and registered `dependency_1787349531_741411` after finding that
+   Hub merge `12e0cc6` moved `botster-hub-client` to
+   `botster-ui-contract-v0.3.3` while no such remote tag existed.
+
+The first two tickets already existed. The Web run registered them from human
+decision `question_1787278509_823001` on `ticket_1787278327_274484`. This run
+reuses them and created no duplicate Hub or Project Pipelines ticket, as
+directed. Plan Review created and registered the third.
+
+**All three dependencies are closed.** Verified state:
+
+| Dependency | Ticket | Repository | Status |
+| --- | --- | --- | --- |
+| `dependency_1787278750_977041` | `ticket_1787278643_145174` | botster-hub | closed |
+| `dependency_1787349143_516346` | `ticket_1787278658_151737` | botster-project-pipelines | closed |
+| `dependency_1787349531_741411` | `ticket_1787349524_364728` | botster-hub | closed |
 
 Ordering: `ticket_1787278643_145174`, then `ticket_1787278658_151737`, then this
 TUI ticket. `ticket_1787278658_151737` already declares its own dependency on
@@ -221,46 +302,83 @@ notice behavior.
 dependencies. The two client repositories must consume one contract with no
 client-specific variant. That is an explicit acceptance line on the Hub ticket.
 
-## Assumptions and unknowns
+## Verified merged contract
+
+Revision 1 listed these as assumptions. They are now verified facts, read from
+the merged revisions. Implement must still re-verify at its own base.
+
+Hub, `botster-hub` `origin/main` at `baeb04d`:
+
+- `DaemonPackage.notice_reactions: Vec<PackageNoticeReactionDescriptor>`
+  (`crates/botster-hub-client/src/lib.rs:1930`). This is the client projection
+  that revision 1 proved absent.
+- `PackageNoticeReactionDescriptor` (`crates/botster-ui-contract/src/notices.rs:42`)
+  carries exactly `owner`, `name`, `subject_scope`, `text_pointer`, `ttl_ms`,
+  and `severity`. It carries no entity family, no entity join, no durable-count
+  family, and no correlation rule, so it holds the bound the human set.
+- `subject_scope` is the single-variant enum `session`. `severity` is `info`,
+  `warning`, or `error`.
+- `resolve_notice_text` and `decode_notice_text_pointer`
+  (`crates/botster-ui-contract/src/notices.rs:288` and `:242`) are the canonical
+  text resolvers. `NOTICE_TEXT_MAX_BYTES` is 512. `NOTICE_TTL_MIN_MS` is 1000
+  and `NOTICE_TTL_MAX_MS` is 60000.
+- `PROTOCOL_VERSION` is 7 and `CONFORMANCE_FIXTURE_REVISION` is 46.
+- `botster-hub-test-support` ships a neutral fixture package,
+  `fixtures/plugin-contract-matrix`, that declares a session notice for event
+  `contract.ready` with `text_pointer: "/notice"`. This is a product-free
+  fixture, exactly what the ticket's neutral-fixture requirement needs.
+
+Project Pipelines, `botster-project-pipelines` `origin/main` at `643c4d7`:
+
+- `botster-package.json` declares one `events.notices` entry: name
+  `question.opened`, `subject_scope: "session"`, `text_pointer: "/notice"`,
+  `ttl_ms: 10000`, `severity: "warning"`. It omits `owner`, so Hub projects the
+  admitted package name `project-pipelines`.
+- The `question.opened` payload schema now declares optional string `subject`,
+  maximum 128 bytes.
+- `record_question` sets `payload.subject` to the current run step's
+  `agent_session_uuid` after the durable question row commits. It omits the key
+  when the question names no run, or when the run step carries no nonempty
+  session uuid.
+
+Resolved unknowns from revision 1:
+
+1. Descriptor type name and fields. Resolved above.
+2. Subscription subject identity. Resolved. The subject is the run step's
+   `agent_session_uuid`, which is the Hub session identity the TUI already holds
+   in `selected_session`. Both use the `sess-...` form. Implement must still
+   assert this against a live event rather than trusting the shape.
+3. Severity vocabulary. Resolved: `info`, `warning`, `error`.
+4. Number of reactions per package. `notice_reactions` is a vector, and
+   `validate_package_notice_reactions` rejects duplicate reactions. The TUI must
+   handle more than one descriptor and must bound the number of active
+   subscriptions.
+
+## Remaining assumptions and unknowns
 
 Assumptions:
 
-1. The Hub descriptor exposes exact `owner` and `name` derived from the
-   admitted package identity, a standard session subject scope, a validated
-   text pointer such as `/notice`, and bounded presentation fields such as TTL
-   and severity. `ticket_1787278643_145174` states these fields directly.
-2. The descriptor reaches the TUI as a field on `DaemonPackage`, through the
-   existing `ListPackages` or `ShowPackage` response path. The Hub ticket
-   states the `DaemonPackage` projection, so this repository needs no new
-   transport and no new request vocabulary.
-3. Project Pipelines keeps `question.opened` as the emitted event and adds
-   `subject` to its payload schema. Its current schema sets
-   `additionalProperties: false`, so the schema change is required, not
-   optional.
-4. Direct merge into `main`. No pull request. This matches the ticket.
+1. Direct merge into `main`. No pull request. This matches the ticket.
+2. The TUI keeps one host-control connection, so all descriptor subscriptions
+   share the existing multiplexed path.
 
-Unknowns for the Implement step to resolve against the merged Hub contract:
+Unknowns for Implement to resolve at its own base:
 
-1. The exact descriptor type name, field names, and whether severity is an
-   enumeration or a string.
-2. Which TUI session identity is the subscription subject. Project Pipelines
-   emits the active agent session uuid. The TUI holds `selected_session`, and
-   the Hub session identity for a spawned agent session is the same uuid, so
-   `selected_session` is the likely subject. Implement must confirm this
-   against the merged contract and must not guess. If it is wrong, the
-   subscription silently receives nothing.
-   Related: the TUI must also decide what to do when no session is focused.
-   Project Pipelines omits the subject when no agent session context exists, so
-   a subject-less subscriber receives no session-scoped notice by design.
-3. Whether the descriptor permits more than one reaction for one package, and
-   how the TUI bounds the number of active subscriptions if it does.
-4. Whether the Hub roll also moves the Core pin. If it does, the charter
+1. Whether the Hub pin roll also moves the Core pin. If it does, the charter
    requires a separate production build gate and README pin prose updates.
-5. Whether Project Pipelines republishes the durable open-question count
-   through a package surface. `ticket_1787278658_151737` keeps durable question
-   state as package-owned entity or surface state, but does not commit to a
-   TUI-visible surface. Until it does, removing `question_attention_band`
-   removes that count from the TUI.
+2. Whether `MINIMUM_CONFORMANCE_FIXTURE_REVISION` in `app.rs` must change. The
+   TUI floor is 44 and the merged Hub reports 46, so the floor still admits.
+   Implement must confirm no fixture the TUI relies on moved between 44 and 46,
+   rather than assuming the inequality is sufficient.
+3. What the TUI does when no session is focused. Project Pipelines omits the
+   subject when no agent session context exists, and a nonempty subject filter
+   does not match a subject-less payload, so a focused-session subscription
+   receives nothing in that case. Implement must decide whether the TUI
+   subscribes at all with no focused session.
+4. Whether Project Pipelines republishes the durable open-question count through
+   a package surface. `ticket_1787278658_151737` keeps durable question state
+   package-owned but does not commit to a TUI-visible surface. Until it does,
+   removing `question_attention_band` removes that count from the TUI.
 
 ## Affected surfaces and files
 
@@ -276,8 +394,10 @@ Deferred implementation:
   Project Pipelines unit tests near lines 28750-29500.
 - `crates/botster-tui/src/entity_options.rs` — only if the always-on family
   plumbing becomes unreachable after the durable attention logic is removed.
-- `crates/botster-tui/Cargo.toml` — Hub pin roll.
-- `Cargo.lock` — pin roll.
+- `crates/botster-tui/Cargo.toml` — `botster-hub-client` rev,
+  `botster-hub-test-support` rev, and the direct `botster-ui-contract` tag roll
+  from `botster-ui-contract-v0.3.2` to `botster-ui-contract-v0.3.3`.
+- `Cargo.lock` — pin roll, one `botster-ui-contract` source only.
 - `README.md` — pin prose and any documented notice behavior.
 - `crates/botster-tui/src/acceptance.rs` — only if a live lane names the
   removed behavior.
@@ -310,6 +430,19 @@ Deferred implementation:
    updating Ghostty live-lane defaults and README pin claims in the same
    commit, and running `cargo build -p botster-tui --locked` as a separate
    production gate.
+7. **Split UI-contract graph.** This is the risk `finding_1787349566_641878`
+   caught. The TUI pins `botster-ui-contract` directly by tag and also receives
+   it transitively through `botster-hub-client`. Rolling only the Hub rev leaves
+   the direct pin at v0.3.2 while the transitive path resolves v0.3.3. Cargo
+   would then build two `botster-ui-contract` crates, and
+   `PackageNoticeReactionDescriptor` from one would not satisfy the other. The
+   symptom is a type mismatch on an identically named type, which reads as
+   nonsense unless the split source is already suspected. The one-source proof
+   below is what catches it.
+8. **Client re-implementing payload policy.** If the TUI parses `text_pointer`
+   itself or reads `payload.subject`, it recreates package payload policy inside
+   the generic client and re-earns this ticket. The canonical resolvers and Hub
+   subject filtering are the boundary.
 
 ## Acceptance checks and tests
 
@@ -326,35 +459,92 @@ For this Plan step:
   worktree path contains no `:`, so no `CARGO_TARGET_DIR` override is needed.
   `test.sh` already sets a colon-free `CARGO_TARGET_DIR`.
 
-For the deferred implementation, after both dependencies merge:
+For the implementation, now unblocked:
 
-- `grep -rn "project-pipelines\|project_pipelines\|question.opened"` over
-  production TUI source returns no hit. Test-only optional conformance code may
-  remain.
+Each check names its authoritative production oracle, per
+[[each acceptance condition names its authoritative production oracle]].
+
+**Ownership scan. Oracle: the TUI repository source tree.**
+
+- Production-only scan that excludes `cfg(test)` code. Revision 1 said "no hit
+  across production TUI source" and then permitted product strings in test-only
+  code in the same file, which is not executable. `finding_1787349566_857519`
+  is correct.
+- Exact rule: for each `crates/botster-tui/src/*.rs`, take the lines before the
+  first `#[cfg(test)]` attribute, and require zero matches for
+  `project-pipelines`, `project_pipelines`, or `question.opened`. Today the only
+  such boundary is `app.rs:11297`.
+- Implement adds this as a repository test, not a manual grep, so a later change
+  cannot silently reintroduce the coupling. The test must fail if a file gains a
+  second `#[cfg(test)]` boundary, so the scan cannot be defeated by moving code
+  below a later marker.
+
+**Generic client mechanism. Oracle: the TUI client, driven through the public
+protocol decode boundary.**
+
 - A neutral contract fixture proves subscribe, receive, filter, gap, reconnect,
-  and notice rendering using a non-product owner and event name.
+  and notice rendering with a non-product owner and event name. Use the Hub-owned
+  `plugin-contract-matrix` fixture identity, event `contract.ready`, which ships
+  in `botster-hub-test-support`.
 - The fixture enters through the public protocol decode boundary. It must not
-  inject a decoded `DaemonEvent` after decoding. Assert the decode entry point
-  explicitly, because the current tests call `apply_mux_event` directly.
-- A negative fixture proves an event for a foreign owner, a foreign event name,
-  a stale subscription id, or a foreign subject changes nothing.
-- A fixture proves the notice expires at the declared TTL and that a newer
-  matching event replaces the current notice.
-- A fixture proves `EventGap` clears the visible notice and performs no
-  durable write and no request.
+  inject a decoded `DaemonEvent`. Current tests call `apply_mux_event` directly,
+  so Implement must move the entry point to frame decode and assert it.
+- A negative fixture proves a foreign owner, a foreign event name, or a stale
+  subscription id changes nothing. These three are client-side gates and the
+  client is their oracle.
+- Notice text resolution goes through `resolve_notice_text`. A fixture proves the
+  TUI surfaces a typed resolver error rather than rendering a notice when the
+  pointer is missing, not a string, or oversized.
+- A fixture proves the notice expires at the descriptor's `ttl_ms`, not at a
+  local constant, and that a newer matching event replaces the current notice.
+- A fixture proves `EventGap` clears the visible notice and performs no durable
+  write and no request.
 - A fixture proves reconnect clears notice and subscription state and does not
   replay past events.
+
+**Subject filtering. Oracle: Hub admission, not the TUI.**
+
+- `finding_1787349566_857519` is right that revision 1 left this ambiguous.
+  Foreign-subject rejection is Hub behavior:
+  [[Package-event subject filters are exact strings compiled at admission]]
+  states Hub compares `payload.subject` against the admitted exact-match set.
+- Therefore the foreign-subject proof belongs in the isolated-Hub lane, where a
+  producer emits a subject the TUI did not subscribe to and the TUI receives no
+  frame. A client-side "foreign subject changes nothing" unit test is rejected,
+  because passing it would mean the client parses `payload.subject` and so
+  recreates package payload policy.
+- The TUI has no canonical client-side subject check in the merged contract. It
+  supplies `subjects` at subscribe time and reads no subject field.
+
+**Pin integrity. Oracle: Cargo resolution and the Git remote.**
+
+- `git ls-remote --tags origin` on `botster-hub` lists
+  `botster-ui-contract-v0.3.3`. Verified at plan time: the tag exists and
+  resolves to `12e0cc6994be18024e4bdfffb22947526a652204`.
+- One-source proof: `cargo tree -p botster-tui -i botster-ui-contract` reports
+  exactly one `botster-ui-contract` source. More than one source fails the gate.
+- `Cargo.lock` contains one `botster-ui-contract` entry.
+- `cargo build -p botster-tui --locked` as a separate production build gate.
+  `cargo test --no-run` is not production build evidence.
+- Search for the old Hub revision and the old UI-contract tag across the
+  repository. Update Ghostty live-lane defaults and README pin claims in the
+  same commit.
+
+**Live product proof. Oracle: an isolated Hub with the real producer.**
+
+- The charter requires downstream proof. An isolated-Hub live lane shows one real
+  notice from the real `project_pipelines_ask_human` producer, targeted by the
+  session subject. Soft residual evidence is not accepted.
+- Shared Ghostty lanes stay terminal-only, per
+  [[current shared session client lanes do not prove package events]].
 - The optional Project Pipelines conformance lane
   (`package_events_live_runtime_runs_against_isolated_hub_when_binaries_are_available`)
-  may stay, but only if it does not enter production composition.
-- Downstream proof required by the charter: an isolated-Hub live lane shows one
-  real notice from a real producer. Soft residual evidence is not accepted. The
-  shared Ghostty lanes stay terminal-only, per
-  [[current shared session client lanes do not prove package events]].
+  may stay only if it does not enter production composition.
+
+**Repository gates.**
+
 - `cargo fmt --all -- --check`.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`.
-- `cargo build -p botster-tui --locked` as a separate production build gate
-  after the pin roll. `cargo test --no-run` is not production build evidence.
 - `./test.sh` passes with one result tally and zero failures.
 
 ## Runtime-teardown class
@@ -372,25 +562,29 @@ instruction not to apply it to ordinary client tickets.
 
 ## Vault gaps worth capturing
 
-1. **Client notice reactions belong to a package declaration, not to client
-   constants.** Two independent human decisions now agree:
-   `question_1787278509_823001` on the Web ticket and
-   `question_1787278563_302595` on this ticket. A thin binary composition root
-   was rejected explicitly, because it relocates the ownership violation rather
-   than removing it. No current note states this.
-2. **A generic client reaction descriptor is bounded transient presentation
-   only.** The explicit exclusion of entity families, entity joins, durable
-   counts, and correlation rules is the load-bearing constraint, and it is the
-   most likely thing a later planner re-adds.
-3. **Superseded TUI notes.** Once the deferred change lands, three current
-   notes become historical for the TUI:
-   [[TUI transient notices use run only fail closed matching]] (run-only
-   fail-closed matching is replaced by session subject scope),
-   [[question opened clients subscribe with empty subjects]] (the TUI will
-   subscribe with a non-empty subject), and
-   [[client filter tiers require reachable view state]] (the reachability
-   analysis assumed a client-side entity join). Capture the supersession when
-   the change merges, not before.
-4. **Hub package event declarations stop at the Hub boundary.** That
-   `HubPackageManifest.events.emitted` has no client projection at `b3b54f1` is
-   a non-obvious gotcha that cost this Plan step a full contract trace.
+Revision 1 captured two inbox notes. Both are now published vault notes, along
+with a third that revision 1 did not anticipate:
+
+- [[client notice reactions belong to package declarations not client constants]]
+- [[question opened notices target the agent session subject]]
+- [[published package owned notice reaction cutover is ui contract 0 3 3 and hub test support 0 1 41]]
+
+Remaining gaps:
+
+1. **A direct Git tag pin and a transitive pin of the same crate must roll
+   together.** `finding_1787349566_641878` found a split
+   `botster-ui-contract` graph that no existing note covers. The general rule is
+   broader than this ticket: any first-party Rust consumer that pins a crate
+   directly and also receives it through a Hub crate must roll both, and must
+   prove one source. This is worth a note, because the failure surfaces as a type
+   mismatch on an identically named type.
+2. **Supersession of the TUI run-filter notes.** When this change merges,
+   [[TUI transient notices use run only fail closed matching]] becomes historical
+   for the TUI, and the Project Pipelines example inside
+   [[client filter tiers require reachable view state]] becomes historical. The
+   charter already records the first as superseded product policy. Capture the
+   TUI-side supersession at merge, not before.
+3. **Hub package event declarations stopped at the Hub boundary before
+   `12e0cc6`.** Already captured as an inbox note in revision 1. Confirm it
+   survived vault processing, and mark it historical rather than deleting it,
+   because it explains why three dependency tickets exist.
