@@ -378,13 +378,15 @@ decision `question_1787278509_823001` on `ticket_1787278327_274484`. This run
 reuses them and created no duplicate Hub or Project Pipelines ticket, as
 directed. Plan Review created and registered the third.
 
-**All three dependencies are closed.** Verified state:
+**The first three dependencies are closed.** Review `review_1787372188_690274`
+then required a Kit pin ticket so TUI does not vendor the UI contract.
 
 | Dependency | Ticket | Repository | Status |
 | --- | --- | --- | --- |
 | `dependency_1787278750_977041` | `ticket_1787278643_145174` | botster-hub | closed |
 | `dependency_1787349143_516346` | `ticket_1787278658_151737` | botster-project-pipelines | closed |
 | `dependency_1787349531_741411` | `ticket_1787349524_364728` | botster-hub | closed |
+| `dependency_1787372424_971579` | `ticket_1787372410_241977` | botster-tui-kit (`tgt_3dfae49c02454037bf13554f552baf7f`) | open. Run `run_1787372425_476748`. Kit must pin `botster-ui-contract-v0.3.3`. After it merges, TUI consumes that Kit revision, deletes `third_party/botster-ui-contract` and the root `[patch]`, and proves one Git-tag identity including the wrong-tag red ablation. |
 
 Ordering: `ticket_1787278643_145174`, then `ticket_1787278658_151737`, then this
 TUI ticket. `ticket_1787278658_151737` already declares its own dependency on
