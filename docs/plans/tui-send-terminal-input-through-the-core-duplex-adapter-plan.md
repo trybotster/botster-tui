@@ -242,7 +242,9 @@ Named code sites in `app.rs`:
 - `AttachHydration.pending_input` — hold `Vec<u8>`.
 - `ObservedRequest` — delete `SendInput`, `ModeGatedInput`, and `Resize`; add an
   observed duplex-frame record so tests can assert the encoded command.
-- A new `TERMINAL_INPUT_WRITE_BOUND` constant beside `DETACH_ON_DISCONNECT_BOUND`.
+- Two new constants beside `DETACH_ON_DISCONNECT_BOUND`:
+  `TERMINAL_INPUT_WRITE_BOUND` of two seconds and
+  `TERMINAL_INPUT_INFLIGHT_CAPACITY` of 64.
 - A new bounded in-flight input queue field, cleared with the mode shadow on
   detach, close, and reconnect.
 - `MINIMUM_CONFORMANCE_FIXTURE_REVISION` and the protocol 7 / revision 44 tests.
@@ -262,6 +264,8 @@ Named code sites in `app.rs`:
 | `TerminalInputResult` has no `session_id`, so a result cannot be matched by session. | Match on `subscription_id` alone against the live attached subscription, and ignore results for retired subscription ids. |
 | Live Ghostty lanes fail for environment reasons and hide a real regression. | Use the IsolatedHub `ghostty` lane as the primary live oracle and require the printed completion markers, per the repository charter. |
 | Hub `main` moves before Implement, so the plan's SHAs go stale. | Implement re-verifies ancestry and records the exact SHAs it used in the Implement report. |
+| The duplex write timeout leaks onto the shared stream and silently bounds later control-plane writes. | Restore `set_write_timeout(None)` on the success path and rely on `hard_close` for the failure path. Test 20 asserts the restored state. |
+| The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Keep `TERMINAL_INPUT_INFLIGHT_CAPACITY` at 64 against Core's 256, and require Implement to re-read Core's constant at the chosen pin. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
 ## Input result correlation
@@ -284,8 +288,16 @@ Correlation rule:
    gated write. Fail closed beats resending the wrong bytes.
 4. Only a popped entry whose `retry` flag is unused may be resent, and only once,
    after one ModeFlags re-probe.
-5. The queue is bounded. When it is full the TUI refuses the write and reports
-   back-pressure rather than losing correlation.
+5. The queue is bounded by `TERMINAL_INPUT_INFLIGHT_CAPACITY`, a TUI constant
+   set to 64. When it is full the TUI refuses the write, records a distinct
+   back-pressure error, and drops the input rather than losing correlation. The
+   value is deliberately far below Core's `INPUT_QUEUE_CAPACITY`, which is 256 at
+   the candidate pin and hard-stops the owner when exceeded, so the client fails
+   soft before Core closes the subscription. Core does not re-export
+   `INPUT_QUEUE_CAPACITY` from `botster_core::engine` at the candidate pin, so the
+   TUI keeps a local constant with a comment naming Core's value, and Implement
+   re-reads Core's constant at the chosen pin to confirm the client bound stays
+   lower.
 6. The queue is cleared on detach, on `TerminalSubscriptionClosed`, on reconnect,
    and whenever the live subscription id changes.
 
@@ -326,9 +338,17 @@ connection when a terminal input fails.
 `write_frame` on the TUI `HubConnection` stream inherits `set_write_timeout(None)`
 from the request path, so a Hub that stops reading can block the TUI event loop
 forever once the socket send buffer fills. The plan therefore adds a
-`TERMINAL_INPUT_WRITE_BOUND` constant, sets a write timeout before every duplex
-write, and on timeout calls the existing `HubConnection::hard_close` and records
-a transport error. This mirrors `DETACH_ON_DISCONNECT_BOUND` and
+`TERMINAL_INPUT_WRITE_BOUND` constant of two seconds, matching the existing
+`DETACH_ON_DISCONNECT_BOUND`, and sets a write timeout before every duplex write.
+
+The stream is shared with the control plane, so the write timeout must not leak.
+`HubConnection::request` sets only a read timeout and never a write timeout, so a
+duplex write that left `set_write_timeout(Some(..))` in place would silently bound
+every later control-plane write. The duplex write therefore restores
+`set_write_timeout(None)` on the success path, exactly as `request_with_deadline`
+already does. On the failure path it calls the existing
+`HubConnection::hard_close`, which already clears both timeouts, and records a
+transport error. This mirrors `DETACH_ON_DISCONNECT_BOUND` and
 `request_with_deadline`, which already bound the Detach path. There is no
 `block_on` and no new thread. Stale-mode handling is bounded to one re-probe plus
 one retry per submitted command. No code waits for an `input_result` that may
@@ -438,6 +458,15 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     `TERMINAL_INPUT_WRITE_BOUND` with the connection hard-closed and a transport
     error recorded. This is the same oracle as
     `bounded_detach_returns_when_peer_stops_reading`.
+19. A full in-flight queue fails soft. The test submits
+    `TERMINAL_INPUT_INFLIGHT_CAPACITY` commands with no `input_result` returned,
+    then drives one more real key, and asserts no further duplex write, the
+    distinct back-pressure error, an unchanged queue length, and a live
+    subscription that is neither detached nor closed. It then delivers one
+    `input_result`, drives another key, and asserts the write resumes.
+20. A successful duplex write leaves no write timeout on the shared stream. The
+    test drives a real key, then asserts the stream's write timeout is `None` so
+    a later control-plane `request` is not silently bounded.
 
 Live proof, per the repository charter:
 
