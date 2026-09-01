@@ -128,6 +128,9 @@ In scope, all inside `botster-tui`:
 7. Carry terminal input as `Vec<u8>` from `InputDispatch::TerminalForward` to the
    encoder, and delete the `String::from_utf8` gate that only existed to fill a
    JSON request field.
+7a. Check every payload against the imported Core ceiling before encode, write,
+   and queue insertion, and split an oversized payload into ordered chunks so
+   large paste does not regress.
 8. Raise `MINIMUM_CONFORMANCE_FIXTURE_REVISION` to the revision reported by the
    chosen Hub pin, and update the Hello protocol assertions that name protocol 7
    and revision 44.
@@ -242,9 +245,12 @@ Named code sites in `app.rs`:
 - `AttachHydration.pending_input` — hold `Vec<u8>`.
 - `ObservedRequest` — delete `SendInput`, `ModeGatedInput`, and `Resize`; add an
   observed duplex-frame record so tests can assert the encoded command.
-- Two new constants beside `DETACH_ON_DISCONNECT_BOUND`:
-  `TERMINAL_INPUT_WRITE_BOUND` of two seconds and
-  `TERMINAL_INPUT_INFLIGHT_CAPACITY` of 64.
+- Three new constants beside `DETACH_ON_DISCONNECT_BOUND`:
+  `TERMINAL_INPUT_WRITE_BOUND` of two seconds,
+  `TERMINAL_INPUT_INFLIGHT_CAPACITY` of 64, and
+  `TERMINAL_INPUT_INFLIGHT_BYTES` of 262,144.
+- Imported Core ceilings `MAX_INPUT_DATA_BYTES` and `MAX_MODE_GATED_DATA_BYTES`
+  from `botster-terminal-protocol-client`, never hardcoded.
 - A new bounded in-flight input queue field, cleared with the mode shadow on
   detach, close, and reconnect.
 - `MINIMUM_CONFORMANCE_FIXTURE_REVISION` and the protocol 7 / revision 44 tests.
@@ -265,6 +271,9 @@ Named code sites in `app.rs`:
 | Live Ghostty lanes fail for environment reasons and hide a real regression. | Use the IsolatedHub `ghostty` lane as the primary live oracle and require the printed completion markers, per the repository charter. |
 | Hub `main` moves before Implement, so the plan's SHAs go stale. | Implement re-verifies ancestry and records the exact SHAs it used in the Implement report. |
 | The duplex write timeout leaks onto the shared stream and silently bounds later control-plane writes. | Restore `set_write_timeout(None)` on the success path and rely on `hard_close` for the failure path. Test 20 asserts the restored state. |
+| The timeout restore itself fails, leaving the shared control stream in an uncertain state that is then reported as success. | Treat a failed restore as a write failure: `hard_close` and record a transport error. Test 21 asserts it. |
+| The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` of 256 KiB as the binding limit against a 4,194,240-byte worst case, enforced before the write and the queue insertion. Test 22 asserts it. |
+| The Core frame ceiling regresses large paste, which works today over the JSON path with no client size limit. | Chunk an oversized payload at the imported Core ceiling into ordered consecutive commands, with retry disabled for the sequence. Test 23 asserts exact byte reassembly, chunk bounds, order, and the partial-application stop. |
 | The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Keep `TERMINAL_INPUT_INFLIGHT_CAPACITY` at 64 against Core's 256, and require Implement to re-read Core's constant at the chosen pin. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
@@ -516,6 +525,20 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
 20. A successful duplex write leaves no write timeout on the shared stream. The
     test drives a real key, then asserts the stream's write timeout is `None` so
     a later control-plane `request` is not silently bounded.
+21. A failed timeout restore is not reported as success. The test forces
+    `set_write_timeout(None)` to fail after a good write and asserts the
+    connection is hard-closed and a transport error is recorded.
+22. The retained-byte budget binds before the entry count. The test submits a few
+    large `Input` payloads whose total exceeds `TERMINAL_INPUT_INFLIGHT_BYTES`
+    while the entry count stays under `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and
+    asserts the back-pressure error, no further write, and a live subscription.
+23. An oversized paste is chunked, not rejected and not truncated. The test drives
+    `Event::Paste` with a payload above `MAX_INPUT_DATA_BYTES`, asserts the
+    concatenated chunk bodies equal the original bracketed-paste bytes exactly,
+    asserts every chunk body is within the ceiling, asserts the chunk order, and
+    asserts no entry in the sequence is retry eligible. A companion case asserts a
+    non-admitted result for one chunk stops the remaining chunks and reports
+    partial application.
 
 Live proof, per the repository charter:
 
