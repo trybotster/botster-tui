@@ -121,7 +121,10 @@ In scope, all inside `botster-tui`:
    `ObservedRequest` test variants and the live-test call sites.
 6. Replace the synchronous `apply_mode_gated_input_response` flow with an
    event-driven `TerminalEvent::InputResult` handler that refreshes the mode
-   shadow and reacts to `StaleMode`.
+   shadow and reacts to `StaleMode`, correlated through the bounded in-flight
+   queue described under "Input result correlation".
+6a. Bound every duplex write with `TERMINAL_INPUT_WRITE_BOUND`, and hard-close
+   plus report a transport error on timeout.
 7. Carry terminal input as `Vec<u8>` from `InputDispatch::TerminalForward` to the
    encoder, and delete the `String::from_utf8` gate that only existed to fill a
    JSON request field.
@@ -185,9 +188,11 @@ Assumptions:
    live handle. The TUI therefore gates every write on the live attached
    subscription and treats absence of an `input_result` as normal, not as an
    error.
-3. Input becomes fire-and-forget at the wire. The user-visible outcome moves from
-   a synchronous response to an asynchronous `input_result` frame plus echoed
-   output. The TUI keeps at most one stale-mode retry per submitted command.
+3. Input becomes fire-and-forget at the wire, but not uncorrelated. The
+   user-visible outcome moves from a synchronous response to an asynchronous
+   `input_result` frame plus echoed output. The TUI correlates each result to a
+   submitted command through the bounded in-flight queue, and keeps at most one
+   stale-mode retry per command. The write itself is deadline bounded.
 4. `ReadModeFlags` remains the initial freshness probe. `input_result` refreshes
    the shadow afterwards.
 5. Raising the conformance floor to the pinned Hub's revision is correct. The
@@ -237,6 +242,9 @@ Named code sites in `app.rs`:
 - `AttachHydration.pending_input` — hold `Vec<u8>`.
 - `ObservedRequest` — delete `SendInput`, `ModeGatedInput`, and `Resize`; add an
   observed duplex-frame record so tests can assert the encoded command.
+- A new `TERMINAL_INPUT_WRITE_BOUND` constant beside `DETACH_ON_DISCONNECT_BOUND`.
+- A new bounded in-flight input queue field, cleared with the mode shadow on
+  detach, close, and reconnect.
 - `MINIMUM_CONFORMANCE_FIXTURE_REVISION` and the protocol 7 / revision 44 tests.
 - The live tests near `headless_live_runtime_ghostty_…`, the shared Ghostty
   lanes, and the socket-cut sibling test.
@@ -248,12 +256,57 @@ Named code sites in `app.rs`:
 | A 208-commit Hub pin roll changes unrelated DTOs and breaks compilation or tests far from terminal input. | Roll the pin first as its own commit, run the full gate set, and fix fallout before the input change. Keep the two concerns in separate commits. |
 | Input silently disappears when the subscription is not live, because Hub drops the envelope without a response. | Gate every write on `attached_session` plus `attached_subscription_id == self.subscription_id`, surface a client error when the gate fails, and prove the stale case with a test. |
 | Losing the synchronous error surface degrades user feedback for rejected input. | Handle `input_result` with `admitted == false`, map each `TerminalInputRejection` to a distinct message, and assert those messages in tests. |
-| A stale-mode retry loop, because the retry itself can be rejected. | Allow at most one re-probe and one retry per submitted command, exactly as the current `allow_reprobe` flag does. Assert the bound in a test. |
-| Byte-type change breaks paste fidelity or the queued-input order. | Keep one ordered queue, keep bytes unmodified end to end, and assert exact bytes for a multi-byte paste. |
+| A stale-mode retry loop, because the retry itself can be rejected. | Allow at most one re-probe and one retry per submitted command. Assert the bound in a test. |
+| An asynchronous `input_result` cannot name the command it answers, so a stale-mode retry could resend the wrong bytes. | Keep a bounded ordered in-flight queue per live subscription and correlate the head entry, with a `kind` cross-check and a fail-closed path on mismatch. See "Input result correlation" below. |
+| Byte-type change breaks paste fidelity or the queued-input order. | Keep one ordered queue, keep bytes unmodified end to end, and assert exact bracketed-paste bytes driven from a real `Event::Paste`. Kit `dispatch_paste` wraps a Rust `String`, so paste bytes are always valid UTF-8 at the kit boundary; the byte-typed pipeline matters for key and mouse encoding, not for reaching non-UTF-8 paste input. |
 | `TerminalInputResult` has no `session_id`, so a result cannot be matched by session. | Match on `subscription_id` alone against the live attached subscription, and ignore results for retired subscription ids. |
 | Live Ghostty lanes fail for environment reasons and hide a real regression. | Use the IsolatedHub `ghostty` lane as the primary live oracle and require the printed completion markers, per the repository charter. |
 | Hub `main` moves before Implement, so the plan's SHAs go stale. | Implement re-verifies ancestry and records the exact SHAs it used in the Implement report. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
+
+## Input result correlation
+
+`TerminalInputResult` carries no command id and no sequence number. It carries
+`subscription_id`, `kind`, `admitted`, `bytes_written`, `mode_generation`,
+`mode_revision`, `mode_flags`, and an optional `rejection`. A retry policy that
+reacts to `StaleMode` therefore needs a correlation rule, because more than one
+command can be in flight on one subscription.
+
+Correlation rule:
+
+1. The TUI keeps one ordered in-flight queue for each live subscription. It
+   pushes an entry on every successful duplex write. The entry holds the command
+   kind, the exact submitted bytes, the freshness tokens used, and a retry flag.
+2. Each `input_result` for the live subscription pops the head entry.
+3. The TUI cross-checks `result.kind` against the head entry's kind. On a
+   mismatch the TUI does not retry. It clears the whole in-flight queue, records
+   a distinct client error, and requires a fresh ModeFlags probe before the next
+   gated write. Fail closed beats resending the wrong bytes.
+4. Only a popped entry whose `retry` flag is unused may be resent, and only once,
+   after one ModeFlags re-probe.
+5. The queue is bounded. When it is full the TUI refuses the write and reports
+   back-pressure rather than losing correlation.
+6. The queue is cleared on detach, on `TerminalSubscriptionClosed`, on reconnect,
+   and whenever the live subscription id changes.
+
+This rule rests on one stated Core assumption, verified by reading Core
+`managed_session_runtime.rs` and `client_worker.rs` at the candidate pin:
+
+- Core enqueues exactly one `input_result` per admitted command onto one ordered
+  per-owner egress queue, so results arrive in submission order for one
+  subscription.
+- A result is never silently lost while the subscription stays live. Every
+  `enqueue_input_result` failure path calls `detach_live` or
+  `owner_apply_teardown_outcome`, so a lost result becomes a subscription close.
+  `Malformed` and `QueueOverflow` are deliberately unpublished for the same
+  reason: close is the report.
+- A gated command parks later input for the same owner, so one owner has at most
+  one outstanding gated wait.
+
+Implement must prove the assumption rather than trust it. The `kind` cross-check
+in step 3 is the guard that keeps the client correct if Core ever reorders or
+drops a result, and Implement must add a test that drives a mismatched result and
+asserts the fail-closed path.
 
 ## Runtime-teardown class answers
 
@@ -269,12 +322,18 @@ keep working. The TUI holds exactly one terminal subscription at a time, so it
 has no terminal siblings of its own, and it must not tear down the host control
 connection when a terminal input fails.
 
-`teardown_bounds`: a duplex input write is a bounded socket write on the existing
-connection. There is no `block_on` and no new thread. The TUI keeps its existing
-detach deadline for control requests. A write error maps to the existing
-transport-error path, which already closes the connection hard. Stale-mode
-handling is bounded to one re-probe plus one retry. No unbounded wait is added,
-and no code waits for an `input_result` that may never arrive.
+`teardown_bounds`: a duplex input write must carry an explicit deadline. A plain
+`write_frame` on the TUI `HubConnection` stream inherits `set_write_timeout(None)`
+from the request path, so a Hub that stops reading can block the TUI event loop
+forever once the socket send buffer fills. The plan therefore adds a
+`TERMINAL_INPUT_WRITE_BOUND` constant, sets a write timeout before every duplex
+write, and on timeout calls the existing `HubConnection::hard_close` and records
+a transport error. This mirrors `DETACH_ON_DISCONNECT_BOUND` and
+`request_with_deadline`, which already bound the Detach path. There is no
+`block_on` and no new thread. Stale-mode handling is bounded to one re-probe plus
+one retry per submitted command. No code waits for an `input_result` that may
+never arrive; a missing result is reported by subscription close, never by a
+blocking wait.
 
 `late_message_matrix`:
 
@@ -335,8 +394,12 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
    shadow `mode_generation` and `mode_revision`.
 3. A mouse report without ModeFlags freshness does not fall through to a plain
    `Input` command.
-4. Paste of a multi-byte, non-UTF-8-safe sequence writes the exact bytes with no
-   replacement characters.
+4. Paste drives the real kit path: the test calls
+   `InputRouter::dispatch_event(Event::Paste(text), &hit_map)` with the terminal
+   region focused, feeds the returned `InputDispatch` to `handle_dispatch`, and
+   asserts one `TerminalInputCommand::Input` whose bytes are exactly
+   `\x1b[200~` plus the multi-byte UTF-8 payload plus `\x1b[201~`. The test must
+   not fabricate an `InputDispatch::TerminalForward` value.
 5. `InputDispatch::TerminalResize` writes `TerminalInputCommand::Resize` with the
    exact rows and columns, and updates the local projection.
 6. Attach hydration queues input and only the latest resize, then releases them
@@ -361,6 +424,20 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     `DaemonRequest::ModeGatedInput`, or `DaemonRequest::Resize`. These variants
     no longer exist at the new Hub pin, so this is compiler-enforced; the
     Implement report states that explicitly.
+15. Two commands in flight: a `StaleMode` result pops and retries the correct
+    head entry, and the second command's later result is applied to the second
+    entry. This proves the correlation rule rather than assuming it.
+16. A result whose `kind` does not match the head entry clears the in-flight
+    queue, records the distinct fail-closed error, and performs no retry.
+17. Detach, `TerminalSubscriptionClosed`, and reconnect each clear the in-flight
+    queue, so no entry survives into a new subscription.
+18. A saturated socket bounds the duplex write. The test reuses the existing
+    `spawn_detach_bound_stub(DetachStubMode::StopReadingAfterAttach)` plus
+    `HubConnection::fill_send_buffer_until_blocked` pattern, drives a real key
+    through `handle_dispatch`, and asserts the call returns inside
+    `TERMINAL_INPUT_WRITE_BOUND` with the connection hard-closed and a transport
+    error recorded. This is the same oracle as
+    `bounded_detach_returns_when_peer_stops_reading`.
 
 Live proof, per the repository charter:
 
