@@ -129,10 +129,10 @@ In scope, all inside `botster-tui`:
    encoder, and delete the `String::from_utf8` gate that only existed to fill a
    JSON request field.
 7a. Check every payload against the imported Core ceiling before encode, write,
-   and queue insertion. Hold the paste framing invariant: never write the opening
-   bracketed-paste marker unless the complete sequence will be written. The
-   oversized-paste policy itself is an open product decision with the human and is
-   the one part of this plan Implement must not start until it is answered.
+   and queue insertion. Oversized payloads are out of scope for this repository:
+   they belong to the Core transaction from `ticket_1788287678_207209`, which this
+   ticket now depends on. This plan adds no client chunk policy and no temporary
+   oversized-input rejection.
 8. Raise `MINIMUM_CONFORMANCE_FIXTURE_REVISION` to the revision reported by the
    chosen Hub pin, and update the Hello protocol assertions that name protocol 7
    and revision 44.
@@ -171,6 +171,11 @@ Boundary rules this plan keeps:
   only, never in host `required_features`.
 
 Cross-repository dependencies:
+
+- **`ticket_1788287678_207209` (`botster-core`, open, blocking).** "Core: bounded
+  atomic multi-frame terminal input transactions". Registered as a dependency of
+  this ticket, and of the Web consumer `ticket_1787600676_914408`. This ticket
+  does not reach Implement until that prerequisite closes.
 
 - `ticket_1787894427_525056` (`botster-hub`, closed) delivered the Hub cold cut
   and the client ingress seam. It is already registered as a dependency.
@@ -275,8 +280,7 @@ Named code sites in `app.rs`:
 | The duplex write timeout leaks onto the shared stream and silently bounds later control-plane writes. | Restore `set_write_timeout(None)` on the success path and rely on `hard_close` for the failure path. Test 20 asserts the restored state. |
 | The timeout restore itself fails, leaving the shared control stream in an uncertain state that is then reported as success. | Treat a failed restore as a write failure: `hard_close` and record a transport error. Test 21 asserts it. |
 | The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` of 256 KiB as the binding limit against a 4,194,240-byte worst case, enforced before the write and the queue insertion. Test 22 asserts it. |
-| The Core frame ceiling affects large paste, which works today over the JSON path with no client size limit. | Hold the framing invariant of complete sequence or zero bytes, asserted by tests 23, 23a, and 23b under every candidate policy. The policy choice is an open human decision, because each option trades regression, rejection atomicity, or complexity. |
-| A partial bracketed paste leaves the child terminal stuck in bracketed-paste mode, corrupting later keystrokes. | Never write the opening marker unless the closing marker will also be written. This invariant binds every candidate policy and is asserted directly. |
+| The Core frame ceiling affects large paste, which works today over the JSON path with no client size limit. | Oversized input moves to the Core bounded atomic transaction in `ticket_1788287678_207209`, which this ticket depends on. This repository adds no chunk policy and no temporary rejection, so no partial paste can originate here. |
 | The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Keep `TERMINAL_INPUT_INFLIGHT_CAPACITY` at 64 against Core's 256, and require Implement to re-read Core's constant at the chosen pin. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
@@ -359,59 +363,59 @@ or the in-flight queue.
 The ceiling is reachable, not theoretical. Today a large paste travels as one
 JSON `SendInput` with no client-side size limit, so a paste above 64 KiB works.
 
-### One invariant, whatever the policy
+### Decision: Core owns the transaction, the TUI owns no chunk policy
 
-A bracketed paste is a framed sequence. It opens with `\x1b[200~` and closes with
-`\x1b[201~`. A child that receives the opening marker without the closing marker
-stays in bracketed-paste mode, which corrupts every later keystroke.
+Revision 4 of this plan put a chunk policy in the TUI. Revision 5 offered the
+human three client-side policies. The answer to `question_1788282946_225545`
+rejected all of them and settled the ownership question instead.
 
-**The TUI must never write the opening marker unless the complete sequence,
-including the closing marker, will be written.** Either every byte of the paste
-reaches the socket in order, or zero bytes do. There is no partial paste, and no
-budget or ceiling check may split that framing.
+Core owns terminal framing, ordering, mode fencing, bounds, retry, and
+`TerminalInputResult`. A payload larger than one frame body is therefore a
+Core-owned transaction, not a client concern. The durable rule is
+[[core owns bounded atomic terminal input transactions across clients]].
 
-This invariant holds under every option below. Revision 4 of this plan violated
-it, and that defect is withdrawn.
+Consequences for this repository:
 
-### Withdrawn from revision 4
+1. The TUI defines no chunk policy, no chunk scheduling, no per-chunk retry rule,
+   and no client-side reassembly. Any such logic in earlier revisions of this plan
+   is withdrawn.
+2. The TUI consumes the one helper that the Rust terminal-protocol client
+   publishes for the bounded atomic transaction, and the Web client consumes the
+   matching TypeScript helper. Both clients use the same semantics.
+3. Core accepts and validates the complete operation before any PTY delivery
+   begins, then delivers the bracketed-paste opener, content, and closer as one
+   ordered operation. Every failure path delivers zero PTY bytes, so a partial
+   bracketed paste is impossible by construction rather than by client care.
+4. This plan lands no oversized-paste rejection as temporary compatibility
+   behavior. The direct cut is preserved, and no second terminal input route
+   appears while the prerequisite is open.
 
-Revision 4 stated two rules that cannot both hold:
+### Blocking dependency
 
-- chunks are submitted as consecutive commands, which writes them eagerly; and
-- a non-admitted `input_result` stops the remaining chunks, which requires
-  waiting for each result before writing the next.
+This ticket now depends on `ticket_1788287678_207209`, "Core: bounded atomic
+multi-frame terminal input transactions", in `botster-core`
+(`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`). That contract must define operation
+identity, total length, ordered chunks, commit, abort, timeout, stale-mode
+behavior, generation fencing, strict resource bounds, and one authoritative
+result, and Hub must stay content blind.
 
-Asynchronous results arrive after every eager write, so no unsent chunk remains
-to stop. Revision 4 also let a sequence over the remaining byte budget "submit
-what fits", which can emit an opening marker with no closing marker. Both rules
-are withdrawn. Nothing in this plan schedules a partial paste.
+`ticket_1787600676_914408`, the Web terminal consumer, depends on the same Core
+ticket. Its `writeInput` path takes an unbounded string from the Restty clipboard
+paste, so its paste path can exceed one frame and it needs the same published
+contract.
 
-### Open product decision
+Implement must not start any part of the oversized-input path in this repository
+until the Core helper is published. The single-frame duplex input path, the
+correlation rule, the write bound, and the pin roll do not depend on it, but this
+Plan does not advance to Implement while the prerequisite is open.
 
-Choosing the replacement policy is a product decision, not a mechanical one, so
-this plan does not choose it silently. The question is with the human. The three
-candidate policies and their exact costs:
+### Retained invariant
 
-- **Reject.** Refuse a paste above the ceiling with a clear error and send zero
-  bytes. No partial paste, no new machinery, no change to rejection atomicity.
-  Cost: a paste above 64 KiB stops working, which regresses today's behavior.
-- **Eager, all-or-nothing.** Check the whole sequence against the ceiling and the
-  remaining byte budget first. If it fits, write every chunk in order, including
-  the closing marker. If it does not fit, send nothing. Cost: on the Kitty path a
-  `StaleMode` rejection of one middle chunk leaves the chunks after it already
-  written, so the pasted text can carry a gap. Today one JSON `ModeGatedInput`
-  carries the whole paste and a stale rejection rejects it atomically, so this
-  weakens rejection atomicity.
-- **Result-gated staging.** Write one chunk, wait for its `input_result`, then
-  write the next. Cost: this needs pending-sequence ownership, next-chunk
-  dispatch, mode-token refresh between chunks, an interleaving policy for keys,
-  mouse reports, and resize while a sequence is pending, lifecycle clearing, and
-  a bound. That is a multi-round-trip state machine well beyond the smallest
-  surgical change, and on a mid-sequence stop it must still write the closing
-  marker to honour the invariant above.
-
-Implement must not start the oversized-paste path until the human answers. Every
-other part of this plan is independent of that answer and is ready.
+The framing invariant stays recorded here as a consumer-side expectation of the
+Core contract, not as TUI logic: the opening bracketed-paste marker must never
+reach the PTY unless the closing marker will also reach it. Under the decided
+architecture Core guarantees this, because it validates the complete operation
+before delivery and delivers zero bytes on every failure.
 
 ## Runtime-teardown class answers
 
@@ -574,25 +578,14 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     large `Input` payloads whose total exceeds `TERMINAL_INPUT_INFLIGHT_BYTES`
     while the entry count stays under `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and
     asserts the back-pressure error, no further write, and a live subscription.
-23. Oversized paste never emits a partial bracketed sequence. This test is
-    required under every candidate policy and does not depend on the open
-    decision. The test drives `Event::Paste` with a payload above
-    `MAX_INPUT_DATA_BYTES`, and asserts that the bytes written to the socket are
-    either the complete original bracketed-paste sequence in order, closing
-    marker included, or exactly zero bytes. It must never observe `\x1b[200~`
-    without `\x1b[201~`.
-23a. The same assertion for a payload above the remaining
-    `TERMINAL_INPUT_INFLIGHT_BYTES` budget: complete sequence or zero bytes, never
-    an opening marker alone.
-23b. A rejection path writes nothing it claims not to write. The test asserts that
-    no chunk described as unsent reached the socket.
-23c. Policy-specific cases are added once the human answers the open product
-    decision. Under Reject, assert the error and zero bytes written. Under Eager,
-    assert every chunk is within the ceiling, the order is preserved, no entry is
-    retry eligible, and a mid-sequence `StaleMode` is reported as a gap rather
-    than silently ignored. Under Result-gated staging, assert next-chunk dispatch,
-    the interleaving policy, the sequence bound, and that a mid-sequence stop
-    still writes the closing marker.
+23. Oversized input is deferred to the Core transaction, not handled locally.
+    Until `ticket_1788287678_207209` publishes the helper, this repository adds no
+    oversized-paste test, because it adds no oversized-paste behavior. Once the
+    helper exists, the TUI test set gains: a paste above `MAX_INPUT_DATA_BYTES`
+    travels through the published transaction helper; the TUI defines no chunk
+    policy of its own; and a rejected transaction leaves the terminal with zero
+    pasted bytes and no bracketed-paste opener. Those cases are written against
+    the Core contract, not against a TUI chunk implementation.
 
 Live proof, per the repository charter:
 
@@ -624,7 +617,12 @@ both results.
 2. `TerminalInputResult` carries no `session_id`, so client correlation is
    subscription-only. [[every TerminalInputResult must stamp the live subscription id]]
    states the producer duty; the consumer duty is not captured.
-3. Duplex terminal input removes the synchronous request-response error surface
+3. [[core owns bounded atomic terminal input transactions across clients]] is the
+   durable rule settled by `question_1788282946_225545`. Payloads larger than one
+   frame body are a Core-owned bounded atomic transaction with one authoritative
+   result, not a client chunk policy, and every failure delivers zero PTY bytes.
+   The Core ticket owns the capture once the contract ships.
+4. Duplex terminal input removes the synchronous request-response error surface
    from first-party clients, so client input error reporting becomes event
    driven and bounded to one stale-mode retry. This is a client-policy decision
    worth a note once it ships in both the TUI and the Web client.
