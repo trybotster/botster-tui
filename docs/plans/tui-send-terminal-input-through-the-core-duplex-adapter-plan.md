@@ -288,16 +288,58 @@ Correlation rule:
    gated write. Fail closed beats resending the wrong bytes.
 4. Only a popped entry whose `retry` flag is unused may be resent, and only once,
    after one ModeFlags re-probe.
-5. The queue is bounded by `TERMINAL_INPUT_INFLIGHT_CAPACITY`, a TUI constant
-   set to 64. When it is full the TUI refuses the write, records a distinct
-   back-pressure error, and drops the input rather than losing correlation. The
-   value is deliberately far below Core's `INPUT_QUEUE_CAPACITY`, which is 256 at
-   the candidate pin and hard-stops the owner when exceeded, so the client fails
-   soft before Core closes the subscription. Core does not re-export
+5. The queue is bounded by two limits, both enforced before the socket write and
+   before queue insertion. An entry count limit,
+   `TERMINAL_INPUT_INFLIGHT_CAPACITY`, set to 64; and a retained-byte limit,
+   `TERMINAL_INPUT_INFLIGHT_BYTES`, set to 262,144 (256 KiB). When either limit
+   would be exceeded the TUI refuses the write, records a distinct back-pressure
+   error, and drops the input rather than losing correlation.
+
+   The byte limit is the binding one, and the count alone is not sufficient. Each
+   entry retains the exact submitted bytes so a stale-mode retry can resend them.
+   `MAX_INPUT_DATA_BYTES` is 65,535 at the pinned Core contract, so 64 maximum
+   `Input` payloads would retain up to 4,194,240 bytes with the count limit alone.
+   256 KiB is far above any realistic in-flight burst and well below that worst
+   case.
+
+   The entry count of 64 stays far below Core's `INPUT_QUEUE_CAPACITY`, which is
+   256 at the candidate pin and hard-stops the owner when exceeded, so the client
+   fails soft before Core closes the subscription. Core does not re-export
    `INPUT_QUEUE_CAPACITY` from `botster_core::engine` at the candidate pin, so the
    TUI keeps a local constant with a comment naming Core's value, and Implement
    re-reads Core's constant at the chosen pin to confirm the client bound stays
    lower.
+
+## Oversized input and the paste ceiling
+
+Core caps one frame body. `MAX_INPUT_DATA_BYTES` is 65,535 and
+`MAX_MODE_GATED_DATA_BYTES` is 65,519, both re-exported from
+`botster-terminal-protocol-client`, so the TUI imports them and must never
+hardcode either value.
+
+The TUI must check the payload against the matching ceiling before it encodes,
+writes, or enqueues. `encode_terminal_input` also returns `PayloadTooLarge`, but
+the client check must come first so an oversized payload never reaches the socket
+or the in-flight queue.
+
+The ceiling is reachable, not theoretical. Today a large paste travels as one
+JSON `SendInput` with no client-side size limit, so a paste above 64 KiB works.
+Rejecting it outright would regress the paste behavior the ticket requires the
+plan to preserve. The TUI therefore splits an oversized payload into ordered
+chunks at the matching ceiling and submits them as consecutive commands on the
+one ordered queue, which preserves byte order and byte fidelity. Chunking is
+forced by the Core frame ceiling. It is not a new feature and gains no
+configurability.
+
+Chunked sequences change two rules:
+
+1. Retry is disabled for every entry in a chunked sequence. Resending one middle
+   chunk would reorder bytes at the PTY. A non-admitted result for any chunk stops
+   the remaining chunks and reports partial application with the byte count that
+   Core admitted.
+2. The byte budget applies to the whole sequence. When a paste does not fit the
+   remaining budget, the TUI submits what fits, stops, and reports back-pressure
+   rather than interleaving a later command into the middle of the sequence.
 6. The queue is cleared on detach, on `TerminalSubscriptionClosed`, on reconnect,
    and whenever the live subscription id changes.
 
@@ -348,7 +390,14 @@ every later control-plane write. The duplex write therefore restores
 `set_write_timeout(None)` on the success path, exactly as `request_with_deadline`
 already does. On the failure path it calls the existing
 `HubConnection::hard_close`, which already clears both timeouts, and records a
-transport error. This mirrors `DETACH_ON_DISCONNECT_BOUND` and
+transport error.
+
+The restore call is itself fallible. If `set_write_timeout(None)` returns an
+error after an otherwise successful write, the shared control stream is left in
+an uncertain timeout state, so the method must not report success. It calls
+`hard_close` and records a transport error, the same as a failed write. A stream
+whose timeout state cannot be trusted is not usable for later control-plane
+requests. This mirrors `DETACH_ON_DISCONNECT_BOUND` and
 `request_with_deadline`, which already bound the Detach path. There is no
 `block_on` and no new thread. Stale-mode handling is bounded to one re-probe plus
 one retry per submitted command. No code waits for an `input_result` that may
