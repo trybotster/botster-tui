@@ -129,8 +129,10 @@ In scope, all inside `botster-tui`:
    encoder, and delete the `String::from_utf8` gate that only existed to fill a
    JSON request field.
 7a. Check every payload against the imported Core ceiling before encode, write,
-   and queue insertion, and split an oversized payload into ordered chunks so
-   large paste does not regress.
+   and queue insertion. Hold the paste framing invariant: never write the opening
+   bracketed-paste marker unless the complete sequence will be written. The
+   oversized-paste policy itself is an open product decision with the human and is
+   the one part of this plan Implement must not start until it is answered.
 8. Raise `MINIMUM_CONFORMANCE_FIXTURE_REVISION` to the revision reported by the
    chosen Hub pin, and update the Hello protocol assertions that name protocol 7
    and revision 44.
@@ -273,7 +275,8 @@ Named code sites in `app.rs`:
 | The duplex write timeout leaks onto the shared stream and silently bounds later control-plane writes. | Restore `set_write_timeout(None)` on the success path and rely on `hard_close` for the failure path. Test 20 asserts the restored state. |
 | The timeout restore itself fails, leaving the shared control stream in an uncertain state that is then reported as success. | Treat a failed restore as a write failure: `hard_close` and record a transport error. Test 21 asserts it. |
 | The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` of 256 KiB as the binding limit against a 4,194,240-byte worst case, enforced before the write and the queue insertion. Test 22 asserts it. |
-| The Core frame ceiling regresses large paste, which works today over the JSON path with no client size limit. | Chunk an oversized payload at the imported Core ceiling into ordered consecutive commands, with retry disabled for the sequence. Test 23 asserts exact byte reassembly, chunk bounds, order, and the partial-application stop. |
+| The Core frame ceiling affects large paste, which works today over the JSON path with no client size limit. | Hold the framing invariant of complete sequence or zero bytes, asserted by tests 23, 23a, and 23b under every candidate policy. The policy choice is an open human decision, because each option trades regression, rejection atomicity, or complexity. |
+| A partial bracketed paste leaves the child terminal stuck in bracketed-paste mode, corrupting later keystrokes. | Never write the opening marker unless the closing marker will also be written. This invariant binds every candidate policy and is asserted directly. |
 | The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Keep `TERMINAL_INPUT_INFLIGHT_CAPACITY` at 64 against Core's 256, and require Implement to re-read Core's constant at the chosen pin. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
@@ -319,36 +322,6 @@ Correlation rule:
    re-reads Core's constant at the chosen pin to confirm the client bound stays
    lower.
 
-## Oversized input and the paste ceiling
-
-Core caps one frame body. `MAX_INPUT_DATA_BYTES` is 65,535 and
-`MAX_MODE_GATED_DATA_BYTES` is 65,519, both re-exported from
-`botster-terminal-protocol-client`, so the TUI imports them and must never
-hardcode either value.
-
-The TUI must check the payload against the matching ceiling before it encodes,
-writes, or enqueues. `encode_terminal_input` also returns `PayloadTooLarge`, but
-the client check must come first so an oversized payload never reaches the socket
-or the in-flight queue.
-
-The ceiling is reachable, not theoretical. Today a large paste travels as one
-JSON `SendInput` with no client-side size limit, so a paste above 64 KiB works.
-Rejecting it outright would regress the paste behavior the ticket requires the
-plan to preserve. The TUI therefore splits an oversized payload into ordered
-chunks at the matching ceiling and submits them as consecutive commands on the
-one ordered queue, which preserves byte order and byte fidelity. Chunking is
-forced by the Core frame ceiling. It is not a new feature and gains no
-configurability.
-
-Chunked sequences change two rules:
-
-1. Retry is disabled for every entry in a chunked sequence. Resending one middle
-   chunk would reorder bytes at the PTY. A non-admitted result for any chunk stops
-   the remaining chunks and reports partial application with the byte count that
-   Core admitted.
-2. The byte budget applies to the whole sequence. When a paste does not fit the
-   remaining budget, the TUI submits what fits, stops, and reports back-pressure
-   rather than interleaving a later command into the middle of the sequence.
 6. The queue is cleared on detach, on `TerminalSubscriptionClosed`, on reconnect,
    and whenever the live subscription id changes.
 
@@ -370,6 +343,75 @@ Implement must prove the assumption rather than trust it. The `kind` cross-check
 in step 3 is the guard that keeps the client correct if Core ever reorders or
 drops a result, and Implement must add a test that drives a mismatched result and
 asserts the fail-closed path.
+
+## Oversized input and the paste ceiling
+
+Core caps one frame body. `MAX_INPUT_DATA_BYTES` is 65,535 and
+`MAX_MODE_GATED_DATA_BYTES` is 65,519, both re-exported from
+`botster-terminal-protocol-client`, so the TUI imports them and must never
+hardcode either value.
+
+The TUI must check the payload against the matching ceiling before it encodes,
+writes, or enqueues. `encode_terminal_input` also returns `PayloadTooLarge`, but
+the client check must come first so an oversized payload never reaches the socket
+or the in-flight queue.
+
+The ceiling is reachable, not theoretical. Today a large paste travels as one
+JSON `SendInput` with no client-side size limit, so a paste above 64 KiB works.
+
+### One invariant, whatever the policy
+
+A bracketed paste is a framed sequence. It opens with `\x1b[200~` and closes with
+`\x1b[201~`. A child that receives the opening marker without the closing marker
+stays in bracketed-paste mode, which corrupts every later keystroke.
+
+**The TUI must never write the opening marker unless the complete sequence,
+including the closing marker, will be written.** Either every byte of the paste
+reaches the socket in order, or zero bytes do. There is no partial paste, and no
+budget or ceiling check may split that framing.
+
+This invariant holds under every option below. Revision 4 of this plan violated
+it, and that defect is withdrawn.
+
+### Withdrawn from revision 4
+
+Revision 4 stated two rules that cannot both hold:
+
+- chunks are submitted as consecutive commands, which writes them eagerly; and
+- a non-admitted `input_result` stops the remaining chunks, which requires
+  waiting for each result before writing the next.
+
+Asynchronous results arrive after every eager write, so no unsent chunk remains
+to stop. Revision 4 also let a sequence over the remaining byte budget "submit
+what fits", which can emit an opening marker with no closing marker. Both rules
+are withdrawn. Nothing in this plan schedules a partial paste.
+
+### Open product decision
+
+Choosing the replacement policy is a product decision, not a mechanical one, so
+this plan does not choose it silently. The question is with the human. The three
+candidate policies and their exact costs:
+
+- **Reject.** Refuse a paste above the ceiling with a clear error and send zero
+  bytes. No partial paste, no new machinery, no change to rejection atomicity.
+  Cost: a paste above 64 KiB stops working, which regresses today's behavior.
+- **Eager, all-or-nothing.** Check the whole sequence against the ceiling and the
+  remaining byte budget first. If it fits, write every chunk in order, including
+  the closing marker. If it does not fit, send nothing. Cost: on the Kitty path a
+  `StaleMode` rejection of one middle chunk leaves the chunks after it already
+  written, so the pasted text can carry a gap. Today one JSON `ModeGatedInput`
+  carries the whole paste and a stale rejection rejects it atomically, so this
+  weakens rejection atomicity.
+- **Result-gated staging.** Write one chunk, wait for its `input_result`, then
+  write the next. Cost: this needs pending-sequence ownership, next-chunk
+  dispatch, mode-token refresh between chunks, an interleaving policy for keys,
+  mouse reports, and resize while a sequence is pending, lifecycle clearing, and
+  a bound. That is a multi-round-trip state machine well beyond the smallest
+  surgical change, and on a mid-sequence stop it must still write the closing
+  marker to honour the invariant above.
+
+Implement must not start the oversized-paste path until the human answers. Every
+other part of this plan is independent of that answer and is ready.
 
 ## Runtime-teardown class answers
 
@@ -532,13 +574,25 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     large `Input` payloads whose total exceeds `TERMINAL_INPUT_INFLIGHT_BYTES`
     while the entry count stays under `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and
     asserts the back-pressure error, no further write, and a live subscription.
-23. An oversized paste is chunked, not rejected and not truncated. The test drives
-    `Event::Paste` with a payload above `MAX_INPUT_DATA_BYTES`, asserts the
-    concatenated chunk bodies equal the original bracketed-paste bytes exactly,
-    asserts every chunk body is within the ceiling, asserts the chunk order, and
-    asserts no entry in the sequence is retry eligible. A companion case asserts a
-    non-admitted result for one chunk stops the remaining chunks and reports
-    partial application.
+23. Oversized paste never emits a partial bracketed sequence. This test is
+    required under every candidate policy and does not depend on the open
+    decision. The test drives `Event::Paste` with a payload above
+    `MAX_INPUT_DATA_BYTES`, and asserts that the bytes written to the socket are
+    either the complete original bracketed-paste sequence in order, closing
+    marker included, or exactly zero bytes. It must never observe `\x1b[200~`
+    without `\x1b[201~`.
+23a. The same assertion for a payload above the remaining
+    `TERMINAL_INPUT_INFLIGHT_BYTES` budget: complete sequence or zero bytes, never
+    an opening marker alone.
+23b. A rejection path writes nothing it claims not to write. The test asserts that
+    no chunk described as unsent reached the socket.
+23c. Policy-specific cases are added once the human answers the open product
+    decision. Under Reject, assert the error and zero bytes written. Under Eager,
+    assert every chunk is within the ceiling, the order is preserved, no entry is
+    retry eligible, and a mid-sequence `StaleMode` is reported as a gap rather
+    than silently ignored. Under Result-gated staging, assert next-chunk dispatch,
+    the interleaving policy, the sequence bound, and that a mid-sequence stop
+    still writes the closing marker.
 
 Live proof, per the repository charter:
 
