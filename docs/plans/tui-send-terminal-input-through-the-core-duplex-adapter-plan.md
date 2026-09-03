@@ -1,7 +1,9 @@
 # TUI: send terminal input through the Core duplex adapter
 
 Ticket: `ticket_1787603674_865638`
-Run: `run_1788280083_197023`
+Run: `run_1788408214_815531` (revision 9; the prior Plan run
+`run_1788280083_197023` was cancelled at Plan after revision 8 and this run
+reconciles the plan with the ticket consolidation revision of 2026-09-02)
 Pipeline: Botster Stack Delivery
 Base ref: `main` (TUI `3b84d57`)
 
@@ -71,14 +73,19 @@ Target repository code:
 
 Dependency repositories (read only):
 
-- `botster-hub` at `main` `b4020a976010f4ec495c89efd6ea66271e02712f`.
-- `botster-core` at `main` `e5a927c31d5b7d0b0f4b198e5e556ed75d53ddf1`.
+- `botster-hub` at `main` `bb1a330543bc06888f894edd5f40a0f867753a12`.
+- `botster-core` at `main` `48a437032791e678010254708259568ce4ad02bf`.
+- `botster-tui-kit` at the pinned `7940306b0d7461a12575b3856a96c0fbb23784f3`,
+  which is also Kit `main`.
+- Both heads were re-verified on 2026-09-02 for revision 9 and are unchanged
+  from the revision 8 candidate pins.
 
 Key facts confirmed by reading the dependency sources:
 
 1. Hub `main` deleted `DaemonRequest::SendInput`, `DaemonRequest::ModeGatedInput`,
    and `DaemonRequest::Resize`. The cold cut merged at `b1aab5d`. The current TUI
-   Hub pin `baeb04d` is 208 commits behind and still has those requests.
+   Hub pin `baeb04d` is 247 commits behind `bb1a330` and still has those
+   requests.
 2. Hub `main` exposes the client ingress seam:
    `DaemonConnection::send_terminal_frame(session_id, subscription_id, frame_bytes)`,
    which writes one `DaemonUnixTerminalEnvelope` and expects no paired response.
@@ -97,9 +104,9 @@ Key facts confirmed by reading the dependency sources:
    `mode_revision`, a complete `TerminalModeFlags`, and an optional
    `TerminalInputRejection` of `StaleMode`, `PartialWrite`, `Timeout`, or
    `SessionNotWritable`.
-6. Hub `main` reports protocol version 8 and conformance fixture revision 47.
+6. Hub `main` reports protocol version 8 and conformance fixture revision 48.
    The TUI floor constant is currently 44 and its Hub pin reports protocol 7.
-7. Hub `main` pins Core `e5a927c31d5b7d0b0f4b198e5e556ed75d53ddf1` in every
+7. Hub `main` pins Core `48a437032791e678010254708259568ce4ad02bf` in every
    member manifest, including `botster-hub-client` and `botster-hub-test-support`.
 8. `DaemonRequest::ReadModeFlags` and `DaemonModeFlags` survive the cold cut, so
    the existing freshness probe stays available.
@@ -228,10 +235,19 @@ Cross-repository dependencies:
   and the client ingress seam. It is already registered as a dependency.
 - `ticket_1787603671_590198` (`botster-hub`, closed, superseded) is already
   registered.
-- No new dependency ticket is required. Both open sibling Hub and Core tickets
-  (`ticket_1788206393_323469`, `ticket_1788112223_631570`,
-  `ticket_1787894967_973951`) are follow-ups on top of the merged cold cut. This
-  run pins an exact commit and does not wait for them.
+- No new dependency ticket is required. The open sibling tickets in the
+  project on 2026-09-02 are `ticket_1788206393_323469` (Hub wake-progress
+  proof), `ticket_1787894967_973951` (Core polling-path deletion, which absorbed
+  `ticket_1788112223_631570`), `ticket_1787600684_892051` (Web DataChannel
+  consumers), and `ticket_1787600679_990088` (final integration). All are
+  follow-ups on top of the merged cold cut or downstream of this run. This run
+  pins an exact commit and does not wait for them.
+- Per the ticket consolidation revision, every TUI duplex consumer change stays
+  in this run. The plan registers no same-repository follow-up ticket, and a
+  review finding on this run is fixed inside this run.
+- Full cross-repository proof belongs to `ticket_1787600679_990088`. This run
+  executes the TUI repository gates and the TUI charter live lanes as its one
+  downstream-shaped conformance proof; see "Acceptance checks and tests".
 
 ## Assumptions and unknowns
 
@@ -314,9 +330,10 @@ Named code sites in `app.rs`:
 - `ObservedRequest` — delete `SendInput`, `ModeGatedInput`, and `Resize`; add an
   observed duplex-frame record so tests can assert the encoded command.
 - Three new constants beside `DETACH_ON_DISCONNECT_BOUND`:
-  `TERMINAL_INPUT_WRITE_BOUND` of two seconds,
-  `TERMINAL_INPUT_INFLIGHT_CAPACITY` of 64, and
-  `TERMINAL_INPUT_INFLIGHT_BYTES` of 262,144.
+  `TERMINAL_INPUT_WRITE_BOUND`, `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and
+  `TERMINAL_INPUT_INFLIGHT_BYTES`. Implement sets their exact values from the
+  published Core contract at the chosen pin under the rules in "Pressure bounds
+  are set in Implement", and proves each with a focused test.
 - Imported Core ceilings `MAX_INPUT_DATA_BYTES`, `MAX_MODE_GATED_DATA_BYTES`,
   `MAX_PASTE_BYTES`, and `MAX_PASTE_CHUNK_DATA_BYTES` from
   `botster-terminal-protocol-client`, never hardcoded.
@@ -346,9 +363,9 @@ Named code sites in `app.rs`:
 | Hub `main` moves before Implement, so the plan's SHAs go stale. | Implement re-verifies ancestry and records the exact SHAs it used in the Implement report. |
 | The duplex write timeout leaks onto the shared stream and silently bounds later control-plane writes. | Restore `set_write_timeout(None)` on the success path and rely on `hard_close` for the failure path. Test 20 asserts the restored state. |
 | The timeout restore itself fails, leaving the shared control stream in an uncertain state that is then reported as success. | Treat a failed restore as a write failure: `hard_close` and record a transport error. Test 21 asserts it. |
-| The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` of 256 KiB as the binding limit against a 4,194,240-byte worst case, enforced before the write and the queue insertion. Test 22 asserts it. |
+| The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` as the binding retained-byte limit, enforced before the write and the queue insertion. Implement sets the value below the count-times-`MAX_INPUT_DATA_BYTES` worst case and records the derivation. Test 22 asserts it. |
 | Large paste behavior depends on a contract this repository does not own. | Consume the published `encode_paste` helper and correlate by `operation_id`. Core validates the whole operation before delivery and delivers zero PTY bytes on every pre-delivery failure. The one exception is an operating-system partial write after delivery began, which Core reports as `PartialWrite` with the exact `bytes_written` and follows with an owner hard-stop; the TUI never retries it. Tests 23 to 30 assert the consumption, not a local implementation. |
-| The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Keep `TERMINAL_INPUT_INFLIGHT_CAPACITY` at 64 against Core's 256, and require Implement to re-read Core's constant at the chosen pin. Test 19 proves the soft-fail path. |
+| The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Implement reads Core's `INPUT_QUEUE_CAPACITY` at the chosen pin and sets `TERMINAL_INPUT_INFLIGHT_CAPACITY` strictly below it, with a test that asserts the ordering. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
 ## Input result correlation
@@ -389,26 +406,23 @@ Correlation rule:
    the exact `bytes_written`, pops the entry, and expects
    `TerminalSubscriptionClosed` to follow because Core hard-stops the owner.
 5. The queue is bounded by two limits, both enforced before the socket write and
-   before queue insertion. An entry count limit,
-   `TERMINAL_INPUT_INFLIGHT_CAPACITY`, set to 64; and a retained-byte limit,
-   `TERMINAL_INPUT_INFLIGHT_BYTES`, set to 262,144 (256 KiB). When either limit
-   would be exceeded the TUI refuses the write, records a distinct back-pressure
-   error, and drops the input rather than losing correlation.
+   before queue insertion: an entry count limit,
+   `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and a retained-byte limit,
+   `TERMINAL_INPUT_INFLIGHT_BYTES`. When either limit would be exceeded the TUI
+   refuses the write, records a distinct back-pressure error, and drops the
+   input rather than losing correlation. The exact values are set in Implement;
+   see "Pressure bounds are set in Implement".
 
    The byte limit is the binding one, and the count alone is not sufficient. Each
-   entry retains the exact submitted bytes so a stale-mode retry can resend them.
-   `MAX_INPUT_DATA_BYTES` is 65,535 at the pinned Core contract, so 64 maximum
-   `Input` payloads would retain up to 4,194,240 bytes with the count limit alone.
-   256 KiB is far above any realistic in-flight burst and well below that worst
-   case.
+   entry retains the exact submitted bytes so a stale-mode retry can resend them,
+   so the count limit alone would retain up to the count times
+   `MAX_INPUT_DATA_BYTES`.
 
-   The entry count of 64 stays far below Core's `INPUT_QUEUE_CAPACITY`, which is
-   256 at the candidate pin and hard-stops the owner when exceeded, so the client
-   fails soft before Core closes the subscription. Core does not re-export
-   `INPUT_QUEUE_CAPACITY` from `botster_core::engine` at the candidate pin, so the
-   TUI keeps a local constant with a comment naming Core's value, and Implement
-   re-reads Core's constant at the chosen pin to confirm the client bound stays
-   lower.
+   The entry count must stay strictly below Core's `INPUT_QUEUE_CAPACITY`, which
+   hard-stops the owner when exceeded, so the client fails soft before Core
+   closes the subscription. Core does not re-export `INPUT_QUEUE_CAPACITY` from
+   `botster_core::engine` at the candidate pin, so the TUI keeps a local
+   constant with a comment naming Core's value and the pin it was read from.
 
 6. The queue is cleared on detach, on `TerminalSubscriptionClosed`, on reconnect,
    and whenever the live subscription id changes.
@@ -431,6 +445,29 @@ Implement must prove the assumption rather than trust it. The `kind` cross-check
 in step 3 is the guard that keeps the client correct if Core ever reorders or
 drops a result, and Implement must add a test that drives a mismatched result and
 asserts the fail-closed path.
+
+## Pressure bounds are set in Implement
+
+The ticket consolidation revision states: "Do not design another paste,
+pressure, or transport contract in Plan. Set exact pressure bounds during
+Implement from the published contract and prove them with focused tests." This
+plan therefore designs no contract. The in-flight queue above is client
+consumption of the published `TerminalInputResult` contract, and the three
+client constants carry no fixed value in this plan. Implement sets each value
+from the published Core contract at the chosen pin, under these rules:
+
+| Constant | Rule | Published source | Proof |
+| --- | --- | --- | --- |
+| `TERMINAL_INPUT_WRITE_BOUND` | A finite deadline on every duplex socket write, restored to `None` on success. Default: equal to `DETACH_ON_DISCONNECT_BOUND`. | The TUI's existing detach bound, not a Core value. | Tests 18, 20, 21. |
+| `TERMINAL_INPUT_INFLIGHT_CAPACITY` | Strictly below Core's `INPUT_QUEUE_CAPACITY` at the chosen pin, so the client fails soft before Core hard-stops the owner. | `botster_core::engine::client_worker::INPUT_QUEUE_CAPACITY` (256 at Core `48a4370`; not re-exported, so read at the pin and cited in a comment). | Test 19, plus one assertion that the client constant is below the cited Core value. |
+| `TERMINAL_INPUT_INFLIGHT_BYTES` | Below `TERMINAL_INPUT_INFLIGHT_CAPACITY` times `MAX_INPUT_DATA_BYTES`, so the byte limit binds before the count limit. | `MAX_INPUT_DATA_BYTES` re-exported by `botster-terminal-protocol-client`. | Test 22. |
+| Paste slot | At most one in-flight or pending paste, retaining at most `MAX_PASTE_BYTES`. | `MAX_PASTE_BYTES` re-exported by `botster-terminal-protocol-client`. | Tests 26 and 30. |
+
+Implement records the chosen values, the Core constants they derive from, and
+the exact Core pin in the Implement report. Tests name the constants, never
+literal values, so a later value change does not rewrite the proof. Revision 8
+of this plan carried candidate values of two seconds, 64 entries, and 256 KiB;
+those are prior candidates, not plan requirements.
 
 ## Oversized input and the paste ceiling
 
@@ -622,8 +659,7 @@ uses for keys:
    with zero frames and a clear error that names Core's ceiling. A paste is then
    accounted separately from the non-paste in-flight budget: at most one
    in-flight or pending paste, retaining at most `MAX_PASTE_BYTES` for its single
-   retry, alongside `TERMINAL_INPUT_INFLIGHT_BYTES` of 262,144 for non-paste
-   commands. The paste slot and its byte budget are reserved before `PasteBegin`
+   retry, alongside `TERMINAL_INPUT_INFLIGHT_BYTES` for non-paste commands. The paste slot and its byte budget are reserved before `PasteBegin`
    is written. The worst-case retained total is therefore bounded and stated
    rather than derived at runtime.
 8. **Rejection reporting.** `OperationInFlight`, `OperationOutOfBounds`,
@@ -679,8 +715,9 @@ adds no new sacrifice policy; it reuses the existing one and states it.
 `write_frame` on the TUI `HubConnection` stream inherits `set_write_timeout(None)`
 from the request path, so a Hub that stops reading can block the TUI event loop
 forever once the socket send buffer fills. The plan therefore adds a
-`TERMINAL_INPUT_WRITE_BOUND` constant of two seconds, matching the existing
-`DETACH_ON_DISCONNECT_BOUND`, and sets a write timeout before every duplex write.
+`TERMINAL_INPUT_WRITE_BOUND` constant and sets a write timeout before every
+duplex write. Implement sets its value; the default is to match the existing
+`DETACH_ON_DISCONNECT_BOUND`, and Implement records a reason if it differs.
 
 The stream is shared with the control plane, so the write timeout must not leak.
 `HubConnection::request` sets only a read timeout and never a write timeout, so a
@@ -938,7 +975,11 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
 30. A payload above `MAX_PASTE_BYTES` reports Core's `PayloadTooLarge` ceiling and
     writes zero frames.
 
-Live proof, per the repository charter:
+Live proof, per the repository charter. These lanes are TUI repository gates
+required by [[botster-tui-playbook]] after any Core or Hub pin roll. The
+`ghostty` lane is this run's one downstream-shaped conformance proof. The full
+cross-repository matrix (Web, TUI, Unix, and WebRTC together) belongs to
+`ticket_1787600679_990088` and is not run here:
 
 1. `./script/test-live-hub ghostty` prints `ghostty-live-complete` and its
    provenance line names the new Hub and Core revisions. This lane must cover
