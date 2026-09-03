@@ -19645,6 +19645,7 @@ mod tests {
     }
 
     struct RecoveryHubStub {
+        root: PathBuf,
         endpoint: DaemonEndpoint,
         events: mpsc::Receiver<RecoveryStubEvent>,
         running: Arc<AtomicBool>,
@@ -19657,6 +19658,7 @@ mod tests {
             if let Some(listener_thread) = self.listener_thread.take() {
                 let _ = listener_thread.join();
             }
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -19950,6 +19952,7 @@ mod tests {
             }
         });
         RecoveryHubStub {
+            root,
             endpoint: DaemonEndpoint::new(socket),
             events: events_rx,
             running,
@@ -31291,6 +31294,7 @@ exit 0
     fn saturated_terminal_write_sweeps_all_connection_owners_and_rejects_late_frames() {
         let _stub_test = lock_unix_stub_test();
         let stub = spawn_recovery_hub_stub();
+        let stub_root = stub.root.clone();
         let mut app = TuiApp::new(Some(stub.endpoint.clone()));
         assert!(wait_for_condition(
             &mut app,
@@ -31557,6 +31561,12 @@ exit 0
             event,
             RecoveryStubEvent::TerminalInput(identity) if identity == &new_terminal_sub
         )));
+        drop(app);
+        drop(stub);
+        assert!(
+            !stub_root.exists(),
+            "recovery stub must remove its Unix socket directory"
+        );
     }
 
     fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
