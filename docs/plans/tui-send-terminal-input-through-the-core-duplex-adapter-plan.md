@@ -1,9 +1,12 @@
 # TUI: send terminal input through the Core duplex adapter
 
 Ticket: `ticket_1787603674_865638`
-Run: `run_1788408214_815531` (revision 9; the prior Plan run
-`run_1788280083_197023` was cancelled at Plan after revision 8 and this run
-reconciles the plan with the ticket consolidation revision of 2026-09-02)
+Run: `run_1788408214_815531` (revision 10; revision 9 reconciled the plan
+with the ticket consolidation revision of 2026-09-02 after the prior Plan run
+`run_1788280083_197023` was cancelled at Plan; revision 10 answers Plan Review
+`review_1788408960_480789`: checked paste operation-id allocation with no wrap,
+and a complete late-message matrix for every shared-connection ownership
+surface)
 Pipeline: Botster Stack Delivery
 Base ref: `main` (TUI `3b84d57`)
 
@@ -365,6 +368,7 @@ Named code sites in `app.rs`:
 | The timeout restore itself fails, leaving the shared control stream in an uncertain state that is then reported as success. | Treat a failed restore as a write failure: `hard_close` and record a transport error. Test 21 asserts it. |
 | The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` as the binding retained-byte limit, enforced before the write and the queue insertion. Implement sets the value below the count-times-`MAX_INPUT_DATA_BYTES` worst case and records the derivation. Test 22 asserts it. |
 | Large paste behavior depends on a contract this repository does not own. | Consume the published `encode_paste` helper and correlate by `operation_id`. Core validates the whole operation before delivery and delivers zero PTY bytes on every pre-delivery failure. The one exception is an operating-system partial write after delivery began, which Core reports as `PartialWrite` with the exact `bytes_written` and follows with an owner hard-stop; the TUI never retries it. Tests 23 to 30 assert the consumption, not a local implementation. |
+| A paste `operation_id` that is not strictly greater than the owner's last id is silently ignored by Core, so a wrapped or reused id leaves a pending paste entry that no result pops and blocks later pastes. | Allocate ids with `checked_add`, never wrap, refuse every paste after exhaustion with a distinct error and zero frames, and never allocate for a refused paste. Test 4f drives the boundary. |
 | The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Implement reads Core's `INPUT_QUEUE_CAPACITY` at the chosen pin and sets `TERMINAL_INPUT_INFLIGHT_CAPACITY` strictly below it, with a test that asserts the ordering. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
@@ -614,13 +618,33 @@ uses for keys:
    existing `probe_terminal_mouse_mode`, which is a synchronous readback. If the
    shadow is still absent it records the existing "mode flags not ready" error
    and writes zero frames. It never sends a paste with guessed tokens.
-5. **`operation_id` allocation.** The TUI keeps one process-wide `u32` counter,
-   `next_paste_operation_id`, starting at 1. Every `encode_paste` call and every
-   paste retry takes the next value, and the counter never resets on detach,
-   reconnect, or subscription change, so a late result from a retired
-   subscription can never share an id with a live operation. On overflow the
-   counter wraps to 1, never to 0. Core scopes the operation to the owner, so
-   the id only needs to be unique within this process.
+5. **`operation_id` allocation is checked and strictly increasing.** Core
+   `48a4370` `client_worker.rs` keeps `last_paste_operation_id: Option<u32>`
+   per live owner and returns early from a `PasteBegin` whose `operation_id`
+   is less than or equal to that value: no rejection, no result, no PTY bytes.
+   A reused or smaller id therefore leaves the client holding a pending paste
+   entry that no result will ever pop. The TUI must never hand Core an id that
+   is not strictly greater than every id it sent before on that owner. The
+   rule is:
+   - One process-wide `u32` counter, `next_paste_operation_id`, starting at 1.
+     Every `encode_paste` call and every paste retry takes the current value
+     and advances the counter with `checked_add(1)`. The counter never resets
+     on detach, reconnect, or subscription change. A new subscription starts
+     with `last_paste_operation_id == None` on the Core side, so a strictly
+     increasing process-wide counter satisfies Core's rule on every owner,
+     old or new, and a late result from a retired subscription can never share
+     an id with a live operation.
+   - The counter never wraps. When `checked_add` returns `None`, the counter
+     is exhausted: the handler refuses the paste before any reservation,
+     hydration insertion, or write, records a distinct
+     "paste operation ids exhausted; restart the TUI" error, and writes zero
+     frames. Every later paste in that process is refused the same way. Keys,
+     mouse, mode-gated input, and resize are unaffected because they carry no
+     operation id. Exhaustion needs 4,294,967,294 pastes in one process, so
+     the refusal is a correctness guard, not an expected user path.
+   - The id is allocated only when the paste is about to be encoded, never
+     for a paste that is refused for size, focus, attach state, or a missing
+     mode shadow, so refused pastes do not consume ids.
 
 ### How the TUI consumes the transaction
 
@@ -700,10 +724,24 @@ it has no terminal siblings of its own.
 exceeds `TERMINAL_INPUT_WRITE_BOUND`, or a failed `set_write_timeout(None)`
 restore leaves the shared stream in an uncertain state. The TUI then calls
 `HubConnection::hard_close`, which today runs `shutdown(Shutdown::Both)` on the
-single Unix stream that also carries host requests and every non-terminal
-subscription. This class therefore sacrifices the complete TUI connection: host
-control, the terminal subscription, entity and session-type subscriptions, and
-any plugin surface, until the existing throttled reconnect succeeds. The Hub
+shared Unix stream. That stream carries host control requests, Hello, Attach
+and Detach, the terminal mux frames, the package-event notice subscriptions
+(`SubscribeEvents`), and the plugin surface request-response pairs. The
+session-entity, session-type, and entity-options subscriptions do not ride
+that stream: each opens its own Unix connection through
+`subscribe_session_entities` or `subscribe_entities` with its own reader thread
+and a `SessionSubscriptionPump` that `stop()` cancels with a bound. The TUI
+still tears those down on a class-2 failure, because `apply_transport_failure`
+stops every pump and the reconnect path recreates them, so the whole TUI-side
+ownership set is replaced together rather than left half-live against a dead
+control stream. This class therefore sacrifices the complete TUI ownership set:
+host control, the terminal subscription, the notice subscriptions, the plugin
+surface, and the three entity pump families, until the existing throttled
+reconnect succeeds. On the Hub side, the dropped stream fires
+`ConnectionCleanupGuard::drop`, which enqueues a `ConnectionCleanup` carrying
+the connection's attached terminal subscriptions and entity subscription ids to
+`handle_connection_cleanup`, so Hub detaches and retires those owners without
+a client Detach. The Hub
 session, its PTY, and separate clients survive, because the TUI never sends
 `ShutdownSession` on an input failure. This is an accepted trade: a stream whose
 timeout or byte position cannot be trusted must not carry further control
@@ -740,18 +778,56 @@ one retry per submitted command. No code waits for an `input_result` that may
 never arrive; a missing result is reported by subscription close, never by a
 blocking wait.
 
-`late_message_matrix`:
+`late_message_matrix`: every message that creates ownership the TUI holds, on
+the shared stream or on a pump-owned stream, with its owner tag, how it is
+rejected after a class-1 or class-2 failure, how a race with the failure is
+handled, and which production function sweeps the residue. Class 1 is a
+Hub-side or Core-side close of one terminal subscription. Class 2 is the local
+hard-close of the shared stream through `record_transport_error` and
+`apply_transport_failure`.
 
-| Message | Direction | Owner tag | Rejection after terminal failure | Residual sweep |
+Terminal data plane (shared stream, mux frames):
+
+| Message | Direction | Owner tag | Rejection after failure | Race and residual sweep |
 | --- | --- | --- | --- | --- |
-| `Input` frame | TUI to Hub | `(session_id, subscription_id)` in the envelope | TUI refuses to write when the pair is not the live attached pair; Hub drops an envelope with no live handle | none needed; the frame creates no durable client state |
-| `ModeGatedInput` frame | TUI to Hub | same pair plus `mode_generation` and `mode_revision` | Core rejects a stale generation or revision with `StaleMode` | the mode shadow is cleared on detach and on subscription close |
-| `Resize` frame | TUI to Hub | same pair | same live-pair gate | the queued resize is dropped when hydration is abandoned |
-| `PasteBegin`, `PasteChunk`, `PasteCommit` frames | TUI to Hub | same pair plus `operation_id`, `mode_generation`, and `mode_revision` | same live-pair gate; Core rejects a stale token with `StaleMode`, a second operation with `OperationInFlight`, and an incomplete or out-of-bounds operation with zero PTY bytes; an operating-system partial write after delivery is reported as `PartialWrite` with exact `bytes_written` and followed by an owner hard-stop | the pending paste entry is dropped when hydration is abandoned; the reserved or active paste entry is cleared with the queue on write failure, detach, close, and reconnect |
-| `PasteAbort` frame | TUI to Hub | same pair plus `operation_id` | never sent: the TUI has no production abort path (see "No abort path") | none |
-| `input_result` | Hub to TUI | `subscription_id` | ignored when the id is retired or is not the live attached subscription | `retired_subscription_ids` already suppresses late frames |
-| `TerminalSubscriptionClosed` | Hub to TUI | `(session_id, subscription_id)` | already handled as the adapter-close signal | retires the subscription id and clears the mode shadow |
-| `Attach` and `Detach` | TUI to Hub | control plane, unchanged | unchanged | unchanged |
+| `Input` frame | TUI to Hub | `(session_id, subscription_id)` in the envelope | TUI refuses to write unless the pair is the live attached pair; Hub drops an envelope with no live handle | creates no durable client state; the in-flight entry is cleared by the queue sweep below |
+| `ModeGatedInput` frame | TUI to Hub | same pair plus `mode_generation` and `mode_revision` | Core rejects a stale generation or revision with `StaleMode` | mode shadow cleared by `clear_terminal_mouse_mode` on detach, close, and both failure classes |
+| `Resize` frame | TUI to Hub | same pair | same live-pair gate | the queued hydration resize is dropped with `attach_hydration` |
+| `PasteBegin`, `PasteChunk`, `PasteCommit` frames | TUI to Hub | same pair plus `operation_id`, `mode_generation`, and `mode_revision` | same live-pair gate; Core rejects a stale token with `StaleMode`, a second operation with `OperationInFlight`, an incomplete or out-of-bounds operation with zero PTY bytes, and silently ignores a non-increasing `operation_id` (prevented by checked allocation); an operating-system partial write is reported as `PartialWrite` with exact `bytes_written` and followed by an owner hard-stop | the pending paste is dropped with `attach_hydration`; the reserved or active paste entry is cleared with the in-flight queue on write failure, detach, close, reconnect, and both failure classes |
+| `PasteAbort` frame | TUI to Hub | same pair plus `operation_id` | never sent; no production abort path | none |
+| `input_result` | Hub to TUI | `subscription_id` | ignored when the id is in `retired_subscription_ids` or is not the live attached subscription | in-flight queue and paste slot cleared on detach, `TerminalSubscriptionClosed`, reconnect, subscription change, and `apply_transport_failure` (extended by this plan) |
+| `TerminalOutput`, `Snapshot`, `Scrollback`, `AttachState` | Hub to TUI | `(session_id, subscription_id)` | ignored unless `hydration_matches` or `attached_matches` for the live pair, which is the existing guard in `apply_terminal_event` and `apply_attach_state_kind` | a late frame for a retired pair after reconnect is dropped by the same guard; `reset_attach_campaign` clears `retired_subscription_ids` only after the new connection replaces every pair |
+| `TerminalSubscriptionClosed` | Hub to TUI | `(session_id, subscription_id)` plus `generation` | ignored for a retired id or a non-matching pair; otherwise the class-1 signal | retires the id, records close evidence, clears the mode shadow, the in-flight queue, and the paste slot |
+
+Terminal control plane (shared stream, request-response):
+
+| Message | Direction | Owner tag | Rejection after failure | Race and residual sweep |
+| --- | --- | --- | --- | --- |
+| `Attach` | TUI to Hub | `session_id` plus a minted `btui-sub-*` `subscription_id`; the response and later `AttachState` carry the generation | class 1: the retired id blocks a re-attach on the same id, and the attach path mints a new id; class 2: `client` is `None`, so no request is sent until Hello completes on the new connection | `attached_session`, `attached_subscription_id`, and `attach_hydration` are cleared and `reset_attach_campaign` runs in `apply_transport_failure`; a late `AttachState` for the old pair hits the live-pair guard above |
+| `Detach` | TUI to Hub | the current owner pair | class 2 sends no Detach because the stream is gone; `detach_owner_if_writable` sends a bounded Detach only when `client` is `Some`; Hub retires the owner itself through `ConnectionCleanupGuard` when the stream drops | `retire_subscription` marks the id and `drop_terminal_frames_for` discards queued frames for the pair; nothing else survives |
+| `ReadModeFlags` | TUI to Hub | request-response, no durable owner | a request on a dead stream fails as a transport error through the existing path | the mode shadow it fills is cleared by `clear_terminal_mouse_mode` |
+| `Hello` | TUI to Hub | connection-level compatibility record | re-run by `try_connect` on every new connection; a failed Hello is a transport error and the connection is not used | `compatibility` is replaced on the new connection; `start_session_type_subscription_if_supported` re-reads it |
+
+Non-terminal ownership on the shared stream:
+
+| Message | Direction | Owner tag | Rejection after failure | Race and residual sweep |
+| --- | --- | --- | --- | --- |
+| `SubscribeEvents` / `UnsubscribeEvents` (package-event notices) | TUI to Hub | `btui-events-*-<name>` `subscription_id`, keyed by `(owner, name)`, with `Candidate` then `Active` state | a response for an id that is no longer the entry's `candidate_id` is ignored; a request on a dead stream fails as a transport error | `clear_event_subscription_state` in `apply_transport_failure` empties `notice_subscriptions`, `notice_subscription_by_id`, the overflow count, and the transient notice; `sync_notice_subscriptions` re-subscribes with fresh ids after Hello |
+| `PackageEvent` / `EventGap` | Hub to TUI | `subscription_id` | dropped unless `active_notice_entry` finds a live `Active` entry with that id and the `(owner, name)` matches | a late frame for an old id after reconnect finds no entry and is dropped; proven today by `reconnect_clears_transient_notice_and_event_subscription_state` |
+| `PluginSurfaceRender` / `PluginSurfaceAction` | TUI to Hub | `plugin_surface.surface_id` and `pending_plugin_request` `(request_id, surface_id, action_id, node_id)` | an action result whose identity does not match the in-flight request or the active surface is ignored with the existing "ignored plugin action result" error | `reset_active_plugin_surface` clears the surface, presentation, action result, pending request, and invalid fields, and drops every entity-options family |
+
+Pump-owned streams (each a separate Unix connection, torn down with the class-2 sweep):
+
+| Message | Direction | Owner tag | Rejection after failure | Race and residual sweep |
+| --- | --- | --- | --- | --- |
+| session entities `subscribe_session_entities` | TUI to Hub, own stream | `btui-sessions-*` `subscription_id`; pump messages carry that id | `invalidate_session_generation` stops the pump with a bound and reports "session subscription cleanup timed out" on failure; a late pump frame after stop has no receiver and is dropped | `session_entities` reset and rows rebuilt; `start_session_subscription` mints a new id on reconnect; Hub retires the old id through its own connection cleanup |
+| session types `subscribe_entities("session_type")` | TUI to Hub, own stream | `btui-session-types-*` `subscription_id` | `invalidate_session_type_generation` stops the pump with a bound and reports on timeout | `session_type_entities` reset; `start_session_type_subscription_if_supported` re-subscribes after Hello when compatibility allows |
+| entity options `start_entity_options_subscription(family)` | TUI to Hub, one stream per family | family name plus the pump | `drop_entity_options_subscriptions` stops every pump; `sync_entity_options_subscriptions` skips restart while `client` is `None` | store, retry state, and injectors cleared; families re-subscribed after reconnect only when the plugin surface demands them, under the existing per-family backoff proven by `entity_options_admission_failure_is_backoff_bounded` |
+
+Every row is swept by the same production function, `apply_transport_failure`,
+which this plan extends by three fields: the terminal mode shadow is already
+cleared there, and the in-flight queue and the paste slot are added. Test 18a
+asserts every row's post-failure state and its recreation after reconnect.
 
 `production_path_proof`: for keys and mouse the exact path is a real `KeyEvent`
 or `MouseEvent` to `handle_focused_terminal_key` or
@@ -852,9 +928,20 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
    that does not answer, the handler records the "mode flags not ready" error
    and writes zero frames.
 4c. An empty paste writes zero frames and records no error.
-4d. `operation_id` allocation is monotonic across the process: two pastes take
-   consecutive ids, a retry takes a new id, and a detach plus reconnect does not
-   reset the counter.
+4d. `operation_id` allocation is strictly increasing across the process: two
+   pastes take consecutive ids, a retry takes a new id, and a detach plus
+   reconnect does not reset the counter. A refused paste (oversized, unfocused,
+   unattached, or no mode shadow) does not consume an id.
+4f. The counter never wraps. The test sets `next_paste_operation_id` to
+   `u32::MAX - 1`, drives one paste and asserts it is written with id
+   `u32::MAX - 1`, drives a second and asserts id `u32::MAX`, then drives a
+   third and asserts the exhaustion error, zero frames written, an empty paste
+   slot and hydration queue, and an unchanged counter. It then drives a real
+   key through the duplex path and asserts the `Input` frame is written, so
+   exhaustion refuses only pastes. A companion assertion runs the same
+   sequence during hydration and asserts no `PendingInput::Paste` is stored
+   after exhaustion. This is red on revert: a wrapping counter would write a
+   `PasteBegin` with id 1 that Core ignores.
 4e. An oversized paste during hydration is refused before storage. The test
    starts hydration, routes an `Event::Paste` whose length exceeds
    `MAX_PASTE_BYTES`, and asserts the ceiling error, an unchanged hydration
@@ -897,19 +984,36 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     `TERMINAL_INPUT_WRITE_BOUND` with the connection hard-closed and a transport
     error recorded. This is the same oracle as
     `bounded_detach_returns_when_peer_stops_reading`.
-18a. The class-2 hard-close cleans up and recovers through the production path.
-    Continuing from test 18 against a stub Hub that accepts a second connection,
-    the test asserts immediately after the failed write that `client` is `None`,
+18a. The class-2 hard-close sweeps every ownership surface and recovers through
+    the production path. Continuing from test 18 against a stub Hub that accepts
+    a second connection, with a live notice subscription, an active plugin
+    surface that demands one entity-options family, a session-entity pump, and
+    a session-type pump all established before the failed write, the test
+    asserts immediately after the failed write that: `client` is `None`;
     `attached_session`, `attached_subscription_id`, and `attach_hydration` are
-    `None`, the terminal mode shadow is `None`, the in-flight queue and paste
-    slot are empty, the old subscription id is retired, event-subscription state
-    is cleared, and the plugin surface is reset. It then runs the normal
+    `None`; the terminal mode shadow is `None`; the in-flight queue and paste
+    slot are empty; the old terminal subscription id is retired;
+    `notice_subscriptions` and `notice_subscription_by_id` are empty and the
+    transient notice is `None`; `plugin_surface` and `pending_plugin_request`
+    are `None`; `entity_options_subscriptions` is empty; and
+    `session_subscription` and `session_type_subscription` are `None` with
+    both `invalidate_*` calls having returned `true`. It then delivers, before
+    reconnect, one late `PackageEvent` for the old notice id, one late
+    `TerminalOutput` and one late `AttachState` for the old terminal pair, and
+    one late `input_result` for the old subscription id, and asserts each is
+    dropped with no state change and no error. It then runs the normal
     `poll_hub` loop, asserts `try_connect_throttled` establishes a new
-    connection that completes Hello, issues one ordinary control request on the
-    new connection and asserts it succeeds, and finally re-attaches and drives
-    one real key through the duplex path on the new subscription id. It follows
-    the pattern of `reconnect_clears_transient_notice_and_event_subscription_state`.
-    This proves the stated blast radius and the recovery, not only the bound.
+    connection that completes Hello, asserts `session_subscription` and
+    `session_type_subscription` are `Some` with ids different from the old
+    ones, asserts the notice subscription is re-subscribed with a new id, and
+    asserts the entity-options family is re-subscribed once the plugin surface
+    is rendered again. It issues one ordinary control request on the new
+    connection and asserts it succeeds, and finally re-attaches and drives one
+    real key through the duplex path on the new subscription id. It follows the
+    pattern of `reconnect_clears_transient_notice_and_event_subscription_state`
+    and extends it to every row of the late-message matrix. This proves the
+    stated blast radius, the complete sweep, and the recovery, not only the
+    bound.
 19. A full in-flight queue fails soft. The test submits
     `TERMINAL_INPUT_INFLIGHT_CAPACITY` commands with no `input_result` returned,
     then drives one more real key, and asserts no further duplex write, the
