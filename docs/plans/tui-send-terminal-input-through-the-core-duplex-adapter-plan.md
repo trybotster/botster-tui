@@ -131,11 +131,11 @@ In scope, all inside `botster-tui`:
 7. Carry terminal input as `Vec<u8>` from `InputDispatch::TerminalForward` to the
    encoder, and delete the `String::from_utf8` gate that only existed to fill a
    JSON request field.
-7a. Check every payload against the imported Core ceiling before encode, write,
-   and queue insertion. Oversized payloads are out of scope for this repository:
-   they belong to the Core transaction from `ticket_1788287678_207209`, which this
-   ticket now depends on. This plan adds no client chunk policy and no temporary
-   oversized-input rejection.
+7a. Route every bracketed paste through the published `encode_paste` transaction
+   helper, correlate its one authoritative result by `operation_id`, allow one
+   in-flight paste per subscription with a single safe retry, and map the four
+   added rejections. Check non-paste payloads against the imported single-frame
+   ceilings before encode, write, and queue insertion. Add no client chunk policy.
 8. Raise `MINIMUM_CONFORMANCE_FIXTURE_REVISION` to the revision reported by the
    chosen Hub pin, and update the Hello protocol assertions that name protocol 7
    and revision 44.
@@ -175,10 +175,12 @@ Boundary rules this plan keeps:
 
 Cross-repository dependencies:
 
-- **`ticket_1788287678_207209` (`botster-core`, open, blocking).** "Core: bounded
-  atomic multi-frame terminal input transactions". Registered as a dependency of
-  this ticket, and of the Web consumer `ticket_1787600676_914408`. This ticket
-  does not reach Implement until that prerequisite closes.
+- **`ticket_1788287678_207209` (`botster-core`, closed).** Published the bounded
+  atomic terminal input transaction and its Rust and TypeScript helpers.
+- **`ticket_1788313897_932611` (`botster-hub`, closed).** Pinned the paste frame
+  kinds so Hub ingress accepts them, and proved live multi-frame paste over the
+  Unix and WebRTC adapters.
+- Both prerequisites are closed, so this ticket is unblocked.
 
 - `ticket_1787894427_525056` (`botster-hub`, closed) delivered the Hub cold cut
   and the client ingress seam. It is already registered as a dependency.
@@ -283,7 +285,7 @@ Named code sites in `app.rs`:
 | The duplex write timeout leaks onto the shared stream and silently bounds later control-plane writes. | Restore `set_write_timeout(None)` on the success path and rely on `hard_close` for the failure path. Test 20 asserts the restored state. |
 | The timeout restore itself fails, leaving the shared control stream in an uncertain state that is then reported as success. | Treat a failed restore as a write failure: `hard_close` and record a transport error. Test 21 asserts it. |
 | The entry count alone does not bound memory, because each entry retains its exact submitted bytes. | Add `TERMINAL_INPUT_INFLIGHT_BYTES` of 256 KiB as the binding limit against a 4,194,240-byte worst case, enforced before the write and the queue insertion. Test 22 asserts it. |
-| The Core frame ceiling affects large paste, which works today over the JSON path with no client size limit. | Oversized input moves to the Core bounded atomic transaction in `ticket_1788287678_207209`, which this ticket depends on. This repository adds no chunk policy and no temporary rejection, so no partial paste can originate here. |
+| Large paste behavior depends on a contract this repository does not own. | Consume the published `encode_paste` helper and correlate by `operation_id`. Core validates the whole operation before delivery and delivers zero PTY bytes on failure, so a partial bracketed paste cannot originate here. Tests 23 to 30 assert the consumption, not a local implementation. |
 | The client in-flight bound drifts above Core's `INPUT_QUEUE_CAPACITY`, so Core hard-stops the subscription before the client fails soft. | Keep `TERMINAL_INPUT_INFLIGHT_CAPACITY` at 64 against Core's 256, and require Implement to re-read Core's constant at the chosen pin. Test 19 proves the soft-fail path. |
 | Resize regression, because resize now rides the terminal plane rather than a request with a response. | Keep the client-side size owner unchanged, keep the "latest queued resize only" rule during hydration, and prove the applied geometry through the worker PTY echo in the live lane. |
 
