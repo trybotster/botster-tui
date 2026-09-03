@@ -1,7 +1,8 @@
 # TUI: send terminal input through the Core duplex adapter
 
 Ticket: `ticket_1787603674_865638`
-Run: `run_1788408214_815531` (revision 10; revision 9 reconciled the plan
+Run: `run_1788408214_815531` (revision 11, which fixes the operation-id
+exhaustion state model after `review_1788409399_251434`; revision 10; revision 9 reconciled the plan
 with the ticket consolidation revision of 2026-09-02 after the prior Plan run
 `run_1788280083_197023` was cancelled at Plan; revision 10 answers Plan Review
 `review_1788408960_480789`: checked paste operation-id allocation with no wrap,
@@ -626,22 +627,28 @@ uses for keys:
    entry that no result will ever pop. The TUI must never hand Core an id that
    is not strictly greater than every id it sent before on that owner. The
    rule is:
-   - One process-wide `u32` counter, `next_paste_operation_id`, starting at 1.
-     Every `encode_paste` call and every paste retry takes the current value
-     and advances the counter with `checked_add(1)`. The counter never resets
-     on detach, reconnect, or subscription change. A new subscription starts
+   - One process-wide `u32` counter, `next_paste_operation_id`, starting at 1,
+     and no other exhaustion field. Allocation is one step: compute
+     `next_paste_operation_id.checked_add(1)`; if that succeeds, the paste
+     takes the current value as its id and the counter stores the incremented
+     value; if it returns `None`, the paste is refused and the counter is left
+     unchanged. The value `u32::MAX` is therefore never emitted as an id: the
+     largest id ever written is `u32::MAX - 1`, and a counter equal to
+     `u32::MAX` is the exhausted state. The counter never resets on detach,
+     reconnect, or subscription change. A new subscription starts
      with `last_paste_operation_id == None` on the Core side, so a strictly
      increasing process-wide counter satisfies Core's rule on every owner,
      old or new, and a late result from a retired subscription can never share
      an id with a live operation.
-   - The counter never wraps. When `checked_add` returns `None`, the counter
-     is exhausted: the handler refuses the paste before any reservation,
-     hydration insertion, or write, records a distinct
-     "paste operation ids exhausted; restart the TUI" error, and writes zero
-     frames. Every later paste in that process is refused the same way. Keys,
+   - The counter never wraps. When `checked_add` returns `None`, the handler
+     refuses the paste before any reservation, hydration insertion, or write,
+     records a distinct "paste operation ids exhausted; restart the TUI"
+     error, and writes zero frames. Every later paste in that process is
+     refused the same way, because the counter stays at `u32::MAX`. Keys,
      mouse, mode-gated input, and resize are unaffected because they carry no
-     operation id. Exhaustion needs 4,294,967,294 pastes in one process, so
-     the refusal is a correctness guard, not an expected user path.
+     operation id. Exhaustion needs 4,294,967,294 successful allocations (ids
+     1 through `u32::MAX - 1`) in one process, so the refusal is a correctness
+     guard, not an expected user path.
    - The id is allocated only when the paste is about to be encoded, never
      for a paste that is refused for size, focus, attach state, or a missing
      mode shadow, so refused pastes do not consume ids.
@@ -932,16 +939,18 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
    pastes take consecutive ids, a retry takes a new id, and a detach plus
    reconnect does not reset the counter. A refused paste (oversized, unfocused,
    unattached, or no mode shadow) does not consume an id.
-4f. The counter never wraps. The test sets `next_paste_operation_id` to
-   `u32::MAX - 1`, drives one paste and asserts it is written with id
-   `u32::MAX - 1`, drives a second and asserts id `u32::MAX`, then drives a
-   third and asserts the exhaustion error, zero frames written, an empty paste
-   slot and hydration queue, and an unchanged counter. It then drives a real
-   key through the duplex path and asserts the `Input` frame is written, so
-   exhaustion refuses only pastes. A companion assertion runs the same
-   sequence during hydration and asserts no `PendingInput::Paste` is stored
-   after exhaustion. This is red on revert: a wrapping counter would write a
-   `PasteBegin` with id 1 that Core ignores.
+4f. The counter never wraps and `u32::MAX` is never emitted. The test sets
+   `next_paste_operation_id` to `u32::MAX - 1`, drives one paste and asserts
+   it is written with id `u32::MAX - 1` and that the counter now equals
+   `u32::MAX`, then drives a second paste and asserts the exhaustion error,
+   zero frames written, an empty paste slot and hydration queue, and a counter
+   still equal to `u32::MAX`. It drives a third paste and asserts the same
+   refusal, so exhaustion is sticky. It then drives a real key through the
+   duplex path and asserts the `Input` frame is written, so exhaustion refuses
+   only pastes. A companion assertion runs the same sequence during hydration
+   and asserts no `PendingInput::Paste` is stored after exhaustion. This is
+   red on revert: a wrapping counter would write a `PasteBegin` with id 0 or
+   1 that Core ignores, and an unchecked increment would emit `u32::MAX`.
 4e. An oversized paste during hydration is refused before storage. The test
    starts hydration, routes an `Event::Paste` whose length exceeds
    `MAX_PASTE_BYTES`, and asserts the ceiling error, an unchanged hydration
