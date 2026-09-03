@@ -107,8 +107,11 @@ In scope, all inside `botster-tui`:
 
 1. Roll the Hub pin to a `botster-hub` `main` commit that contains the cold cut,
    and roll the Core pins to the exact Core revision that Hub commit pins.
-   Candidate pins: Hub `b4020a976010f4ec495c89efd6ea66271e02712f`, Core
-   `e5a927c31d5b7d0b0f4b198e5e556ed75d53ddf1`, `@trybotster/hub-test-support@0.1.42`.
+   Candidate pins after both prerequisites closed: Hub `bb1a330` (`main` HEAD,
+   which pins Core `48a437032791e678010254708259568ce4ad02bf`), that same Core
+   revision, and `@trybotster/hub-test-support@0.1.43`. Hub reports protocol 8
+   and conformance fixture revision 48. Implement re-verifies ancestry and
+   lockstep at the moment it rolls the pins.
 2. Add one TUI-owned duplex input path. The path encodes a
    `TerminalInputCommand` with `encode_terminal_input`, wraps the frame bytes in
    `DaemonUnixTerminalEnvelope::from_frame_bytes`, and writes it on the live
@@ -363,59 +366,80 @@ or the in-flight queue.
 The ceiling is reachable, not theoretical. Today a large paste travels as one
 JSON `SendInput` with no client-side size limit, so a paste above 64 KiB works.
 
-### Decision: Core owns the transaction, the TUI owns no chunk policy
+### Decision: Core owns the transaction, the TUI consumes the published helper
 
 Revision 4 of this plan put a chunk policy in the TUI. Revision 5 offered the
 human three client-side policies. The answer to `question_1788282946_225545`
-rejected all of them and settled the ownership question instead.
-
-Core owns terminal framing, ordering, mode fencing, bounds, retry, and
-`TerminalInputResult`. A payload larger than one frame body is therefore a
-Core-owned transaction, not a client concern. The durable rule is
+rejected all of them and settled ownership instead. The durable rule is
 [[core owns bounded atomic terminal input transactions across clients]].
 
-Consequences for this repository:
+Both prerequisites have since closed:
 
-1. The TUI defines no chunk policy, no chunk scheduling, no per-chunk retry rule,
-   and no client-side reassembly. Any such logic in earlier revisions of this plan
-   is withdrawn.
-2. The TUI consumes the one helper that the Rust terminal-protocol client
-   publishes for the bounded atomic transaction, and the Web client consumes the
-   matching TypeScript helper. Both clients use the same semantics.
-3. Core accepts and validates the complete operation before any PTY delivery
-   begins, then delivers the bracketed-paste opener, content, and closer as one
-   ordered operation. Every failure path delivers zero PTY bytes, so a partial
-   bracketed paste is impossible by construction rather than by client care.
-4. This plan lands no oversized-paste rejection as temporary compatibility
-   behavior. The direct cut is preserved, and no second terminal input route
-   appears while the prerequisite is open.
+- `ticket_1788287678_207209` (`botster-core`) published the transaction.
+- `ticket_1788313897_932611` (`botster-hub`) pinned the paste frame kinds and
+  proved live multi-frame paste over the Unix and WebRTC adapters. Hub ingress
+  validates frame headers against the pinned protocol crate, so this pin was
+  required before any client could send the new kinds.
 
-### Blocking dependency
+### The published contract
 
-This ticket now depends on `ticket_1788287678_207209`, "Core: bounded atomic
-multi-frame terminal input transactions", in `botster-core`
-(`tgt_1f7bce66eb304881980f9b4a2a5ae3fe`). That contract must define operation
-identity, total length, ordered chunks, commit, abort, timeout, stale-mode
-behavior, generation fencing, strict resource bounds, and one authoritative
-result, and Hub must stay content blind.
+`botster-terminal-protocol-client` at Core `48a4370` exposes:
 
-`ticket_1787600676_914408`, the Web terminal consumer, depends on the same Core
-ticket. Its `writeInput` path takes an unbounded string from the Restty clipboard
-paste, so its paste path can exceed one frame and it needs the same published
-contract.
+- `encode_paste(operation_id, mode_generation, mode_revision, data)` returning an
+  ordered `Vec<TerminalInputFrame>`: one `PasteBegin`, the `PasteChunk` frames,
+  then one `PasteCommit`.
+- `encode_paste_abort(operation_id)` returning one frame.
+- `MAX_PASTE_BYTES` of 1,048,576, `MAX_PASTE_CHUNK_DATA_BYTES`, and
+  `MAX_PASTE_CHUNKS`.
+- `TerminalInputKind::Paste`, and `TerminalInputResult.operation_id:
+  Option<u32>`, so one authoritative result identifies its operation.
+- Four added rejections: `OperationInFlight`, `OperationOutOfBounds`,
+  `OperationIncomplete`, and `Aborted`.
 
-Implement must not start any part of the oversized-input path in this repository
-until the Core helper is published. The single-frame duplex input path, the
-correlation rule, the write bound, and the pin roll do not depend on it, but this
-Plan does not advance to Implement while the prerequisite is open.
+Core validates the complete operation before any PTY delivery and delivers zero
+PTY bytes on every failure, so a partial bracketed paste is impossible by
+construction. Hub stays content blind.
+
+### How the TUI consumes it
+
+1. **Every bracketed paste uses the transaction.** The TUI does not branch on
+   size. One path removes the threshold, and the result's `operation_id` gives
+   explicit correlation for small and large pastes alike. The TUI writes the
+   frames the helper returns, in order, on the live subscription, and defines no
+   chunk policy, no scheduling, and no reassembly of its own.
+2. **Paste correlation is by `operation_id`, not by queue position.** A paste
+   in-flight entry records its `operation_id`, and a `Paste` result pops that
+   entry by id match. Non-paste commands keep the ordered head correlation and
+   the `kind` cross-check from the correlation section above.
+3. **One paste in flight per subscription.** Core publishes `OperationInFlight`,
+   so the TUI refuses a second paste while one is outstanding and reports
+   back-pressure rather than sending a guaranteed rejection.
+4. **Paste retry is now safe, and is kept to one attempt.** Because every failure
+   path delivers zero PTY bytes, a `StaleMode` paste may be retried once with
+   refreshed mode tokens and a **new** `operation_id`. This is strictly safer than
+   the withdrawn chunk design, where a retry could reorder bytes at the PTY.
+5. **Abort.** When the TUI abandons an in-flight paste while the subscription is
+   still live, it sends `encode_paste_abort(operation_id)` and expects the
+   `Aborted` rejection as the authoritative result. It sends no abort when the
+   subscription is already retired, because the operation dies with the owner.
+6. **Payloads above `MAX_PASTE_BYTES`.** `encode_paste` returns `PayloadTooLarge`.
+   The TUI reports that ceiling as Core's declared contract. This is not a client
+   policy and not a temporary compatibility rejection.
+7. **Bounds.** A paste is accounted separately from the non-paste in-flight
+   budget: at most one in-flight paste retaining at most `MAX_PASTE_BYTES` for its
+   single retry, alongside `TERMINAL_INPUT_INFLIGHT_BYTES` of 262,144 for
+   non-paste commands. The worst-case retained total is therefore bounded and
+   stated rather than derived at runtime.
+8. **Rejection reporting.** `OperationInFlight`, `OperationOutOfBounds`,
+   `OperationIncomplete`, and `Aborted` each map to a distinct client message,
+   alongside the four pre-existing rejections.
 
 ### Retained invariant
 
-The framing invariant stays recorded here as a consumer-side expectation of the
-Core contract, not as TUI logic: the opening bracketed-paste marker must never
-reach the PTY unless the closing marker will also reach it. Under the decided
-architecture Core guarantees this, because it validates the complete operation
-before delivery and delivers zero bytes on every failure.
+The framing invariant is now a Core guarantee rather than TUI logic: the opening
+bracketed-paste marker never reaches the PTY unless the closing marker does,
+because Core validates the whole operation before delivery and delivers zero
+bytes on failure. The TUI relies on that guarantee and adds no framing logic.
 
 ## Runtime-teardown class answers
 
@@ -578,14 +602,33 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     large `Input` payloads whose total exceeds `TERMINAL_INPUT_INFLIGHT_BYTES`
     while the entry count stays under `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and
     asserts the back-pressure error, no further write, and a live subscription.
-23. Oversized input is deferred to the Core transaction, not handled locally.
-    Until `ticket_1788287678_207209` publishes the helper, this repository adds no
-    oversized-paste test, because it adds no oversized-paste behavior. Once the
-    helper exists, the TUI test set gains: a paste above `MAX_INPUT_DATA_BYTES`
-    travels through the published transaction helper; the TUI defines no chunk
-    policy of its own; and a rejected transaction leaves the terminal with zero
-    pasted bytes and no bracketed-paste opener. Those cases are written against
-    the Core contract, not against a TUI chunk implementation.
+23. Every bracketed paste travels as one Core transaction. The test drives
+    `Event::Paste` through `InputRouter::dispatch_event` with the terminal region
+    focused, and asserts the written frames are exactly the ordered
+    `encode_paste` output: one `PasteBegin` carrying the live mode tokens and the
+    total length, the `PasteChunk` frames in index order, then one `PasteCommit`.
+    It asserts the TUI builds no frames of its own.
+24. A paste above one frame body uses the same single path. The test uses a
+    payload above `MAX_PASTE_CHUNK_DATA_BYTES`, asserts the concatenated chunk
+    payloads equal the original bracketed-paste bytes exactly, and asserts the
+    TUI branches on no size threshold.
+25. Paste results correlate by `operation_id`, not by queue position. The test
+    puts a paste and a later key in flight, delivers the `Paste` result with its
+    `operation_id`, and asserts it pops the paste entry while the key entry stays
+    pending.
+26. One paste in flight per subscription. A second paste while one is outstanding
+    is refused with the back-pressure error, writes nothing, and leaves the
+    subscription live.
+27. A `StaleMode` paste result is retried exactly once, with refreshed mode tokens
+    and a new `operation_id`. A second `StaleMode` reports the error with no
+    further writes.
+28. Each added rejection maps to a distinct message: `OperationInFlight`,
+    `OperationOutOfBounds`, `OperationIncomplete`, and `Aborted`.
+29. Abandoning an in-flight paste on a live subscription writes
+    `encode_paste_abort(operation_id)` and treats the `Aborted` result as
+    authoritative. Abandoning it on a retired subscription writes nothing.
+30. A payload above `MAX_PASTE_BYTES` reports Core's `PayloadTooLarge` ceiling and
+    writes zero frames.
 
 Live proof, per the repository charter:
 
