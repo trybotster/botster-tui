@@ -320,8 +320,11 @@ Named code sites in `app.rs`:
 - Imported Core ceilings `MAX_INPUT_DATA_BYTES`, `MAX_MODE_GATED_DATA_BYTES`,
   `MAX_PASTE_BYTES`, and `MAX_PASTE_CHUNK_DATA_BYTES` from
   `botster-terminal-protocol-client`, never hardcoded.
-- A new bounded in-flight input queue field, cleared with the mode shadow on
-  detach, close, and reconnect.
+- A new bounded in-flight input queue field and paste slot, cleared with the
+  mode shadow on detach, `TerminalSubscriptionClosed`, and reconnect.
+- `apply_transport_failure` — also clear the terminal mode shadow, the in-flight
+  queue, and the paste slot, so the class-2 hard-close leaves no stale terminal
+  state for the next connection.
 - `MINIMUM_CONFORMANCE_FIXTURE_REVISION` and the protocol 7 / revision 44 tests.
 - The live tests near `headless_live_runtime_ghostty_…`, the shared Ghostty
   lanes, and the socket-cut sibling test.
@@ -331,6 +334,7 @@ Named code sites in `app.rs`:
 | Risk | Mitigation |
 | --- | --- |
 | A 208-commit Hub pin roll changes unrelated DTOs and breaks compilation or tests far from terminal input. | Roll the pin first as its own commit, run the full gate set, and fix fallout before the input change. Keep the two concerns in separate commits. |
+| A local write failure hard-closes the one shared Unix stream, so it ends host control and every TUI subscription, not only the terminal subscription. | Name the blast radius (class 2 in the teardown answers), reuse the existing `record_transport_error` and throttled reconnect path rather than adding a second policy, extend `apply_transport_failure` to clear terminal state, and prove cleanup plus recovery through the production path in test 18a. The Hub session and separate clients survive because the TUI never sends `ShutdownSession`. |
 | Input silently disappears when the subscription is not live, because Hub drops the envelope without a response. | Gate every write on `attached_session` plus `attached_subscription_id == self.subscription_id`, surface a client error when the gate fails, and prove the stale case with a test. |
 | Losing the synchronous error surface degrades user feedback for rejected input. | Handle `input_result` with `admitted == false`, map each `TerminalInputRejection` to a distinct message, and assert those messages in tests. |
 | A stale-mode retry loop, because the retry itself can be rejected. | Allow at most one re-probe and one retry per submitted command. Assert the bound in a test. |
@@ -643,13 +647,33 @@ TUI relies on that guarantee and adds no framing logic.
 subscription-scoped ownership, stale subscription closure, and the divergence
 between client terminal state and the live runtime.
 
-`teardown_isolation`: the ownership set is one `(session_id, subscription_id)`
-pair on one Unix mux connection. A rejected or dropped input affects only that
-subscription. Hub closes only the offending subscription handle when ingress
-overflows; other subscriptions and the host control plane on the same connection
-keep working. The TUI holds exactly one terminal subscription at a time, so it
-has no terminal siblings of its own, and it must not tear down the host control
-connection when a terminal input fails.
+`teardown_isolation`: there are two failure classes with different blast radii,
+and the plan names both.
+
+*Class 1, Hub-side or Core-side rejection or close.* The ownership set is one
+`(session_id, subscription_id)` pair on one Unix mux connection. A rejected
+input (`StaleMode`, `PartialWrite`, `OperationInFlight`, and the rest), a dropped
+envelope with no live handle, an ingress overflow, or a Core owner hard-stop
+affects only that subscription. Hub closes only the offending subscription
+handle and sends `TerminalSubscriptionClosed`; the host control plane and every
+other subscription on the same connection keep working, and the TUI keeps the
+connection open. The TUI holds exactly one terminal subscription at a time, so
+it has no terminal siblings of its own.
+
+*Class 2, local socket write failure.* A duplex write error, a write that
+exceeds `TERMINAL_INPUT_WRITE_BOUND`, or a failed `set_write_timeout(None)`
+restore leaves the shared stream in an uncertain state. The TUI then calls
+`HubConnection::hard_close`, which today runs `shutdown(Shutdown::Both)` on the
+single Unix stream that also carries host requests and every non-terminal
+subscription. This class therefore sacrifices the complete TUI connection: host
+control, the terminal subscription, entity and session-type subscriptions, and
+any plugin surface, until the existing throttled reconnect succeeds. The Hub
+session, its PTY, and separate clients survive, because the TUI never sends
+`ShutdownSession` on an input failure. This is an accepted trade: a stream whose
+timeout or byte position cannot be trusted must not carry further control
+requests, and the TUI already takes exactly this path for every other transport
+failure through `record_transport_error` and `apply_transport_failure`. The plan
+adds no new sacrifice policy; it reuses the existing one and states it.
 
 `teardown_bounds`: a duplex input write must carry an explicit deadline. A plain
 `write_frame` on the TUI `HubConnection` stream inherits `set_write_timeout(None)`
@@ -715,13 +739,30 @@ subscription. This is proven by a test that feeds a retired-id `input_result`
 after a reconnect and asserts the live shadow and the live error state are
 unchanged.
 
-`sibling_fail_closed_policy`: on a successful terminal-subscription close, the
-host control connection and every non-terminal subscription keep working. On an
-input write failure, the TUI records a transport error through the existing path
-and does not shut down the session or other subscriptions. The TUI never sends
-`ShutdownSession` in response to an input failure. The existing socket-cut test
-already asserts that a sibling client keeps echoing after the TUI connection
-dies; that test migrates to the duplex path and keeps its assertion.
+`sibling_fail_closed_policy`:
+
+- *Class 1 (Hub or Core closes or rejects the terminal subscription):* the host
+  control connection and every non-terminal subscription keep working on the
+  same stream. The TUI retires the subscription id, clears the mode shadow, the
+  in-flight queue, and the paste slot, and lets the existing attach path mint a
+  new subscription. Nothing else on the connection is touched.
+- *Class 2 (local write, timeout, or restore failure):* the TUI hard-closes the
+  shared connection and records a transport error through the existing
+  `record_transport_error` path. `apply_transport_failure` already drops the
+  client, clears event-subscription state, resets the plugin surface,
+  invalidates the session and session-type generations, and clears attach,
+  hydration, mouse-mode, and Ghostty projection state. The plan extends that
+  same function to also clear the terminal mode shadow, the in-flight queue,
+  and the paste slot, so no stale terminal state can survive into the next
+  connection. `poll_hub` then reconnects through `try_connect_throttled`, and
+  the control path is usable again once the new connection completes Hello.
+  Every TUI-side subscription is sacrificed until then; the Hub session and any
+  separate client survive. The TUI never sends `ShutdownSession` in response to
+  an input failure.
+- *Proof:* the existing live socket-cut sequence keeps its assertion that a
+  separate sibling client echoes after the TUI connection dies, and migrates to
+  the duplex path. Test 18a below adds the production-path proof that the
+  failed TUI connection itself cleans up and recovers.
 
 ## Acceptance checks and tests
 
@@ -819,6 +860,19 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     `TERMINAL_INPUT_WRITE_BOUND` with the connection hard-closed and a transport
     error recorded. This is the same oracle as
     `bounded_detach_returns_when_peer_stops_reading`.
+18a. The class-2 hard-close cleans up and recovers through the production path.
+    Continuing from test 18 against a stub Hub that accepts a second connection,
+    the test asserts immediately after the failed write that `client` is `None`,
+    `attached_session`, `attached_subscription_id`, and `attach_hydration` are
+    `None`, the terminal mode shadow is `None`, the in-flight queue and paste
+    slot are empty, the old subscription id is retired, event-subscription state
+    is cleared, and the plugin surface is reset. It then runs the normal
+    `poll_hub` loop, asserts `try_connect_throttled` establishes a new
+    connection that completes Hello, issues one ordinary control request on the
+    new connection and asserts it succeeds, and finally re-attaches and drives
+    one real key through the duplex path on the new subscription id. It follows
+    the pattern of `reconnect_clears_transient_notice_and_event_subscription_state`.
+    This proves the stated blast radius and the recovery, not only the bound.
 19. A full in-flight queue fails soft. The test submits
     `TERMINAL_INPUT_INFLIGHT_CAPACITY` commands with no `input_result` returned,
     then drives one more real key, and asserts no further duplex write, the
