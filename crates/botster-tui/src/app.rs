@@ -21111,6 +21111,92 @@ mod tests {
     }
 
     #[test]
+    fn mode_gated_key_stops_after_a_second_stale_mode_result() {
+        let mut app = connected_terminal_app(true);
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        let input_bytes = app.terminal_input_in_flight_bytes;
+        assert!(input_bytes > 0);
+
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::ModeGatedInput,
+            operation_id: None,
+            admitted: false,
+            bytes_written: 0,
+            mode_generation: 7,
+            mode_revision: 12,
+            mode_flags: TerminalModeFlags {
+                kitty_enabled: true,
+                cursor_visible: true,
+                ..empty_mode_flags()
+            },
+            rejection: Some(TerminalInputRejection::StaleMode),
+        });
+        assert_eq!(app.terminal_input_in_flight.len(), 1);
+        assert!(app.terminal_input_in_flight[0].retried);
+        assert_eq!(app.terminal_input_in_flight_bytes, input_bytes);
+        let writes_after_retry = app.observed_terminal_inputs.len();
+        let probes_after_retry = app
+            .observed_requests
+            .iter()
+            .filter(|request| matches!(request, ObservedRequest::ReadModeFlags(_)))
+            .count();
+        assert_eq!(probes_after_retry, 1);
+
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::ModeGatedInput,
+            operation_id: None,
+            admitted: false,
+            bytes_written: 0,
+            mode_generation: 4,
+            mode_revision: 9,
+            mode_flags: TerminalModeFlags {
+                kitty_enabled: true,
+                cursor_visible: true,
+                ..empty_mode_flags()
+            },
+            rejection: Some(TerminalInputRejection::StaleMode),
+        });
+        assert_eq!(
+            app.observed_terminal_inputs.len(),
+            writes_after_retry,
+            "a second stale result must not write another retry"
+        );
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::ReadModeFlags(_)))
+                .count(),
+            probes_after_retry,
+            "a second stale result must not re-probe mode flags"
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("terminal input rejected: stale mode")
+        );
+        assert!(app.terminal_input_in_flight.is_empty());
+        assert_eq!(app.terminal_input_in_flight_bytes, 0);
+    }
+
+    #[test]
+    fn terminal_subscription_ids_advance_the_per_app_sequence() {
+        let mut app = TuiApp::new(None);
+        assert_eq!(app.next_terminal_subscription_sequence, 1);
+
+        let first = app.mint_subscription_id();
+        let second = app.mint_subscription_id();
+
+        assert_ne!(first, second);
+        assert!(first.ends_with("-1"));
+        assert!(second.ends_with("-2"));
+        assert_eq!(app.next_terminal_subscription_sequence, 3);
+    }
+
+    #[test]
     fn stale_paste_gets_one_new_operation_id_and_partial_write_never_retries() {
         let mut app = connected_terminal_app(false);
         app.next_paste_operation_id = 7;
