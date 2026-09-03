@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Read, Stdout},
     net::Shutdown,
     path::PathBuf,
@@ -27,14 +27,13 @@ use botster_hub_client::{
     DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
-    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_MODE_GATED_INPUT,
-    FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
-    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL,
-    TerminalCompatibilityRequirement, connect_and_hello_with_terminal_requirement,
-    ensure_terminal_compatible, parse_unix_mux_value, subscribe_entities,
-    subscribe_session_entities, write_frame,
+    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+    FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
+    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+    FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
+    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible, parse_unix_mux_value,
+    subscribe_entities, subscribe_session_entities, write_frame,
 };
 #[cfg(test)]
 use botster_hub_client::{
@@ -47,9 +46,15 @@ use botster_terminal_ghostty::{
     ViewportProjection,
 };
 #[cfg(test)]
-use botster_terminal_protocol_client::{AttachState, ProcessExit, Snapshot, TerminalOutput};
 use botster_terminal_protocol_client::{
-    AttachStateKind, SnapshotPhase, TerminalEvent, TerminalFrame,
+    AttachState, MAX_PASTE_CHUNK_DATA_BYTES, ProcessExit, Snapshot, TerminalInputFrame,
+    TerminalOutput, decode_terminal_input,
+};
+use botster_terminal_protocol_client::{
+    AttachStateKind, MAX_INPUT_DATA_BYTES, MAX_MODE_GATED_DATA_BYTES, MAX_PASTE_BYTES,
+    SnapshotPhase, TerminalEvent, TerminalFrame, TerminalInputCommand, TerminalInputKind,
+    TerminalInputRejection, TerminalInputResult, TerminalModeFlags, encode_paste,
+    encode_terminal_input,
 };
 use botster_ui_contract::{
     EntityFamilyStore, PackageNoticeReactionDescriptor, PackageSurfaceDescriptor,
@@ -91,8 +96,16 @@ const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
 #[cfg(test)]
 const SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 44;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 48;
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
+const TERMINAL_INPUT_WRITE_BOUND: Duration = DETACH_ON_DISCONNECT_BOUND;
+// Core INPUT_QUEUE_CAPACITY is 256 at 48a437032791e678010254708259568ce4ad02bf.
+const TERMINAL_INPUT_INFLIGHT_CAPACITY: usize = 64;
+const TERMINAL_INPUT_INFLIGHT_BYTES: usize = 256 * 1024;
+const _: () = assert!(TERMINAL_INPUT_INFLIGHT_CAPACITY < 256);
+const _: () = assert!(
+    TERMINAL_INPUT_INFLIGHT_BYTES < TERMINAL_INPUT_INFLIGHT_CAPACITY * MAX_INPUT_DATA_BYTES
+);
 const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 const MUX_POLL_BATCH_FRAMES: usize = 32;
 const MUX_APPLY_BATCH_FRAMES: usize = 32;
@@ -287,7 +300,7 @@ struct AttachHydration {
     session_id: String,
     subscription_id: String,
     buffered_live_output: Vec<u8>,
-    pending_input: Vec<String>,
+    pending_input: Vec<PendingTerminalInput>,
     pending_resize: Option<TerminalScreenSize>,
     /// True after the incremental decoder validates READY.
     snapshot_ready: bool,
@@ -297,12 +310,27 @@ struct AttachHydration {
     attached_seen: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingTerminalInput {
+    Bytes(Vec<u8>),
+    Paste { operation_id: u32, data: Vec<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InFlightTerminalInput {
+    kind: TerminalInputKind,
+    data: Vec<u8>,
+    operation_id: Option<u32>,
+    retried: bool,
+}
+
 /// Attachment-scoped Hub mode flags used for ModeGatedInput freshness.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TerminalModeShadow {
     session_id: String,
     subscription_id: String,
     kitty_enabled: bool,
+    bracketed_paste: bool,
     mouse_mode: u8,
     mode_generation: u64,
     mode_revision: u64,
@@ -1178,23 +1206,36 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
 
         if event::poll(Duration::from_millis(100))? {
             let event = event::read()?;
-            match event {
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press
-                        && app.handle_tui_owned_key(key, router.focused_node_id()) => {}
-                Event::Key(key)
-                    if app.handle_focused_terminal_key(key, router.focused_node_id()) => {}
-                Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => break,
-                _ => {
-                    let dispatch = router.dispatch_event(event, &hit_map);
-                    app.sync_focused_session(router.selected_row_value("tui-session-list"));
-                    app.handle_dispatch(dispatch);
-                }
+            if !route_input_event(&mut app, &mut router, &hit_map, event) {
+                break;
             }
         }
     }
 
     Ok(())
+}
+
+fn route_input_event(
+    app: &mut TuiApp,
+    router: &mut InputRouter,
+    hit_map: &HitMap,
+    event: Event,
+) -> bool {
+    match event {
+        Event::Key(key)
+            if key.kind == KeyEventKind::Press
+                && app.handle_tui_owned_key(key, router.focused_node_id()) => {}
+        Event::Key(key) if app.handle_focused_terminal_key(key, router.focused_node_id()) => {}
+        Event::Paste(ref text)
+            if app.handle_focused_terminal_paste(text, router.focused_node_id()) => {}
+        Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => return false,
+        event => {
+            let dispatch = router.dispatch_event(event, hit_map);
+            app.sync_focused_session(router.selected_row_value("tui-session-list"));
+            app.handle_dispatch(dispatch);
+        }
+    }
+    true
 }
 
 fn draw(frame: &mut Frame<'_>, hit_map: &mut HitMap, app: &TuiApp, render_state: &RenderState) {
@@ -1414,6 +1455,39 @@ fn should_quit(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+fn terminal_input_rejection_message(
+    rejection: Option<TerminalInputRejection>,
+    bytes_written: usize,
+) -> String {
+    match rejection {
+        Some(TerminalInputRejection::StaleMode) => {
+            "terminal input rejected: stale mode".to_string()
+        }
+        Some(TerminalInputRejection::PartialWrite) => {
+            format!("terminal input rejected: partial write after {bytes_written} bytes")
+        }
+        Some(TerminalInputRejection::Timeout) => {
+            "terminal input rejected: mode wait timed out".to_string()
+        }
+        Some(TerminalInputRejection::SessionNotWritable) => {
+            "terminal input rejected: session is not writable".to_string()
+        }
+        Some(TerminalInputRejection::OperationInFlight) => {
+            "terminal paste rejected: another operation is in flight".to_string()
+        }
+        Some(TerminalInputRejection::OperationOutOfBounds) => {
+            "terminal paste rejected: operation is out of bounds".to_string()
+        }
+        Some(TerminalInputRejection::OperationIncomplete) => {
+            "terminal paste rejected: operation is incomplete".to_string()
+        }
+        Some(TerminalInputRejection::Aborted) => {
+            "terminal paste rejected: operation was aborted".to_string()
+        }
+        None => "terminal input rejected without a reason".to_string(),
+    }
+}
+
 struct TuiApp {
     endpoint: Option<DaemonEndpoint>,
     host_requirement: DaemonCompatibilityRequirement,
@@ -1487,6 +1561,9 @@ struct TuiApp {
     terminal_mouse_mode: u8,
     terminal_mouse_mode_attachment: Option<(String, String)>,
     terminal_mode_shadow: Option<TerminalModeShadow>,
+    terminal_input_in_flight: VecDeque<InFlightTerminalInput>,
+    terminal_input_in_flight_bytes: usize,
+    next_paste_operation_id: u32,
     terminal_mouse_mode_refresh_due: bool,
     last_terminal_mouse_mode_probe: Option<Instant>,
     terminal_viewport_size: TerminalScreenSize,
@@ -1500,6 +1577,8 @@ struct TuiApp {
     acceptance_audit: Option<AcceptanceRequestAudit>,
     #[cfg(test)]
     observed_requests: Vec<ObservedRequest>,
+    #[cfg(test)]
+    observed_terminal_inputs: Vec<TerminalInputCommand>,
     #[cfg(test)]
     list_for_target_stub: Option<ListForTargetStub>,
     /// When true, entity-options SubscribeEntities uses local pumps (no network).
@@ -1624,6 +1703,9 @@ impl TuiApp {
             terminal_mouse_mode: 0,
             terminal_mouse_mode_attachment: None,
             terminal_mode_shadow: None,
+            terminal_input_in_flight: VecDeque::new(),
+            terminal_input_in_flight_bytes: 0,
+            next_paste_operation_id: 1,
             terminal_mouse_mode_refresh_due: false,
             last_terminal_mouse_mode_probe: None,
             terminal_viewport_size: TerminalScreenSize::new(
@@ -1640,6 +1722,8 @@ impl TuiApp {
             acceptance_audit: None,
             #[cfg(test)]
             observed_requests: Vec::new(),
+            #[cfg(test)]
+            observed_terminal_inputs: Vec::new(),
             #[cfg(test)]
             list_for_target_stub: None,
             #[cfg(test)]
@@ -1719,15 +1803,10 @@ impl TuiApp {
             }
             InputDispatch::TerminalForward { bytes, .. } => {
                 if let Some(hydration) = self.attach_hydration.as_mut() {
-                    match String::from_utf8(bytes) {
-                        Ok(data) => {
-                            hydration.pending_input.push(data);
-                            self.error = None;
-                        }
-                        Err(error) => {
-                            self.error = Some(format!("terminal input was not UTF-8: {error}"));
-                        }
-                    }
+                    hydration
+                        .pending_input
+                        .push(PendingTerminalInput::Bytes(bytes));
+                    self.error = None;
                     return;
                 }
                 let Some(session_id) = self.attached_session.clone() else {
@@ -1744,15 +1823,8 @@ impl TuiApp {
                     );
                     return;
                 }
-                match String::from_utf8(bytes) {
-                    Ok(data) => {
-                        self.error = None;
-                        self.forward_terminal_input(session_id, data);
-                    }
-                    Err(error) => {
-                        self.error = Some(format!("terminal input was not UTF-8: {error}"))
-                    }
-                }
+                self.error = None;
+                self.forward_terminal_input(session_id, bytes);
             }
             InputDispatch::TerminalResize { rows, cols, .. } => {
                 if let Some(hydration) = self.attach_hydration.as_mut() {
@@ -1765,11 +1837,13 @@ impl TuiApp {
                 }
                 self.refresh_ghostty_viewport_cache();
                 if let Some(session_id) = self.attached_session.clone() {
-                    self.request_and_apply(DaemonRequest::Resize {
+                    self.forward_terminal_command(
                         session_id,
-                        rows,
-                        cols,
-                    });
+                        TerminalInputCommand::Resize { rows, cols },
+                        Vec::new(),
+                        None,
+                        false,
+                    );
                 }
             }
             InputDispatch::Scroll { node_id, lines } => {
@@ -1886,19 +1960,80 @@ impl TuiApp {
             // Consumed unencodable edge (e.g. classic Release has no bytes).
             return true;
         };
-        match String::from_utf8(bytes) {
-            Ok(data) => {
-                self.error = None;
-                if shadow.kitty_enabled {
-                    self.forward_mode_gated_input(session_id, data, true);
-                } else {
-                    self.request_and_apply(DaemonRequest::SendInput { session_id, data });
-                }
-            }
-            Err(error) => {
-                self.error = Some(format!("terminal input was not UTF-8: {error}"));
-            }
+        self.error = None;
+        if shadow.kitty_enabled {
+            self.forward_mode_gated_input(session_id, bytes, true);
+        } else {
+            self.forward_terminal_command(
+                session_id,
+                TerminalInputCommand::Input {
+                    data: bytes.clone(),
+                },
+                bytes,
+                None,
+                false,
+            );
         }
+        true
+    }
+
+    fn handle_focused_terminal_paste(&mut self, text: &str, focused_node_id: Option<&str>) -> bool {
+        let terminal_focused = focused_node_id == Some("tui-terminal")
+            || focused_node_id == Some("tui-terminal-output");
+        if !terminal_focused {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        let data = text.as_bytes().to_vec();
+        if data.len() > MAX_PASTE_BYTES {
+            self.error = Some(format!(
+                "terminal paste payload too large: max={MAX_PASTE_BYTES} actual={}",
+                data.len()
+            ));
+            return true;
+        }
+        if self.paste_is_pending() {
+            self.error = Some("terminal paste unavailable: another paste is in flight".to_string());
+            return true;
+        }
+        let Some(next_id) = self.next_paste_operation_id.checked_add(1) else {
+            self.error = Some("terminal paste unavailable: operation ids exhausted".to_string());
+            return true;
+        };
+        if let Some(hydration) = self.attach_hydration.as_mut() {
+            let operation_id = self.next_paste_operation_id;
+            hydration
+                .pending_input
+                .push(PendingTerminalInput::Paste { operation_id, data });
+            self.next_paste_operation_id = next_id;
+            self.error = None;
+            return true;
+        }
+        let Some(session_id) = self.attached_session.clone() else {
+            self.error = Some(
+                "terminal stream unavailable: attach a session before sending terminal input"
+                    .to_string(),
+            );
+            return true;
+        };
+        if self.attached_subscription_id.as_deref() != Some(self.subscription_id.as_str()) {
+            self.error = Some(
+                "terminal stream unavailable: current subscription is not attached".to_string(),
+            );
+            return true;
+        }
+        if self.current_mode_shadow().is_none() {
+            self.probe_terminal_mouse_mode(&session_id);
+        }
+        if self.current_mode_shadow().is_none() {
+            self.error = Some("terminal paste unavailable: mode flags not ready".to_string());
+            return true;
+        }
+        let operation_id = self.next_paste_operation_id;
+        self.next_paste_operation_id = next_id;
+        self.forward_terminal_paste(session_id, operation_id, data, false);
         true
     }
 
@@ -3603,6 +3738,7 @@ impl TuiApp {
         self.subscription_id = subscription_id.to_string();
         self.attached_session = None;
         self.attached_subscription_id = None;
+        self.clear_terminal_input_queue();
         self.clear_terminal_mouse_mode();
         self.clear_ghostty_projection();
         self.terminal_output.clear();
@@ -3823,6 +3959,7 @@ impl TuiApp {
     fn retire_subscription(&mut self, subscription_id: &str) {
         self.retired_subscription_ids
             .insert(subscription_id.to_string());
+        self.clear_terminal_input_queue();
     }
 
     fn current_owner_pair(&self) -> Option<(String, String)> {
@@ -4276,6 +4413,7 @@ impl TuiApp {
             TerminalEvent::AttachState(state) => {
                 self.apply_attach_state_kind(state.session_id, state.subscription_id, state.state);
             }
+            TerminalEvent::InputResult(result) => self.apply_terminal_input_result(result),
         }
     }
 
@@ -4581,34 +4719,6 @@ impl TuiApp {
             DaemonRequest::CaptureSnapshot { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::CaptureSnapshot(session_id.clone())),
-            DaemonRequest::Resize {
-                session_id,
-                rows,
-                cols,
-            } => self.observed_requests.push(ObservedRequest::Resize {
-                session_id: session_id.clone(),
-                rows: *rows,
-                cols: *cols,
-            }),
-            DaemonRequest::SendInput { session_id, data } => {
-                self.observed_requests.push(ObservedRequest::SendInput {
-                    session_id: session_id.clone(),
-                    data: data.clone(),
-                })
-            }
-            DaemonRequest::ModeGatedInput {
-                session_id,
-                data,
-                mode_generation,
-                mode_revision,
-            } => self
-                .observed_requests
-                .push(ObservedRequest::ModeGatedInput {
-                    session_id: session_id.clone(),
-                    data: data.clone(),
-                    mode_generation: *mode_generation,
-                    mode_revision: *mode_revision,
-                }),
             DaemonRequest::ListSpawnTargets => self
                 .observed_requests
                 .push(ObservedRequest::ListSpawnTargets),
@@ -4686,6 +4796,7 @@ impl TuiApp {
 
     fn apply_transport_failure(&mut self, error: DaemonTransportError) {
         self.client = None;
+        self.clear_terminal_input_queue();
         self.clear_event_subscription_state();
         self.reset_active_plugin_surface();
         if !self.invalidate_session_generation() {
@@ -5147,17 +5258,32 @@ impl TuiApp {
                 self.error = Some(format!("terminal resize failed: {error}"));
             }
             self.refresh_ghostty_viewport_cache();
-            self.request_and_apply(DaemonRequest::Resize {
-                session_id: session_id.to_string(),
-                rows: size.rows,
-                cols: size.cols,
-            });
+            self.forward_terminal_command(
+                session_id.to_string(),
+                TerminalInputCommand::Resize {
+                    rows: size.rows,
+                    cols: size.cols,
+                },
+                Vec::new(),
+                None,
+                false,
+            );
         }
         if !hydration.buffered_live_output.is_empty() {
             self.apply_live_terminal_output(&hydration.buffered_live_output);
         }
-        for data in hydration.pending_input {
-            self.forward_terminal_input(session_id.to_string(), data);
+        if self.attached_session.as_deref() == Some(session_id) {
+            self.probe_terminal_mouse_mode(session_id);
+        }
+        for input in hydration.pending_input {
+            match input {
+                PendingTerminalInput::Bytes(data) => {
+                    self.forward_terminal_input(session_id.to_string(), data);
+                }
+                PendingTerminalInput::Paste { operation_id, data } => {
+                    self.forward_terminal_paste(session_id.to_string(), operation_id, data, false);
+                }
+            }
         }
         // Optional diagnostic ReadScreen only — never terminal content authority.
         self.request_optional_readback(
@@ -5172,9 +5298,6 @@ impl TuiApp {
             },
             "capture_snapshot",
         );
-        if self.attached_session.as_deref() == Some(session_id) {
-            self.probe_terminal_mouse_mode(session_id);
-        }
     }
 
     fn scroll_projection(&mut self, op: ScrollOp) {
@@ -5236,12 +5359,11 @@ impl TuiApp {
         }
     }
 
-    fn looks_like_mouse_report(data: &str) -> bool {
-        let bytes = data.as_bytes();
+    fn looks_like_mouse_report(bytes: &[u8]) -> bool {
         bytes.starts_with(b"\x1b[<") || bytes.starts_with(b"\x1b[M")
     }
 
-    fn mode_gated_input_required(&self, data: &str) -> bool {
+    fn mode_gated_input_required(&self, data: &[u8]) -> bool {
         let looks_like_mouse = Self::looks_like_mouse_report(data);
         let Some(shadow) = self.current_mode_shadow() else {
             // Mouse reports without ModeFlags freshness must not plain-SendInput.
@@ -5258,15 +5380,21 @@ impl TuiApp {
         false
     }
 
-    fn forward_terminal_input(&mut self, session_id: String, data: String) {
+    fn forward_terminal_input(&mut self, session_id: String, data: Vec<u8>) {
         if !self.mode_gated_input_required(&data) {
-            self.request_and_apply(DaemonRequest::SendInput { session_id, data });
+            self.forward_terminal_command(
+                session_id,
+                TerminalInputCommand::Input { data: data.clone() },
+                data,
+                None,
+                false,
+            );
             return;
         }
         self.forward_mode_gated_input(session_id, data, /*allow_reprobe*/ true);
     }
 
-    fn forward_mode_gated_input(&mut self, session_id: String, data: String, allow_reprobe: bool) {
+    fn forward_mode_gated_input(&mut self, session_id: String, data: Vec<u8>, allow_reprobe: bool) {
         let Some(shadow) = self.current_mode_shadow().cloned() else {
             // No freshness yet: single re-probe then retry once.
             if allow_reprobe {
@@ -5280,76 +5408,272 @@ impl TuiApp {
                 Some("mode-gated terminal input unavailable: mode flags not ready".to_string());
             return;
         };
-        let request = DaemonRequest::ModeGatedInput {
-            session_id: session_id.clone(),
-            data: data.clone(),
-            mode_generation: shadow.mode_generation,
-            mode_revision: shadow.mode_revision,
+        self.forward_terminal_command(
+            session_id,
+            TerminalInputCommand::ModeGatedInput {
+                data: data.clone(),
+                mode_generation: shadow.mode_generation,
+                mode_revision: shadow.mode_revision,
+            },
+            data,
+            None,
+            false,
+        );
+    }
+
+    fn forward_terminal_paste(
+        &mut self,
+        session_id: String,
+        operation_id: u32,
+        data: Vec<u8>,
+        retried: bool,
+    ) {
+        let Some(shadow) = self.current_mode_shadow().cloned() else {
+            self.error = Some("terminal paste unavailable: mode flags not ready".to_string());
+            return;
         };
-        #[cfg(test)]
-        self.record_request(&request);
-        match self.request(request) {
-            Ok(response) => {
-                self.apply_mode_gated_input_response(response, session_id, data, allow_reprobe);
+        let frames = match encode_paste(
+            operation_id,
+            shadow.mode_generation,
+            shadow.mode_revision,
+            &data,
+        ) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
             }
+        };
+        if !self.reserve_terminal_input(InFlightTerminalInput {
+            kind: TerminalInputKind::Paste,
+            data,
+            operation_id: Some(operation_id),
+            retried,
+        }) {
+            return;
+        }
+        self.write_terminal_frames(&session_id, &frames);
+    }
+
+    fn forward_terminal_command(
+        &mut self,
+        session_id: String,
+        command: TerminalInputCommand,
+        data: Vec<u8>,
+        operation_id: Option<u32>,
+        retried: bool,
+    ) {
+        let kind = match command {
+            TerminalInputCommand::Input { .. } => TerminalInputKind::Input,
+            TerminalInputCommand::ModeGatedInput { .. } => TerminalInputKind::ModeGatedInput,
+            TerminalInputCommand::Resize { .. } => TerminalInputKind::Resize,
+            _ => TerminalInputKind::Paste,
+        };
+        let max = match kind {
+            TerminalInputKind::Input => MAX_INPUT_DATA_BYTES,
+            TerminalInputKind::ModeGatedInput => MAX_MODE_GATED_DATA_BYTES,
+            TerminalInputKind::Resize | TerminalInputKind::Paste => usize::MAX,
+        };
+        if data.len() > max {
+            self.error = Some(format!(
+                "terminal input payload too large: kind={kind:?} max={max} actual={}",
+                data.len()
+            ));
+            return;
+        }
+        let frame = match encode_terminal_input(&command) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        if !self.reserve_terminal_input(InFlightTerminalInput {
+            kind,
+            data,
+            operation_id,
+            retried,
+        }) {
+            return;
+        }
+        self.write_terminal_frames(&session_id, &[frame]);
+    }
+
+    fn reserve_terminal_input(&mut self, entry: InFlightTerminalInput) -> bool {
+        let retained = if entry.kind == TerminalInputKind::Paste {
+            0
+        } else {
+            entry.data.len()
+        };
+        if self.terminal_input_in_flight.len() >= TERMINAL_INPUT_INFLIGHT_CAPACITY
+            || self.terminal_input_in_flight_bytes.saturating_add(retained)
+                > TERMINAL_INPUT_INFLIGHT_BYTES
+        {
+            self.error = Some("terminal input unavailable: client back pressure".to_string());
+            return false;
+        }
+        self.terminal_input_in_flight_bytes += retained;
+        self.terminal_input_in_flight.push_back(entry);
+        true
+    }
+
+    fn write_terminal_frames(
+        &mut self,
+        session_id: &str,
+        frames: &[botster_terminal_protocol_client::TerminalInputFrame],
+    ) {
+        #[cfg(test)]
+        for frame in frames {
+            if let Ok(command) = decode_terminal_input(frame) {
+                self.observed_terminal_inputs.push(command);
+            }
+        }
+        let Some(subscription_id) = self.attached_subscription_id.clone() else {
+            self.clear_terminal_input_queue();
+            self.error = Some("terminal stream unavailable: no attached subscription".to_string());
+            return;
+        };
+        if subscription_id != self.subscription_id
+            || self.attached_session.as_deref() != Some(session_id)
+        {
+            self.clear_terminal_input_queue();
+            self.error = Some(
+                "terminal stream unavailable: current subscription is not attached".to_string(),
+            );
+            return;
+        }
+        let result = self
+            .client
+            .as_mut()
+            .ok_or(DaemonTransportError::ClientDisconnected)
+            .and_then(|client| {
+                for frame in frames {
+                    client.write_terminal_frame(
+                        session_id,
+                        &subscription_id,
+                        frame.as_bytes(),
+                        TERMINAL_INPUT_WRITE_BOUND,
+                    )?;
+                }
+                Ok(())
+            });
+        match result {
+            Ok(()) => self.error = None,
             Err(error) => self.record_transport_error(error),
         }
     }
 
-    fn apply_mode_gated_input_response(
-        &mut self,
-        response: DaemonResponse,
-        session_id: String,
-        data: String,
-        allow_reprobe: bool,
-    ) {
-        self.record_diagnostics(response.diagnostics);
-        if let Some(error) = response.error {
-            self.record_diagnostics(error.diagnostics);
-            self.error = Some(format!(
-                "mode_gated_input unavailable: {} (code={} operation={})",
-                error.message, error.code, error.operation
-            ));
+    fn paste_is_pending(&self) -> bool {
+        self.terminal_input_in_flight
+            .iter()
+            .any(|entry| entry.kind == TerminalInputKind::Paste)
+            || self.attach_hydration.as_ref().is_some_and(|hydration| {
+                hydration
+                    .pending_input
+                    .iter()
+                    .any(|input| matches!(input, PendingTerminalInput::Paste { .. }))
+            })
+    }
+
+    fn clear_terminal_input_queue(&mut self) {
+        self.terminal_input_in_flight.clear();
+        self.terminal_input_in_flight_bytes = 0;
+    }
+
+    fn apply_terminal_input_result(&mut self, result: TerminalInputResult) {
+        if self
+            .retired_subscription_ids
+            .contains(&result.subscription_id)
+            || self.attached_subscription_id.as_deref() != Some(result.subscription_id.as_str())
+        {
             return;
         }
-        let Some(result) = response.mode_gated_input else {
-            self.error = Some("mode_gated_input response missing body".to_string());
+        let Some(entry) = self.terminal_input_in_flight.pop_front() else {
+            self.error = Some("terminal input result has no pending command".to_string());
+            self.terminal_mode_shadow = None;
             return;
         };
-        // Keep mode shadow aligned with the gate outcome.
-        if let Some(subscription_id) = self.attached_subscription_id.clone() {
-            self.terminal_mode_shadow = Some(TerminalModeShadow {
-                session_id: result.session_id.clone(),
-                subscription_id: subscription_id.clone(),
-                kitty_enabled: result.kitty_enabled,
-                mouse_mode: result.mouse_mode,
-                mode_generation: result.mode_generation,
-                mode_revision: result.mode_revision,
-            });
-            self.terminal_mouse_mode = result.mouse_mode;
-            self.terminal_mouse_mode_attachment =
-                Some((result.session_id.clone(), subscription_id));
+        if entry.kind != TerminalInputKind::Paste {
+            self.terminal_input_in_flight_bytes = self
+                .terminal_input_in_flight_bytes
+                .saturating_sub(entry.data.len());
         }
+        if entry.kind != result.kind
+            || (entry.kind == TerminalInputKind::Paste && entry.operation_id != result.operation_id)
+        {
+            self.clear_terminal_input_queue();
+            self.terminal_mode_shadow = None;
+            self.error =
+                Some("terminal input result did not match the pending command".to_string());
+            return;
+        }
+        let Some(session_id) = self.attached_session.clone() else {
+            self.clear_terminal_input_queue();
+            return;
+        };
+        self.apply_result_mode_shadow(&session_id, &result.mode_flags, &result);
         if result.admitted {
             self.error = None;
             return;
         }
-        // Single re-probe on stale rejection, then one retry with fresh tokens.
-        if allow_reprobe {
+        if result.rejection == Some(TerminalInputRejection::StaleMode) && !entry.retried {
             self.probe_terminal_mouse_mode(&session_id);
             if self.current_mode_shadow().is_some() {
-                self.forward_mode_gated_input(session_id, data, false);
+                match entry.kind {
+                    TerminalInputKind::Paste => {
+                        let Some(next_id) = self.next_paste_operation_id.checked_add(1) else {
+                            self.error = Some(
+                                "terminal paste unavailable: operation ids exhausted".to_string(),
+                            );
+                            return;
+                        };
+                        let operation_id = self.next_paste_operation_id;
+                        self.next_paste_operation_id = next_id;
+                        self.forward_terminal_paste(session_id, operation_id, entry.data, true);
+                        self.move_last_retry_to_front();
+                    }
+                    TerminalInputKind::ModeGatedInput => {
+                        self.forward_mode_gated_input(session_id, entry.data, false);
+                        if let Some(retry) = self.terminal_input_in_flight.back_mut() {
+                            retry.retried = true;
+                        }
+                        self.move_last_retry_to_front();
+                    }
+                    _ => {}
+                }
                 return;
             }
         }
-        self.error = Some(format!(
-            "mode-gated input rejected{}",
-            result
-                .error_kind
-                .as_deref()
-                .map(|kind| format!(": {kind}"))
-                .unwrap_or_default()
+        self.error = Some(terminal_input_rejection_message(
+            result.rejection,
+            result.bytes_written,
         ));
+    }
+
+    fn apply_result_mode_shadow(
+        &mut self,
+        session_id: &str,
+        flags: &TerminalModeFlags,
+        result: &TerminalInputResult,
+    ) {
+        self.terminal_mode_shadow = Some(TerminalModeShadow {
+            session_id: session_id.to_string(),
+            subscription_id: result.subscription_id.clone(),
+            kitty_enabled: flags.kitty_enabled,
+            bracketed_paste: flags.bracketed_paste,
+            mouse_mode: flags.mouse_mode,
+            mode_generation: result.mode_generation,
+            mode_revision: result.mode_revision,
+        });
+        self.terminal_mouse_mode = flags.mouse_mode;
+        self.terminal_mouse_mode_attachment =
+            Some((session_id.to_string(), result.subscription_id.clone()));
+    }
+
+    fn move_last_retry_to_front(&mut self) {
+        if let Some(retry) = self.terminal_input_in_flight.pop_back() {
+            self.terminal_input_in_flight.push_front(retry);
+        }
     }
 
     fn apply_terminal_mouse_mode(&self, hit_map: &mut HitMap) {
@@ -5426,6 +5750,7 @@ impl TuiApp {
                     session_id: mode_flags.session_id,
                     subscription_id,
                     kitty_enabled: mode_flags.kitty_enabled,
+                    bracketed_paste: mode_flags.bracketed_paste,
                     mouse_mode: mode_flags.mouse_mode,
                     mode_generation: mode_flags.mode_generation,
                     mode_revision: mode_flags.mode_revision,
@@ -7086,21 +7411,6 @@ enum ObservedRequest {
     ReadScreen(String),
     ReadModeFlags(String),
     CaptureSnapshot(String),
-    Resize {
-        session_id: String,
-        rows: u16,
-        cols: u16,
-    },
-    SendInput {
-        session_id: String,
-        data: String,
-    },
-    ModeGatedInput {
-        session_id: String,
-        data: String,
-        mode_generation: u64,
-        mode_revision: u64,
-    },
     ListSpawnTargets,
     ListSessionTypesForTarget {
         target_id: String,
@@ -9195,15 +9505,14 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     wait_for_authoritative_session(&mut app, &session_id)?;
     app.attach_selected_or_first();
     wait_for_app_output(&mut app, "botster-tui-ready")?;
-    app.request_and_apply(DaemonRequest::Resize {
-        session_id: session_id.clone(),
-        rows: 24,
-        cols: 80,
-    });
-    app.request_and_apply(DaemonRequest::SendInput {
-        session_id: session_id.clone(),
-        data: HEADLESS_INPUT.to_string(),
-    });
+    app.forward_terminal_command(
+        session_id.clone(),
+        TerminalInputCommand::Resize { rows: 24, cols: 80 },
+        Vec::new(),
+        None,
+        false,
+    );
+    app.forward_terminal_input(session_id.clone(), HEADLESS_INPUT.as_bytes().to_vec());
     wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
     #[cfg(test)]
     {
@@ -9223,7 +9532,6 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
             FEATURE_PLUGIN_SURFACE_ACTION,
             FEATURE_TERMINAL_READBACK,
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-            FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
             FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
@@ -9484,6 +9792,30 @@ impl HubConnection {
             self.fill_mux_buf()?;
             self.decode_ready_mux_frames()?;
         }
+    }
+
+    fn write_terminal_frame(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        frame_bytes: &[u8],
+        bound: Duration,
+    ) -> DaemonTransportResult<()> {
+        if let Err(error) = self.stream.set_write_timeout(Some(bound)) {
+            self.hard_close();
+            return Err(DaemonTransportError::Io(error));
+        }
+        let envelope =
+            DaemonUnixTerminalEnvelope::from_frame_bytes(session_id, subscription_id, frame_bytes);
+        if let Err(error) = write_frame(&mut self.stream, &envelope) {
+            self.hard_close();
+            return Err(error);
+        }
+        if let Err(error) = self.stream.set_write_timeout(None) {
+            self.hard_close();
+            return Err(DaemonTransportError::Io(error));
+        }
+        Ok(())
     }
 
     fn request_with_deadline(
@@ -9762,7 +10094,6 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
             FEATURE_TERMINAL_READBACK.to_string(),
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
-            FEATURE_MODE_GATED_INPUT.to_string(),
             FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
             FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string(),
@@ -12581,7 +12912,7 @@ mod tests {
     #[test]
     fn destructive_confirmation_isolates_workspace_and_dispatches_only_after_confirm() {
         let mut app = workspace_fixture();
-        app.observed_requests.clear();
+        app.observed_terminal_inputs.clear();
 
         app.handle_action(
             "botster.tui.session.shutdown".to_string(),
@@ -12873,7 +13204,6 @@ mod tests {
             FEATURE_PLUGIN_SURFACE_ACTION,
             FEATURE_TERMINAL_READBACK,
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-            FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
             FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
@@ -12899,7 +13229,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_protocol_7_revision_44_and_split_terminal_hello() {
+    fn tui_requires_protocol_8_revision_48_and_split_terminal_hello() {
         let requirement = tui_compatibility_requirement();
         let compatible_hub = host_compatibility_omitting_terminal_mechanism_tokens;
 
@@ -12911,8 +13241,8 @@ mod tests {
             requirement.protocol_version,
             botster_hub_client::PROTOCOL_VERSION
         );
-        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 7);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 44);
+        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 48);
         assert!(
             !requirement
                 .required_features
@@ -12927,7 +13257,6 @@ mod tests {
             FEATURE_PLUGIN_SURFACE_ACTION,
             FEATURE_TERMINAL_READBACK,
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-            FEATURE_MODE_GATED_INPUT,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
             FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
@@ -12954,19 +13283,19 @@ mod tests {
             );
         }
 
-        for revision in 16..44 {
+        for revision in 16..48 {
             let mut older_hub = compatible_hub();
             older_hub.conformance_fixture_revision = revision;
             let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
                 .expect_err("pre-event-plane fixture revision must be rejected");
             assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 44"));
+            assert!(error.diagnostic.contains("requires at least 48"));
         }
         // `ensure_compatible` now matches protocol version exactly rather than as a
         // floor, so a *newer* hub is rejected as firmly as an older one. Both
         // directions are covered deliberately: dropping the newer-protocol case
         // would silently restore the old minimum semantics this bump replaced.
-        for protocol_version in (2..7).chain(8..10) {
+        for protocol_version in (2..8).chain(9..11) {
             let mut mismatched_hub = compatible_hub();
             mismatched_hub.protocol_version = protocol_version;
             let error = botster_hub_client::ensure_compatible(&requirement, &mismatched_hub)
@@ -12976,19 +13305,19 @@ mod tests {
                     .diagnostic
                     .contains(&format!("version {protocol_version}"))
             );
-            assert!(error.diagnostic.contains("client requires 7"));
+            assert!(error.diagnostic.contains("client requires 8"));
         }
         botster_hub_client::ensure_compatible(&requirement, &compatible_hub())
-            .expect("protocol 7 fixture revision 44 hub should connect");
+            .expect("protocol 8 fixture revision 48 hub should connect");
         botster_hub_client::ensure_compatible(
             &requirement,
             &previous_hub_descriptor_without_occupancy(),
         )
         .expect("default Hello must accept the previous Hub descriptor without attach_occupancy");
         let mut future_hub = compatible_hub();
-        future_hub.conformance_fixture_revision = 45;
+        future_hub.conformance_fixture_revision = 49;
         botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 45");
+            .expect("runtime compatibility must preserve minimum semantics for revision 49");
     }
 
     #[test]
@@ -18294,10 +18623,12 @@ mod tests {
         );
 
         app.handle_dispatch(dispatch);
-        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
-            session_id: "session-alpha".to_string(),
-            data: "x".to_string(),
-        }));
+        assert!(
+            app.observed_terminal_inputs
+                .contains(&TerminalInputCommand::Input {
+                    data: b"x".to_vec(),
+                })
+        );
     }
 
     #[test]
@@ -18383,22 +18714,20 @@ mod tests {
             0
         );
         // Mouse reports use ModeGatedInput with ModeFlags freshness, not plain SendInput.
-        assert!(app.observed_requests.iter().any(|request| {
+        assert!(app.observed_terminal_inputs.iter().any(|request| {
             matches!(
                 request,
-                ObservedRequest::ModeGatedInput {
-                    session_id,
+                TerminalInputCommand::ModeGatedInput {
                     data,
                     mode_generation: 1,
                     mode_revision: 2,
-                } if session_id == "session-alpha"
-                    && data.as_bytes() == sgr_release
+                } if data.as_slice() == sgr_release
             )
         }));
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|request| matches!(request, ObservedRequest::SendInput { .. }))
+                .any(|request| matches!(request, TerminalInputCommand::Input { .. }))
         );
     }
 
@@ -18645,6 +18974,86 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             app.probe_terminal_mouse_mode(session_id);
         }
+    }
+
+    fn prove_live_paste(
+        app: &mut TuiApp,
+        session_id: &str,
+        capture_path: &Path,
+        text: &str,
+        bracketed: bool,
+        label: &str,
+    ) {
+        let _ = std::fs::remove_file(capture_path);
+        let mut expected = Vec::new();
+        if bracketed {
+            expected.extend_from_slice(b"\x1b[200~");
+        }
+        expected.extend_from_slice(text.as_bytes());
+        if bracketed {
+            expected.extend_from_slice(b"\x1b[201~");
+        }
+        app.forward_terminal_input(
+            session_id.to_string(),
+            format!(
+                "paste-capture {} {} {}\n",
+                expected.len(),
+                if bracketed { "bracketed" } else { "plain" },
+                label
+            )
+            .into_bytes(),
+        );
+        let ready_marker = format!("paste-ready-{label}");
+        let ready_deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < ready_deadline {
+            app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            if viewport_cache_contains(app, &ready_marker) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            viewport_cache_contains(app, &ready_marker),
+            "live paste capture must become ready for {label}"
+        );
+        wait_for_mode_flags(app, session_id, |shadow| {
+            shadow.bracketed_paste == bracketed
+        });
+        assert!(app.handle_focused_terminal_paste(text, Some("tui-terminal")));
+
+        let marker = format!("paste-done-{label}");
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
+            app.poll_hub();
+            app.refresh_ghostty_viewport_cache();
+            if viewport_cache_contains(app, &marker)
+                && std::fs::metadata(capture_path)
+                    .is_ok_and(|metadata| metadata.len() == expected.len() as u64)
+                && app.terminal_input_in_flight.is_empty()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let captured = std::fs::read(capture_path).expect("read live paste capture");
+        assert_eq!(
+            captured, expected,
+            "live paste bytes must match for {label}"
+        );
+        assert!(
+            viewport_cache_contains(app, &marker),
+            "live paste marker must paint for {label}"
+        );
+        assert!(
+            app.terminal_input_in_flight.is_empty(),
+            "live paste result must clear the in-flight entry for {label}"
+        );
+        println!(
+            "ghostty-live-paste: label={label} raw_bytes={} delivered_bytes={} bracketed={bracketed}",
+            text.len(),
+            captured.len()
+        );
     }
 
     #[test]
@@ -19459,21 +19868,19 @@ mod tests {
         app.apply_response(attach_state_response("session-alpha", "attached"));
 
         assert_eq!(
-            app.observed_requests
+            app.observed_terminal_inputs
                 .iter()
-                .filter(|request| matches!(request, ObservedRequest::Resize { .. }))
+                .filter(|request| matches!(request, TerminalInputCommand::Resize { .. }))
                 .count(),
             1
         );
-        assert!(app.observed_requests.contains(&ObservedRequest::Resize {
-            session_id: "session-alpha".to_string(),
-            rows: 12,
-            cols: 60,
-        }));
-        assert!(app.observed_requests.iter().any(|request| matches!(
+        assert!(
+            app.observed_terminal_inputs
+                .contains(&TerminalInputCommand::Resize { rows: 12, cols: 60 })
+        );
+        assert!(app.observed_terminal_inputs.iter().any(|request| matches!(
             request,
-            ObservedRequest::SendInput { session_id, data }
-                if session_id == "session-alpha" && data == "queued-input\n"
+            TerminalInputCommand::Input { data } if data == b"queued-input\n"
         )));
     }
 
@@ -19869,18 +20276,17 @@ mod tests {
             "read_mode_flags",
         );
         assert!(app.current_mode_shadow().is_some_and(|s| s.kitty_enabled));
-        assert!(app.mode_gated_input_required("typed\n"));
-        let sgr = String::from_utf8(b"\x1b[<0;1;1M".to_vec()).expect("utf8");
+        assert!(app.mode_gated_input_required(b"typed\n"));
+        let sgr = b"\x1b[<0;1;1M".to_vec();
         assert!(app.mode_gated_input_required(&sgr));
 
         // Kitty-enabled: plain text records ModeGatedInput with generation/revision.
         // (No live Hub client: request fails closed after observation.)
-        app.forward_terminal_input("session-alpha".to_string(), "typed\n".to_string());
+        app.forward_terminal_input("session-alpha".to_string(), b"typed\n".to_vec());
         assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ModeGatedInput {
-                    session_id: "session-alpha".to_string(),
-                    data: "typed\n".to_string(),
+            app.observed_terminal_inputs
+                .contains(&TerminalInputCommand::ModeGatedInput {
+                    data: b"typed\n".to_vec(),
                     mode_generation: 3,
                     mode_revision: 7,
                 })
@@ -19895,51 +20301,19 @@ mod tests {
         );
         app.observed_requests.clear();
         // Mouse mode without Kitty: only SGR mouse reports require ModeGatedInput.
-        assert!(!app.mode_gated_input_required("plain"));
+        assert!(!app.mode_gated_input_required(b"plain"));
         assert!(app.mode_gated_input_required(&sgr));
         app.forward_terminal_input("session-alpha".to_string(), sgr.clone());
-        assert!(app.observed_requests.iter().any(|request| {
+        assert!(app.observed_terminal_inputs.iter().any(|request| {
             matches!(
                 request,
-                ObservedRequest::ModeGatedInput {
-                    session_id,
+                TerminalInputCommand::ModeGatedInput {
                     data,
                     mode_generation: 3,
                     mode_revision: 7,
-                } if session_id == "session-alpha" && data == &sgr
+                } if data == &sgr
             )
         }));
-
-        // Stale rejection updates mode shadow tokens (single re-probe path).
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-alpha".to_string());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", true, 9, 3, 7),
-            "read_mode_flags",
-        );
-        let mut rejected = base_response(DaemonResponseKind::ModeGatedInput);
-        rejected.mode_gated_input = Some(botster_hub_client::DaemonModeGatedInputResult::new(
-            "session-alpha",
-            false,
-            0,
-            true,
-            true,
-            false,
-            9,
-            false,
-            false,
-            false,
-            3,
-            8, // advanced revision on rejection
-            Some("stale".to_string()),
-        ));
-        app.apply_mode_gated_input_response(
-            rejected,
-            "session-alpha".to_string(),
-            "retry\n".to_string(),
-            false, // do not re-forward without a live client
-        );
-        assert_eq!(app.current_mode_shadow().map(|s| s.mode_revision), Some(8));
     }
 
     #[test]
@@ -20002,20 +20376,18 @@ mod tests {
         assert!(app.handle_focused_terminal_key(key, router.focused_node_id()));
         let expected = renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
             .expect("kitty encodes char a");
-        let expected = String::from_utf8(expected).expect("utf8");
         assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ModeGatedInput {
-                    session_id: "session-alpha".to_string(),
+            app.observed_terminal_inputs
+                .contains(&TerminalInputCommand::ModeGatedInput {
                     data: expected,
                     mode_generation: 5,
                     mode_revision: 9,
                 })
         );
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::SendInput { .. }))
+                .any(|r| matches!(r, TerminalInputCommand::Input { .. }))
         );
     }
 
@@ -20028,20 +20400,22 @@ mod tests {
             mode_flags_response_full("session-alpha", false, 0, 1, 1),
             "read_mode_flags",
         );
-        app.observed_requests.clear();
+        app.observed_terminal_inputs.clear();
         // Without kitty, focused key path still consumes and classic-encodes.
         assert!(app.handle_focused_terminal_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
             Some("tui-terminal"),
         ));
-        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
-            session_id: "session-alpha".to_string(),
-            data: "x".to_string(),
-        }));
         assert!(
-            !app.observed_requests
+            app.observed_terminal_inputs
+                .contains(&TerminalInputCommand::Input {
+                    data: b"x".to_vec(),
+                })
+        );
+        assert!(
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::ModeGatedInput { .. }))
+                .any(|r| matches!(r, TerminalInputCommand::ModeGatedInput { .. }))
         );
     }
 
@@ -20057,9 +20431,9 @@ mod tests {
             Some("tui-terminal"),
         ));
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::SendInput { .. })),
+                .any(|r| matches!(r, TerminalInputCommand::Input { .. })),
             "unknown ModeFlags must not plain-SendInput classic key bytes"
         );
         assert!(
@@ -20089,11 +20463,11 @@ mod tests {
         let expected_mod =
             renderer::terminal_key_bytes_with(mod_key, renderer::TerminalKeyEncoding::Kitty)
                 .expect("kitty encodes ctrl-c");
-        assert!(app.observed_requests.iter().any(|r| {
+        assert!(app.observed_terminal_inputs.iter().any(|r| {
             matches!(
                 r,
-                ObservedRequest::ModeGatedInput { data, mode_generation: 2, mode_revision: 4, .. }
-                    if data.as_bytes() == expected_mod.as_slice()
+                TerminalInputCommand::ModeGatedInput { data, mode_generation: 2, mode_revision: 4 }
+                    if data.as_slice() == expected_mod.as_slice()
             )
         }));
 
@@ -20105,14 +20479,14 @@ mod tests {
         repeat.kind = KeyEventKind::Repeat;
         assert!(app.handle_focused_terminal_key(repeat, Some("tui-terminal")));
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::SendInput { .. }))
+                .any(|r| matches!(r, TerminalInputCommand::Input { .. }))
         );
         assert!(
-            app.observed_requests
+            app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::ModeGatedInput { .. }))
+                .any(|r| matches!(r, TerminalInputCommand::ModeGatedInput { .. }))
         );
 
         // Release is consumed (Kitty may encode release; either way no classic SendInput).
@@ -20122,14 +20496,14 @@ mod tests {
         release.kind = KeyEventKind::Release;
         assert!(app.handle_focused_terminal_key(release, Some("tui-terminal")));
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::SendInput { .. }))
+                .any(|r| matches!(r, TerminalInputCommand::Input { .. }))
         );
     }
 
     #[test]
-    fn mode_gated_stale_token_reprobes_once_then_retries() {
+    fn input_result_refreshes_the_live_mode_shadow() {
         let mut app = TuiApp::new(None);
         app.attached_session = Some("session-alpha".to_string());
         app.attached_subscription_id = Some(app.subscription_id.clone());
@@ -20137,31 +20511,329 @@ mod tests {
             mode_flags_response_full("session-alpha", true, 0, 1, 1),
             "read_mode_flags",
         );
-        // Simulate stale rejection with advanced revision, no live re-forward.
-        let mut rejected = base_response(DaemonResponseKind::ModeGatedInput);
-        rejected.mode_gated_input = Some(botster_hub_client::DaemonModeGatedInputResult::new(
-            "session-alpha",
-            false,
-            0,
-            true,
-            true,
-            false,
-            0,
-            false,
-            false,
-            false,
-            1,
-            2,
-            Some("stale".to_string()),
-        ));
-        app.apply_mode_gated_input_response(
-            rejected,
-            "session-alpha".to_string(),
-            "retry\n".to_string(),
-            false, // unit path: no live client for re-probe retry
-        );
-        // Shadow advanced from rejection body tokens.
+        app.terminal_input_in_flight
+            .push_back(InFlightTerminalInput {
+                kind: TerminalInputKind::ModeGatedInput,
+                data: b"input".to_vec(),
+                operation_id: None,
+                retried: false,
+            });
+        app.terminal_input_in_flight_bytes = 5;
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::ModeGatedInput,
+            operation_id: None,
+            admitted: true,
+            bytes_written: 5,
+            mode_generation: 1,
+            mode_revision: 2,
+            mode_flags: TerminalModeFlags {
+                kitty_enabled: true,
+                cursor_visible: true,
+                bracketed_paste: false,
+                mouse_mode: 0,
+                alt_screen: false,
+                focus_reporting: false,
+                application_cursor: false,
+            },
+            rejection: None,
+        });
         assert_eq!(app.current_mode_shadow().map(|s| s.mode_revision), Some(2));
+    }
+
+    #[test]
+    fn paste_event_routes_raw_bytes_through_the_core_transaction_helper() {
+        let mut app = TuiApp::new(None);
+        app.sessions = vec![SessionRow::running("session-alpha")];
+        app.selected_session = Some("session-alpha".to_string());
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 0, 7, 11),
+            "read_mode_flags",
+        );
+        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
+        let terminal = hit_map
+            .regions()
+            .iter()
+            .find(|region| region.node_id == "tui-terminal")
+            .expect("terminal region");
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let focus = router.dispatch_event(
+            mouse_event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                terminal.rect.x.saturating_add(1),
+                terminal.rect.y.saturating_add(1),
+            ),
+            &hit_map,
+        );
+        app.handle_dispatch(focus);
+        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
+        app.observed_terminal_inputs.clear();
+
+        assert!(route_input_event(
+            &mut app,
+            &mut router,
+            &hit_map,
+            Event::Paste("héllo".to_string()),
+        ));
+
+        let operation_id = match app.observed_terminal_inputs.first() {
+            Some(TerminalInputCommand::PasteBegin {
+                operation_id,
+                mode_generation: 7,
+                mode_revision: 11,
+                total_len: 6,
+            }) => *operation_id,
+            other => panic!("expected paste begin, got {other:?}"),
+        };
+        let mut content = Vec::new();
+        for (expected_index, command) in app.observed_terminal_inputs
+            [1..app.observed_terminal_inputs.len() - 1]
+            .iter()
+            .enumerate()
+        {
+            match command {
+                TerminalInputCommand::PasteChunk {
+                    operation_id: found,
+                    index,
+                    data,
+                } => {
+                    assert_eq!(*found, operation_id);
+                    assert_eq!(*index as usize, expected_index);
+                    content.extend_from_slice(data);
+                }
+                other => panic!("expected paste chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(content, "héllo".as_bytes());
+        assert!(!content.windows(6).any(|bytes| bytes == b"\x1b[200~"));
+        assert!(!content.windows(6).any(|bytes| bytes == b"\x1b[201~"));
+        assert_eq!(
+            app.observed_terminal_inputs.last(),
+            Some(&TerminalInputCommand::PasteCommit { operation_id })
+        );
+        assert!(
+            !app.observed_terminal_inputs
+                .iter()
+                .any(|command| matches!(command, TerminalInputCommand::Input { .. }))
+        );
+    }
+
+    #[test]
+    fn terminal_forward_preserves_non_utf8_bytes() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        let bytes = vec![0, 0xff, 0x80, b'x'];
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: bytes.clone(),
+        });
+        assert_eq!(
+            app.observed_terminal_inputs,
+            vec![TerminalInputCommand::Input { data: bytes }]
+        );
+    }
+
+    #[test]
+    fn unix_duplex_writer_wraps_the_exact_core_frame_and_restores_timeout() {
+        let (writer, mut reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let mut connection = HubConnection::from_stream(writer);
+        let frame = encode_terminal_input(&TerminalInputCommand::Resize { rows: 31, cols: 97 })
+            .expect("encode resize");
+        connection
+            .write_terminal_frame(
+                "session-alpha",
+                "sub-alpha",
+                frame.as_bytes(),
+                TERMINAL_INPUT_WRITE_BOUND,
+            )
+            .expect("write duplex frame");
+        assert_eq!(connection.stream.write_timeout().expect("timeout"), None);
+
+        let mut bytes = [0_u8; 1024];
+        let read = reader.read(&mut bytes).expect("read envelope");
+        let line = std::str::from_utf8(&bytes[..read]).expect("UTF-8 envelope");
+        let envelope: DaemonUnixTerminalEnvelope =
+            serde_json::from_str(line.trim()).expect("decode envelope");
+        assert_eq!(envelope.session_id, "session-alpha");
+        assert_eq!(envelope.subscription_id, "sub-alpha");
+        let decoded = TerminalInputFrame::from_bytes(&envelope.payload_bytes().expect("payload"))
+            .expect("input frame");
+        assert_eq!(
+            decode_terminal_input(&decoded).expect("decode command"),
+            TerminalInputCommand::Resize { rows: 31, cols: 97 }
+        );
+    }
+
+    #[test]
+    fn input_queue_fails_soft_before_the_core_capacity() {
+        let mut app = TuiApp::new(None);
+        for _ in 0..TERMINAL_INPUT_INFLIGHT_CAPACITY {
+            assert!(app.reserve_terminal_input(InFlightTerminalInput {
+                kind: TerminalInputKind::Resize,
+                data: Vec::new(),
+                operation_id: None,
+                retried: false,
+            }));
+        }
+        assert!(!app.reserve_terminal_input(InFlightTerminalInput {
+            kind: TerminalInputKind::Input,
+            data: vec![1],
+            operation_id: None,
+            retried: false,
+        }));
+        assert_eq!(
+            app.terminal_input_in_flight.len(),
+            TERMINAL_INPUT_INFLIGHT_CAPACITY
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("back pressure"))
+        );
+    }
+
+    #[test]
+    fn paste_operation_ids_exhaust_without_wrapping_or_blocking_keys() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 0, 3, 4),
+            "read_mode_flags",
+        );
+        app.next_paste_operation_id = u32::MAX - 1;
+        assert!(app.handle_focused_terminal_paste("first", Some("tui-terminal")));
+        assert!(matches!(
+            app.observed_terminal_inputs.first(),
+            Some(TerminalInputCommand::PasteBegin { operation_id, .. })
+                if *operation_id == u32::MAX - 1
+        ));
+        assert_eq!(app.next_paste_operation_id, u32::MAX);
+
+        let written = app.observed_terminal_inputs.len();
+        assert!(app.handle_focused_terminal_paste("second", Some("tui-terminal")));
+        assert_eq!(app.observed_terminal_inputs.len(), written);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("operation ids exhausted"))
+        );
+        assert_eq!(app.next_paste_operation_id, u32::MAX);
+
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 0, 3, 4),
+            "read_mode_flags",
+        );
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        assert!(matches!(
+            app.observed_terminal_inputs.last(),
+            Some(TerminalInputCommand::Input { data }) if data == b"k"
+        ));
+    }
+
+    #[test]
+    fn paste_hydration_keeps_one_raw_operation_and_refuses_oversize() {
+        let mut app = TuiApp::new(None);
+        app.begin_attach_hydration("session-alpha", "sub-alpha");
+        assert!(app.handle_focused_terminal_paste("raw", Some("tui-terminal")));
+        let operation_id = app.next_paste_operation_id - 1;
+        assert_eq!(
+            app.attach_hydration
+                .as_ref()
+                .expect("hydration")
+                .pending_input,
+            vec![PendingTerminalInput::Paste {
+                operation_id,
+                data: b"raw".to_vec(),
+            }]
+        );
+        assert!(app.handle_focused_terminal_paste("later", Some("tui-terminal")));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("another paste"))
+        );
+
+        let pending = app
+            .attach_hydration
+            .as_ref()
+            .expect("hydration")
+            .pending_input
+            .len();
+        let oversized = "x".repeat(MAX_PASTE_BYTES + 1);
+        assert!(app.handle_focused_terminal_paste(&oversized, Some("tui-terminal")));
+        assert_eq!(
+            app.attach_hydration
+                .as_ref()
+                .expect("hydration")
+                .pending_input
+                .len(),
+            pending
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains(&MAX_PASTE_BYTES.to_string()))
+        );
+    }
+
+    #[test]
+    fn mismatched_input_result_clears_correlation_and_mode_freshness() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.terminal_mode_shadow = Some(TerminalModeShadow {
+            session_id: "session-alpha".to_string(),
+            subscription_id: app.subscription_id.clone(),
+            kitty_enabled: false,
+            bracketed_paste: false,
+            mouse_mode: 0,
+            mode_generation: 1,
+            mode_revision: 1,
+        });
+        app.terminal_input_in_flight
+            .push_back(InFlightTerminalInput {
+                kind: TerminalInputKind::Input,
+                data: b"x".to_vec(),
+                operation_id: None,
+                retried: false,
+            });
+        app.terminal_input_in_flight_bytes = 1;
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Resize,
+            operation_id: None,
+            admitted: true,
+            bytes_written: 0,
+            mode_generation: 1,
+            mode_revision: 2,
+            mode_flags: TerminalModeFlags {
+                kitty_enabled: false,
+                cursor_visible: true,
+                bracketed_paste: false,
+                mouse_mode: 0,
+                alt_screen: false,
+                focus_reporting: false,
+                application_cursor: false,
+            },
+            rejection: None,
+        });
+        assert!(app.terminal_input_in_flight.is_empty());
+        assert_eq!(app.terminal_input_in_flight_bytes, 0);
+        assert!(app.terminal_mode_shadow.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("did not match"))
+        );
     }
 
     #[test]
@@ -20175,9 +20847,9 @@ mod tests {
             bytes: b"\x1b[<0;1;1M".to_vec(),
         });
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::SendInput { .. })),
+                .any(|r| matches!(r, TerminalInputCommand::Input { .. })),
             "mouse reports must not plain-SendInput without ModeFlags freshness"
         );
         assert!(app.error.is_some());
@@ -22008,7 +22680,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub baeb04d and Core 7eafa47. Export
+        // Build matching binaries from Hub bb1a330 and Core 48a4370. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -22027,9 +22699,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "baeb04dcb4a11de4c3932d16bf09a8e5ff6ba4b5".to_string());
+            .unwrap_or_else(|_| "bb1a330543bc06888f894edd5f40a0f867753a12".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "7eafa470a18025895995bbedc20d34b58106a03b".to_string());
+            .unwrap_or_else(|_| "48a437032791e678010254708259568ce4ad02bf".to_string());
         let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
         let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
         assert_eq!(
@@ -22065,37 +22737,49 @@ mod tests {
         let mut app = TuiApp::new(Some(hub.endpoint().clone()));
         app.workspace_test_mode = true;
         // Full OSC form matches Core projection tests; STYLED is bold truecolor green.
-        let command = concat!(
-            // Kernel echo would insert the command token between split UTF-8
-            // fragments. Disable it so barrier writes are exact payloads.
-            "stty -echo; ",
-            "printf 'HISTORY_HEAD\\n'; ",
-            "i=0; while [ $i -lt 12000 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
-            "printf 'HISTORY_TAIL\\n'; ",
-            "printf 'BOTTOM_LIVE\\n'; ",
-            "printf '\\033]4;1;rgb:ffff/0000/0000\\033\\\\'; ",
-            "printf '\\033]10;rgb:0000/ffff/0000\\033\\\\'; ",
-            "printf '\\033[1;38;2;0;128;0mSTYLED\\033[0m\\n'; ",
-            "printf 'palette-ready\\n'; ",
-            "while IFS= read -r line; do ",
-            "  if [ \"$line\" = enable-modes ]; then ",
-            "    printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
-            "    printf 'modes-enabled\\n'; ",
-            "  elif [ \"$line\" = emit-split-e2 ]; then ",
-            "    printf '\\342'; ",
-            "  elif [ \"$line\" = emit-split-rest ]; then ",
-            "    printf '\\202\\254'; ",
-            "  elif [ \"$line\" = emit-invalid-bytes ]; then ",
-            "    printf '\\000\\033\\377\\300'; ",
-            "  elif [ \"$line\" = emit-later-marker ]; then ",
-            "    printf '\\033[0mBYTEFAITH'; ",
-            "  else ",
-            "    printf 'echo:%s\\n' \"$line\"; ",
-            "  fi; ",
-            "done"
-        )
-        .to_string();
         let session_id = format!("btui-ghostty-{}", short_suffix());
+        let paste_capture_path = PathBuf::from(format!("/tmp/{session_id}-paste.bin"));
+        let command = format!(
+            concat!(
+                // Kernel echo would insert the command token between split UTF-8
+                // fragments. Disable it so barrier writes are exact payloads.
+                "stty -echo; ",
+                "printf 'HISTORY_HEAD\\n'; ",
+                "i=0; while [ $i -lt 12000 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
+                "printf 'HISTORY_TAIL\\n'; ",
+                "printf 'BOTTOM_LIVE\\n'; ",
+                "printf '\\033]4;1;rgb:ffff/0000/0000\\033\\\\'; ",
+                "printf '\\033]10;rgb:0000/ffff/0000\\033\\\\'; ",
+                "printf '\\033[1;38;2;0;128;0mSTYLED\\033[0m\\n'; ",
+                "printf 'palette-ready\\n'; ",
+                "while IFS= read -r line; do ",
+                "  if [ \"$line\" = enable-modes ]; then ",
+                "    printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
+                "    printf 'modes-enabled\\n'; ",
+                "  elif [ \"$line\" = emit-split-e2 ]; then ",
+                "    printf '\\342'; ",
+                "  elif [ \"$line\" = emit-split-rest ]; then ",
+                "    printf '\\202\\254'; ",
+                "  elif [ \"$line\" = emit-invalid-bytes ]; then ",
+                "    printf '\\000\\033\\377\\300'; ",
+                "  elif [ \"$line\" = emit-later-marker ]; then ",
+                "    printf '\\033[0mBYTEFAITH'; ",
+                "  elif set -- $line && [ \"$1\" = paste-capture ]; then ",
+                "    paste_bytes=$2; paste_mode=$3; paste_label=$4; ",
+                "    if [ \"$paste_mode\" = bracketed ]; then printf '\\033[?2004h'; else printf '\\033[?2004l'; fi; ",
+                "    printf 'paste-ready-%s\\n' \"$paste_label\"; ",
+                "    stty raw -echo; ",
+                "    dd bs=1 count=\"$paste_bytes\" of='{paste_capture}' 2>/dev/null; ",
+                "    stty -raw -echo; ",
+                "    printf '\\033[?2004l'; ",
+                "    printf 'paste-done-%s\\n' \"$paste_label\"; ",
+                "  else ",
+                "    printf 'echo:%s\\n' \"$line\"; ",
+                "  fi; ",
+                "done"
+            ),
+            paste_capture = paste_capture_path.display()
+        );
         app.pending_sessions
             .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
         app.selected_session = Some(session_id.clone());
@@ -22250,10 +22934,7 @@ mod tests {
         }
 
         // Enable Kitty + mouse tracking in-session; fail if either branch does not run.
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "enable-modes\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"enable-modes\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         while Instant::now() < deadline {
             app.poll_hub();
@@ -22280,7 +22961,37 @@ mod tests {
             shadow.mouse_mode
         );
 
-        // Resize production path: local viewport update + Hub DaemonRequest::Resize.
+        prove_live_paste(
+            &mut app,
+            &session_id,
+            &paste_capture_path,
+            "small-paste\n",
+            true,
+            "small",
+        );
+        let mut large_paste = "p".repeat(MAX_PASTE_CHUNK_DATA_BYTES + 37);
+        large_paste.push('\n');
+        prove_live_paste(
+            &mut app,
+            &session_id,
+            &paste_capture_path,
+            &large_paste,
+            true,
+            "large",
+        );
+        prove_live_paste(
+            &mut app,
+            &session_id,
+            &paste_capture_path,
+            "plain-paste\n",
+            false,
+            "plain",
+        );
+        let post_paste_shadow = wait_for_mode_flags(&mut app, &session_id, |shadow| {
+            shadow.kitty_enabled && !shadow.bracketed_paste
+        });
+
+        // Resize production path: local viewport update plus a Core duplex frame.
         // Client-owned dimensions alone are not enough — require Hub success, then
         // prove session-worker applied 30x100 via reconnect Snapshot dimensions.
         app.error = None;
@@ -22293,7 +23004,7 @@ mod tests {
         assert_eq!(app.terminal_viewport_size.cols, 100);
         assert!(
             app.error.is_none(),
-            "TerminalResize must complete without Hub/transport error after DaemonRequest::Resize; error={:?}",
+            "TerminalResize must complete without a transport error; error={:?}",
             app.error
         );
         let post_resize_dims = app
@@ -22304,55 +23015,51 @@ mod tests {
         assert_eq!(post_resize_dims.rows, 30);
         assert_eq!(post_resize_dims.cols, 100);
 
-        // Required Kitty branch: real focused KeyEvent → ModeGatedInput CSI-u.
-        app.observed_requests.clear();
+        // Required Kitty branch: real focused KeyEvent → duplex ModeGatedInput.
+        app.observed_terminal_inputs.clear();
         let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
         assert!(app.handle_focused_terminal_key(key, Some("tui-terminal")));
         let expected = renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
             .expect("kitty encodes z");
         assert!(
-            app.observed_requests.iter().any(|r| matches!(
+            app.observed_terminal_inputs.iter().any(|r| matches!(
                 r,
-                ObservedRequest::ModeGatedInput {
+                TerminalInputCommand::ModeGatedInput {
                     data,
                     mode_generation,
                     mode_revision,
-                    ..
-                } if data.as_bytes() == expected.as_slice()
-                    && *mode_generation == shadow.mode_generation
-                    && *mode_revision == shadow.mode_revision
+                } if data.as_slice() == expected.as_slice()
+                    && *mode_generation == post_paste_shadow.mode_generation
+                    && *mode_revision == post_paste_shadow.mode_revision
             )),
             "Kitty branch must ModeGatedInput CSI-u with freshness tokens: {:?}",
             app.observed_requests
         );
         assert!(
-            !app.observed_requests
+            !app.observed_terminal_inputs
                 .iter()
-                .any(|r| matches!(r, ObservedRequest::SendInput { .. })),
-            "Kitty branch must not plain-SendInput"
+                .any(|r| matches!(r, TerminalInputCommand::Input { .. })),
+            "Kitty branch must not send plain input"
         );
 
         // Required mouse branch: SGR → ModeGatedInput.
-        app.observed_requests.clear();
+        app.observed_terminal_inputs.clear();
         let sgr = "\x1b[<0;1;1M".to_string();
         app.handle_dispatch(InputDispatch::TerminalForward {
             node_id: "tui-terminal".to_string(),
             bytes: sgr.as_bytes().to_vec(),
         });
         assert!(
-            app.observed_requests.iter().any(|r| matches!(
+            app.observed_terminal_inputs.iter().any(|r| matches!(
                 r,
-                ObservedRequest::ModeGatedInput { data, .. } if data == &sgr
+                TerminalInputCommand::ModeGatedInput { data, .. } if data == sgr.as_bytes()
             )),
             "mouse branch must ModeGatedInput SGR: {:?}",
             app.observed_requests
         );
 
         // Later live output required in painted Ratatui frame (not cache alone).
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "live-marker\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"live-marker\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut painted_live = String::new();
         while Instant::now() < deadline {
@@ -22373,10 +23080,7 @@ mod tests {
         // Deterministic split-UTF-8 barrier: write [0xE2], observe that exact
         // applied payload, then release [0x82, 0xAC] and prove euro without U+FFFD.
         app.applied_live_payloads.clear();
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "emit-split-e2\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"emit-split-e2\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut saw_e2 = false;
         while Instant::now() < deadline {
@@ -22409,10 +23113,7 @@ mod tests {
             "split-first-frame must not paint U+FFFD"
         );
 
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "emit-split-rest\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"emit-split-rest\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut painted_euro = String::new();
         while Instant::now() < deadline {
@@ -22451,10 +23152,7 @@ mod tests {
         );
 
         app.applied_live_payloads.clear();
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "emit-invalid-bytes\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"emit-invalid-bytes\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut saw_invalid_sequence = false;
         while Instant::now() < deadline {
@@ -22499,10 +23197,7 @@ mod tests {
             "live invalid bytes must not be UTF-8-repaired to U+FFFD; applied={applied:?}"
         );
 
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "emit-later-marker\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"emit-later-marker\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut painted_marker = String::new();
         while Instant::now() < deadline {
@@ -22589,10 +23284,7 @@ mod tests {
         );
         app.scroll_projection(ScrollOp::Bottom);
 
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: "reconnect-live\n".to_string(),
-        });
+        app.forward_terminal_input(session_id.clone(), b"reconnect-live\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut painted_reconnect_live = String::new();
         while Instant::now() < deadline {
@@ -22656,10 +23348,7 @@ mod tests {
             !viewport_cache_contains(&app, "ready"),
             "silent session must not print a pre-attach readiness banner"
         );
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: no_hist_id.clone(),
-            data: "after-empty\n".to_string(),
-        });
+        app.forward_terminal_input(no_hist_id.clone(), b"after-empty\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut painted_empty = String::new();
         while Instant::now() < deadline {
@@ -23024,10 +23713,7 @@ mod tests {
         let suffix = short_suffix();
         let marker = format!("NORTH_STAR_TUI_{suffix}");
         app.applied_live_payloads.clear();
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: format!("{marker}\n"),
-        });
+        app.forward_terminal_input(session_id.clone(), format!("{marker}\n").into_bytes());
         assert!(
             wait_for_shared_marker(&mut app, &marker),
             "exact TUI marker bytes must appear; applied={:?}",
@@ -23051,15 +23737,14 @@ mod tests {
         assert_eq!(app.terminal_viewport_size.cols, 100);
         assert!(app.error.is_none(), "resize must succeed: {:?}", app.error);
         assert!(
-            app.observed_requests.iter().any(|request| matches!(
+            app.observed_terminal_inputs.iter().any(|request| matches!(
                 request,
-                ObservedRequest::Resize {
+                TerminalInputCommand::Resize {
                     rows: 30,
-                    cols: 100,
-                    ..
+                    cols: 100
                 }
             )),
-            "production TerminalResize must send DaemonRequest::Resize"
+            "production TerminalResize must send a duplex Resize frame"
         );
 
         app.observed_requests.clear();
@@ -23147,12 +23832,18 @@ mod tests {
         );
 
         let sibling_marker = format!("SIB_{suffix}");
+        let sibling_frame = encode_terminal_input(&TerminalInputCommand::Input {
+            data: format!("{sibling_marker}\n").into_bytes(),
+        })
+        .expect("encode sibling input");
         sibling
-            .request(&DaemonRequest::SendInput {
-                session_id: session_id.clone(),
-                data: format!("{sibling_marker}\n"),
-            })
-            .expect("sibling SendInput after cut");
+            .write_terminal_frame(
+                &session_id,
+                &sibling_sub,
+                sibling_frame.as_bytes(),
+                TERMINAL_INPUT_WRITE_BOUND,
+            )
+            .expect("sibling duplex input after cut");
         let echo_deadline = Instant::now() + Duration::from_secs(8);
         let mut sibling_echoed = false;
         while Instant::now() < echo_deadline {
@@ -23191,10 +23882,7 @@ mod tests {
             "reconnect must still show NORTH_STAR_HISTORY"
         );
         let live_marker = format!("NORTH_STAR_LIVE_{suffix}");
-        app.request_and_apply(DaemonRequest::SendInput {
-            session_id: session_id.clone(),
-            data: format!("{live_marker}\n"),
-        });
+        app.forward_terminal_input(session_id.clone(), format!("{live_marker}\n").into_bytes());
         assert!(
             wait_for_shared_marker(&mut app, &live_marker),
             "reconnect must show a later live marker"
@@ -25097,9 +25785,9 @@ mod tests {
             InputDispatch::TerminalForward { bytes, .. } if bytes == b"\x1b[<0;1;1m"
         ));
         app.handle_dispatch(sgr_release);
-        assert!(app.observed_requests.iter().any(|request| {
-            matches!(request, ObservedRequest::SendInput { session_id, data }
-                if session_id == &prior_session_id && data == "\x1b[<0;1;1m")
+        assert!(app.observed_terminal_inputs.iter().any(|request| {
+            matches!(request, TerminalInputCommand::Input { data }
+                if data == b"\x1b[<0;1;1m")
         }));
 
         app.handle_dispatch(InputDispatch::TerminalForward {
@@ -25134,10 +25822,12 @@ mod tests {
             node_id: "tui-terminal".to_string(),
             bytes: format!("{later_marker}\n").into_bytes(),
         });
-        assert!(app.observed_requests.contains(&ObservedRequest::SendInput {
-            session_id: prior_session_id.clone(),
-            data: format!("{later_marker}\n"),
-        }));
+        assert!(
+            app.observed_terminal_inputs
+                .contains(&TerminalInputCommand::Input {
+                    data: format!("{later_marker}\n").into_bytes(),
+                })
+        );
         wait_for_app_output(&mut app, &later_marker).expect("TUI renders later live output");
         assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
         let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
@@ -27830,8 +28520,8 @@ mod tests {
     fn pinned_session_plugin_binding_fixture_is_conformance_40() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 46,
-            "hub-test-support pin must publish fixture revision 46"
+            scenario.conformance_fixture_revision, 48,
+            "hub-test-support pin must publish fixture revision 48"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -27895,7 +28585,7 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
         );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 44);
+        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 48);
     }
 
     #[test]
@@ -28917,9 +29607,9 @@ exit 0
     }
 
     #[test]
-    fn tui_requires_package_event_subscriptions_at_floor_44() {
+    fn tui_requires_package_event_subscriptions_at_floor_48() {
         let requirement = tui_compatibility_requirement();
-        assert_eq!(requirement.minimum_conformance_fixture_revision, 44);
+        assert_eq!(requirement.minimum_conformance_fixture_revision, 48);
         assert!(
             requirement
                 .required_features
@@ -29869,7 +30559,8 @@ exit 0
             session_context: None,
             read_screen: None,
             mode_flags: None,
-            mode_gated_input: None,
+            terminal_reservation: None,
+            subscription_reservation: None,
             capture_snapshot: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
