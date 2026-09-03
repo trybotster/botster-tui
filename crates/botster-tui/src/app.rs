@@ -5611,7 +5611,12 @@ impl TuiApp {
             self.clear_terminal_input_queue();
             return;
         };
-        self.apply_result_mode_shadow(&session_id, &result.mode_flags, &result);
+        if matches!(
+            entry.kind,
+            TerminalInputKind::ModeGatedInput | TerminalInputKind::Paste
+        ) {
+            self.apply_result_mode_shadow(&session_id, &result.mode_flags, &result);
+        }
         if result.admitted {
             self.error = None;
             return;
@@ -20541,6 +20546,292 @@ mod tests {
         assert_eq!(app.current_mode_shadow().map(|s| s.mode_revision), Some(2));
     }
 
+    fn empty_mode_flags() -> TerminalModeFlags {
+        TerminalModeFlags {
+            kitty_enabled: false,
+            cursor_visible: false,
+            bracketed_paste: false,
+            mouse_mode: 0,
+            alt_screen: false,
+            focus_reporting: false,
+            application_cursor: false,
+        }
+    }
+
+    #[test]
+    fn plain_key_and_resize_results_preserve_live_mode_safety() {
+        let mut mouse_app = TuiApp::new(None);
+        let _mouse_peer = install_dummy_hub_client(&mut mouse_app);
+        mouse_app.attached_session = Some("session-alpha".to_string());
+        mouse_app.attached_subscription_id = Some(mouse_app.subscription_id.clone());
+        mouse_app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 9, 4, 8),
+            "read_mode_flags",
+        );
+        assert!(mouse_app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        mouse_app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: mouse_app.subscription_id.clone(),
+            kind: TerminalInputKind::Input,
+            operation_id: None,
+            admitted: true,
+            bytes_written: 1,
+            mode_generation: 0,
+            mode_revision: 0,
+            mode_flags: empty_mode_flags(),
+            rejection: None,
+        });
+        assert_eq!(mouse_app.current_terminal_mouse_mode(), 9);
+        mouse_app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: b"\x1b[<0;1;1M".to_vec(),
+        });
+        assert!(matches!(
+            mouse_app.observed_terminal_inputs.last(),
+            Some(TerminalInputCommand::ModeGatedInput {
+                mode_generation: 4,
+                mode_revision: 8,
+                ..
+            })
+        ));
+
+        let mut kitty_app = TuiApp::new(None);
+        let _kitty_peer = install_dummy_hub_client(&mut kitty_app);
+        kitty_app.attached_session = Some("session-alpha".to_string());
+        kitty_app.attached_subscription_id = Some(kitty_app.subscription_id.clone());
+        kitty_app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", true, 0, 5, 9),
+            "read_mode_flags",
+        );
+        kitty_app.handle_dispatch(InputDispatch::TerminalResize {
+            node_id: "tui-terminal".to_string(),
+            rows: 31,
+            cols: 97,
+        });
+        kitty_app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: kitty_app.subscription_id.clone(),
+            kind: TerminalInputKind::Resize,
+            operation_id: None,
+            admitted: true,
+            bytes_written: 0,
+            mode_generation: 0,
+            mode_revision: 0,
+            mode_flags: empty_mode_flags(),
+            rejection: None,
+        });
+        assert!(kitty_app.current_mode_shadow().is_some_and(|shadow| {
+            shadow.kitty_enabled && shadow.mode_generation == 5 && shadow.mode_revision == 9
+        }));
+        assert!(kitty_app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        assert!(matches!(
+            kitty_app.observed_terminal_inputs.last(),
+            Some(TerminalInputCommand::ModeGatedInput {
+                mode_generation: 5,
+                mode_revision: 9,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stale_mode_retries_are_correlated_and_bounded() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.terminal_input_in_flight
+            .push_back(InFlightTerminalInput {
+                kind: TerminalInputKind::ModeGatedInput,
+                data: b"key".to_vec(),
+                operation_id: None,
+                retried: false,
+            });
+        app.terminal_input_in_flight_bytes = 3;
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::ModeGatedInput,
+            operation_id: None,
+            admitted: false,
+            bytes_written: 0,
+            mode_generation: 7,
+            mode_revision: 12,
+            mode_flags: TerminalModeFlags {
+                kitty_enabled: true,
+                cursor_visible: true,
+                ..empty_mode_flags()
+            },
+            rejection: Some(TerminalInputRejection::StaleMode),
+        });
+        assert!(matches!(
+            app.observed_terminal_inputs.last(),
+            Some(TerminalInputCommand::ModeGatedInput {
+                data,
+                mode_generation: 7,
+                mode_revision: 12,
+            }) if data == b"key"
+        ));
+
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.terminal_input_in_flight
+            .push_back(InFlightTerminalInput {
+                kind: TerminalInputKind::ModeGatedInput,
+                data: b"key".to_vec(),
+                operation_id: None,
+                retried: true,
+            });
+        app.terminal_input_in_flight_bytes = 3;
+        app.observed_terminal_inputs.clear();
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::ModeGatedInput,
+            operation_id: None,
+            admitted: false,
+            bytes_written: 0,
+            mode_generation: 7,
+            mode_revision: 13,
+            mode_flags: TerminalModeFlags {
+                kitty_enabled: true,
+                cursor_visible: true,
+                ..empty_mode_flags()
+            },
+            rejection: Some(TerminalInputRejection::StaleMode),
+        });
+        assert!(app.observed_terminal_inputs.is_empty());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale"))
+        );
+    }
+
+    #[test]
+    fn stale_paste_gets_one_new_operation_id_and_partial_write_never_retries() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.next_paste_operation_id = 8;
+        app.terminal_input_in_flight
+            .push_back(InFlightTerminalInput {
+                kind: TerminalInputKind::Paste,
+                data: b"paste".to_vec(),
+                operation_id: Some(7),
+                retried: false,
+            });
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Paste,
+            operation_id: Some(7),
+            admitted: false,
+            bytes_written: 0,
+            mode_generation: 3,
+            mode_revision: 6,
+            mode_flags: empty_mode_flags(),
+            rejection: Some(TerminalInputRejection::StaleMode),
+        });
+        assert!(matches!(
+            app.observed_terminal_inputs.first(),
+            Some(TerminalInputCommand::PasteBegin {
+                operation_id: 8,
+                mode_generation: 3,
+                mode_revision: 6,
+                ..
+            })
+        ));
+        assert_eq!(app.next_paste_operation_id, 9);
+
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.terminal_input_in_flight
+            .push_back(InFlightTerminalInput {
+                kind: TerminalInputKind::Paste,
+                data: b"paste".to_vec(),
+                operation_id: Some(8),
+                retried: true,
+            });
+        app.observed_terminal_inputs.clear();
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Paste,
+            operation_id: Some(8),
+            admitted: false,
+            bytes_written: 3,
+            mode_generation: 3,
+            mode_revision: 6,
+            mode_flags: empty_mode_flags(),
+            rejection: Some(TerminalInputRejection::PartialWrite),
+        });
+        assert!(app.observed_terminal_inputs.is_empty());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains('3'))
+        );
+    }
+
+    #[test]
+    fn ordered_results_pop_only_the_correlated_head_and_byte_pressure_is_soft() {
+        let mut app = TuiApp::new(None);
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        for data in [b"first".to_vec(), b"second".to_vec()] {
+            assert!(app.reserve_terminal_input(InFlightTerminalInput {
+                kind: TerminalInputKind::Input,
+                data,
+                operation_id: None,
+                retried: false,
+            }));
+        }
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Input,
+            operation_id: None,
+            admitted: true,
+            bytes_written: 5,
+            mode_generation: 0,
+            mode_revision: 0,
+            mode_flags: empty_mode_flags(),
+            rejection: None,
+        });
+        assert_eq!(app.terminal_input_in_flight.len(), 1);
+        assert_eq!(
+            app.terminal_input_in_flight
+                .front()
+                .map(|entry| entry.data.as_slice()),
+            Some(b"second".as_slice())
+        );
+        assert_eq!(app.terminal_input_in_flight_bytes, 6);
+
+        app.clear_terminal_input_queue();
+        for _ in 0..4 {
+            assert!(app.reserve_terminal_input(InFlightTerminalInput {
+                kind: TerminalInputKind::Input,
+                data: vec![0; MAX_INPUT_DATA_BYTES],
+                operation_id: None,
+                retried: false,
+            }));
+        }
+        let before = app.terminal_input_in_flight.len();
+        assert!(!app.reserve_terminal_input(InFlightTerminalInput {
+            kind: TerminalInputKind::Input,
+            data: vec![0; 5],
+            operation_id: None,
+            retried: false,
+        }));
+        assert_eq!(app.terminal_input_in_flight.len(), before);
+        assert_eq!(app.terminal_input_in_flight_bytes, 4 * MAX_INPUT_DATA_BYTES);
+        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("back pressure"))
+        );
+    }
+
     #[test]
     fn paste_event_routes_raw_bytes_through_the_core_transaction_helper() {
         let mut app = TuiApp::new(None);
@@ -30544,6 +30835,164 @@ exit 0
         assert!(app.notice_subscription_by_id.is_empty());
         assert!(app.transient_notice.is_none());
         assert!(!rendered_workspace(&app).contains("old"));
+    }
+
+    #[test]
+    fn saturated_terminal_write_sweeps_all_connection_owners_and_rejects_late_frames() {
+        let mut app = workspace_fixture();
+        let _blocked_peer = install_dummy_hub_client(&mut app);
+        let old_terminal_sub = "old-terminal-sub".to_string();
+        let old_session_sub = "old-session-sub".to_string();
+        let old_type_sub = "old-type-sub".to_string();
+        let old_notice_sub = "old-notice-sub".to_string();
+        let old_options_sub = "old-options-sub".to_string();
+
+        app.subscription_id = old_terminal_sub.clone();
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(old_terminal_sub.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", false, 0, 4, 8),
+            "read_mode_flags",
+        );
+        app.ensure_ghostty_projection("session-alpha");
+        app.session_entities
+            .begin_generation(old_session_sub.clone());
+        app.session_type_entities
+            .begin_generation(old_type_sub.clone());
+        activate_notice(&mut app, &old_notice_sub, 5_000, "session-alpha");
+        app.transient_notice = Some(TransientNotice {
+            text: "old notice".to_string(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        });
+        app.plugin_surface = Some(presentation_plugin_surface());
+        app.pending_plugin_request = Some(plugin_request(
+            "old-request",
+            "contract.presentation",
+            "contract.open",
+            "contract-open",
+        ));
+        app.entity_options
+            .begin_generation("old.option", old_options_sub.clone());
+
+        assert!(
+            app.handle_focused_terminal_paste(&"x".repeat(MAX_PASTE_BYTES), Some("tui-terminal"),)
+        );
+        assert!(
+            app.client.is_none(),
+            "the saturated write must close the stream"
+        );
+        assert!(app.terminal_input_in_flight.is_empty());
+        assert_eq!(app.terminal_input_in_flight_bytes, 0);
+        assert!(app.attached_session.is_none());
+        assert!(app.attached_subscription_id.is_none());
+        assert!(app.attach_hydration.is_none());
+        assert!(app.terminal_mode_shadow.is_none());
+        assert!(app.ghostty_projection.is_none());
+        assert!(app.session_entities.subscription_id.is_none());
+        assert!(app.session_type_entities.subscription_id.is_none());
+        assert!(app.notice_subscriptions.is_empty());
+        assert!(app.notice_subscription_by_id.is_empty());
+        assert!(app.transient_notice.is_none());
+        assert!(app.plugin_surface.is_none());
+        assert!(app.pending_plugin_request.is_none());
+        assert!(app.entity_options.family("old.option").is_none());
+
+        app.apply_unix_terminal_envelope(mux_output_envelope(
+            "session-alpha",
+            &old_terminal_sub,
+            b"late terminal",
+        ));
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: old_terminal_sub.clone(),
+            kind: TerminalInputKind::Paste,
+            operation_id: Some(1),
+            admitted: true,
+            bytes_written: MAX_PASTE_BYTES,
+            mode_generation: 4,
+            mode_revision: 8,
+            mode_flags: empty_mode_flags(),
+            rejection: None,
+        });
+        apply_json_mux(
+            &mut app,
+            &package_event_line(
+                &old_notice_sub,
+                MATRIX_OWNER,
+                MATRIX_EVENT,
+                json!({ "notice": "late notice" }),
+            ),
+        );
+        assert!(
+            !app.session_entities
+                .apply(DaemonEntityFrame::Error {
+                    subscription_id: old_session_sub.clone(),
+                    entity_type: "session".to_string(),
+                    code: "late".to_string(),
+                    message: "late".to_string(),
+                })
+                .expect("late session frame is ignored")
+        );
+        assert!(
+            !app.session_type_entities
+                .apply(DaemonEntityFrame::Error {
+                    subscription_id: old_type_sub.clone(),
+                    entity_type: "session_type".to_string(),
+                    code: "late".to_string(),
+                    message: "late".to_string(),
+                })
+                .expect("late session-type frame is ignored")
+        );
+        assert!(
+            !app.entity_options
+                .apply_daemon_frame(DaemonEntityFrame::Error {
+                    subscription_id: old_options_sub.clone(),
+                    entity_type: "old.option".to_string(),
+                    code: "late".to_string(),
+                    message: "late".to_string(),
+                })
+                .expect("late options frame is ignored")
+        );
+        assert!(app.ghostty_projection.is_none());
+        assert!(app.transient_notice.is_none());
+        assert!(app.terminal_mode_shadow.is_none());
+
+        let _replacement_peer = install_dummy_hub_client(&mut app);
+        let new_terminal_sub = "new-terminal-sub".to_string();
+        let new_session_sub = "new-session-sub".to_string();
+        let new_type_sub = "new-type-sub".to_string();
+        let new_notice_sub = "new-notice-sub".to_string();
+        let new_options_sub = "new-options-sub".to_string();
+        app.begin_attach_hydration("session-alpha", &new_terminal_sub);
+        app.session_entities
+            .begin_generation(new_session_sub.clone());
+        app.session_type_entities
+            .begin_generation(new_type_sub.clone());
+        activate_notice(&mut app, &new_notice_sub, 5_000, "session-alpha");
+        app.plugin_surface = Some(presentation_plugin_surface());
+        app.entity_options
+            .begin_generation("new.option", new_options_sub.clone());
+        assert_ne!(new_terminal_sub, old_terminal_sub);
+        assert_ne!(new_session_sub, old_session_sub);
+        assert_ne!(new_type_sub, old_type_sub);
+        assert_ne!(new_notice_sub, old_notice_sub);
+        assert_ne!(new_options_sub, old_options_sub);
+        assert_eq!(app.subscription_id, new_terminal_sub);
+        assert_eq!(
+            app.session_entities.subscription_id.as_deref(),
+            Some(new_session_sub.as_str())
+        );
+        assert_eq!(
+            app.session_type_entities.subscription_id.as_deref(),
+            Some(new_type_sub.as_str())
+        );
+        assert!(app.notice_subscription_by_id.contains_key(&new_notice_sub));
+        assert!(app.plugin_surface.is_some());
+        assert_eq!(
+            app.entity_options
+                .family("new.option")
+                .and_then(|family| family.subscription_id.as_deref()),
+            Some(new_options_sub.as_str())
+        );
     }
 
     fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
