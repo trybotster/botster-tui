@@ -1543,6 +1543,7 @@ struct TuiApp {
     attached_subscription_id: Option<String>,
     schema_version: Option<u16>,
     subscription_id: String,
+    next_terminal_subscription_sequence: u64,
     terminal_output: String,
     terminal_output_session_id: Option<String>,
     /// Core-owned Ghostty projection for incremental GHOSTSNP and live output.
@@ -1690,6 +1691,7 @@ impl TuiApp {
             attached_subscription_id: None,
             schema_version: None,
             subscription_id: format!("btui-sub-{}", short_suffix()),
+            next_terminal_subscription_sequence: 1,
             terminal_output: String::new(),
             terminal_output_session_id: None,
             ghostty_projection: None,
@@ -3729,7 +3731,9 @@ impl TuiApp {
     }
 
     fn mint_subscription_id(&mut self) -> String {
-        format!("btui-sub-{}", short_suffix())
+        let sequence = self.next_terminal_subscription_sequence;
+        self.next_terminal_subscription_sequence = sequence.saturating_add(1);
+        format!("btui-sub-{}-{sequence}", short_suffix())
     }
 
     fn begin_attach_hydration(&mut self, session_id: &str, subscription_id: &str) {
@@ -4808,7 +4812,8 @@ impl TuiApp {
         self.attached_session = None;
         self.attached_subscription_id = None;
         self.attach_hydration = None;
-        self.reset_attach_campaign();
+        self.attach_recovery_used = false;
+        self.terminal_close_evidence = None;
         self.clear_terminal_mouse_mode();
         self.clear_ghostty_projection();
         match error {
@@ -11700,6 +11705,30 @@ mod tests {
         UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
     };
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    static UNIX_STUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    static UNIX_STUB_BIND: Mutex<()> = Mutex::new(());
+    static UNIX_STUB_TEST: Mutex<()> = Mutex::new(());
+
+    fn lock_unix_stub_test() -> MutexGuard<'static, ()> {
+        UNIX_STUB_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn bind_unix_stub(label: &str) -> (PathBuf, std::os::unix::net::UnixListener) {
+        let _bind_guard = UNIX_STUB_BIND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = UNIX_STUB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!("/tmp/bt-{label}-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("stub dir");
+        let listener =
+            std::os::unix::net::UnixListener::bind(root.join("hub.sock")).expect("bind Unix stub");
+        (root, listener)
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum SessionEntityExpectation<'a> {
@@ -19546,15 +19575,8 @@ mod tests {
     }
 
     fn spawn_detach_bound_stub(mode: DetachStubMode) -> (DaemonEndpoint, PathBuf) {
-        use std::os::unix::net::UnixListener;
-
-        let root = PathBuf::from(format!(
-            "/tmp/bt-detach-stub-{}",
-            short_suffix() % 1_000_000
-        ));
-        std::fs::create_dir_all(&root).expect("stub dir");
+        let (root, listener) = bind_unix_stub("detach-stub");
         let socket = root.join("hub.sock");
-        let listener = UnixListener::bind(&socket).expect("bind detach stub");
         thread::spawn(move || {
             let (mut stream, _) = match listener.accept() {
                 Ok(accepted) => accepted,
@@ -19615,6 +19637,326 @@ mod tests {
         (DaemonEndpoint::new(socket), root)
     }
 
+    #[derive(Debug)]
+    enum RecoveryStubEvent {
+        Hello,
+        Request(&'static str, Option<String>),
+        TerminalInput(String),
+    }
+
+    struct RecoveryHubStub {
+        endpoint: DaemonEndpoint,
+        events: mpsc::Receiver<RecoveryStubEvent>,
+        running: Arc<AtomicBool>,
+        listener_thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for RecoveryHubStub {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Release);
+            if let Some(listener_thread) = self.listener_thread.take() {
+                let _ = listener_thread.join();
+            }
+        }
+    }
+
+    fn spawn_recovery_hub_stub() -> RecoveryHubStub {
+        let (root, listener) = bind_unix_stub("recovery-stub");
+        let socket = root.join("hub.sock");
+        let (events_tx, events_rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let listener_running = running.clone();
+        listener
+            .set_nonblocking(true)
+            .expect("set recovery listener nonblocking");
+        let listener_thread = thread::spawn(move || {
+            while listener_running.load(Ordering::Acquire) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                if stream.set_nonblocking(false).is_err() {
+                    return;
+                }
+                let events_tx = events_tx.clone();
+                thread::spawn(move || {
+                    let Ok(reader_stream) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut reader = std::io::BufReader::new(reader_stream);
+                    let _hello: botster_hub_client::DaemonHello =
+                        match botster_hub_client::read_frame_from_reader(&mut reader) {
+                            Ok(hello) => hello,
+                            Err(_) => return,
+                        };
+                    let _ = events_tx.send(RecoveryStubEvent::Hello);
+                    let ack = DaemonHelloAck {
+                        protocol: PROTOCOL.to_string(),
+                        compatibility: DaemonCompatibility::current(),
+                        terminal_compatibility: Some(TerminalCompatibility::current()),
+                        diagnostics: Vec::new(),
+                    };
+                    if write_frame(&mut stream, &ack).is_err() {
+                        return;
+                    }
+                    loop {
+                        let value: Value =
+                            match botster_hub_client::read_frame_from_reader(&mut reader) {
+                                Ok(value) => value,
+                                Err(_) => return,
+                            };
+                        if value.get("plane").and_then(Value::as_str)
+                            == Some(botster_hub_client::UNIX_TERMINAL_PLANE)
+                        {
+                            if let Ok(envelope) =
+                                serde_json::from_value::<DaemonUnixTerminalEnvelope>(value)
+                            {
+                                let _ = events_tx.send(RecoveryStubEvent::TerminalInput(
+                                    envelope.subscription_id,
+                                ));
+                            }
+                            continue;
+                        }
+                        let Ok(request) = serde_json::from_value::<DaemonRequest>(value) else {
+                            return;
+                        };
+                        let (label, identity) = match &request {
+                            DaemonRequest::SubscribeEntities {
+                                entity_type,
+                                subscription_id,
+                            } => (
+                                "subscribe_entities",
+                                Some(format!("{entity_type}:{subscription_id}")),
+                            ),
+                            DaemonRequest::SubscribeEvents {
+                                subscription_id, ..
+                            } => ("subscribe_events", Some(subscription_id.clone())),
+                            DaemonRequest::Attach {
+                                subscription_id, ..
+                            } => ("attach", Some(subscription_id.clone())),
+                            DaemonRequest::ReadModeFlags { .. } => ("read_mode_flags", None),
+                            DaemonRequest::PluginSurfaceRender { .. } => ("plugin_surface", None),
+                            DaemonRequest::Status => ("status", None),
+                            _ => ("control", None),
+                        };
+                        let _ = events_tx.send(RecoveryStubEvent::Request(label, identity));
+                        match request {
+                            DaemonRequest::SubscribeEntities {
+                                entity_type,
+                                subscription_id,
+                            } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::EntitySubscribed),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                let items = if entity_type == "session" {
+                                    vec![session_entity_value(session_entity(
+                                        "session-alpha",
+                                        Some("running"),
+                                    ))]
+                                } else {
+                                    Vec::new()
+                                };
+                                let frame = DaemonEntityFrame::Snapshot {
+                                    subscription_id,
+                                    entity_type,
+                                    snapshot_seq: 1,
+                                    items,
+                                    resync_reason: None,
+                                };
+                                if write_frame(&mut stream, &frame).is_err() {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::UnsubscribeEntities { .. } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::EntityUnsubscribed),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::Status => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::Status),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::ListApps => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::Apps),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::ListPackageNavigation => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::PackageNavigation),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::ListPackages => {
+                                let mut response = base_response(DaemonResponseKind::Packages);
+                                response.packages = vec![matrix_package(5_000)];
+                                if write_frame(&mut stream, &response).is_err() {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::ListSpawnTargets => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::SpawnTargets),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::SubscribeEvents { .. } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::EventSubscribed),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::UnsubscribeEvents { .. } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::EventUnsubscribed),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::PluginSurfaceRender { .. } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &plugin_surface_response(entity_options_picker_surface()),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::Attach {
+                                session_id,
+                                subscription_id,
+                            } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::Shutdown),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                for frame in producer_incremental_ghostsnp(
+                                    TerminalScreenSize::new(24, 80),
+                                    b"RECOVERY_READY",
+                                ) {
+                                    if write_frame(
+                                        &mut stream,
+                                        &mux_snapshot_envelope(
+                                            &session_id,
+                                            &subscription_id,
+                                            &frame.bytes,
+                                            snapshot_phase_for_frame(frame.kind),
+                                        ),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                if write_frame(
+                                    &mut stream,
+                                    &mux_attach_state_envelope(
+                                        &session_id,
+                                        &subscription_id,
+                                        AttachStateKind::Attached,
+                                    ),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::ReadModeFlags { session_id } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &mode_flags_response_full(&session_id, false, 0, 4, 8),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::ReadScreen { session_id } => {
+                                if write_frame(&mut stream, &read_screen_response(&session_id, ""))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            DaemonRequest::CaptureSnapshot { .. }
+                            | DaemonRequest::Detach { .. } => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::Shutdown),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            _ => {
+                                if write_frame(
+                                    &mut stream,
+                                    &base_response(DaemonResponseKind::Shutdown),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        RecoveryHubStub {
+            endpoint: DaemonEndpoint::new(socket),
+            events: events_rx,
+            running,
+            listener_thread: Some(listener_thread),
+        }
+    }
+
     fn assert_no_shutdown_session(app: &TuiApp) {
         assert!(
             !app.observed_requests
@@ -19627,6 +19969,7 @@ mod tests {
 
     #[test]
     fn bounded_detach_returns_when_hub_withholds_the_response() {
+        let _stub_test = lock_unix_stub_test();
         let (endpoint, root) = spawn_detach_bound_stub(DetachStubMode::WithholdResponse);
         let client = HubConnection::connect(&endpoint).expect("hello");
         let mut connected = client;
@@ -19656,6 +19999,7 @@ mod tests {
 
     #[test]
     fn bounded_detach_returns_when_peer_stops_reading() {
+        let _stub_test = lock_unix_stub_test();
         let (endpoint, root) = spawn_detach_bound_stub(DetachStubMode::StopReadingAfterAttach);
         let client = HubConnection::connect(&endpoint).expect("hello");
         let mut connected = client;
@@ -20558,6 +20902,52 @@ mod tests {
         }
     }
 
+    fn connected_terminal_app(kitty_enabled: bool) -> TuiApp {
+        use std::os::unix::net::UnixStream;
+
+        let mut app = TuiApp::new(None);
+        let (client, mut responder) = UnixStream::pair().expect("terminal responder pair");
+        app.client = Some(HubConnection::from_stream(client));
+        thread::spawn(move || {
+            let Ok(reader_stream) = responder.try_clone() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(reader_stream);
+            loop {
+                let value: Value = match botster_hub_client::read_frame_from_reader(&mut reader) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                if value.get("plane").and_then(Value::as_str)
+                    == Some(botster_hub_client::UNIX_TERMINAL_PLANE)
+                {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_value::<DaemonRequest>(value) else {
+                    return;
+                };
+                let response = match request {
+                    DaemonRequest::ReadModeFlags { session_id } => {
+                        mode_flags_response_full(&session_id, false, 0, 4, 8)
+                    }
+                    _ => base_response(DaemonResponseKind::Shutdown),
+                };
+                if write_frame(&mut responder, &response).is_err() {
+                    return;
+                }
+            }
+        });
+        app.attached_session = Some("session-alpha".to_string());
+        app.attached_subscription_id = Some(app.subscription_id.clone());
+        app.apply_optional_readback_response(
+            mode_flags_response_full("session-alpha", kitty_enabled, 0, 1, 1),
+            "read_mode_flags",
+        );
+        app.observed_requests.clear();
+        app.observed_terminal_inputs.clear();
+        app
+    }
+
     #[test]
     fn plain_key_and_resize_results_preserve_live_mode_safety() {
         let mut mouse_app = TuiApp::new(None);
@@ -20640,17 +21030,19 @@ mod tests {
 
     #[test]
     fn stale_mode_retries_are_correlated_and_bounded() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.terminal_input_in_flight
-            .push_back(InFlightTerminalInput {
-                kind: TerminalInputKind::ModeGatedInput,
-                data: b"key".to_vec(),
-                operation_id: None,
-                retried: false,
-            });
-        app.terminal_input_in_flight_bytes = 3;
+        let mut app = connected_terminal_app(true);
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        let first_data = app.terminal_input_in_flight[0].data.clone();
+        let second_data = app.terminal_input_in_flight[1].data.clone();
+        assert_eq!(app.terminal_input_in_flight.len(), 2);
+
         app.apply_terminal_input_result(TerminalInputResult {
             subscription_id: app.subscription_id.clone(),
             kind: TerminalInputKind::ModeGatedInput,
@@ -20666,169 +21058,227 @@ mod tests {
             },
             rejection: Some(TerminalInputRejection::StaleMode),
         });
+        assert_eq!(
+            app.observed_requests
+                .iter()
+                .filter(|request| matches!(request, ObservedRequest::ReadModeFlags(_)))
+                .count(),
+            1,
+            "one stale result must cause one real ReadModeFlags request"
+        );
         assert!(matches!(
             app.observed_terminal_inputs.last(),
             Some(TerminalInputCommand::ModeGatedInput {
                 data,
-                mode_generation: 7,
-                mode_revision: 12,
-            }) if data == b"key"
+                mode_generation: 4,
+                mode_revision: 8,
+            }) if data == &first_data
         ));
+        assert_eq!(app.terminal_input_in_flight.len(), 2);
+        assert!(app.terminal_input_in_flight[0].retried);
+        assert_eq!(app.terminal_input_in_flight[0].data, first_data);
+        assert_eq!(app.terminal_input_in_flight[1].data, second_data);
 
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.terminal_input_in_flight
-            .push_back(InFlightTerminalInput {
-                kind: TerminalInputKind::ModeGatedInput,
-                data: b"key".to_vec(),
-                operation_id: None,
-                retried: true,
-            });
-        app.terminal_input_in_flight_bytes = 3;
-        app.observed_terminal_inputs.clear();
         app.apply_terminal_input_result(TerminalInputResult {
             subscription_id: app.subscription_id.clone(),
             kind: TerminalInputKind::ModeGatedInput,
+            admitted: true,
+            bytes_written: first_data.len(),
+            mode_generation: 4,
+            mode_revision: 8,
+            mode_flags: empty_mode_flags(),
             operation_id: None,
+            rejection: None,
+        });
+        assert_eq!(app.terminal_input_in_flight.len(), 1);
+        assert_eq!(app.terminal_input_in_flight[0].data, second_data);
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::ModeGatedInput,
+            admitted: true,
+            bytes_written: second_data.len(),
+            mode_generation: 4,
+            mode_revision: 8,
+            mode_flags: empty_mode_flags(),
+            operation_id: None,
+            rejection: None,
+        });
+        assert!(app.terminal_input_in_flight.is_empty());
+        assert_eq!(app.terminal_input_in_flight_bytes, 0);
+    }
+
+    #[test]
+    fn stale_paste_gets_one_new_operation_id_and_partial_write_never_retries() {
+        let mut app = connected_terminal_app(false);
+        app.next_paste_operation_id = 7;
+        assert!(app.handle_focused_terminal_paste("paste", Some("tui-terminal")));
+        let first_id = app.terminal_input_in_flight[0]
+            .operation_id
+            .expect("first paste operation id");
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Paste,
+            operation_id: Some(first_id),
             admitted: false,
             bytes_written: 0,
-            mode_generation: 7,
-            mode_revision: 13,
-            mode_flags: TerminalModeFlags {
-                kitty_enabled: true,
-                cursor_visible: true,
-                ..empty_mode_flags()
-            },
+            mode_generation: 3,
+            mode_revision: 6,
+            mode_flags: empty_mode_flags(),
             rejection: Some(TerminalInputRejection::StaleMode),
         });
-        assert!(app.observed_terminal_inputs.is_empty());
+        let retry_id = app.terminal_input_in_flight[0]
+            .operation_id
+            .expect("retry paste operation id");
+        assert_ne!(retry_id, first_id);
+        assert!(matches!(
+            app.observed_terminal_inputs.iter().rev().find(|command| matches!(
+                command,
+                TerminalInputCommand::PasteBegin { .. }
+            )),
+            Some(TerminalInputCommand::PasteBegin {
+                operation_id,
+                mode_generation: 4,
+                mode_revision: 8,
+                ..
+            }) if *operation_id == retry_id
+        ));
+        let commands_after_retry = app.observed_terminal_inputs.len();
+
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Paste,
+            operation_id: Some(retry_id),
+            admitted: false,
+            bytes_written: 0,
+            mode_generation: 4,
+            mode_revision: 9,
+            mode_flags: empty_mode_flags(),
+            rejection: Some(TerminalInputRejection::StaleMode),
+        });
+        assert_eq!(app.observed_terminal_inputs.len(), commands_after_retry);
+        assert!(app.terminal_input_in_flight.is_empty());
         assert!(
             app.error
                 .as_deref()
                 .is_some_and(|error| error.contains("stale"))
         );
-    }
 
-    #[test]
-    fn stale_paste_gets_one_new_operation_id_and_partial_write_never_retries() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.next_paste_operation_id = 8;
-        app.terminal_input_in_flight
-            .push_back(InFlightTerminalInput {
-                kind: TerminalInputKind::Paste,
-                data: b"paste".to_vec(),
-                operation_id: Some(7),
-                retried: false,
-            });
+        assert!(app.handle_focused_terminal_paste("partial", Some("tui-terminal")));
+        let partial_id = app.terminal_input_in_flight[0]
+            .operation_id
+            .expect("partial paste operation id");
+        let commands_before_partial_result = app.observed_terminal_inputs.len();
         app.apply_terminal_input_result(TerminalInputResult {
             subscription_id: app.subscription_id.clone(),
             kind: TerminalInputKind::Paste,
-            operation_id: Some(7),
-            admitted: false,
-            bytes_written: 0,
-            mode_generation: 3,
-            mode_revision: 6,
-            mode_flags: empty_mode_flags(),
-            rejection: Some(TerminalInputRejection::StaleMode),
-        });
-        assert!(matches!(
-            app.observed_terminal_inputs.first(),
-            Some(TerminalInputCommand::PasteBegin {
-                operation_id: 8,
-                mode_generation: 3,
-                mode_revision: 6,
-                ..
-            })
-        ));
-        assert_eq!(app.next_paste_operation_id, 9);
-
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.terminal_input_in_flight
-            .push_back(InFlightTerminalInput {
-                kind: TerminalInputKind::Paste,
-                data: b"paste".to_vec(),
-                operation_id: Some(8),
-                retried: true,
-            });
-        app.observed_terminal_inputs.clear();
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Paste,
-            operation_id: Some(8),
+            operation_id: Some(partial_id),
             admitted: false,
             bytes_written: 3,
-            mode_generation: 3,
-            mode_revision: 6,
+            mode_generation: 4,
+            mode_revision: 9,
             mode_flags: empty_mode_flags(),
             rejection: Some(TerminalInputRejection::PartialWrite),
         });
-        assert!(app.observed_terminal_inputs.is_empty());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains('3'))
+        assert_eq!(
+            app.observed_terminal_inputs.len(),
+            commands_before_partial_result,
+            "PartialWrite must not retry"
         );
+        let closed_subscription = app.subscription_id.clone();
+        app.apply_mux_frames(vec![DaemonUnixMuxFrame::Event(
+            DaemonEvent::TerminalSubscriptionClosed {
+                session_id: "session-alpha".to_string(),
+                subscription_id: closed_subscription.clone(),
+                generation: 12,
+                reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+            },
+        )]);
+        assert!(app.retired_subscription_ids.contains(&closed_subscription));
+        assert_ne!(app.subscription_id, closed_subscription);
+        assert!(app.attached_session.is_none());
     }
 
     #[test]
-    fn ordered_results_pop_only_the_correlated_head_and_byte_pressure_is_soft() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        for data in [b"first".to_vec(), b"second".to_vec()] {
-            assert!(app.reserve_terminal_input(InFlightTerminalInput {
-                kind: TerminalInputKind::Input,
-                data,
-                operation_id: None,
-                retried: false,
-            }));
+    fn entry_and_byte_pressure_recover_after_results_and_real_input() {
+        let mut app = connected_terminal_app(false);
+        for _ in 0..TERMINAL_INPUT_INFLIGHT_CAPACITY {
+            assert!(app.handle_focused_terminal_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                Some("tui-terminal"),
+            ));
         }
+        assert_eq!(
+            app.terminal_input_in_flight.len(),
+            TERMINAL_INPUT_INFLIGHT_CAPACITY
+        );
+        let commands_at_entry_limit = app.observed_terminal_inputs.len();
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+        assert_eq!(app.observed_terminal_inputs.len(), commands_at_entry_limit);
+        assert!(app.client.is_some());
         app.apply_terminal_input_result(TerminalInputResult {
             subscription_id: app.subscription_id.clone(),
             kind: TerminalInputKind::Input,
             operation_id: None,
             admitted: true,
-            bytes_written: 5,
+            bytes_written: 1,
             mode_generation: 0,
             mode_revision: 0,
             mode_flags: empty_mode_flags(),
             rejection: None,
         });
-        assert_eq!(app.terminal_input_in_flight.len(), 1);
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
         assert_eq!(
-            app.terminal_input_in_flight
-                .front()
-                .map(|entry| entry.data.as_slice()),
-            Some(b"second".as_slice())
+            app.observed_terminal_inputs.len(),
+            commands_at_entry_limit + 1
         );
-        assert_eq!(app.terminal_input_in_flight_bytes, 6);
+        assert_eq!(
+            app.terminal_input_in_flight.len(),
+            TERMINAL_INPUT_INFLIGHT_CAPACITY
+        );
 
-        app.clear_terminal_input_queue();
+        let mut app = connected_terminal_app(false);
         for _ in 0..4 {
-            assert!(app.reserve_terminal_input(InFlightTerminalInput {
-                kind: TerminalInputKind::Input,
-                data: vec![0; MAX_INPUT_DATA_BYTES],
-                operation_id: None,
-                retried: false,
-            }));
+            app.handle_dispatch(InputDispatch::TerminalForward {
+                node_id: "tui-terminal".to_string(),
+                bytes: vec![b'x'; MAX_INPUT_DATA_BYTES],
+            });
         }
-        let before = app.terminal_input_in_flight.len();
-        assert!(!app.reserve_terminal_input(InFlightTerminalInput {
-            kind: TerminalInputKind::Input,
-            data: vec![0; 5],
-            operation_id: None,
-            retried: false,
-        }));
-        assert_eq!(app.terminal_input_in_flight.len(), before);
         assert_eq!(app.terminal_input_in_flight_bytes, 4 * MAX_INPUT_DATA_BYTES);
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("back pressure"))
+        let commands_at_byte_limit = app.observed_terminal_inputs.len();
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: b"extra".to_vec(),
+        });
+        assert_eq!(app.observed_terminal_inputs.len(), commands_at_byte_limit);
+        assert!(app.client.is_some());
+        app.apply_terminal_input_result(TerminalInputResult {
+            subscription_id: app.subscription_id.clone(),
+            kind: TerminalInputKind::Input,
+            operation_id: None,
+            admitted: true,
+            bytes_written: MAX_INPUT_DATA_BYTES,
+            mode_generation: 0,
+            mode_revision: 0,
+            mode_flags: empty_mode_flags(),
+            rejection: None,
+        });
+        app.handle_dispatch(InputDispatch::TerminalForward {
+            node_id: "tui-terminal".to_string(),
+            bytes: b"extra".to_vec(),
+        });
+        assert_eq!(
+            app.observed_terminal_inputs.len(),
+            commands_at_byte_limit + 1
+        );
+        assert_eq!(
+            app.terminal_input_in_flight_bytes,
+            3 * MAX_INPUT_DATA_BYTES + 5
         );
     }
 
@@ -30839,27 +31289,71 @@ exit 0
 
     #[test]
     fn saturated_terminal_write_sweeps_all_connection_owners_and_rejects_late_frames() {
-        let mut app = workspace_fixture();
-        let _blocked_peer = install_dummy_hub_client(&mut app);
-        let old_terminal_sub = "old-terminal-sub".to_string();
-        let old_session_sub = "old-session-sub".to_string();
-        let old_type_sub = "old-type-sub".to_string();
-        let old_notice_sub = "old-notice-sub".to_string();
-        let old_options_sub = "old-options-sub".to_string();
+        let _stub_test = lock_unix_stub_test();
+        let stub = spawn_recovery_hub_stub();
+        let mut app = TuiApp::new(Some(stub.endpoint.clone()));
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(3),
+            |app| {
+                app.sessions
+                    .iter()
+                    .any(|session| session.session_id == "session-alpha")
+                    && app.session_subscription.is_some()
+                    && app.session_type_subscription.is_some()
+            }
+        ));
+        app.set_selected_session(Some("session-alpha".to_string()));
+        app.request_and_apply(DaemonRequest::PluginSurfaceRender {
+            package_name: MATRIX_OWNER.to_string(),
+            surface_id: "entity-options-picker".to_string(),
+            payload: Value::Null,
+        });
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(3),
+            |app| {
+                !app.notice_subscriptions.is_empty() && !app.entity_options_subscriptions.is_empty()
+            }
+        ));
+        app.attach_selected_or_first();
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(3),
+            |app| {
+                app.attached_session.as_deref() == Some("session-alpha")
+                    && app.current_mode_shadow().is_some()
+            }
+        ));
 
-        app.subscription_id = old_terminal_sub.clone();
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(old_terminal_sub.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 0, 4, 8),
-            "read_mode_flags",
-        );
-        app.ensure_ghostty_projection("session-alpha");
-        app.session_entities
-            .begin_generation(old_session_sub.clone());
-        app.session_type_entities
-            .begin_generation(old_type_sub.clone());
-        activate_notice(&mut app, &old_notice_sub, 5_000, "session-alpha");
+        let old_terminal_sub = app.subscription_id.clone();
+        let old_session_sub = app
+            .session_entities
+            .subscription_id
+            .clone()
+            .expect("old session subscription");
+        let old_type_sub = app
+            .session_type_entities
+            .subscription_id
+            .clone()
+            .expect("old session-type subscription");
+        let old_notice_sub = app
+            .notice_subscription_by_id
+            .keys()
+            .next()
+            .cloned()
+            .expect("old notice subscription");
+        let (old_options_family, old_options_sub) = app
+            .entity_options_subscriptions
+            .keys()
+            .next()
+            .and_then(|family| {
+                app.entity_options
+                    .family(family)
+                    .and_then(|state| state.subscription_id.clone())
+                    .map(|subscription_id| (family.clone(), subscription_id))
+            })
+            .expect("old entity-options subscription");
         app.transient_notice = Some(TransientNotice {
             text: "old notice".to_string(),
             deadline: Instant::now() + Duration::from_secs(5),
@@ -30867,12 +31361,14 @@ exit 0
         app.plugin_surface = Some(presentation_plugin_surface());
         app.pending_plugin_request = Some(plugin_request(
             "old-request",
-            "contract.presentation",
+            "entity-options-picker",
             "contract.open",
             "contract-open",
         ));
-        app.entity_options
-            .begin_generation("old.option", old_options_sub.clone());
+
+        let (blocked_local, _blocked_peer) =
+            std::os::unix::net::UnixStream::pair().expect("blocked Unix pair");
+        app.client = Some(HubConnection::from_stream(blocked_local));
 
         assert!(
             app.handle_focused_terminal_paste(&"x".repeat(MAX_PASTE_BYTES), Some("tui-terminal"),)
@@ -30895,14 +31391,24 @@ exit 0
         assert!(app.transient_notice.is_none());
         assert!(app.plugin_surface.is_none());
         assert!(app.pending_plugin_request.is_none());
-        assert!(app.entity_options.family("old.option").is_none());
+        assert!(app.entity_options_subscriptions.is_empty());
+        assert!(app.entity_options.family(&old_options_family).is_none());
+        assert!(app.session_subscription.is_none());
+        assert!(app.session_type_subscription.is_none());
+        assert!(app.retired_subscription_ids.contains(&old_terminal_sub));
 
+        let error_after_failure = app.error.clone();
         app.apply_unix_terminal_envelope(mux_output_envelope(
             "session-alpha",
             &old_terminal_sub,
             b"late terminal",
         ));
-        app.apply_terminal_input_result(TerminalInputResult {
+        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
+            "session-alpha",
+            &old_terminal_sub,
+            AttachStateKind::Attached,
+        ));
+        let late_result = TerminalEvent::InputResult(TerminalInputResult {
             subscription_id: old_terminal_sub.clone(),
             kind: TerminalInputKind::Paste,
             operation_id: Some(1),
@@ -30912,7 +31418,15 @@ exit 0
             mode_revision: 8,
             mode_flags: empty_mode_flags(),
             rejection: None,
-        });
+        })
+        .to_frame()
+        .expect("encode late input result");
+        let late_result_bytes = late_result.to_bytes().expect("input result frame bytes");
+        app.apply_unix_terminal_envelope(DaemonUnixTerminalEnvelope::from_frame_bytes(
+            "session-alpha",
+            &old_terminal_sub,
+            &late_result_bytes,
+        ));
         apply_json_mux(
             &mut app,
             &package_event_line(
@@ -30922,77 +31436,127 @@ exit 0
                 json!({ "notice": "late notice" }),
             ),
         );
-        assert!(
-            !app.session_entities
-                .apply(DaemonEntityFrame::Error {
-                    subscription_id: old_session_sub.clone(),
-                    entity_type: "session".to_string(),
-                    code: "late".to_string(),
-                    message: "late".to_string(),
-                })
-                .expect("late session frame is ignored")
-        );
-        assert!(
-            !app.session_type_entities
-                .apply(DaemonEntityFrame::Error {
-                    subscription_id: old_type_sub.clone(),
-                    entity_type: "session_type".to_string(),
-                    code: "late".to_string(),
-                    message: "late".to_string(),
-                })
-                .expect("late session-type frame is ignored")
-        );
-        assert!(
-            !app.entity_options
-                .apply_daemon_frame(DaemonEntityFrame::Error {
-                    subscription_id: old_options_sub.clone(),
-                    entity_type: "old.option".to_string(),
-                    code: "late".to_string(),
-                    message: "late".to_string(),
-                })
-                .expect("late options frame is ignored")
-        );
         assert!(app.ghostty_projection.is_none());
         assert!(app.transient_notice.is_none());
         assert!(app.terminal_mode_shadow.is_none());
+        assert_eq!(app.error, error_after_failure);
 
-        let _replacement_peer = install_dummy_hub_client(&mut app);
-        let new_terminal_sub = "new-terminal-sub".to_string();
-        let new_session_sub = "new-session-sub".to_string();
-        let new_type_sub = "new-type-sub".to_string();
-        let new_notice_sub = "new-notice-sub".to_string();
-        let new_options_sub = "new-options-sub".to_string();
-        app.begin_attach_hydration("session-alpha", &new_terminal_sub);
-        app.session_entities
-            .begin_generation(new_session_sub.clone());
-        app.session_type_entities
-            .begin_generation(new_type_sub.clone());
-        activate_notice(&mut app, &new_notice_sub, 5_000, "session-alpha");
-        app.plugin_surface = Some(presentation_plugin_surface());
-        app.entity_options
-            .begin_generation("new.option", new_options_sub.clone());
-        assert_ne!(new_terminal_sub, old_terminal_sub);
+        app.last_reconnect_attempt = None;
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(4),
+            |app| {
+                app.client.is_some()
+                    && app.session_entities.subscription_id.is_some()
+                    && app.session_type_entities.subscription_id.is_some()
+                    && app
+                        .notice_subscription_by_id
+                        .keys()
+                        .any(|id| id != &old_notice_sub)
+            }
+        ));
+        let new_session_sub = app
+            .session_entities
+            .subscription_id
+            .clone()
+            .expect("new session subscription");
+        let new_type_sub = app
+            .session_type_entities
+            .subscription_id
+            .clone()
+            .expect("new session-type subscription");
         assert_ne!(new_session_sub, old_session_sub);
         assert_ne!(new_type_sub, old_type_sub);
-        assert_ne!(new_notice_sub, old_notice_sub);
-        assert_ne!(new_options_sub, old_options_sub);
-        assert_eq!(app.subscription_id, new_terminal_sub);
-        assert_eq!(
-            app.session_entities.subscription_id.as_deref(),
-            Some(new_session_sub.as_str())
+        assert!(
+            app.request(DaemonRequest::Status).is_ok(),
+            "ordinary control request must succeed after reconnect"
         );
-        assert_eq!(
-            app.session_type_entities.subscription_id.as_deref(),
-            Some(new_type_sub.as_str())
+
+        app.request_and_apply(DaemonRequest::PluginSurfaceRender {
+            package_name: MATRIX_OWNER.to_string(),
+            surface_id: "entity-options-picker".to_string(),
+            payload: Value::Null,
+        });
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(3),
+            |app| {
+                app.entity_options_subscriptions.keys().any(|family| {
+                    family == &old_options_family
+                        && app
+                            .entity_options
+                            .family(family)
+                            .and_then(|state| state.subscription_id.as_deref())
+                            .is_some_and(|id| id != old_options_sub)
+                })
+            }
+        ));
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(3),
+            |app| {
+                app.sessions
+                    .iter()
+                    .any(|session| session.session_id == "session-alpha")
+            }
+        ));
+        app.set_selected_session(Some("session-alpha".to_string()));
+        app.attach_selected_or_first();
+        assert!(wait_for_condition(
+            &mut app,
+            Duration::from_secs(3),
+            |app| {
+                app.attached_session.as_deref() == Some("session-alpha")
+                    && app.current_mode_shadow().is_some()
+            }
+        ));
+        let new_terminal_sub = app.subscription_id.clone();
+        assert_ne!(new_terminal_sub, old_terminal_sub);
+        assert!(app.handle_focused_terminal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            Some("tui-terminal"),
+        ));
+
+        let event_deadline = Instant::now() + Duration::from_secs(1);
+        let mut observed = Vec::new();
+        while Instant::now() < event_deadline
+            && !observed.iter().any(|event| {
+                matches!(
+                    event,
+                    RecoveryStubEvent::TerminalInput(identity) if identity == &new_terminal_sub
+                )
+            })
+        {
+            if let Ok(event) = stub.events.recv_timeout(Duration::from_millis(20)) {
+                observed.push(event);
+            }
+        }
+        observed.extend(stub.events.try_iter());
+        assert!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, RecoveryStubEvent::Hello))
+                .count()
+                >= 6
         );
-        assert!(app.notice_subscription_by_id.contains_key(&new_notice_sub));
-        assert!(app.plugin_surface.is_some());
-        assert_eq!(
-            app.entity_options
-                .family("new.option")
-                .and_then(|family| family.subscription_id.as_deref()),
-            Some(new_options_sub.as_str())
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event, RecoveryStubEvent::Request("status", _)))
         );
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RecoveryStubEvent::Request("subscribe_entities", Some(identity))
+                if identity.ends_with(&new_session_sub)
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RecoveryStubEvent::Request("attach", Some(identity)) if identity == &new_terminal_sub
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RecoveryStubEvent::TerminalInput(identity) if identity == &new_terminal_sub
+        )));
     }
 
     fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
