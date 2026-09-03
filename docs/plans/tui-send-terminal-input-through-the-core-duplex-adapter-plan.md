@@ -24,9 +24,19 @@ Role and repository:
 - [[botster-planner-playbook]]
 - [[botster-tui-playbook]]
 - [[botster runtime teardown lenses]] (runtime-teardown class applies)
+- [[botster-architecture]] (Botster Plan overlay must-load; the domain map that
+  places paste ownership in Core and keeps TUI policy above Kit mechanics)
+- [[cli-patterns]] (Botster Plan overlay must-load; Rust TUI, PTY, and terminal
+  layer constraints, including the TUI Patterns section)
+- [[project-pipelines-playbook]] (loaded for workflow policy: this Plan visit
+  submits gate evidence, an artifact, and a vault checklist)
 
 Targeted atomic notes:
 
+- [[core owns bounded atomic terminal input transactions across clients]]
+- [[botster tui consumes tui kit through a thin app policy adapter]]
+- [[botster tui uinode event routing captures hit regions during draw]]
+- [[tui error dedup tests must drive real input handlers]]
 - [[core owns duplex terminal transport while Hub stays content blind]]
 - [[every TerminalInputResult must stamp the live subscription id]]
 - [[core default requirement includes duplex binary again]]
@@ -43,8 +53,9 @@ Targeted atomic notes:
 - [[tui and browser are equal clients]]
 - [[vault example paths are not repository placement conventions]]
 
-[[project-pipelines-playbook]] is not loaded. This ticket changes no Project
-Pipelines package or plugin path.
+This ticket changes no Project Pipelines package or plugin path, so
+[[project-pipelines-playbook]] constrains only the workflow evidence of this
+run, not the product change.
 
 ## Context loaded
 
@@ -92,6 +103,24 @@ Key facts confirmed by reading the dependency sources:
    member manifest, including `botster-hub-client` and `botster-hub-test-support`.
 8. `DaemonRequest::ReadModeFlags` and `DaemonModeFlags` survive the cold cut, so
    the existing freshness probe stays available.
+9. Kit `botster-tui-kit` at the pinned `7940306`: `InputRouter::dispatch_event`
+   routes `Event::Paste(text)` to `dispatch_paste`, which returns only
+   `InputDispatch::TerminalForward { node_id, bytes }` with
+   `terminal_bracketed_paste_bytes(text)`. The dispatch carries no paste
+   identity, and its bytes already contain `ESC[200~` and `ESC[201~`
+   unconditionally, whether or not the child enabled bracketed-paste mode.
+10. Core `48a4370` `managed_session_runtime.rs` delivers
+   `TerminalInputOperation::Paste` by looking up the mode flags for the paste's
+   freshness token, wrapping `paste.data` in `ESC[200~` and `ESC[201~` only when
+   `flags.bracketed_paste` is true, and submitting the result as one mode-gated
+   PTY write. A missing or stale token yields `StaleMode` with the
+   `operation_id` and zero PTY bytes. Core owns bracket insertion, so a client
+   must hand Core the raw pasted text.
+11. The TUI event loop in `run` already matches `Event::Key` against
+   `handle_focused_terminal_key(key, router.focused_node_id())` before the
+   `_ => router.dispatch_event(event, &hit_map)` fallback. That handler is the
+   existing TUI-owned seam that keeps key provenance ahead of generic Kit
+   routing. No equivalent arm exists for `Event::Paste` today.
 
 Vault and project context:
 
@@ -131,11 +160,16 @@ In scope, all inside `botster-tui`:
 7. Carry terminal input as `Vec<u8>` from `InputDispatch::TerminalForward` to the
    encoder, and delete the `String::from_utf8` gate that only existed to fill a
    JSON request field.
-7a. Route every bracketed paste through the published `encode_paste` transaction
-   helper, correlate its one authoritative result by `operation_id`, allow one
-   in-flight paste per subscription with a single safe retry, and map the four
-   added rejections. Check non-paste payloads against the imported single-frame
-   ceilings before encode, write, and queue insertion. Add no client chunk policy.
+7a. Claim `Event::Paste` in the TUI event loop before Kit routing with a new
+   `handle_focused_terminal_paste(text, focused_node_id)` arm, the sibling of
+   `handle_focused_terminal_key`. Pass the raw pasted text, with no `ESC[200~`
+   or `ESC[201~`, to the published `encode_paste` helper. Correlate the one
+   authoritative result by `operation_id`, allow one in-flight paste per
+   subscription with a single safe retry, and map the four added rejections.
+   Check non-paste payloads against the imported single-frame ceilings before
+   encode, write, and queue insertion. Add no client chunk policy and no client
+   bracket insertion. Kit's `dispatch_paste` output never reaches the duplex
+   path.
 8. Raise `MINIMUM_CONFORMANCE_FIXTURE_REVISION` to the revision reported by the
    chosen Hub pin, and update the Hello protocol assertions that name protocol 7
    and revision 44.
@@ -146,7 +180,8 @@ In scope, all inside `botster-tui`:
 Out of scope:
 
 - Any change in `botster-hub`, `botster-core`, `botster-tui-kit`, or
-  `botster-web`.
+  `botster-web`. The paste seam is TUI-local, so no Kit contract change is
+  required; see "Paste provenance and the TUI seam" below.
 - A JSON terminal input fallback, a feature flag, or a compatibility shim. The
   ticket and the project both forbid a second active route.
 - WebRTC transport work. The TUI is a Unix client.
@@ -237,7 +272,7 @@ JSON fallback.
 | --- | --- |
 | `crates/botster-tui/Cargo.toml` | Hub and Core pin roll in lockstep. |
 | `Cargo.lock` | Regenerated by the pin roll. |
-| `crates/botster-tui/src/app.rs` | Duplex input path, resize path, `InputResult` handler, mode shadow refresh, byte-typed input, deleted JSON request paths, floor and protocol assertions, live-lane provenance defaults, new and migrated tests. |
+| `crates/botster-tui/src/app.rs` | Duplex input path, resize path, `Event::Paste` arm in `run` plus `handle_focused_terminal_paste`, `InputResult` handler, mode shadow refresh, byte-typed input, deleted JSON request paths, floor and protocol assertions, live-lane provenance defaults including live paste proof, new and migrated tests. |
 | `README.md` | Pin table, live Hub prose, terminal input contract prose. |
 | `docs/plans/tui-send-terminal-input-through-the-core-duplex-adapter-plan.md` | This plan. |
 | `docs/reports/…-implement-report.md` | Implement evidence report, per repository prior art. |
@@ -248,21 +283,32 @@ Named code sites in `app.rs`:
 - `InputDispatch::TerminalForward` — stop converting bytes to `String`.
 - `InputDispatch::TerminalResize` — replace `DaemonRequest::Resize`.
 - `handle_focused_terminal_key` — replace the `SendInput` branch.
+- `run` event loop — add `Event::Paste(text) if
+  app.handle_focused_terminal_paste(text, router.focused_node_id()) => {}`
+  immediately after the `handle_focused_terminal_key` arm and before the
+  `_ => router.dispatch_event(..)` fallback.
+- `handle_focused_terminal_paste` — new. Owns paste provenance, raw text,
+  `operation_id` allocation, hydration queueing, and the `encode_paste` write.
+- `next_paste_operation_id` — new `u32` field, see "Paste provenance and the
+  TUI seam".
 - `forward_terminal_input`, `forward_mode_gated_input`,
   `apply_mode_gated_input_response` — rewrite as encode plus write, and move
   outcome handling to the event path.
 - `apply_terminal_event` — add the `TerminalEvent::InputResult` arm.
 - `open_attach_live_path` — release the queued resize and queued input through
   the duplex path.
-- `AttachHydration.pending_input` — hold `Vec<u8>`.
+- `AttachHydration.pending_input` — hold an ordered `Vec<PendingInput>` where
+  `PendingInput::Bytes(Vec<u8>)` is key or mouse input and
+  `PendingInput::Paste(String)` is raw pasted text with its identity kept.
 - `ObservedRequest` — delete `SendInput`, `ModeGatedInput`, and `Resize`; add an
   observed duplex-frame record so tests can assert the encoded command.
 - Three new constants beside `DETACH_ON_DISCONNECT_BOUND`:
   `TERMINAL_INPUT_WRITE_BOUND` of two seconds,
   `TERMINAL_INPUT_INFLIGHT_CAPACITY` of 64, and
   `TERMINAL_INPUT_INFLIGHT_BYTES` of 262,144.
-- Imported Core ceilings `MAX_INPUT_DATA_BYTES` and `MAX_MODE_GATED_DATA_BYTES`
-  from `botster-terminal-protocol-client`, never hardcoded.
+- Imported Core ceilings `MAX_INPUT_DATA_BYTES`, `MAX_MODE_GATED_DATA_BYTES`,
+  `MAX_PASTE_BYTES`, and `MAX_PASTE_CHUNK_DATA_BYTES` from
+  `botster-terminal-protocol-client`, never hardcoded.
 - A new bounded in-flight input queue field, cleared with the mode shadow on
   detach, close, and reconnect.
 - `MINIMUM_CONFORMANCE_FIXTURE_REVISION` and the protocol 7 / revision 44 tests.
@@ -278,7 +324,8 @@ Named code sites in `app.rs`:
 | Losing the synchronous error surface degrades user feedback for rejected input. | Handle `input_result` with `admitted == false`, map each `TerminalInputRejection` to a distinct message, and assert those messages in tests. |
 | A stale-mode retry loop, because the retry itself can be rejected. | Allow at most one re-probe and one retry per submitted command. Assert the bound in a test. |
 | An asynchronous `input_result` cannot name the command it answers, so a stale-mode retry could resend the wrong bytes. | Keep a bounded ordered in-flight queue per live subscription and correlate the head entry, with a `kind` cross-check and a fail-closed path on mismatch. See "Input result correlation" below. |
-| Byte-type change breaks paste fidelity or the queued-input order. | Keep one ordered queue, keep bytes unmodified end to end, and assert exact bracketed-paste bytes driven from a real `Event::Paste`. Kit `dispatch_paste` wraps a Rust `String`, so paste bytes are always valid UTF-8 at the kit boundary; the byte-typed pipeline matters for key and mouse encoding, not for reaching non-UTF-8 paste input. |
+| Paste loses its identity or is bracketed twice. Kit `dispatch_paste` returns plain `TerminalForward` bytes that already carry `ESC[200~` and `ESC[201~`, and Core wraps paste data again when the child enabled bracketed-paste mode. | Claim `Event::Paste` in the TUI event loop before Kit routing, exactly as keys are claimed today, and hand Core the raw text. Never infer a paste from an `ESC[200~` byte prefix. Tests 4 and 23 assert raw chunk content with no bracket bytes; the live lane asserts exactly one Core-applied bracket pair at the PTY. |
+| Byte-type change breaks the queued-input order. | Keep one ordered hydration queue that preserves entry identity, keep bytes unmodified end to end, and release entries in order through the duplex path. The byte-typed pipeline matters for key and mouse encoding; pasted text is a Rust `String` and is always valid UTF-8. |
 | `TerminalInputResult` has no `session_id`, so a result cannot be matched by session. | Match on `subscription_id` alone against the live attached subscription, and ignore results for retired subscription ids. |
 | Live Ghostty lanes fail for environment reasons and hide a real regression. | Use the IsolatedHub `ghostty` lane as the primary live oracle and require the printed completion markers, per the repository charter. |
 | Hub `main` moves before Implement, so the plan's SHAs go stale. | Implement re-verifies ancestry and records the exact SHAs it used in the Implement report. |
@@ -402,13 +449,79 @@ Core validates the complete operation before any PTY delivery and delivers zero
 PTY bytes on every failure, so a partial bracketed paste is impossible by
 construction. Hub stays content blind.
 
-### How the TUI consumes it
+### Paste provenance and the TUI seam
 
-1. **Every bracketed paste uses the transaction.** The TUI does not branch on
-   size. One path removes the threshold, and the result's `operation_id` gives
-   explicit correlation for small and large pastes alike. The TUI writes the
-   frames the helper returns, in order, on the live subscription, and defines no
-   chunk policy, no scheduling, and no reassembly of its own.
+Kit's generic routing cannot carry a paste to the duplex path. At the pinned Kit,
+`dispatch_paste` returns `InputDispatch::TerminalForward` with bytes that Kit has
+already wrapped in `ESC[200~` and `ESC[201~`, and the dispatch has no field that
+says "this was a paste". If the TUI fed those bytes to `encode_paste`, Core would
+wrap them again whenever the child has bracketed-paste mode enabled, and the
+child would receive two opener and closer pairs. If the TUI instead tried to
+recognize a paste by its `ESC[200~` prefix, ordinary input with the same bytes
+would be misclassified. Neither is acceptable.
+
+The TUI therefore claims paste before Kit routing, with the same seam it already
+uses for keys:
+
+1. **Event-loop arm.** `run` gains
+   `Event::Paste(text) if app.handle_focused_terminal_paste(text, router.focused_node_id()) => {}`
+   directly after the `handle_focused_terminal_key` arm and before the
+   `_ => router.dispatch_event(event, &hit_map)` fallback. The handler receives
+   the raw `String` from crossterm and knows it is a paste, so provenance and
+   content are both preserved. This is TUI application policy above Kit
+   mechanics, per [[botster tui consumes tui kit through a thin app policy adapter]].
+2. **The handler claims every paste while the terminal is focused.** The focus
+   test is the one `handle_focused_terminal_key` uses: `focused_node_id` is
+   `tui-terminal` or `tui-terminal-output`. When the terminal is focused the
+   handler returns `true` in all three states below, so Kit's `dispatch_paste`
+   is unreachable for a focused terminal and its pre-bracketed bytes never enter
+   the duplex path. When the terminal is not focused the handler returns `false`
+   and Kit routes the paste as it does today, which for every non-passthrough
+   region is `InputDispatch::Ignored`.
+   - *Live:* `attached_session` is set, `attached_subscription_id` equals
+     `subscription_id`, and no hydration is in progress. The handler encodes and
+     writes the paste transaction as described in the consumption rules below.
+   - *Hydrating:* `attach_hydration` is `Some`. The handler pushes
+     `PendingInput::Paste(text)` onto the ordered hydration queue so the paste
+     keeps its identity and its position relative to queued keys. At most one
+     paste may be pending during hydration; a second paste is refused with the
+     back-pressure error, because Core allows one paste in flight per
+     subscription and the release step cannot wait for a result. On release,
+     `open_attach_live_path` walks the queue in order and sends `Bytes` entries
+     as `Input` or `ModeGatedInput` and the `Paste` entry through `encode_paste`.
+     Core parks later input behind a gated operation on the same owner, so keys
+     queued after the paste stay ordered at the PTY.
+   - *Unattached:* neither of the above. The handler records the existing
+     "attach a session before sending terminal input" error and writes nothing.
+3. **Raw content only.** The handler passes `text.as_bytes()` to `encode_paste`.
+   It never prepends `ESC[200~` or appends `ESC[201~`, and it never calls Kit's
+   `terminal_bracketed_paste_bytes`. Core inserts the bracket pair only when the
+   child enabled bracketed-paste mode. This corrects today's behavior, where Kit
+   brackets every paste unconditionally; a child that never enabled mode 2004
+   now receives plain text, which is the terminal contract. An empty paste is
+   dropped with zero frames, because `encode_paste` rejects it with
+   `EmptyPaste` and there is nothing to deliver.
+4. **Mode tokens.** `PasteBegin` carries `mode_generation` and `mode_revision`,
+   so a paste needs the mode shadow exactly as mode-gated input does today. When
+   no shadow exists the handler runs one `ReadModeFlags` probe through the
+   existing `probe_terminal_mouse_mode`, which is a synchronous readback. If the
+   shadow is still absent it records the existing "mode flags not ready" error
+   and writes zero frames. It never sends a paste with guessed tokens.
+5. **`operation_id` allocation.** The TUI keeps one process-wide `u32` counter,
+   `next_paste_operation_id`, starting at 1. Every `encode_paste` call and every
+   paste retry takes the next value, and the counter never resets on detach,
+   reconnect, or subscription change, so a late result from a retired
+   subscription can never share an id with a live operation. On overflow the
+   counter wraps to 1, never to 0. Core scopes the operation to the owner, so
+   the id only needs to be unique within this process.
+
+### How the TUI consumes the transaction
+
+1. **Every paste uses the transaction.** The TUI does not branch on size. One
+   path removes the threshold, and the result's `operation_id` gives explicit
+   correlation for small and large pastes alike. The TUI writes the frames the
+   helper returns, in order, on the live subscription, and defines no chunk
+   policy, no scheduling, no bracket insertion, and no reassembly of its own.
 2. **Paste correlation is by `operation_id`, not by queue position.** A paste
    in-flight entry records its `operation_id`, and a `Paste` result pops that
    entry by id match. Non-paste commands keep the ordered head correlation and
@@ -439,9 +552,11 @@ construction. Hub stays content blind.
 ### Retained invariant
 
 The framing invariant is now a Core guarantee rather than TUI logic: the opening
-bracketed-paste marker never reaches the PTY unless the closing marker does,
-because Core validates the whole operation before delivery and delivers zero
-bytes on failure. The TUI relies on that guarantee and adds no framing logic.
+bracketed-paste marker never reaches the PTY unless the closing marker does, and
+it is inserted exactly once and only when the child enabled bracketed-paste
+mode, because Core validates the whole operation before delivery, wraps the raw
+text itself, and delivers zero bytes on failure. The TUI relies on that
+guarantee and adds no framing logic.
 
 ## Runtime-teardown class answers
 
@@ -492,15 +607,23 @@ blocking wait.
 | `Input` frame | TUI to Hub | `(session_id, subscription_id)` in the envelope | TUI refuses to write when the pair is not the live attached pair; Hub drops an envelope with no live handle | none needed; the frame creates no durable client state |
 | `ModeGatedInput` frame | TUI to Hub | same pair plus `mode_generation` and `mode_revision` | Core rejects a stale generation or revision with `StaleMode` | the mode shadow is cleared on detach and on subscription close |
 | `Resize` frame | TUI to Hub | same pair | same live-pair gate | the queued resize is dropped when hydration is abandoned |
+| `PasteBegin`, `PasteChunk`, `PasteCommit` frames | TUI to Hub | same pair plus `operation_id`, `mode_generation`, and `mode_revision` | same live-pair gate; Core rejects a stale token with `StaleMode`, a second operation with `OperationInFlight`, and an incomplete or out-of-bounds operation with zero PTY bytes | the pending paste entry is dropped when hydration is abandoned; the in-flight paste entry is cleared with the queue on detach, close, and reconnect |
+| `PasteAbort` frame | TUI to Hub | same pair plus `operation_id` | sent only while the pair is live; never sent for a retired subscription | none; the `Aborted` result retires the in-flight entry |
 | `input_result` | Hub to TUI | `subscription_id` | ignored when the id is retired or is not the live attached subscription | `retired_subscription_ids` already suppresses late frames |
 | `TerminalSubscriptionClosed` | Hub to TUI | `(session_id, subscription_id)` | already handled as the adapter-close signal | retires the subscription id and clears the mode shadow |
 | `Attach` and `Detach` | TUI to Hub | control plane, unchanged | unchanged | unchanged |
 
-`production_path_proof`: the exact path is real `KeyEvent` or paste bytes to
+`production_path_proof`: for keys and mouse the exact path is a real `KeyEvent`
+or `MouseEvent` to `handle_focused_terminal_key` or
 `InputDispatch::TerminalForward`, to `forward_terminal_input`, to
 `encode_terminal_input`, to the `DaemonUnixTerminalEnvelope` write on the live
 Unix stream, to Hub `push_ingress`, to the Core adapter, to the PTY, and back as
-`TerminalOutput`. The live oracle is `script/test-live-hub ghostty`, which drives
+`TerminalOutput`. For paste the exact path is a real `Event::Paste(text)` in
+`run`, to `handle_focused_terminal_paste`, to `encode_paste` over the raw text,
+to the ordered envelope writes on the live Unix stream, to Hub `push_ingress`,
+to Core paste assembly and validation, to Core bracket insertion when the child
+enabled mode 2004, to one mode-gated PTY write, and back as one `input_result`
+carrying the `operation_id` plus the echoed `TerminalOutput`. The live oracle is `script/test-live-hub ghostty`, which drives
 real input handlers against an IsolatedHub and asserts the echoed marker in the
 Ghostty viewport cache. Hermetic tests must drive `handle_dispatch` and
 `handle_focused_terminal_key`, not inner helpers, per the repository charter.
@@ -544,12 +667,33 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
    shadow `mode_generation` and `mode_revision`.
 3. A mouse report without ModeFlags freshness does not fall through to a plain
    `Input` command.
-4. Paste drives the real kit path: the test calls
-   `InputRouter::dispatch_event(Event::Paste(text), &hit_map)` with the terminal
-   region focused, feeds the returned `InputDispatch` to `handle_dispatch`, and
-   asserts one `TerminalInputCommand::Input` whose bytes are exactly
-   `\x1b[200~` plus the multi-byte UTF-8 payload plus `\x1b[201~`. The test must
-   not fabricate an `InputDispatch::TerminalForward` value.
+4. Paste drives the real TUI seam: the test calls the production
+   `handle_focused_terminal_paste(text, Some("tui-terminal"))` with a live
+   attached subscription and a multi-byte UTF-8 payload, asserts it returns
+   `true`, asserts the written frames decode to exactly one `PasteBegin`, the
+   `PasteChunk` frames, and one `PasteCommit`, asserts the concatenated chunk
+   payloads equal `text.as_bytes()` and contain no `\x1b[200~` and no
+   `\x1b[201~`, and asserts no `TerminalInputCommand::Input` was written. A
+   companion assertion calls the handler with a non-terminal focus and asserts
+   it returns `false` and writes nothing. A third assertion calls the handler
+   with the terminal focused but no attached session and asserts `true`, the
+   existing attach error, and zero frames. The test must not fabricate an
+   `InputDispatch` value and must not call Kit's `terminal_bracketed_paste_bytes`.
+4a. Paste during hydration keeps its identity and order. The test starts attach
+   hydration, calls `handle_focused_terminal_paste` once and then a key through
+   the real path, asserts the queue holds `PendingInput::Paste` followed by
+   `PendingInput::Bytes`, asserts a second paste during hydration is refused
+   with the back-pressure error, then completes READY, FINISH, and `attached`
+   and asserts the release writes the `encode_paste` frames for the raw text
+   first and the key's `Input` frame after them.
+4b. A paste with no mode shadow runs exactly one `ReadModeFlags` probe. With a
+   probe that answers, the paste is written with the probed tokens. With a probe
+   that does not answer, the handler records the "mode flags not ready" error
+   and writes zero frames.
+4c. An empty paste writes zero frames and records no error.
+4d. `operation_id` allocation is monotonic across the process: two pastes take
+   consecutive ids, a retry takes a new id, and a detach plus reconnect does not
+   reset the counter.
 5. `InputDispatch::TerminalResize` writes `TerminalInputCommand::Resize` with the
    exact rows and columns, and updates the local projection.
 6. Attach hydration queues input and only the latest resize, then releases them
@@ -604,16 +748,18 @@ New hermetic tests in `crates/botster-tui/src/app.rs`:
     large `Input` payloads whose total exceeds `TERMINAL_INPUT_INFLIGHT_BYTES`
     while the entry count stays under `TERMINAL_INPUT_INFLIGHT_CAPACITY`, and
     asserts the back-pressure error, no further write, and a live subscription.
-23. Every bracketed paste travels as one Core transaction. The test drives
-    `Event::Paste` through `InputRouter::dispatch_event` with the terminal region
-    focused, and asserts the written frames are exactly the ordered
-    `encode_paste` output: one `PasteBegin` carrying the live mode tokens and the
-    total length, the `PasteChunk` frames in index order, then one `PasteCommit`.
-    It asserts the TUI builds no frames of its own.
+23. Every paste travels as one Core transaction over raw text. The test drives
+    `handle_focused_terminal_paste` with the terminal focused and asserts the
+    written frames are exactly the ordered `encode_paste(operation_id,
+    mode_generation, mode_revision, text.as_bytes())` output: one `PasteBegin`
+    carrying the live mode tokens and `total_len == text.len()`, the
+    `PasteChunk` frames in index order, then one `PasteCommit`. It asserts the
+    TUI builds no frames of its own and that no chunk payload contains
+    `\x1b[200~` or `\x1b[201~`.
 24. A paste above one frame body uses the same single path. The test uses a
-    payload above `MAX_PASTE_CHUNK_DATA_BYTES`, asserts the concatenated chunk
-    payloads equal the original bracketed-paste bytes exactly, and asserts the
-    TUI branches on no size threshold.
+    payload above `MAX_PASTE_CHUNK_DATA_BYTES`, asserts more than one
+    `PasteChunk`, asserts the concatenated chunk payloads equal the raw text
+    bytes exactly, and asserts the TUI branches on no size threshold.
 25. Paste results correlate by `operation_id`, not by queue position. The test
     puts a paste and a later key in flight, delivers the `Paste` result with its
     `operation_id`, and asserts it pops the paste entry while the key entry stays
@@ -637,7 +783,27 @@ Live proof, per the repository charter:
 1. `./script/test-live-hub ghostty` prints `ghostty-live-complete` and its
    provenance line names the new Hub and Core revisions. This lane must cover
    typing, the Kitty branch, the mouse branch, resize with an echoed geometry
-   check, and the socket-cut plus reconnect sequence.
+   check, the socket-cut plus reconnect sequence, and live paste as follows.
+1a. Live paste crosses the production path byte-exact, once, through TUI, Hub,
+   Core, and the PTY. The lane drives `handle_focused_terminal_paste` against the
+   IsolatedHub session, the same function the `run` event loop calls, so the
+   proof uses the production seam and not a fabricated dispatch. The controlled
+   child shell gains a `paste-capture N` case arm that enables bracketed-paste
+   mode with `printf '\033[?2004h'`, reads exactly `N` bytes from the PTY into a
+   file, disables the mode, and prints one line
+   `paste-done bytes=<count> open=<opener count> close=<closer count> sum=<cksum>`
+   where the counts come from a byte-wise scan and `sum` is the POSIX `cksum`
+   of the file. The test recomputes the same `cksum` in Rust over the expected
+   bytes, which are `ESC[200~` plus the raw text plus `ESC[201~`, and asserts
+   `bytes`, `open == 1`, `close == 1`, and `sum` all match in the Ghostty
+   viewport cache, with a `ghostty-live-paste` marker line printed. Two sizes
+   run: a small paste that fits one chunk, and a paste above
+   `MAX_PASTE_CHUNK_DATA_BYTES` that needs at least two `PasteChunk` frames, so
+   the above-one-frame case is proven on the real transport. A third capture
+   runs with bracketed-paste mode left disabled and asserts `open == 0`,
+   `close == 0`, and `bytes == text.len()`, which proves Core inserts the pair
+   only when the child asked for it. Implement may choose a different
+   byte-exact oracle only if it records why `cksum` was unavailable.
 2. `./script/test-live-hub ghostty-shared` prints `ghostty-shared-complete`.
 3. `./script/test-live-hub ghostty-shared-exit` prints
    `ghostty-shared-exit-attached` before the caller ends the shared session, then
@@ -667,7 +833,15 @@ both results.
    frame body are a Core-owned bounded atomic transaction with one authoritative
    result, not a client chunk policy, and every failure delivers zero PTY bytes.
    The Core ticket owns the capture once the contract ships.
-4. Duplex terminal input removes the synchronous request-response error surface
+4. Kit's generic `dispatch_paste` pre-brackets pasted text and carries no paste
+   identity, so a client that consumes Core-owned paste transactions must claim
+   `Event::Paste` at its own event loop before generic Kit routing, exactly as
+   the TUI already claims focused keys. No note records this client duty or the
+   fact that unconditional client-side bracketing is wrong once Core inserts the
+   pair by mode. A Kit follow-up to stop bracketing or to add a paste dispatch
+   variant is optional and is not a dependency of this ticket, because the
+   TUI-local seam is complete without it.
+5. Duplex terminal input removes the synchronous request-response error surface
    from first-party clients, so client input error reporting becomes event
    driven and bounded to one stale-mode retry. This is a client-policy decision
    worth a note once it ships in both the TUI and the Web client.
