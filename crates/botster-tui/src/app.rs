@@ -23529,9 +23529,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "bb1a330543bc06888f894edd5f40a0f867753a12".to_string());
+            .unwrap_or_else(|_| "e50e0f04885205522aa46936b6863dc732a3224d".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "48a437032791e678010254708259568ce4ad02bf".to_string());
+            .unwrap_or_else(|_| "93acae3f98adbc21dc981d113c4eb2f31ead4ad0".to_string());
         let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
         let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
         assert_eq!(
