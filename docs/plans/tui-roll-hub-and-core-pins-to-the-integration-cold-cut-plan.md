@@ -8,6 +8,8 @@ Revision 3 history: applies steward correction `msg_plugin-w_1788571659_a664fb` 
 
 Revision 4: human answer `question_1788573184_913439` authorizes Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` after one documentation-only commit on `205cadf6f8dab9dc990537c2c00ef3d27edb31dd`. This decision supersedes the prior frozen Hub revision. Core stays at `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The Hub-first matrix and merge barrier remains unchanged.
 
+Revision 5: Verify finding C in `review_1788577387_456888` returns the isolated Ghostty pressure fixture to Implement. Human answer `question_1788577472_219314` authorizes a test-owned producer release signal and a disposable Hub source ablation. The ablation must suppress actual Core close enforcement or delivery for the negative control. It must leave no tracked Hub change. No permanent Hub or Core export is authorized.
+
 ## Target repository
 
 - Target repository: `botster-tui` (`https://github.com/trybotster/botster-tui`)
@@ -103,14 +105,22 @@ In scope:
    - The Workspaces lanes sentence at README line 308, "the revision this crate pins, currently `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`". It is an active current-pin claim and changes to `9a02e55...`.
    - Keep genuine minimum-version claims (`7a09292` or later for shared lanes, floor 48, protocol 8) and the historical public package reference `@trybotster/hub-test-support@0.1.39` in the contract-matrix paragraph. Those are not current-pin claims and have no source evidence for a change.
 6. Update this active plan for the authorized Hub revision and keep historical context labeled.
-7. One implement report under `docs/reports/` that records the candidate SHA, gate commands, live-lane provenance, and the zero-match search.
+7. Repair the isolated Ghostty pressure fixture in `app.rs`, including one focused regression test that uses the same proof helper:
+   - Configure the existing `IsolatedHubBuilder::env` pressure hook for the exact flood session. Disable inherited global pressure controls.
+   - Keep the real producer. Release its output only after real Attached, pre-close Status, and the pressure marker.
+   - Require Core-generated `core_adapter_closed` through the real Unix mux. Preserve the exact reason, host-close exclusion, one recovery, retired subscription and generation, and sibling progress.
+   - Keep the 30-second close deadline and Core budgets unchanged.
+   - Run the focused proof and the full isolated Ghostty lane with debug Hub and worker binaries.
+   - Temporarily suppress actual close delivery for the exact flood session in a disposable Hub checkout. Require the focused proof to fail for missing close evidence. Record the diff, command, failure, restoration, and clean tracked Hub status.
+   - Restore and rebuild Hub before final positive proof. Do not overlap source ablation with another suite.
+8. One implement report under `docs/reports/` that records the candidate SHA, gate commands, live-lane provenance, and the zero-match search.
 
 Out of scope:
 
 - Adopting the new `botster-hub-client` `poll_terminal` or `next_terminal` helpers. The TUI keeps its own production mux reader (`pending_mux_frames`, `mux_buf`). The ticket does not ask for that change.
 - Any adapter, fallback, shim, `#[allow(dead_code)]`, or compatibility branch. The scratch commit's `#[allow(dead_code)]` on `ObservedRequest::Drain` is a hack and is not adopted.
 - Compensation for any Hub or Core close defect. If a live lane exposes one, file it against Hub or Core and stop.
-- Unrelated historical files under `docs/plans/**` and `docs/reports/**`. They keep their original revisions. This ticket's active plan and report follow revision 4.
+- Unrelated historical files under `docs/plans/**` and `docs/reports/**`. They keep their original revisions. This ticket's active plan and report follow revision 5.
 - Any re-pin to a Hub revision other than `9a02e55`. See Sequencing.
 - Merging this ticket before Hub merges exact `9a02e55`.
 
@@ -161,8 +171,8 @@ Unknowns for Implement to resolve:
 | --- | --- |
 | `crates/botster-tui/Cargo.toml` | Six `rev` values (two Hub, four Core) |
 | `Cargo.lock` | Hub and Core Git source lines only |
-| This plan | Revision 4 records the human decision and updates active acceptance commands |
-| `crates/botster-tui/src/app.rs` | Drain arm and variant removal, three assertion removals, one test deletion, three `read_frame_from_reader` calls with a persistent buffer, two live-lane revision defaults |
+| This plan | Revision 5 records the human decision and updates active acceptance commands |
+| `crates/botster-tui/src/app.rs` | Drain arm and variant removal, three assertion removals, one test deletion, three `read_frame_from_reader` calls with a persistent buffer, two live-lane revision defaults, exact-session pressure fixture and focused proof |
 | `README.md` | Every active sentence that names Hub `bb1a330`, Core `48a4370`, or the current-pin claim `4f30d69` at line 308 |
 | `docs/reports/tui-roll-hub-and-core-pins-to-the-integration-cold-cut-implement-report.md` | New report |
 
@@ -217,11 +227,13 @@ git diff origin/main -- Cargo.lock | grep '^[-+]source' | grep -v 'botster-hub.g
 Source-migration proof:
 
 - `grep -n 'read_frame_from_reader' crates/botster-tui/src/app.rs` shows three calls, each passing a `&mut String` declared once per `BufReader` and reused across every read on that stream.
-- The deleted test and the three removed assertions appear in the diff. No other test assertion is removed.
+- The deleted test and the three removed assertions appear in the diff. No other migration assertion is removed. The pressure repair replaces the permissive Attached-or-close check with strict Attached before producer release.
 
 ### Live proof, isolated lane (TUI-owned, Implement and Verify)
 
-Build Hub and session-worker binaries from a clean Hub checkout at exact `9a02e55` into a fresh target directory. Write the build receipt with `script/write-claim-build-receipt` so `hub_rev` comes from `git rev-parse HEAD` of that checkout and `core_rev` comes from the Hub `Cargo.lock` (`93acae3`). Record the receipt path, both binary paths, and the receipt contents in the implement report.
+Build debug Hub and session-worker binaries from a clean Hub checkout at exact `9a02e55` into a fresh target directory. Use `cargo build --locked -p botster-hub -p botster-core-daemon --bin botster-hub --bin botster-session-worker`. Record the actual command, source status, binary paths and hashes, Hub HEAD, and Core lock source in a runtime receipt. The existing receipt writer emits release commands, so it cannot describe this required debug build accurately. Do not change that writer in this ticket.
+
+Run the focused test through `./test.sh -p botster-tui app::tests::ghostty_live_core_close_uses_session_scoped_pressure -- --exact --nocapture`. Supply both debug binary paths and `BOTSTER_TUI_REQUIRE_HUB_TEST=1`. Require one selected test. The authorized negative control must reach the pressure marker and then fail because close evidence is missing. Restore and rebuild the clean Hub source before the final focused test and both full isolated runs.
 
 ```sh
 export CARGO_TARGET_DIR="$TMPDIR/botster-tui-cold-cut-target"

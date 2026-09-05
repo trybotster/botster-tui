@@ -23546,13 +23546,8 @@ mod tests {
         );
 
         let root = PathBuf::from(format!("/tmp/bt-ghostty-{}", short_suffix() % 1_000_000));
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(&session_worker_bin)
-            .root(&root)
-            .name("botster-tui-ghostty-live")
-            .start()
-            .expect("isolated hub starts");
+        let flood_id = format!("btui-flood-{}", short_suffix());
+        let hub = start_ghostty_pressure_hub(&hub_path, &worker_path, &root, &flood_id);
 
         // --- History attach: GHOSTSNP, scrollback, palette, styles, modes, live, reconnect ---
         let mut app = TuiApp::new(Some(hub.endpoint().clone()));
@@ -24222,9 +24217,83 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // Keep reading this Unix mux while `yes` fills the Core adapter.
-        // Hub emits core_adapter_closed without host egress close.
+        let sibling_id = prove_ghostty_core_close(&hub, &mut app, &root, &flood_id);
+
+        println!(
+            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} ghostty_rev={ghostty_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
+            shadow.kitty_enabled, shadow.mouse_mode
+        );
+    }
+
+    fn start_ghostty_pressure_hub(
+        hub_bin: &Path,
+        worker_bin: &Path,
+        root: &Path,
+        flood_id: &str,
+    ) -> botster_hub_test_support::IsolatedHub {
+        let observation = root.join("pressure");
+        std::fs::create_dir_all(&observation).expect("create pressure observation directory");
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(hub_bin)
+            .session_worker_bin(worker_bin)
+            .root(root)
+            .name("botster-tui-ghostty-live")
+            .env("BOTSTER_ENV", "test")
+            .env("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK", "0")
+            .env(
+                "BOTSTER_HUB_TEST_CLEAR_ADAPTER_WOULD_BLOCK_AFTER_REJECTION",
+                "0",
+            )
+            .env(
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
+                flood_id,
+            )
+            .env("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS", "500")
+            .env(
+                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION",
+                observation.to_string_lossy(),
+            )
+            .start()
+            .expect("isolated hub starts")
+    }
+
+    #[test]
+    fn ghostty_live_core_close_uses_session_scoped_pressure() {
+        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
+            skip_or_panic("BOTSTER_HUB_BIN");
+            return;
+        };
+        let Some(worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
+            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
+            return;
+        };
+        let root = PathBuf::from(format!("/tmp/bt-pressure-{}", short_suffix() % 1_000_000));
         let flood_id = format!("btui-flood-{}", short_suffix());
+        let hub = start_ghostty_pressure_hub(
+            Path::new(&hub_bin),
+            Path::new(&worker_bin),
+            &root,
+            &flood_id,
+        );
+        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
+        app.workspace_test_mode = true;
+        prove_ghostty_core_close(&hub, &mut app, &root, &flood_id);
+    }
+
+    fn prove_ghostty_core_close(
+        hub: &botster_hub_test_support::IsolatedHub,
+        app: &mut TuiApp,
+        root: &Path,
+        flood_id: &str,
+    ) -> String {
+        let flood_id = flood_id.to_string();
+        let release = root.join("flood.release");
+        let pressure = root.join("pressure/would_block");
+        assert!(!release.exists(), "producer release must start absent");
+        assert!(
+            !pressure.exists(),
+            "other sessions must not activate pressure"
+        );
         let sibling_id = format!("btui-sib-{}", short_suffix());
         app.reset_attach_campaign();
         app.pending_sessions
@@ -24233,7 +24302,10 @@ mod tests {
         app.rebuild_session_rows();
         match app.request(DaemonRequest::Spawn {
             session_id: flood_id.clone(),
-            command: "yes write-budget-stall".to_string(),
+            command: format!(
+                "while [ ! -f '{}' ]; do sleep 0.02; done; exec yes write-budget-stall",
+                release.display()
+            ),
         }) {
             Ok(response) => app.apply_response(response),
             Err(error) => panic!("flood spawn failed: {error}"),
@@ -24246,29 +24318,21 @@ mod tests {
             Ok(response) => app.apply_response(response),
             Err(error) => panic!("sibling spawn failed: {error}"),
         }
-        wait_for_authoritative_session(&mut app, &flood_id).expect("flood session ready");
-        wait_for_authoritative_session(&mut app, &sibling_id).expect("sibling session ready");
+        wait_for_authoritative_session(app, &flood_id).expect("flood session ready");
+        wait_for_authoritative_session(app, &sibling_id).expect("sibling session ready");
         app.selected_session = Some(flood_id.clone());
         app.attach_selected_or_first();
-        wait_for_attached_projection(&mut app, &flood_id);
+        wait_for_attached_projection(app, &flood_id);
+        assert_eq!(
+            app.attached_session.as_deref(),
+            Some(flood_id.as_str()),
+            "flood must reach Attached before producer release"
+        );
+        assert!(app.terminal_close_evidence.is_none());
         let flood_sub = app
             .attached_subscription_id
             .clone()
-            .or_else(|| app.retired_subscription_ids.iter().next().cloned())
-            .unwrap_or_else(|| app.subscription_id.clone());
-        assert!(
-            app.attached_session.as_deref() == Some(flood_id.as_str())
-                || app
-                    .terminal_close_evidence
-                    .as_ref()
-                    .is_some_and(|(_, reason)| {
-                        reason == TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
-                    }),
-            "flood attach must reach Attached or core_adapter_closed; attached={:?} error={:?} close={:?}",
-            app.attached_session,
-            app.error,
-            app.terminal_close_evidence
-        );
+            .expect("flood has a live subscription");
 
         let mut sibling = HubConnection::connect(hub.endpoint()).expect("sibling connection");
         let sibling_sub = format!("sib-sub-{}", short_suffix());
@@ -24279,8 +24343,7 @@ mod tests {
             })
             .expect("sibling attach");
 
-        // Status before the flood poll loop. Hub c72712e can emit
-        // core_adapter_closed on the first poll, which skipped this oracle.
+        // Observe host Status before the producer can fill the adapter.
         match app.request(DaemonRequest::Status) {
             Ok(response) => {
                 assert_ne!(
@@ -24293,8 +24356,24 @@ mod tests {
             }
             Err(error) => panic!("pre-close Status failed: {error}"),
         }
+        assert!(app.terminal_close_evidence.is_none());
+        assert_eq!(
+            app.attached_subscription_id.as_deref(),
+            Some(flood_sub.as_str())
+        );
         let mut sibling_terminal_frames = 0_usize;
         let deadline = Instant::now() + Duration::from_secs(30);
+        while !pressure.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pressure.exists(),
+            "exact-session pressure hook must activate"
+        );
+        std::fs::write(&release, b"release").expect("release flood after Attached and Status");
+        println!(
+            "ghostty-live-pressure: session={flood_id} subscription={flood_sub} attached=true pre_close_status=true hook=would_block"
+        );
         while Instant::now() < deadline {
             app.poll_hub();
             let frames = sibling
@@ -24374,10 +24453,7 @@ mod tests {
                 .map(|(generation, _)| *generation)
         );
 
-        println!(
-            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} ghostty_rev={ghostty_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
-            shadow.kitty_enabled, shadow.mouse_mode
-        );
+        sibling_id
     }
 
     fn require_shared_ghostty_injectors() -> Option<(DaemonEndpoint, String)> {

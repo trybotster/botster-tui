@@ -2,11 +2,11 @@
 
 Target: `trybotster/botster-tui`, `tgt_c3d470bab78549df920a41e8fb0e58d8`.
 Ticket: `ticket_1788460430_647093`. Run: `run_1788570301_694931`.
-Plan basis: approved revision 3 at `e3e73751b1db92ee4099de4e037366b608e3ca54`, updated to revision 4 under human answer `question_1788573184_913439`.
+Plan basis: approved revision 3 at `e3e73751b1db92ee4099de4e037366b608e3ca54`, updated through revision 5 under human answers `question_1788573184_913439` and `question_1788577472_219314`.
 
 The implementation report artifact identifies the final candidate SHA and records command results after commit. No gate result is claimed before execution.
 
-The implementation removes the deleted Drain match, observation variant, one vacuous test, and three Drain assertions. All other assertions remain. Each of the two test readers owns one persistent incomplete-frame buffer across its reads. The production mux reader remains the entry point for terminal output.
+The implementation removes the deleted Drain match, observation variant, one vacuous test, and three Drain assertions. All other migration assertions remain. Each of the two test readers owns one persistent incomplete-frame buffer across its reads. The production mux reader remains the entry point for terminal output.
 
 The manifest, lockfile, live defaults, and README consume Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The live build comment and Core capacity comment use the verified new revisions. The close-event comment removes its historical revision label. Core still defines `INPUT_QUEUE_CAPACITY = 256`.
 
@@ -36,14 +36,19 @@ Required commands at the committed candidate:
 - `./test.sh --workspace --all-targets`
 - `cargo build -p botster-tui --locked`
 - `cargo build --locked`
+- The focused pressure test through `./test.sh`, with required debug binaries.
 - `script/test-live-hub ghostty`, with explicit revision labels and again with both labels unset.
 
 Each gate records HEAD and clean status before and after execution. The artifact records exits, test counts, marker lines, and log paths. Pin checks require five Core and two Hub lock sources, no registry changes, no active old revisions, and no deleted Drain symbols.
 
-The isolated live lane uses the clean Hub checkout. Fresh release builds use the fresh release target directory. The repository receipt writer records the checkout revision, locked Core revision, binary paths, and build commands. The artifact preserves the receipt contents.
+The isolated lane and focused proof use debug Hub and worker binaries from the exact clean Hub checkout. The runtime receipt records the actual build command, revisions, paths, and binary hashes. The existing receipt writer hard-codes release commands, so this report uses a receipt that describes the debug build accurately.
 
-Assumptions and residual risk: shared matrix evidence does not exist for this candidate until independent Review and the Hub matrix finish. No shared resources are owned by this run. Final Verify must not advance early. Any candidate change renews the relevant review and proof.
+Verify finding C identified missing close evidence under debug binaries. The fixture now selects the exact flood session with the existing Hub pressure hook. The producer waits for a test-owned file. The test writes that file after Attached, pre-close Status, and the pressure marker. The focused test and full lane share all close assertions. Both require real Core close delivery through the Unix mux, one recovery, retired subscription and generation, and sibling progress. The exact close reason and the 30-second deadline remain unchanged.
 
-Approved deviation: human answer `question_1788573184_913439` authorizes Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` after documentation corrections to the prior candidate. The active plan and every acceptance command now use this revision. Core and runtime behavior remain unchanged. The old-pin invariant requires updating the existing Core capacity comment. The deleted API requires no new adapter or test abstraction.
+The authorized negative control temporarily removes actual close-event delivery for the selected flood session in a disposable Hub checkout. The artifact records its diff, command, missing-close failure, source restoration, and clean tracked status. No Hub source change belongs to this candidate. Final positive proof uses the restored debug build.
+
+Assumptions and residual risk: shared matrix evidence does not exist for this candidate until independent Review and the Hub matrix finish. No shared resources are owned by this run. This fixture result does not exclude other debug runtime defects. The full Hub matrix must determine that. Final Verify must not advance early. Any candidate change renews the relevant review and proof.
+
+Approved deviation: human answer `question_1788573184_913439` authorizes Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` after documentation corrections to the prior candidate. The active plan and every acceptance command now use this revision. Core and production runtime behavior remain unchanged. The old-pin invariant requires updating the existing Core capacity comment. Finding C and `question_1788577472_219314` also authorize the test fixture repair and disposable negative control. The active plan includes these acceptance checks.
 
 Guidance gaps: the plan identifies stale current-pin prose, per-reader buffer lifetime, caller-owned provenance, and the frozen-candidate barrier. Existing notes already cover these constraints in part. The final checklist records whether this visit adds durable knowledge.
