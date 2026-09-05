@@ -2,13 +2,13 @@
 
 Target: `trybotster/botster-tui`, `tgt_c3d470bab78549df920a41e8fb0e58d8`.
 Ticket: `ticket_1788460430_647093`. Run: `run_1788570301_694931`.
-Approved plan: revision 3 at `e3e73751b1db92ee4099de4e037366b608e3ca54`.
+Plan basis: approved revision 3 at `e3e73751b1db92ee4099de4e037366b608e3ca54`, updated to revision 4 under human answer `question_1788573184_913439`.
 
 The implementation report artifact identifies the final candidate SHA and records command results after commit. No gate result is claimed before execution.
 
 The implementation removes the deleted Drain match, observation variant, one vacuous test, and three Drain assertions. All other assertions remain. Each of the two test readers owns one persistent incomplete-frame buffer across its reads. The production mux reader remains the entry point for terminal output.
 
-The manifest, lockfile, live defaults, and README consume Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The live build comment and Core capacity comment use the verified new revisions. The close-event comment removes its historical revision label. Core still defines `INPUT_QUEUE_CAPACITY = 256`.
+The manifest, lockfile, live defaults, and README consume Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The live build comment and Core capacity comment use the verified new revisions. The close-event comment removes its historical revision label. Core still defines `INPUT_QUEUE_CAPACITY = 256`.
 
 Implementation files:
 
@@ -16,9 +16,10 @@ Implementation files:
 - `Cargo.lock`
 - `crates/botster-tui/src/app.rs`
 - `README.md`
+- `docs/plans/tui-roll-hub-and-core-pins-to-the-integration-cold-cut-plan.md`
 - This report.
 
-The branch also contains the approved plan under `docs/plans/`. The implementation does not change that plan.
+The branch also contains the approved plan under `docs/plans/`. This revision updates the active plan to the superseding human decision.
 
 Guidance: `implementer-playbook`, `botster-implementer-playbook`, `botster-tui-playbook`, the runtime Review and Verify overlays, and `project-pipelines-playbook` for the approved barrier. Targeted guidance includes the pin-roll defaults and README note, exact Git identity notes, persistent Unix mux guidance, split Hello and close guidance, live Ghostty profiles, primary-screen history, binary provenance, stable-commit verification, preserved assertion coverage, and repository test wrappers. The pipeline checklist records exact note filenames.
 
@@ -43,6 +44,6 @@ The isolated live lane uses the clean Hub checkout. Fresh release builds use the
 
 Assumptions and residual risk: shared matrix evidence does not exist for this candidate until independent Review and the Hub matrix finish. No shared resources are owned by this run. Final Verify must not advance early. Any candidate change renews the relevant review and proof.
 
-Deviations: none. The old-pin invariant requires updating the existing Core capacity comment. The deleted API requires no new adapter or test abstraction.
+Approved deviation: human answer `question_1788573184_913439` authorizes Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` after documentation corrections to the prior candidate. The active plan and every acceptance command now use this revision. Core and runtime behavior remain unchanged. The old-pin invariant requires updating the existing Core capacity comment. The deleted API requires no new adapter or test abstraction.
 
 Guidance gaps: the plan identifies stale current-pin prose, per-reader buffer lifetime, caller-owned provenance, and the frozen-candidate barrier. Existing notes already cover these constraints in part. The final checklist records whether this visit adds durable knowledge.
