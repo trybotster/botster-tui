@@ -4,11 +4,11 @@ Target: `trybotster/botster-tui`, `tgt_c3d470bab78549df920a41e8fb0e58d8`.
 Ticket: `ticket_1788460430_647093`. Run: `run_1788570301_694931`.
 Approved plan: revision 3 at `e3e73751b1db92ee4099de4e037366b608e3ca54`.
 
-This report belongs to the candidate commit that adds this file. The implementation report artifact records its exact SHA and command results after commit. No gate result is claimed before execution.
+The implementation report artifact identifies the final candidate SHA and records command results after commit. No gate result is claimed before execution.
 
 The implementation removes the deleted Drain match, observation variant, one vacuous test, and three Drain assertions. All other assertions remain. Each of the two test readers owns one persistent incomplete-frame buffer across its reads. The production mux reader remains the entry point for terminal output.
 
-The manifest, lockfile, live defaults, and README consume Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The Core capacity comment uses the verified new revision. Core still defines `INPUT_QUEUE_CAPACITY = 256`.
+The manifest, lockfile, live defaults, and README consume Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The live build comment and Core capacity comment use the verified new revisions. The close-event comment removes its historical revision label. Core still defines `INPUT_QUEUE_CAPACITY = 256`.
 
 Implementation files:
 
