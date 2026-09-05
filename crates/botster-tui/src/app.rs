@@ -23501,7 +23501,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub bb1a330 and Core 48a4370. Export
+        // Build matching binaries from Hub 205cadf and Core 93acae3. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -24223,7 +24223,7 @@ mod tests {
         );
 
         // Keep reading this Unix mux while `yes` fills the Core adapter.
-        // Hub 4f30d695 emits core_adapter_closed without host egress close.
+        // Hub emits core_adapter_closed without host egress close.
         let flood_id = format!("btui-flood-{}", short_suffix());
         let sibling_id = format!("btui-sib-{}", short_suffix());
         app.reset_attach_campaign();
