@@ -4,7 +4,9 @@ Ticket: `ticket_1788460430_647093`
 Run: `run_1788570301_694931`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Plan base: `origin/main` at `b051c67` (the run worktree was 21 commits behind main at spawn; the branch was reset to `origin/main` before planning)
-Revision 3: applies steward correction `msg_plugin-w_1788571659_a664fb` to the gate barrier and resolves Plan Review `review_1788571199_153928` findings `finding_1788571199_226441`, `finding_1788571199_658184`, and `finding_1788571199_293708`.
+Revision 3 history: applies steward correction `msg_plugin-w_1788571659_a664fb` to the gate barrier and resolves Plan Review `review_1788571199_153928` findings `finding_1788571199_226441`, `finding_1788571199_658184`, and `finding_1788571199_293708`.
+
+Revision 4: human answer `question_1788573184_913439` authorizes Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` after one documentation-only commit on `205cadf6f8dab9dc990537c2c00ef3d27edb31dd`. This decision supersedes the prior frozen Hub revision. Core stays at `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The Hub-first matrix and merge barrier remains unchanged.
 
 ## Target repository
 
@@ -49,14 +51,14 @@ Targeted atomic notes:
 
 Pipeline context:
 
-- Human sequencing decision `question_1788570185_464058` (Hub run) froze Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`.
-- Coordinator message `msg_plugin-w_1788570541_5a4ccf` under the operator's authority set the final order. The ticket description now carries it under "Coordinated candidate barrier". The Sequencing section below follows the ticket text exactly.
+- Historical human sequencing decision `question_1788570185_464058` (Hub run) initially froze Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`.
+- Coordinator message `msg_plugin-w_1788570541_5a4ccf` under the operator's authority set the final order. The ticket description now carries it under "Coordinated candidate barrier". The Sequencing section preserves that order and applies the later human revision decision.
 - Failed Hub integration evidence `artifact_1788569974_983676` names TUI `app.rs` lines 4714, 19694, 19710, and 20920 as the four compile failures against Hub `205cadf`.
 - Human answer `question_1788570499_542658` (this run) chose option A: the Hub integration agent pushed the existing branch `project-pipelines/ticket_1787600679_990088` at exact commit `205cadf` to origin, with no rewrite. Hub evidence `artifact_1788570656_582032`.
 - Hub integration ticket `ticket_1787600679_990088` (target `tgt_7e208a0c76a44980a83b63af976b1f22`) owns the complete matrix. Its post-Core correction requires `script/test-live-hub ghostty` and `script/prove-north-star-shared-session` in the final matrix before Hub merge.
 - Scratch commit `eeadb33` (parent `38e5717`, branch `proof/ticket_1787600679-e50e0f0`) is an unreviewed handoff reference. This plan reimplements it in the run worktree. It does not cherry-pick it.
 
-Verified facts at plan time:
+Historical facts verified for revision 3 (before the authorized Hub documentation correction):
 
 | Fact | Result |
 | --- | --- |
@@ -82,51 +84,52 @@ Verified facts at plan time:
 
 In scope:
 
-1. Source migration in `crates/botster-tui/src/app.rs` against Hub `205cadf`:
+1. Source migration in `crates/botster-tui/src/app.rs` against Hub `9a02e55`:
    - Remove the `DaemonRequest::Drain { .. }` match arm at line 4714.
    - Remove the `ObservedRequest::Drain(String)` variant at line 7420. The variant has no producer after the arm is gone.
    - Remove the three assertions that state no `ObservedRequest::Drain` was observed (lines 20167, 26551, 26821). The type can no longer express a Drain request, so the assertions become unrepresentable.
    - Delete the test `poll_hub_does_not_send_terminal_drain` (line 20157). Its only assertion is the Drain check. The two larger tests at 26551 and 26821 keep every other assertion.
    - Give each `read_frame_from_reader` stream one persistent `incomplete: String` that lives as long as the `BufReader` for that stream. The recovery stub thread (lines 19694 and 19710) uses one buffer for Hello and the frame loop. The second stub (line 20920) uses one buffer for its loop.
 2. Durable pin roll in `crates/botster-tui/Cargo.toml`:
-   - `botster-hub-client` and `botster-hub-test-support`: `rev = "205cadf6f8dab9dc990537c2c00ef3d27edb31dd"`.
+   - `botster-hub-client` and `botster-hub-test-support`: `rev = "9a02e55f06ac269188a7d81604eda6efd9584a13"`.
    - `botster-core`, `botster-terminal-ghostty`, `botster-terminal-protocol-client`, `botster-core-test-support`: `rev = "93acae3f98adbc21dc981d113c4eb2f31ead4ad0"`.
    - Keep the `https://github.com/trybotster/botster-core.git` and `https://github.com/trybotster/botster-hub.git` URL forms and the `rev =` selector.
    - Keep `default-features = false` on `botster-core` and `botster-core-test-support`. Keep `features = ["libghostty-vt"]` on `botster-terminal-ghostty`.
    - Do not touch `botster-tui-kit` or `botster-ui-contract`.
 3. `Cargo.lock`: update only the Hub and Core Git sources. No registry crate churn.
-4. Ghostty live-lane defaults in `app.rs` (main lines 23532 and 23534): `BOTSTER_HUB_BIN_REV` default `205cadf...`, `BOTSTER_SESSION_WORKER_BIN_REV` default `93acae3...`.
+4. Ghostty live-lane defaults in `app.rs` (main lines 23532 and 23534): `BOTSTER_HUB_BIN_REV` default `9a02e55...`, `BOTSTER_SESSION_WORKER_BIN_REV` default `93acae3...`.
 5. README pin prose. Every active sentence that states the revision this crate pins changes to the new pins:
    - Every sentence that names `bb1a330...` or `48a4370...` (Foundation table, Live hub verification paragraph, the Ghostty live proof build sentence and export block, the session-types `Pins` list and its comment). Short-form SHAs count.
-   - The Workspaces lanes sentence at README line 308, "the revision this crate pins, currently `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`". It is an active current-pin claim and changes to `205cadf...`.
+   - The Workspaces lanes sentence at README line 308, "the revision this crate pins, currently `4f30d6952f9a29541ab3a670a54bf5e136b8eb8e`". It is an active current-pin claim and changes to `9a02e55...`.
    - Keep genuine minimum-version claims (`7a09292` or later for shared lanes, floor 48, protocol 8) and the historical public package reference `@trybotster/hub-test-support@0.1.39` in the contract-matrix paragraph. Those are not current-pin claims and have no source evidence for a change.
-6. One implement report under `docs/reports/` that records the candidate SHA, gate commands, live-lane provenance, and the zero-match search.
+6. Update this active plan for the authorized Hub revision and keep historical context labeled.
+7. One implement report under `docs/reports/` that records the candidate SHA, gate commands, live-lane provenance, and the zero-match search.
 
 Out of scope:
 
 - Adopting the new `botster-hub-client` `poll_terminal` or `next_terminal` helpers. The TUI keeps its own production mux reader (`pending_mux_frames`, `mux_buf`). The ticket does not ask for that change.
 - Any adapter, fallback, shim, `#[allow(dead_code)]`, or compatibility branch. The scratch commit's `#[allow(dead_code)]` on `ObservedRequest::Drain` is a hack and is not adopted.
 - Compensation for any Hub or Core close defect. If a live lane exposes one, file it against Hub or Core and stop.
-- Historical files under `docs/plans/**` and `docs/reports/**`. They keep their original revisions.
-- Any re-pin to a Hub revision other than `205cadf`. See Sequencing.
-- Merging this ticket before Hub merges exact `205cadf`.
+- Unrelated historical files under `docs/plans/**` and `docs/reports/**`. They keep their original revisions. This ticket's active plan and report follow revision 4.
+- Any re-pin to a Hub revision other than `9a02e55`. See Sequencing.
+- Merging this ticket before Hub merges exact `9a02e55`.
 
 ## Sequencing and the candidate barrier
 
-The pins stay exact through final merge: Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. There is no phase that re-pins to a later Hub main tip. Hub direct-merges the exact frozen candidate, so the merged Hub main contains `205cadf`, and the TUI pin already names the consumed revision.
+The pins stay exact through final merge: Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` and Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`. The authorized documentation correction selects this exact candidate. No later Hub main tip is selected automatically. Hub direct-merges the exact frozen candidate, so the merged Hub main contains `9a02e55`, and the TUI pin already names the consumed revision.
 
 Order:
 
-1. Implement verifies fetchability before it changes any pin: `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088` must return `205cadf...`.
+1. Implement verifies fetchability before it changes any pin: `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088` must return `9a02e55...`.
 2. Implement makes the source migration, pin roll, lock update, defaults, README, and report. It commits one clean candidate on `project-pipelines/ticket_1788460430_647093`, pushes the branch, and runs every repository gate plus the isolated `ghostty` lane (Acceptance section).
 3. Review approves that exact candidate SHA independently. Review records the SHA for the Hub integration ticket `ticket_1787600679_990088` on target `tgt_7e208a0c76a44980a83b63af976b1f22`. Use the operator-approved Verify gate barrier. Do not register a formal ticket dependency in either direction. Coordinator decision `msg_plugin-w_1788570541_5a4ccf`, clarified by steward message `msg_plugin-w_1788571659_a664fb`, controls this exception.
-4. The Hub integration run consumes the exact approved TUI SHA for one complete unspliced matrix, including its `script/test-live-hub ghostty` and `script/prove-north-star-shared-session` legs, and direct-merges exact `205cadf` after the matrix passes.
-5. Verify holds until Hub merge evidence exists. Verify gate evidence must include: the Hub matrix artifact id that names the TUI candidate SHA; `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/main`; and `git merge-base --is-ancestor 205cadf6f8dab9dc990537c2c00ef3d27edb31dd <hub main>` returning success in a fresh Hub fetch. Verify must not submit a passed gate or request advancement before this evidence exists. The steward resumes Verify when the Hub matrix and merge evidence are available.
+4. The Hub integration run consumes the exact approved TUI SHA for one complete unspliced matrix, including its `script/test-live-hub ghostty` and `script/prove-north-star-shared-session` legs, and direct-merges exact `9a02e55` after the matrix passes.
+5. Verify holds until Hub merge evidence exists. Verify gate evidence must include: the Hub matrix artifact id that names the TUI candidate SHA; `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/main`; and `git merge-base --is-ancestor 9a02e55f06ac269188a7d81604eda6efd9584a13 <hub main>` returning success in a fresh Hub fetch. Verify must not submit a passed gate or request advancement before this evidence exists. The steward resumes Verify when the Hub matrix and merge evidence are available.
 6. Verify confirms the merged Hub pin (step 5 evidence), reruns the repository gates and the isolated `ghostty` lane at the same candidate SHA from a clean tree, records the shared-lane evidence from the Hub matrix, and approves. The run then merges directly to main.
 
 Stop conditions:
 
-- If Hub merges a revision that is not `205cadf`, or the Hub branch is rewritten, or the Core revision consumed by the merged Hub differs from `93acae3`: stop. Ask the human for coordination. Any new candidate on either side renews Review, the complete Hub matrix, and Verify before merge.
+- If Hub merges a revision that is not `9a02e55`, or the Hub branch is rewritten, or the Core revision consumed by the merged Hub differs from `93acae3`: stop. Ask the human for coordination. Any new candidate on either side renews Review, the complete Hub matrix, and Verify before merge.
 - If the TUI candidate changes after Review approval (for example a Review send-back), the Hub matrix must rerun against the new SHA before Hub merges.
 
 ## Ownership boundaries and cross-repository dependencies
@@ -135,7 +138,7 @@ Stop conditions:
 - botster-hub owns `botster-hub-client`, `botster-hub-test-support`, the Hub binary, the removal of `Drain`, the complete integration matrix, the north-star shared-session harness, and the Hub merge. The TUI does not restore any of it.
 - botster-core owns the session worker and the terminal protocol crates. Core `93acae3` is Core main; no Core change is required.
 - botster-web owns the Web keep-alive leg that produces `NORTH_STAR_HISTORY` and the browser one-document reconnect proof inside the Hub matrix.
-- Cross-repository prerequisite (satisfied at plan time): Hub `205cadf` fetchable on the Hub remote. Fetchability is re-checked as the first Implement gate.
+- Cross-repository prerequisite (rechecked for revision 4): Hub `9a02e55` fetchable on the Hub remote. Fetchability is re-checked as the first Implement gate.
 - Cross-repository barrier: the operator-approved Verify gate holds completion until the Hub matrix and merge evidence exist. The Hub integration ticket `ticket_1787600679_990088` owns that evidence on target `tgt_7e208a0c76a44980a83b63af976b1f22`. No formal ticket dependency is registered. Barrier proof: Sequencing step 5.
 
 ## Assumptions and unknowns
@@ -143,14 +146,14 @@ Stop conditions:
 Assumptions:
 
 - The Hub matrix consumes the TUI candidate by Git SHA. It may additionally patch Hub crates to its own worktree; that is Hub's concern and does not change the TUI candidate.
-- Hub direct-merges exact `205cadf`. If the merge creates a merge commit, the ancestry check in Sequencing step 5 still passes and the TUI pin stays `205cadf`.
+- Hub direct-merges exact `9a02e55`. If the merge creates a merge commit, the ancestry check in Sequencing step 5 still passes and the TUI pin stays `9a02e55`.
 - The three `read_frame_from_reader` sites plus the Drain arm are the only compile failures. The Core API delta adds one method and removes nothing, so no Core-driven source change is expected.
 - Formal dependencies cannot represent this candidate barrier under the controlling operator decision. The steward coordinates resumption. Final Verify still requires every gate field in Sequencing step 5.
 
 Unknowns for Implement to resolve:
 
 - Whether `cargo test --workspace --all-targets` at the new pins exposes a behavioral change in the shared-connection recovery stubs beyond the signature change. The scratch commit built and ran with a 21-line diff, which suggests no.
-- Whether `script/test-live-hub ghostty` at Hub `205cadf` and Core `93acae3` completes with `ghostty-live-complete`. The Hub matrix previously failed at compile, so no live TUI result exists at these pins.
+- Whether `script/test-live-hub ghostty` at Hub `9a02e55` and Core `93acae3` completes with `ghostty-live-complete`. Prior isolated proof passed at the old candidate. Renew isolated proof and the complete matrix at the new candidate.
 
 ## Affected surfaces and files
 
@@ -158,6 +161,7 @@ Unknowns for Implement to resolve:
 | --- | --- |
 | `crates/botster-tui/Cargo.toml` | Six `rev` values (two Hub, four Core) |
 | `Cargo.lock` | Hub and Core Git source lines only |
+| This plan | Revision 4 records the human decision and updates active acceptance commands |
 | `crates/botster-tui/src/app.rs` | Drain arm and variant removal, three assertion removals, one test deletion, three `read_frame_from_reader` calls with a persistent buffer, two live-lane revision defaults |
 | `README.md` | Every active sentence that names Hub `bb1a330`, Core `48a4370`, or the current-pin claim `4f30d69` at line 308 |
 | `docs/reports/tui-roll-hub-and-core-pins-to-the-integration-cold-cut-implement-report.md` | New report |
@@ -168,7 +172,7 @@ Unknowns for Implement to resolve:
 - Production build versus test build divergence (`default-features = false`): green tests can hide a broken binary graph. Mitigation: `cargo build -p botster-tui --locked` as a separate gate.
 - Stale README or default revisions. Mitigation: zero-match search for both old SHAs (full and seven-character forms) and for `4f30d69` outside `Cargo.lock` and `docs/`.
 - Coverage loss from test deletion: only `poll_hub_does_not_send_terminal_drain` is deleted, and its single assertion cannot be expressed. The two larger tests keep every non-Drain assertion.
-- Live-lane fixture mismatch: the isolated lane asserts `Hub fixture Core pin must match the live session worker`. Hub `205cadf` test support pins Core `93acae3`, which matches the new worker default.
+- Live-lane fixture mismatch: the isolated lane asserts `Hub fixture Core pin must match the live session worker`. Hub `9a02e55` test support pins Core `93acae3`, which matches the new worker default.
 - Shared-lane screen state: if the Web keep-alive leg leaves the producer on the alternate screen, `ghostty-shared` fails on `NORTH_STAR_HISTORY` without a TUI defect. Mitigation: the matrix leg contract in Acceptance.
 - Environment revision labels are not running-binary proof. Mitigation: the isolated lane records the caller build receipt and binary paths; the shared lanes record the caller's receipt, socket, and session identity.
 - Barrier drift: completing Verify before Hub merge would permit an early TUI merge. Mitigation: Verify must not pass or advance without every evidence field in Sequencing step 5.
@@ -181,7 +185,7 @@ Pre-change gate:
 
 ```sh
 git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088
-# must print 205cadf6f8dab9dc990537c2c00ef3d27edb31dd
+# must print 9a02e55f06ac269188a7d81604eda6efd9584a13
 git ls-remote https://github.com/trybotster/botster-core.git refs/heads/main
 # must print 93acae3f98adbc21dc981d113c4eb2f31ead4ad0
 ```
@@ -199,11 +203,11 @@ cargo build --locked
 Pin invariants:
 
 ```sh
-grep -rn 'bb1a330543bc06888f894edd5f40a0f867753a12\|48a437032791e678010254708259568ce4ad02bf\|bb1a330\|48a4370\|4f30d6952f9a29541ab3a670a54bf5e136b8eb8e\|4f30d69' . --exclude-dir=target --exclude-dir=.git --exclude-dir=docs --exclude=Cargo.lock
+grep -rn '205cadf\|bb1a330543bc06888f894edd5f40a0f867753a12\|48a437032791e678010254708259568ce4ad02bf\|bb1a330\|48a4370\|4f30d6952f9a29541ab3a670a54bf5e136b8eb8e\|4f30d69' . --exclude-dir=target --exclude-dir=.git --exclude-dir=docs --exclude=Cargo.lock
 # must return zero matches
 grep -c 'botster-core.git?rev=93acae3f98adbc21dc981d113c4eb2f31ead4ad0' Cargo.lock   # expected 5
-grep -c 'botster-hub.git?rev=205cadf6f8dab9dc990537c2c00ef3d27edb31dd' Cargo.lock    # expected 2
-grep -c 'rev=bb1a330\|rev=48a4370' Cargo.lock                                          # expected 0
+grep -c 'botster-hub.git?rev=9a02e55f06ac269188a7d81604eda6efd9584a13' Cargo.lock    # expected 2
+grep -c 'rev=205cadf\|rev=bb1a330\|rev=48a4370' Cargo.lock                                          # expected 0
 grep -n 'DaemonRequest::Drain\|ObservedRequest::Drain\|Drain(String)\|allow(dead_code)' crates/botster-tui/src/app.rs
 # must return zero matches
 git diff origin/main -- Cargo.lock | grep '^[-+]source' | grep -v 'botster-hub.git\|botster-core.git'
@@ -217,16 +221,16 @@ Source-migration proof:
 
 ### Live proof, isolated lane (TUI-owned, Implement and Verify)
 
-Build Hub and session-worker binaries from a clean Hub checkout at exact `205cadf` into a fresh target directory. Write the build receipt with `script/write-claim-build-receipt` so `hub_rev` comes from `git rev-parse HEAD` of that checkout and `core_rev` comes from the Hub `Cargo.lock` (`93acae3`). Record the receipt path, both binary paths, and the receipt contents in the implement report.
+Build Hub and session-worker binaries from a clean Hub checkout at exact `9a02e55` into a fresh target directory. Write the build receipt with `script/write-claim-build-receipt` so `hub_rev` comes from `git rev-parse HEAD` of that checkout and `core_rev` comes from the Hub `Cargo.lock` (`93acae3`). Record the receipt path, both binary paths, and the receipt contents in the implement report.
 
 ```sh
 export CARGO_TARGET_DIR="$TMPDIR/botster-tui-cold-cut-target"
 export BOTSTER_HUB_BIN=<receipt hub_bin>
 export BOTSTER_SESSION_WORKER_BIN=<receipt worker_bin>
-export BOTSTER_HUB_BIN_REV=205cadf6f8dab9dc990537c2c00ef3d27edb31dd
+export BOTSTER_HUB_BIN_REV=9a02e55f06ac269188a7d81604eda6efd9584a13
 export BOTSTER_SESSION_WORKER_BIN_REV=93acae3f98adbc21dc981d113c4eb2f31ead4ad0
 script/test-live-hub ghostty
-# must stream: ghostty-live-complete: hub_rev=205cadf… worker_rev=93acae3…
+# must stream: ghostty-live-complete: hub_rev=9a02e55… worker_rev=93acae3…
 ```
 
 Run the lane twice: once with the two `BOTSTER_*_REV` exports, and once with them unset. Both runs must print the same `hub_rev` and `worker_rev`, which proves the new defaults. The printed revisions are labels; the receipt and binary paths are the running-binary proof.
@@ -237,7 +241,7 @@ This lane proves terminal input, output, Ghostty install, scrollback, palette, m
 
 The caller is the Hub integration run's `script/prove-north-star-shared-session` harness at the same frozen tuple. The caller owns the Hub, the shared session, and the Web producer. The TUI run does not spawn or shut down shared resources.
 
-Caller provenance that the TUI evidence must record verbatim: the caller's build receipt (`hub_rev` = `205cadf…`, `core_rev` = `93acae3…`, binary paths), the Hub socket path inside `BOTSTER_HUB_CONNECTION`, and the session identity `BOTSTER_SHARED_SESSION_ID=north-star-shared`. `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN` must be unset for these lanes. Environment revision labels are not accepted as running-binary proof for shared lanes.
+Caller provenance that the TUI evidence must record verbatim: the caller's build receipt (`hub_rev` = `9a02e55…`, `core_rev` = `93acae3…`, binary paths), the Hub socket path inside `BOTSTER_HUB_CONNECTION`, and the session identity `BOTSTER_SHARED_SESSION_ID=north-star-shared`. `BOTSTER_HUB_BIN` and `BOTSTER_SESSION_WORKER_BIN` must be unset for these lanes. Environment revision labels are not accepted as running-binary proof for shared lanes.
 
 Named matrix legs, in order, at the same frozen tuple:
 
@@ -253,12 +257,12 @@ The TUI report and Verify evidence cite the Hub matrix artifact id and each leg'
 ### Downstream and barrier proof
 
 - The Hub matrix runs against the exact approved TUI candidate SHA, not TUI main.
-- Verify gate evidence includes the Hub matrix artifact id, the Hub main SHA from a fresh `ls-remote`, and a successful `git merge-base --is-ancestor 205cadf… <hub main>` (Sequencing step 5).
+- Verify gate evidence includes the Hub matrix artifact id, the Hub main SHA from a fresh `ls-remote`, and a successful `git merge-base --is-ancestor 9a02e55… <hub main>` (Sequencing step 5).
 - Verify reruns the repository gates and the isolated lane at the candidate SHA after Hub merge, from a clean tree.
 
 ## Vault gaps worth capturing
 
 - The TUI README carried an active current-pin claim (`4f30d69` in the Workspaces lanes paragraph) that earlier zero-match searches missed because they targeted only the pins being rolled. A capture should require every "the revision this crate pins" sentence to be part of the search, not only the old SHAs.
 - A consumer candidate pinned to a frozen branch-only upstream commit, with the upstream merging that exact commit first and the consumer holding Verify on ancestry proof, is a reusable cold-cut barrier pattern worth one convention note.
-- The persistent `incomplete` buffer per stream for `read_frame_from_reader` is a new client-side contract at Hub `205cadf`. A short gotcha note should point consumers at one buffer per `BufReader`.
+- The persistent `incomplete` buffer per stream for `read_frame_from_reader` is a new client-side contract at the prior Hub `205cadf`. A short gotcha note should point consumers at one buffer per `BufReader`.
 - Shared live lanes take no binary inputs, so their running-binary provenance must come from the caller's receipt, socket, and session identity. Worth folding into the live Ghostty profile note.

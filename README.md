@@ -31,9 +31,9 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` |
+| `botster-hub-client` / live hub | Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `205cadf6f8dab9dc990537c2c00ef3d27edb31dd` (`@trybotster/hub-test-support@0.1.43`) |
+| `botster-hub-test-support` package | Hub git `9a02e55f06ac269188a7d81604eda6efd9584a13` (`@trybotster/hub-test-support@0.1.43`) |
 | `botster-tui-kit` | `7940306b0d7461a12575b3856a96c0fbb23784f3` |
 | `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
@@ -74,7 +74,7 @@ signal: one recovery Attach with a new `subscription_id`, then fail closed.
 Generic package-event notice consumption is
 `script/test-live-hub package-events` against the Hub-owned
 `plugin-contract-matrix` fixture. Shared live lanes need a caller Hub at
-`205cadf` or later.
+`9a02e55` or later.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -169,7 +169,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`205cadf6f8dab9dc990537c2c00ef3d27edb31dd` (same Hub pin as Foundation above).
+`9a02e55f06ac269188a7d81604eda6efd9584a13` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -196,14 +196,14 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 ```
 
 Incremental Ghostty live proof (protocol 8 / floor 48). Build Hub
-`205cadf6f8dab9dc990537c2c00ef3d27edb31dd` and Core worker
+`9a02e55f06ac269188a7d81604eda6efd9584a13` and Core worker
 `93acae3f98adbc21dc981d113c4eb2f31ead4ad0` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=205cadf6f8dab9dc990537c2c00ef3d27edb31dd
+export BOTSTER_HUB_BIN_REV=9a02e55f06ac269188a7d81604eda6efd9584a13
 export BOTSTER_SESSION_WORKER_BIN_REV=93acae3f98adbc21dc981d113c4eb2f31ead4ad0
 script/test-live-hub ghostty
 ```
@@ -273,7 +273,7 @@ Session types are authoritative Hub descriptors consumed through the
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 48` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `205cadf6f8dab9dc990537c2c00ef3d27edb31dd`, Core crates
+- Pins: Hub crates `9a02e55f06ac269188a7d81604eda6efd9584a13`, Core crates
   `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`, Ghostty
   `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
   `botster-ui-contract-v0.3.3`, and kit
@@ -282,7 +282,7 @@ Session types are authoritative Hub descriptors consumed through the
 Live proof (independent of contract-matrix):
 
 ```sh
-# Use Hub 205cadf and Core 93acae3 binaries (same pins as Foundation).
+# Use Hub 9a02e55 and Core 93acae3 binaries (same pins as Foundation).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -305,7 +305,7 @@ list-for-target for a real admitted spawn point `T` (not `device:local`).
 are the repository-owned runtime proof that the installed Workspaces package,
 including the spawn-form `session_type_id` field and lifecycle bindings, works
 against a protocol-7 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `205cadf6f8dab9dc990537c2c00ef3d27edb31dd`) and an
+this crate pins, currently `9a02e55f06ac269188a7d81604eda6efd9584a13`) and an
 explicit clean post-migration `botster-workspaces` package path via
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
 also pins the acceptance driver field key so a silent `template_id` revert
