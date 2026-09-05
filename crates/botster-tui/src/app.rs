@@ -4711,9 +4711,6 @@ impl TuiApp {
             DaemonRequest::RemoveSession { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::RemoveSession(session_id.clone())),
-            DaemonRequest::Drain { session_id, .. } => self
-                .observed_requests
-                .push(ObservedRequest::Drain(session_id.clone())),
             DaemonRequest::ReadScreen { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::ReadScreen(session_id.clone())),
@@ -7417,6 +7414,7 @@ enum ObservedRequest {
     },
     ShutdownSession(String),
     RemoveSession(String),
+    #[allow(dead_code)]
     Drain(String),
     ReadScreen(String),
     ReadModeFlags(String),
@@ -19690,8 +19688,12 @@ mod tests {
                         return;
                     };
                     let mut reader = std::io::BufReader::new(reader_stream);
+                    let mut incomplete = String::new();
                     let _hello: botster_hub_client::DaemonHello =
-                        match botster_hub_client::read_frame_from_reader(&mut reader) {
+                        match botster_hub_client::read_frame_from_reader(
+                            &mut reader,
+                            &mut incomplete,
+                        ) {
                             Ok(hello) => hello,
                             Err(_) => return,
                         };
@@ -19707,7 +19709,10 @@ mod tests {
                     }
                     loop {
                         let value: Value =
-                            match botster_hub_client::read_frame_from_reader(&mut reader) {
+                            match botster_hub_client::read_frame_from_reader(
+                                &mut reader,
+                                &mut incomplete,
+                            ) {
                                 Ok(value) => value,
                                 Err(_) => return,
                             };
@@ -20916,8 +20921,12 @@ mod tests {
                 return;
             };
             let mut reader = std::io::BufReader::new(reader_stream);
+            let mut incomplete = String::new();
             loop {
-                let value: Value = match botster_hub_client::read_frame_from_reader(&mut reader) {
+                let value: Value = match botster_hub_client::read_frame_from_reader(
+                    &mut reader,
+                    &mut incomplete,
+                ) {
                     Ok(value) => value,
                     Err(_) => return,
                 };
