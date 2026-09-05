@@ -99,7 +99,7 @@ const SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 48;
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const TERMINAL_INPUT_WRITE_BOUND: Duration = DETACH_ON_DISCONNECT_BOUND;
-// Core INPUT_QUEUE_CAPACITY is 256 at 48a437032791e678010254708259568ce4ad02bf.
+// Core INPUT_QUEUE_CAPACITY is 256 at 93acae3f98adbc21dc981d113c4eb2f31ead4ad0.
 const TERMINAL_INPUT_INFLIGHT_CAPACITY: usize = 64;
 const TERMINAL_INPUT_INFLIGHT_BYTES: usize = 256 * 1024;
 const _: () = assert!(TERMINAL_INPUT_INFLIGHT_CAPACITY < 256);
@@ -4711,9 +4711,6 @@ impl TuiApp {
             DaemonRequest::RemoveSession { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::RemoveSession(session_id.clone())),
-            DaemonRequest::Drain { session_id, .. } => self
-                .observed_requests
-                .push(ObservedRequest::Drain(session_id.clone())),
             DaemonRequest::ReadScreen { session_id } => self
                 .observed_requests
                 .push(ObservedRequest::ReadScreen(session_id.clone())),
@@ -7417,7 +7414,6 @@ enum ObservedRequest {
     },
     ShutdownSession(String),
     RemoveSession(String),
-    Drain(String),
     ReadScreen(String),
     ReadModeFlags(String),
     CaptureSnapshot(String),
@@ -19690,8 +19686,12 @@ mod tests {
                         return;
                     };
                     let mut reader = std::io::BufReader::new(reader_stream);
+                    let mut incomplete = String::new();
                     let _hello: botster_hub_client::DaemonHello =
-                        match botster_hub_client::read_frame_from_reader(&mut reader) {
+                        match botster_hub_client::read_frame_from_reader(
+                            &mut reader,
+                            &mut incomplete,
+                        ) {
                             Ok(hello) => hello,
                             Err(_) => return,
                         };
@@ -19706,11 +19706,13 @@ mod tests {
                         return;
                     }
                     loop {
-                        let value: Value =
-                            match botster_hub_client::read_frame_from_reader(&mut reader) {
-                                Ok(value) => value,
-                                Err(_) => return,
-                            };
+                        let value: Value = match botster_hub_client::read_frame_from_reader(
+                            &mut reader,
+                            &mut incomplete,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => return,
+                        };
                         if value.get("plane").and_then(Value::as_str)
                             == Some(botster_hub_client::UNIX_TERMINAL_PLANE)
                         {
@@ -20151,21 +20153,6 @@ mod tests {
         });
         assert_eq!(app.attached_session.as_deref(), Some("session-b"));
         assert!(viewport_cache_contains(&app, "BBB"));
-    }
-
-    #[test]
-    fn poll_hub_does_not_send_terminal_drain() {
-        let mut app = TuiApp::new(None);
-        app.sessions = vec![SessionRow::running("session-alpha")];
-        app.selected_session = Some("session-alpha".to_string());
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        app.observed_requests.clear();
-        app.poll_hub();
-        assert!(
-            app.observed_requests
-                .iter()
-                .all(|request| !matches!(request, ObservedRequest::Drain(_)))
-        );
     }
 
     #[test]
@@ -20916,8 +20903,12 @@ mod tests {
                 return;
             };
             let mut reader = std::io::BufReader::new(reader_stream);
+            let mut incomplete = String::new();
             loop {
-                let value: Value = match botster_hub_client::read_frame_from_reader(&mut reader) {
+                let value: Value = match botster_hub_client::read_frame_from_reader(
+                    &mut reader,
+                    &mut incomplete,
+                ) {
                     Ok(value) => value,
                     Err(_) => return,
                 };
@@ -23529,9 +23520,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "bb1a330543bc06888f894edd5f40a0f867753a12".to_string());
+            .unwrap_or_else(|_| "205cadf6f8dab9dc990537c2c00ef3d27edb31dd".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "48a437032791e678010254708259568ce4ad02bf".to_string());
+            .unwrap_or_else(|_| "93acae3f98adbc21dc981d113c4eb2f31ead4ad0".to_string());
         let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
         let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
         assert_eq!(
@@ -26545,12 +26536,6 @@ mod tests {
             app.observed_requests
                 .contains(&ObservedRequest::ReadScreen(prior_session_id.clone()))
         );
-        assert!(
-            app.observed_requests
-                .iter()
-                .all(|request| !matches!(request, ObservedRequest::Drain(_))),
-            "production attach must not send terminal Drain"
-        );
 
         let attached_deadline = Instant::now() + Duration::from_secs(7);
         while app.attached_session.as_deref() != Some(prior_session_id.as_str())
@@ -26813,13 +26798,6 @@ mod tests {
                 .filter(|request| matches!(request, ObservedRequest::ReadScreen(id) if id == &empty_session_id))
                 .count(),
             1
-        );
-        assert!(
-            empty_app
-                .observed_requests
-                .iter()
-                .all(|request| !matches!(request, ObservedRequest::Drain(_))),
-            "production attach must not send terminal Drain"
         );
         assert_eq!(
             empty_app
