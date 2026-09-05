@@ -39,7 +39,7 @@ Required commands at the committed candidate:
 
 Each gate records HEAD and clean status before and after execution. The artifact records exits, test counts, marker lines, and log paths. Pin checks require five Core and two Hub lock sources, no registry changes, no active old revisions, and no deleted Drain symbols.
 
-The isolated live lane uses a clean Hub checkout at `/private/tmp/tui-cold-cut-hub-647093`. Fresh release builds use `/private/tmp/tui-cold-cut-hub-build-647093`. The repository receipt writer records the checkout revision, locked Core revision, binary paths, and build commands. The artifact preserves the receipt contents.
+The isolated live lane uses the clean Hub checkout. Fresh release builds use the fresh release target directory. The repository receipt writer records the checkout revision, locked Core revision, binary paths, and build commands. The artifact preserves the receipt contents.
 
 Assumptions and residual risk: shared matrix evidence does not exist for this candidate until independent Review and the Hub matrix finish. No shared resources are owned by this run. Final Verify must not advance early. Any candidate change renews the relevant review and proof.
 
