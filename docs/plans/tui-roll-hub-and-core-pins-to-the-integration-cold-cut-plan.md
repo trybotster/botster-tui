@@ -4,7 +4,7 @@ Ticket: `ticket_1788460430_647093`
 Run: `run_1788570301_694931`
 Pipeline: Botster Stack Delivery (`botster_stack_delivery`)
 Plan base: `origin/main` at `b051c67` (the run worktree was 21 commits behind main at spawn; the branch was reset to `origin/main` before planning)
-Revision 2: resolves Plan Review `review_1788571199_153928` findings `finding_1788571199_226441`, `finding_1788571199_658184`, and `finding_1788571199_293708`.
+Revision 3: applies steward correction `msg_plugin-w_1788571659_a664fb` to the gate barrier and resolves Plan Review `review_1788571199_153928` findings `finding_1788571199_226441`, `finding_1788571199_658184`, and `finding_1788571199_293708`.
 
 ## Target repository
 
@@ -22,7 +22,7 @@ Role and stack playbooks:
 - `[[botster-tui-playbook]]`
 - `[[botster-runtime-reviewer-playbook]]` -- Review overlay for the terminal, transport, and live-lane surfaces this roll touches.
 - `[[botster-runtime-verifier-playbook]]` -- Verify overlay; live evidence must come from exact commands, a clean tree, and production paths.
-- `[[project-pipelines-playbook]]` -- for the dependency and hold policy in the Sequencing section only.
+- `[[project-pipelines-playbook]]` -- for the gate barrier and hold policy in the Sequencing section only.
 
 Targeted atomic notes:
 
@@ -42,8 +42,8 @@ Targeted atomic notes:
 - `[[deleting a waiver proof test can drop unrelated coverage in its tail]]` -- remove only the Drain assertion inside larger tests.
 - `[[colon worktree paths break cargo dyld library paths]]` -- colon-free `CARGO_TARGET_DIR` for gates.
 - `[[test script required for rust tests not cargo test]]` -- use the repository wrappers.
-- `[[cross repo dependency registration must use dependency repo target]]` -- the Hub barrier registers against the Hub target id.
-- `[[dependency closure must requeue the blocked parent step]]` -- Hub ticket closure resumes the held TUI step.
+- `[[cross repo dependency registration must use dependency repo target]]` -- identifies the Hub owner; the operator forbids formal dependency edges for this candidate barrier.
+- `[[dependency closure must requeue the blocked parent step]]` -- describes a proposed workflow invariant, not proof of automatic resumption; the steward resumes Verify.
 
 `[[botster runtime teardown lenses]]` was not loaded. The ticket removes one deleted request variant and changes one helper signature. It does not change peer, session, or adapter ownership. Plan Review confirmed that the teardown class does not apply.
 
@@ -119,9 +119,9 @@ Order:
 
 1. Implement verifies fetchability before it changes any pin: `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088` must return `205cadf...`.
 2. Implement makes the source migration, pin roll, lock update, defaults, README, and report. It commits one clean candidate on `project-pipelines/ticket_1788460430_647093`, pushes the branch, and runs every repository gate plus the isolated `ghostty` lane (Acceptance section).
-3. Review approves that exact candidate SHA independently. At approval, Review registers the durable barrier: a ticket dependency from this ticket to the Hub integration ticket `ticket_1787600679_990088` on Hub target `tgt_7e208a0c76a44980a83b63af976b1f22`, with the approved TUI candidate SHA in the dependency evidence. The barrier is registered at the handoff, not before candidate creation, so it cannot block the candidate. It is not circular: the Hub ticket consumes a TUI commit SHA, not TUI ticket closure.
+3. Review approves that exact candidate SHA independently. Review records the SHA for the Hub integration ticket `ticket_1787600679_990088` on target `tgt_7e208a0c76a44980a83b63af976b1f22`. Use the operator-approved Verify gate barrier. Do not register a formal ticket dependency in either direction. Coordinator decision `msg_plugin-w_1788570541_5a4ccf`, clarified by steward message `msg_plugin-w_1788571659_a664fb`, controls this exception.
 4. The Hub integration run consumes the exact approved TUI SHA for one complete unspliced matrix, including its `script/test-live-hub ghostty` and `script/prove-north-star-shared-session` legs, and direct-merges exact `205cadf` after the matrix passes.
-5. Verify holds until Hub merge evidence exists. Verify gate evidence must include: the Hub matrix artifact id that names the TUI candidate SHA; `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/main`; and `git merge-base --is-ancestor 205cadf6f8dab9dc990537c2c00ef3d27edb31dd <hub main>` returning success in a fresh Hub fetch. Hub ticket closure requeues the held step per `[[dependency closure must requeue the blocked parent step]]`; if the engine does not requeue, the steward reactivates Verify with the same evidence.
+5. Verify holds until Hub merge evidence exists. Verify gate evidence must include: the Hub matrix artifact id that names the TUI candidate SHA; `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/main`; and `git merge-base --is-ancestor 205cadf6f8dab9dc990537c2c00ef3d27edb31dd <hub main>` returning success in a fresh Hub fetch. Verify must not submit a passed gate or request advancement before this evidence exists. The steward resumes Verify when the Hub matrix and merge evidence are available.
 6. Verify confirms the merged Hub pin (step 5 evidence), reruns the repository gates and the isolated `ghostty` lane at the same candidate SHA from a clean tree, records the shared-lane evidence from the Hub matrix, and approves. The run then merges directly to main.
 
 Stop conditions:
@@ -136,7 +136,7 @@ Stop conditions:
 - botster-core owns the session worker and the terminal protocol crates. Core `93acae3` is Core main; no Core change is required.
 - botster-web owns the Web keep-alive leg that produces `NORTH_STAR_HISTORY` and the browser one-document reconnect proof inside the Hub matrix.
 - Cross-repository prerequisite (satisfied at plan time): Hub `205cadf` fetchable on the Hub remote. Fetchability is re-checked as the first Implement gate.
-- Cross-repository barrier: the ticket dependency on `ticket_1787600679_990088` (target `tgt_7e208a0c76a44980a83b63af976b1f22`), registered by Review at candidate handoff (Sequencing step 3). Barrier owner: the Hub integration ticket. Barrier proof: Sequencing step 5.
+- Cross-repository barrier: the operator-approved Verify gate holds completion until the Hub matrix and merge evidence exist. The Hub integration ticket `ticket_1787600679_990088` owns that evidence on target `tgt_7e208a0c76a44980a83b63af976b1f22`. No formal ticket dependency is registered. Barrier proof: Sequencing step 5.
 
 ## Assumptions and unknowns
 
@@ -145,7 +145,7 @@ Assumptions:
 - The Hub matrix consumes the TUI candidate by Git SHA. It may additionally patch Hub crates to its own worktree; that is Hub's concern and does not change the TUI candidate.
 - Hub direct-merges exact `205cadf`. If the merge creates a merge commit, the ancestry check in Sequencing step 5 still passes and the TUI pin stays `205cadf`.
 - The three `read_frame_from_reader` sites plus the Drain arm are the only compile failures. The Core API delta adds one method and removes nothing, so no Core-driven source change is expected.
-- The engine's dependency registration on an active run holds Verify without blocking Implement or Review. If the engine blocks earlier steps, the steward removes the edge and uses the Verify gate evidence alone as the barrier.
+- Formal dependencies cannot represent this candidate barrier under the controlling operator decision. The steward coordinates resumption. Final Verify still requires every gate field in Sequencing step 5.
 
 Unknowns for Implement to resolve:
 
@@ -171,7 +171,7 @@ Unknowns for Implement to resolve:
 - Live-lane fixture mismatch: the isolated lane asserts `Hub fixture Core pin must match the live session worker`. Hub `205cadf` test support pins Core `93acae3`, which matches the new worker default.
 - Shared-lane screen state: if the Web keep-alive leg leaves the producer on the alternate screen, `ghostty-shared` fails on `NORTH_STAR_HISTORY` without a TUI defect. Mitigation: the matrix leg contract in Acceptance.
 - Environment revision labels are not running-binary proof. Mitigation: the isolated lane records the caller build receipt and binary paths; the shared lanes record the caller's receipt, socket, and session identity.
-- Barrier drift: if Verify runs before Hub merge evidence exists, the merge would precede the matrix. Mitigation: the Verify gate fields in Sequencing step 5 are required, and the dependency edge holds the step.
+- Barrier drift: completing Verify before Hub merge would permit an early TUI merge. Mitigation: Verify must not pass or advance without every evidence field in Sequencing step 5.
 
 ## Acceptance checks and tests
 
