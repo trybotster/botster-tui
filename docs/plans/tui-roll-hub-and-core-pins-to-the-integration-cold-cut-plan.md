@@ -10,9 +10,9 @@ Historical revision 4: human answer `question_1788573184_913439` authorizes Hub 
 
 Historical revision 5: Verify finding C in `review_1788577387_456888` returns the isolated Ghostty pressure fixture to Implement. Human answer `question_1788577472_219314` authorizes a test-owned producer release signal and a disposable Hub source ablation. The ablation must suppress actual Core close enforcement or delivery for the negative control. It must leave no tracked Hub change. No permanent Hub or Core export is authorized.
 
-Revision 6 preparation: Verify finding D in `review_1788657073_301842` and Root message `msg_plugin-w_1788657168_1f7475` select Hub `1a0df65230a476cfea362fdc5131e035d303a928` and Core `bf6e7d996bca2786ad4142c870a13c57a490e241`. This tuple supersedes revision 5. Root authorizes a clean preparation commit before publication approval. The lockfile remains at the prior tuple during preparation. This checkpoint is unvalidated and cannot advance to Review.
+Revision 6: Verify finding D in `review_1788657073_301842` and Root message `msg_plugin-w_1788657168_1f7475` select Hub `1a0df65230a476cfea362fdc5131e035d303a928` and Core `bf6e7d996bca2786ad4142c870a13c57a490e241`. This tuple supersedes revision 5. Root authorizes a clean preparation commit before publication approval. Preparation commit `4953756` temporarily retained the prior lock. Hub publication confirmation `msg_plugin-w_1788659554_0e0031` released normal lock resolution. Cargo changed only five Core and two Hub source lines. Validation must use the next clean committed candidate before Review.
 
-Root controls the build window. Do not resolve the lock before publication approval. Do not start tests before the lock is valid and Root assigns the window. Use the existing assigned TUI worktree for every phase. Preserve the Ghostty close fixture from `812b200` exactly. Root message `msg_plugin-w_1788657222_a67b12` preserves historical and minimum-version references. README retains `9a02e55 or later` as a minimum-version claim. Classify that match separately from active pin claims.
+Root assigned the TUI test window in `msg_plugin-w_1788659388_0a613e`. Run commands sequentially with at most two Cargo jobs. Stop on an unexpected failure and preserve its log. Do not run the full matrix before Root freezes the tuple. Use the existing assigned TUI worktree for every phase. Preserve the Ghostty close fixture from `812b200` exactly. Root message `msg_plugin-w_1788657222_a67b12` preserves historical and minimum-version references. README retains `9a02e55 or later` as a minimum-version claim. Classify that match separately from active pin claims.
 
 ## Target repository
 
@@ -134,7 +134,7 @@ The pins stay exact through final merge: Hub `1a0df65230a476cfea362fdc5131e035d3
 
 Order:
 
-1. Implement verifies fetchability before it changes any pin: `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088` must return `1a0df65...`.
+1. Implement verifies fetchability before it changes any pin: `git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088-rc1` must return `1a0df65...`.
 2. Implement makes the source migration, pin roll, lock update, defaults, README, and report. It commits one clean candidate on `project-pipelines/ticket_1788460430_647093`, pushes the branch, and runs every repository gate plus the isolated `ghostty` lane (Acceptance section).
 3. Review approves that exact candidate SHA independently. Review records the SHA for the Hub integration ticket `ticket_1787600679_990088` on target `tgt_7e208a0c76a44980a83b63af976b1f22`. Use the operator-approved Verify gate barrier. Do not register a formal ticket dependency in either direction. Coordinator decision `msg_plugin-w_1788570541_5a4ccf`, clarified by steward message `msg_plugin-w_1788571659_a664fb`, controls this exception.
 4. The Hub integration run consumes the exact approved TUI SHA for one complete unspliced matrix, including its `script/test-live-hub ghostty` and `script/prove-north-star-shared-session` legs, and direct-merges exact `1a0df65` after the matrix passes.
@@ -198,7 +198,7 @@ All commands run from the run worktree at the candidate SHA with a clean tracked
 Pre-change gate:
 
 ```sh
-git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088
+git ls-remote https://github.com/trybotster/botster-hub.git refs/heads/project-pipelines/ticket_1787600679_990088-rc1
 # must print 1a0df65230a476cfea362fdc5131e035d303a928
 git ls-remote https://github.com/trybotster/botster-core.git refs/heads/foundation/stale-mode-contract
 # must print bf6e7d996bca2786ad4142c870a13c57a490e241
@@ -209,7 +209,7 @@ Repository gates (all must exit 0):
 ```sh
 script/fmt
 script/clippy
-./test.sh --workspace --all-targets
+./test.sh --locked --workspace --all-targets
 cargo build -p botster-tui --locked
 cargo build --locked
 ```

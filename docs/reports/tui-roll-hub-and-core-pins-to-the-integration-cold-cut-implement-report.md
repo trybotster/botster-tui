@@ -2,7 +2,7 @@
 
 Target: `trybotster/botster-tui`, `tgt_c3d470bab78549df920a41e8fb0e58d8`.
 Ticket: `ticket_1788460430_647093`. Run: `run_1788570301_694931`.
-Status: preparation/unvalidated. Root message `msg_plugin-w_1788657168_1f7475` authorizes this checkpoint. The manifest and documentation select the new tuple. `Cargo.lock` still records the prior tuple until publication approval and normal resolution. No test or build result transfers from `812b200`. Review admission remains blocked until the lock, gates, and report artifact are complete.
+Status: coherent tuple candidate, awaiting validation. Preparation commit `4953756` used Root's explicit exception for a temporarily stale lock. Hub publication confirmation `msg_plugin-w_1788659554_0e0031` released normal resolution. Cargo changed only five Core and two Hub Git sources. No registry package changed. No test result transfers from `812b200`. The final artifact records the committed candidate and actual validation results.
 
 Plan basis: approved revision 3 at `e3e73751b1db92ee4099de4e037366b608e3ca54`, updated through revision 5 under historical human answers `question_1788573184_913439` and `question_1788577472_219314`.
 
@@ -29,13 +29,13 @@ TUI owns client consumption and proof. Hub retains policy, lifecycle, and transp
 
 The Hub matrix belongs to `ticket_1787600679_990088` on `tgt_7e208a0c76a44980a83b63af976b1f22`. The operator forbids formal dependency edges. Review must approve this exact candidate before the steward hands it to Hub. Final Verify must hold for the complete matrix and Hub merge ancestry evidence. Shared attach, shared exit, and browser reconnect remain Hub-matrix proof obligations.
 
-Root reports Core publication and pending Hub publication approval. Fresh lock resolution and provenance checks remain required. The prior candidate used base `b051c6747180fa8375a56f0e4d71aae5bc68f2be`; this preparation did not refresh main.
+Hub published the exact candidate on `project-pipelines/ticket_1787600679_990088-rc1`. Core is published on `foundation/stale-mode-contract`. Normal Cargo resolution succeeded. Binary provenance and runtime proof remain required. The prior candidate used base `b051c6747180fa8375a56f0e4d71aae5bc68f2be`; this preparation did not refresh main.
 
 Required commands at the committed candidate:
 
 - `script/fmt`
 - `script/clippy`
-- `./test.sh --workspace --all-targets`
+- `./test.sh --locked --workspace --all-targets`
 - `cargo build -p botster-tui --locked`
 - `cargo build --locked`
 - The focused pressure test through `./test.sh`, with required debug binaries.
@@ -56,3 +56,7 @@ Approved deviation: Verify finding D and Root message `msg_plugin-w_1788657168_1
 Guidance gaps: the plan identifies stale current-pin prose, per-reader buffer lifetime, caller-owned provenance, and the frozen-candidate barrier. Existing notes already cover these constraints in part. The final checklist records whether this visit adds durable knowledge.
 
 README retains the `9a02e55 or later` minimum-version claim under Root message `msg_plugin-w_1788657222_a67b12`. This is not an active pin. Historical plan evidence keeps its original revisions.
+
+API inspection: Hub client source and IsolatedHub source do not change between the prior and current Hub pins. Hub test support updates Core revision and provenance values. Core terminal protocol, protocol-client, and Ghostty source do not change. Core adds the `ResizeAckHold` runtime export and revises adapter-close documentation. Core runtime implementation changes still require downstream proof. No TUI API migration is indicated by these inspected surfaces.
+
+Root assigned this run the test window. Validation uses at most two Cargo jobs and one command at a time. Stop on an unexpected failure. The full matrix awaits Root's final tuple decision.
