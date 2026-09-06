@@ -93,6 +93,8 @@ const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// Live OUTPUT retained while SNAPSHOT_HISTORY is still arriving for a route.
 const MAX_HYDRATION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Frames retained before the Attach response fixes the attachment generation.
+const MAX_PRE_ATTACH_FRAMES: usize = 64;
 /// Encoded input retained while a route is still attaching.
 const MAX_PENDING_HYDRATION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Package events parked per candidate subscription until EventSubscribed lands.
@@ -295,6 +297,10 @@ struct SessionRow {
 struct AttachHydration {
     session_id: String,
     route: String,
+    /// Frames that arrived before the trusted Attach response fixed the
+    /// attachment generation. Replayed once the response lands.
+    pending_frames: VecDeque<RoutedTerminalFrame>,
+    pending_frame_bytes: usize,
     buffered_live_output: Vec<u8>,
     pending_input: Vec<PendingTerminalInput>,
     pending_input_bytes: usize,
@@ -312,6 +318,8 @@ impl AttachHydration {
         Self {
             session_id: session_id.to_string(),
             route: route.to_string(),
+            pending_frames: VecDeque::new(),
+            pending_frame_bytes: 0,
             buffered_live_output: Vec::new(),
             pending_input: Vec::new(),
             pending_input_bytes: 0,
@@ -405,7 +413,12 @@ enum PendingReply {
         key: NoticeSubscriptionKey,
         subscription_id: String,
     },
-    /// UnsubscribeEvents; the response is informational.
+    /// SubscribeEntities for one entity family on this connection.
+    SubscribeEntities {
+        family: String,
+        subscription_id: String,
+    },
+    /// UnsubscribeEvents or UnsubscribeEntities; the response is informational.
     Unsubscribe,
 }
 
@@ -1641,9 +1654,14 @@ struct TuiApp {
     /// Route id of the current attach campaign or attachment.
     subscription_id: String,
     next_terminal_subscription_sequence: u64,
-    /// Adopted stream generation for the current route; lower generations are
-    /// stale and dropped, a higher generation is a resync boundary.
+    /// Fixed attachment generation for the current route, adopted from the
+    /// Attach response or the first ATTACH_STATE attached frame; frames with
+    /// any other generation are dropped.
     route_generation: Option<u64>,
+    /// Accepted stream epoch for snapshot and live continuity within the
+    /// attachment: 0 after ATTACH_STATE attached, `to_epoch` after an accepted
+    /// ROUTE_RESYNC. Data frames with another epoch are dropped.
+    route_epoch: Option<u32>,
     /// Core-owned Ghostty projection for incremental GHOSTSNP and live output.
     ghostty_projection: Option<GhosttyClientProjection>,
     ghostty_projection_session_id: Option<String>,
@@ -1785,6 +1803,7 @@ impl TuiApp {
             subscription_id: format!("btui-sub-{}", short_suffix()),
             next_terminal_subscription_sequence: 1,
             route_generation: None,
+            route_epoch: None,
             ghostty_projection: None,
             ghostty_projection_session_id: None,
             ghostty_viewport_cache: None,
@@ -1939,18 +1958,7 @@ impl TuiApp {
             AppWake::Terminal(routed) => self.apply_routed_terminal_frame(routed),
             AppWake::Completed { request_id, result } => self.complete_request(request_id, result),
             AppWake::Event(event) => self.apply_mux_event(event),
-            AppWake::Entity {
-                subscription_id,
-                frame,
-            } => self.apply_entity_frame(&subscription_id, frame),
-            AppWake::EntitySubscribed {
-                subscription_id,
-                result,
-            } => self.apply_entity_subscribed(&subscription_id, result),
-            AppWake::EntityClosed {
-                subscription_id,
-                error,
-            } => self.apply_entity_closed(&subscription_id, error),
+            AppWake::Entity(frame) => self.apply_entity_frame(frame),
             AppWake::Connected { generation, ack } => self.apply_connected(generation, *ack),
             AppWake::Disconnected { generation, error } => {
                 self.apply_disconnected(generation, error);
@@ -2597,9 +2605,23 @@ impl TuiApp {
         self.attached = None;
         self.attach_hydration = None;
         self.route_generation = None;
+        self.route_epoch = None;
         self.terminal_modes = None;
-        self.input_window = InputWindow::new();
+        self.resolve_unknown_input_operations("route closed");
         self.clear_ghostty_projection();
+    }
+
+    /// Resolve every in-flight input operation as unknown when its route
+    /// closes. Their INPUT_RESULT frames can no longer arrive; the user sees
+    /// one explicit line instead of a silently dropped result.
+    fn resolve_unknown_input_operations(&mut self, reason: &str) {
+        let unresolved = self.input_window.in_flight_len();
+        self.input_window = InputWindow::new();
+        if unresolved > 0 {
+            self.action_feedback = Some(format!(
+                "{unresolved} terminal input operation(s) unresolved: {reason}"
+            ));
+        }
     }
 
     fn apply_connected(&mut self, generation: u64, ack: DaemonHelloAck) {
@@ -2771,14 +2793,12 @@ impl TuiApp {
                     );
                     return;
                 }
-                // The Attach response carries the attach generation. Stream
-                // frames may already have adopted it; a later ROUTE_RESYNC may
-                // replace it.
+                // The Attach response is the only source of the attachment
+                // generation. Frames parked before it replay now.
                 match attached {
                     Some(attach) if attach.subscription_id == route => {
-                        if self.route_generation.is_none() {
-                            self.route_generation = Some(attach.generation);
-                        }
+                        self.route_generation = Some(attach.generation);
+                        self.replay_pre_attach_frames();
                     }
                     _ => self.fail_attach_campaign(
                         &session_id,
@@ -2792,6 +2812,10 @@ impl TuiApp {
                 key,
                 subscription_id,
             } => self.complete_notice_subscription(&key, &subscription_id, response),
+            PendingReply::SubscribeEntities {
+                family,
+                subscription_id,
+            } => self.complete_entity_subscription(&family, &subscription_id, response),
         }
     }
 
@@ -2839,6 +2863,10 @@ impl TuiApp {
                 &subscription_id,
                 format!("event subscription failed: {message}"),
             ),
+            PendingReply::SubscribeEntities {
+                family,
+                subscription_id,
+            } => self.fail_entity_subscription(&family, &subscription_id, message),
         }
     }
 
@@ -2862,42 +2890,35 @@ impl TuiApp {
         self.submit_apply(DaemonRequest::ListPackages);
     }
 
-    /// Open the dedicated entity stream for one family.
-    ///
-    /// Hub converts a connection into an entity stream on `SubscribeEntities`
-    /// and refuses the request on a mux connection, so every family owns its
-    /// own connection. Admission arrives as `AppWake::EntitySubscribed`.
-    fn open_entity_stream(&mut self, entity_type: &str, subscription_id: &str) {
-        let Some(endpoint) = self.endpoint.clone() else {
-            self.fail_entity_subscription(
-                entity_type,
-                subscription_id,
-                "Hub connection not configured".to_string(),
-            );
-            return;
-        };
-        self.hub_io.subscribe_entities(
-            endpoint,
-            self.host_requirement.clone(),
-            entity_type,
-            subscription_id,
-        );
-    }
-
-    /// Subscribe to the built-in session family.
+    /// Subscribe to the built-in session family on the current connection.
     fn start_session_subscription(&mut self) {
         let subscription_id = format!("btui-sessions-{}", short_suffix());
         self.session_entities
             .begin_generation(subscription_id.clone());
         self.rebuild_session_rows();
-        self.open_entity_stream("session", &subscription_id);
+        self.submit(
+            DaemonRequest::SubscribeEntities {
+                entity_type: "session".to_string(),
+                subscription_id: subscription_id.clone(),
+            },
+            PendingReply::SubscribeEntities {
+                family: "session".to_string(),
+                subscription_id,
+            },
+            REQUEST_DEADLINE,
+        );
     }
 
-    /// Drop the session generation and end its entity stream.
+    /// Drop the session generation and unsubscribe when connected.
     fn invalidate_session_generation(&mut self) {
-        if let Some(subscription_id) = self.session_entities.subscription_id.take() {
-            self.hub_io
-                .unsubscribe_entities(&subscription_id, DETACH_ON_DISCONNECT_BOUND);
+        if let Some(subscription_id) = self.session_entities.subscription_id.take()
+            && self.is_connected()
+        {
+            self.submit(
+                DaemonRequest::UnsubscribeEntities { subscription_id },
+                PendingReply::Unsubscribe,
+                REQUEST_DEADLINE,
+            );
         }
         self.session_entities = SessionEntityState::default();
         self.rebuild_session_rows();
@@ -2919,43 +2940,37 @@ impl TuiApp {
         self.session_type_entities
             .begin_generation(subscription_id.clone());
         self.session_type_subscription_error = None;
-        self.open_entity_stream("session_type", &subscription_id);
+        self.submit(
+            DaemonRequest::SubscribeEntities {
+                entity_type: "session_type".to_string(),
+                subscription_id: subscription_id.clone(),
+            },
+            PendingReply::SubscribeEntities {
+                family: "session_type".to_string(),
+                subscription_id,
+            },
+            REQUEST_DEADLINE,
+        );
     }
 
     fn invalidate_session_type_generation(&mut self) {
-        if let Some(subscription_id) = self.session_type_entities.subscription_id.take() {
-            self.hub_io
-                .unsubscribe_entities(&subscription_id, DETACH_ON_DISCONNECT_BOUND);
+        if let Some(subscription_id) = self.session_type_entities.subscription_id.take()
+            && self.is_connected()
+        {
+            self.submit(
+                DaemonRequest::UnsubscribeEntities { subscription_id },
+                PendingReply::Unsubscribe,
+                REQUEST_DEADLINE,
+            );
         }
         self.session_type_entities = SessionTypeEntityState::default();
         self.session_type_subscription_error = None;
     }
 
-    /// Family that owns one live subscription id, if any.
-    fn entity_family_for_subscription(&self, subscription_id: &str) -> Option<String> {
-        if self.session_entities.subscription_id.as_deref() == Some(subscription_id) {
-            return Some("session".to_string());
-        }
-        if self.session_type_entities.subscription_id.as_deref() == Some(subscription_id) {
-            return Some("session_type".to_string());
-        }
-        self.entity_options_subscriptions
-            .iter()
-            .find(|family| {
-                self.entity_options
-                    .family(family)
-                    .and_then(|state| state.subscription_id.as_deref())
-                    == Some(subscription_id)
-            })
-            .cloned()
-    }
-
-    /// Route one entity frame from its stream to the owning family state.
-    fn apply_entity_frame(&mut self, subscription_id: &str, frame: DaemonEntityFrame) {
-        let Some(family) = self.entity_family_for_subscription(subscription_id) else {
-            return;
-        };
-        match family.as_str() {
+    /// Route one entity frame from the connection to its family state.
+    fn apply_entity_frame(&mut self, frame: DaemonEntityFrame) {
+        let entity_type = entity_frame_type(&frame).to_string();
+        match entity_type.as_str() {
             "session" => match self.session_entities.apply(frame) {
                 Ok(true) => {
                     self.rebuild_session_rows();
@@ -2983,6 +2998,7 @@ impl TuiApp {
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    self.session_type_subscription_error = Some(error.clone());
                     self.error = Some(format!("session type sync: {error}"));
                     self.invalidate_session_type_generation();
                     self.session_type_subscription_error = Some(error);
@@ -2991,69 +3007,39 @@ impl TuiApp {
                     }
                 }
             },
-            other => self.apply_entity_options_frame(other, frame),
+            family => self.apply_entity_options_frame(family, frame),
         }
     }
 
-    /// SubscribeEntities admission for one stream.
-    fn apply_entity_subscribed(&mut self, subscription_id: &str, result: Result<(), String>) {
-        let Some(family) = self.entity_family_for_subscription(subscription_id) else {
+    fn complete_entity_subscription(
+        &mut self,
+        family: &str,
+        subscription_id: &str,
+        response: DaemonResponse,
+    ) {
+        self.record_diagnostics(response.diagnostics);
+        if response.kind == DaemonResponseKind::EntitySubscribed && response.error.is_none() {
+            if !is_process_wide_entity_family(family) {
+                self.reset_entity_options_backoff(family);
+            }
             return;
-        };
-        match result {
-            Ok(()) => {
-                if !is_process_wide_entity_family(&family) {
-                    self.reset_entity_options_backoff(&family);
-                }
-            }
-            Err(detail) => self.fail_entity_subscription(
-                &family,
-                subscription_id,
-                format!("entity subscription was not accepted: {detail}"),
-            ),
         }
-    }
-
-    /// One entity stream ended on its own. The session family is the
-    /// authoritative read model: losing it is a connection failure. Other
-    /// families re-open with backoff.
-    fn apply_entity_closed(&mut self, subscription_id: &str, error: DaemonTransportError) {
-        let Some(family) = self.entity_family_for_subscription(subscription_id) else {
-            return;
-        };
-        match family.as_str() {
-            "session" => {
-                self.session_entities.subscription_id = None;
-                self.apply_link_failure(error);
-            }
-            "session_type" => {
-                self.session_type_entities.subscription_id = None;
-                self.invalidate_session_type_generation();
-                self.session_type_subscription_error = Some(error.to_string());
-                if self.is_connected() && self.session_types_supported {
-                    self.start_session_type_subscription();
-                }
-            }
-            other => {
-                self.entity_options_subscriptions.remove(other);
-                self.entity_options.drop_family(other);
-                self.note_entity_options_admission_failure(
-                    other,
-                    format!("entity options subscription disconnected: {error}"),
-                );
-                if self.is_connected()
-                    && self.family_still_demanded(other)
-                    && self.entity_options_retry_ready(other)
-                {
-                    self.start_entity_options_subscription(other);
-                }
-            }
+        let detail = response
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| format!("{:?}", response.kind));
+        if let Some(error) = response.error {
+            self.record_diagnostics(error.diagnostics);
         }
+        self.fail_entity_subscription(
+            family,
+            subscription_id,
+            format!("entity subscription was not accepted: {detail}"),
+        );
     }
 
     fn fail_entity_subscription(&mut self, family: &str, subscription_id: &str, message: String) {
-        self.hub_io
-            .unsubscribe_entities(subscription_id, DETACH_ON_DISCONNECT_BOUND);
         match family {
             "session" => {
                 if self.session_entities.subscription_id.as_deref() == Some(subscription_id) {
@@ -3082,41 +3068,6 @@ impl TuiApp {
                 }
             }
         }
-    }
-
-    /// End one entity-options family stream and forget its generation.
-    fn stop_entity_options_subscription(&mut self, family: &str) {
-        self.entity_options_subscriptions.remove(family);
-        let subscription_id = self
-            .entity_options
-            .family(family)
-            .and_then(|state| state.subscription_id.clone());
-        if let Some(subscription_id) = subscription_id {
-            self.hub_io
-                .unsubscribe_entities(&subscription_id, DETACH_ON_DISCONNECT_BOUND);
-        }
-        self.entity_options.drop_family(family);
-        self.entity_options_retry.remove(family);
-    }
-
-    fn start_entity_options_subscription(&mut self, entity_type: &str) {
-        #[cfg(test)]
-        {
-            *self
-                .entity_options_subscribe_attempts
-                .entry(entity_type.to_string())
-                .or_insert(0) += 1;
-            if let Some(message) = self.entity_options_forced_subscribe_error {
-                self.note_entity_options_admission_failure(entity_type, message.to_string());
-                return;
-            }
-        }
-        let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
-        self.entity_options
-            .begin_generation(entity_type, subscription_id.clone());
-        self.entity_options_subscriptions
-            .insert(entity_type.to_string());
-        self.open_entity_stream(entity_type, &subscription_id);
     }
 
     fn drop_entity_options_subscriptions(&mut self) {
@@ -3174,6 +3125,56 @@ impl TuiApp {
             self.start_entity_options_subscription(&family);
         }
         self.reconcile_entity_option_drafts();
+    }
+
+    /// Unsubscribe one entity-options family and forget its generation.
+    fn stop_entity_options_subscription(&mut self, family: &str) {
+        self.entity_options_subscriptions.remove(family);
+        let subscription_id = self
+            .entity_options
+            .family(family)
+            .and_then(|state| state.subscription_id.clone());
+        if let Some(subscription_id) = subscription_id
+            && self.is_connected()
+        {
+            self.submit(
+                DaemonRequest::UnsubscribeEntities { subscription_id },
+                PendingReply::Unsubscribe,
+                REQUEST_DEADLINE,
+            );
+        }
+        self.entity_options.drop_family(family);
+        self.entity_options_retry.remove(family);
+    }
+
+    fn start_entity_options_subscription(&mut self, entity_type: &str) {
+        #[cfg(test)]
+        {
+            *self
+                .entity_options_subscribe_attempts
+                .entry(entity_type.to_string())
+                .or_insert(0) += 1;
+            if let Some(message) = self.entity_options_forced_subscribe_error {
+                self.note_entity_options_admission_failure(entity_type, message.to_string());
+                return;
+            }
+        }
+        let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
+        self.entity_options
+            .begin_generation(entity_type, subscription_id.clone());
+        self.entity_options_subscriptions
+            .insert(entity_type.to_string());
+        self.submit(
+            DaemonRequest::SubscribeEntities {
+                entity_type: entity_type.to_string(),
+                subscription_id: subscription_id.clone(),
+            },
+            PendingReply::SubscribeEntities {
+                family: entity_type.to_string(),
+                subscription_id,
+            },
+            REQUEST_DEADLINE,
+        );
     }
 
     /// Re-open demanded entity-options families whose backoff expired.
@@ -3788,7 +3789,8 @@ impl TuiApp {
         self.subscription_id = route.to_string();
         self.attached = None;
         self.route_generation = None;
-        self.input_window = InputWindow::new();
+        self.route_epoch = None;
+        self.resolve_unknown_input_operations("route replaced");
         self.terminal_modes = None;
         self.clear_ghostty_projection();
         self.attach_hydration = Some(AttachHydration::new(session_id, route));
@@ -3860,8 +3862,9 @@ impl TuiApp {
     fn retire_subscription(&mut self, route: &str) {
         self.retired_subscription_ids.insert(route.to_string());
         self.hub_io.forget_route(route);
-        self.input_window = InputWindow::new();
+        self.resolve_unknown_input_operations("route retired");
         self.route_generation = None;
+        self.route_epoch = None;
     }
 
     fn current_owner_pair(&self) -> Option<(String, String)> {
@@ -4318,9 +4321,21 @@ impl TuiApp {
 
     /// One routed scheme 2 frame from the connection.
     ///
-    /// Frames for retired or foreign routes are dropped. The first frame adopts
-    /// the stream generation; a lower generation is stale and dropped; a higher
-    /// generation is a resync boundary and the route restarts at SNAPSHOT_READY.
+    /// Identity rules (root ruling on attachment identity versus resync state):
+    ///
+    /// - Frames for retired or foreign routes are dropped.
+    /// - `generation` is the fixed attachment generation from the trusted
+    ///   Attach response and never changes; frames that arrive before the
+    ///   response wait (bounded) and frames with another generation are dropped.
+    /// - `stream_epoch` fences snapshot and live continuity. It is 0 after
+    ///   ATTACH_STATE attached. A ROUTE_RESYNC is accepted only when its
+    ///   `from_epoch` equals the accepted epoch and its envelope epoch equals
+    ///   `to_epoch`; other RESYNC frames are stale and dropped. Data frames
+    ///   with another epoch are dropped. No numeric comparison is used.
+    /// - A ROUTE_RESYNC must also change the epoch (`to_epoch != from_epoch`).
+    /// - INPUT_RESULT is correlated by operation id within the attachment on
+    ///   any epoch, so an accepted operation is never left unresolved by a
+    ///   resync; unknown or already completed ids are reported, not tracked.
     fn apply_routed_terminal_frame(&mut self, routed: RoutedTerminalFrame) {
         let route = routed.route.as_str().to_string();
         if self.retired_subscription_ids.contains(&route) {
@@ -4338,25 +4353,83 @@ impl TuiApp {
                 return;
             }
         };
-        // Adopt a generation only from ATTACH_STATE attached or ROUTE_RESYNC on
-        // the current route; every other frame must carry the adopted value.
-        // Frames on one route arrive in order, so no ordering comparison is
-        // needed, and retired routes were already dropped above. Input
-        // operation ids are per attach and do not restart on resync.
-        let adopts = matches!(
-            event,
-            TerminalEvent::AttachState(AttachStateCode::Attached) | TerminalEvent::RouteResync
-        );
-        match self.route_generation {
-            Some(current) if routed.generation == current => {}
-            _ if adopts => self.route_generation = Some(routed.generation),
-            _ => return,
+        // The attachment generation comes only from the trusted Attach
+        // response. Frames that arrive first wait, bounded, and replay once the
+        // response lands; a frame is never allowed to set the reservation.
+        let Some(generation) = self.route_generation else {
+            self.park_pre_attach_frame(routed);
+            return;
+        };
+        if routed.generation != generation {
+            return;
+        }
+        let epoch_ok = match &event {
+            TerminalEvent::AttachState(AttachStateCode::Attached) => routed.stream_epoch == 0,
+            TerminalEvent::AttachState(_) => self
+                .route_epoch
+                .is_none_or(|accepted| accepted == routed.stream_epoch),
+            TerminalEvent::RouteResync(transition) => {
+                transition.to_epoch != transition.from_epoch
+                    && self.route_epoch == Some(transition.from_epoch)
+                    && routed.stream_epoch == transition.to_epoch
+            }
+            TerminalEvent::InputResult(_) => true,
+            _ => self.route_epoch == Some(routed.stream_epoch),
+        };
+        if !epoch_ok {
+            return;
+        }
+        match &event {
+            TerminalEvent::AttachState(AttachStateCode::Attached) => self.route_epoch = Some(0),
+            TerminalEvent::RouteResync(transition) => {
+                self.route_epoch = Some(transition.to_epoch);
+            }
+            _ => {}
         }
         self.apply_terminal_event(&route, event);
     }
 
+    /// Retain one frame until the Attach response fixes the generation.
+    fn park_pre_attach_frame(&mut self, routed: RoutedTerminalFrame) {
+        let Some(hydration) = self.attach_hydration.as_mut() else {
+            return;
+        };
+        let bytes = routed.frame.len();
+        if hydration.pending_frames.len() >= MAX_PRE_ATTACH_FRAMES
+            || hydration.pending_frame_bytes.saturating_add(bytes) > MAX_HYDRATION_OUTPUT_BYTES
+        {
+            let session_id = hydration.session_id.clone();
+            let route = hydration.route.clone();
+            self.recover_current_subscription(
+                &session_id,
+                &route,
+                "frames before the attach response exceeded the retention bound",
+            );
+            return;
+        }
+        hydration.pending_frame_bytes += bytes;
+        hydration.pending_frames.push_back(routed);
+    }
+
+    /// Replay frames parked before the Attach response, in arrival order.
+    fn replay_pre_attach_frames(&mut self) {
+        let Some(hydration) = self.attach_hydration.as_mut() else {
+            return;
+        };
+        let parked = std::mem::take(&mut hydration.pending_frames);
+        hydration.pending_frame_bytes = 0;
+        for routed in parked {
+            if self.attach_hydration.is_none() && self.attached.is_none() {
+                return;
+            }
+            self.apply_routed_terminal_frame(routed);
+        }
+    }
+
     /// The route restarts from a fresh SNAPSHOT_READY. The decoder state is
-    /// reset, never continued. Input captured so far stays queued.
+    /// reset, never continued. Input captured so far stays queued; in-flight
+    /// operations keep their window slots because INPUT_RESULT frames are
+    /// accepted on every epoch of the attachment.
     fn begin_route_resync(&mut self) {
         let Some((session_id, route)) = self.current_owner_pair() else {
             return;
@@ -4427,7 +4500,7 @@ impl TuiApp {
             TerminalEvent::HistoryUnavailable(reason) => {
                 self.apply_history_unavailable(&session_id, reason);
             }
-            TerminalEvent::RouteResync => self.begin_route_resync(),
+            TerminalEvent::RouteResync(_) => self.begin_route_resync(),
         }
     }
 
@@ -4956,11 +5029,8 @@ impl TuiApp {
         if !self.attached_matches_route(route) {
             return;
         }
-        if let Some(state) = self.terminal_modes.as_mut()
-            && state.route == route
-        {
-            state.modes.mode_bits = result.mode_bits;
-        }
+        // `result.mode_bits` is the mode set at the time of that operation;
+        // current stream state comes only from epoch-valid MODES frames.
         let (completed, released) = self.input_window.complete(result.operation_id);
         if completed.is_none() {
             self.error = Some(format!(
@@ -16102,11 +16172,232 @@ mod tests {
         generation: u64,
         frame: botster_terminal_protocol_client::TerminalFrame,
     ) -> AppWake {
+        routed_at_epoch(route, generation, 0, frame)
+    }
+
+    fn routed_at_epoch(
+        route: &str,
+        generation: u64,
+        stream_epoch: u32,
+        frame: botster_terminal_protocol_client::TerminalFrame,
+    ) -> AppWake {
         AppWake::Terminal(RoutedTerminalFrame {
             route: RouteId::new(route).expect("route id"),
             generation,
+            stream_epoch,
             frame,
         })
+    }
+
+    fn resync_frame(
+        from_epoch: u32,
+        to_epoch: u32,
+    ) -> botster_terminal_protocol_client::TerminalFrame {
+        botster_terminal_protocol_client::encode_route_resync(
+            botster_terminal_protocol_client::RouteResyncBody {
+                from_epoch,
+                to_epoch,
+            },
+        )
+        .expect("resync frame")
+    }
+
+    /// Complete the Attach request for `route` with the trusted generation.
+    fn complete_attach(app: &mut TuiApp, session_id: &str, route: &str, generation: u64) {
+        let mut response = base_response(DaemonResponseKind::TerminalAttached);
+        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach {
+            session_id: session_id.to_string(),
+            subscription_id: route.to_string(),
+            generation,
+        });
+        app.apply_completion(
+            PendingReply::Attach {
+                session_id: session_id.to_string(),
+                route: route.to_string(),
+            },
+            response,
+        );
+    }
+
+    #[test]
+    fn generation_comes_only_from_the_attach_response_and_parked_frames_replay() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        // Frames before the response never set the reservation; they wait.
+        app.apply_wake(routed(
+            "route-1",
+            9,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed(
+            "route-1",
+            4,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed("route-1", 4, modes_frame(mode_bits::MOUSE_NORMAL)));
+        assert_eq!(app.route_generation, None);
+        assert_eq!(
+            app.attach_hydration
+                .as_ref()
+                .map(|hydration| hydration.pending_frames.len()),
+            Some(3)
+        );
+        complete_attach(&mut app, "session-alpha", "route-1", 4);
+        assert_eq!(app.route_generation, Some(4));
+        assert_eq!(app.route_epoch, Some(0));
+        let hydration = app.attach_hydration.as_ref().expect("campaign continues");
+        assert!(hydration.attached_seen);
+        assert!(hydration.pending_frames.is_empty());
+        assert_eq!(
+            app.terminal_modes
+                .as_ref()
+                .map(|state| state.modes.mode_bits),
+            Some(mode_bits::MOUSE_NORMAL)
+        );
+        // Another generation is dropped after the response, including a stale
+        // ATTACH_STATE attached; another epoch on a data frame is dropped.
+        app.terminal_modes = None;
+        app.apply_wake(routed(
+            "route-1",
+            5,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed("route-1", 3, modes_frame(mode_bits::MOUSE_NORMAL)));
+        app.apply_wake(routed_at_epoch(
+            "route-1",
+            4,
+            1,
+            modes_frame(mode_bits::MOUSE_NORMAL),
+        ));
+        assert_eq!(app.route_generation, Some(4));
+        assert!(app.terminal_modes.is_none());
+        // Frames for a foreign route never touch the campaign.
+        app.apply_wake(routed(
+            "route-9",
+            4,
+            attach_state_frame(AttachStateCode::Detached),
+        ));
+        assert!(app.attach_hydration.is_some());
+    }
+
+    #[test]
+    fn frames_before_the_attach_response_are_bounded() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        for _ in 0..MAX_PRE_ATTACH_FRAMES {
+            app.apply_wake(routed("route-1", 1, modes_frame(0)));
+        }
+        assert!(app.attach_hydration.is_some());
+        app.apply_wake(routed("route-1", 1, modes_frame(0)));
+        assert!(app.retired_subscription_ids.contains("route-1"));
+        assert!(app.attach_recovery_used);
+    }
+
+    #[test]
+    fn route_resync_adopts_to_epoch_and_restarts_hydration() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 1);
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        // Stale transition (wrong from_epoch), envelope epoch not to_epoch, and
+        // a transition that does not change the epoch are all dropped.
+        app.apply_wake(routed_at_epoch("route-1", 1, 2, resync_frame(1, 2)));
+        app.apply_wake(routed_at_epoch("route-1", 1, 0, resync_frame(0, 1)));
+        app.apply_wake(routed_at_epoch("route-1", 1, 0, resync_frame(0, 0)));
+        assert_eq!(app.route_epoch, Some(0));
+        app.apply_wake(routed_at_epoch("route-1", 1, 1, resync_frame(0, 1)));
+        assert_eq!(app.route_generation, Some(1));
+        assert_eq!(app.route_epoch, Some(1));
+        let hydration = app
+            .attach_hydration
+            .as_ref()
+            .expect("hydration restarts at SNAPSHOT_READY");
+        assert!(hydration.attached_seen);
+        assert!(!hydration.snapshot_ready);
+        assert!(app.attached.is_none());
+        assert!(app.ghostty_projection.is_none());
+        // Data from the previous epoch is stale after the transition.
+        app.apply_wake(routed_at_epoch(
+            "route-1",
+            1,
+            0,
+            modes_frame(mode_bits::MOUSE_NORMAL),
+        ));
+        assert!(app.terminal_modes.is_none());
+        app.apply_wake(routed_at_epoch(
+            "route-1",
+            1,
+            1,
+            modes_frame(mode_bits::MOUSE_NORMAL),
+        ));
+        assert!(app.terminal_modes.is_some());
+    }
+
+    #[test]
+    fn input_results_are_correlated_by_operation_on_every_epoch() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 1);
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.attach_hydration = None;
+        app.terminal_modes = Some(TerminalModeState {
+            route: "route-1".to_string(),
+            modes: ModesBody::default(),
+        });
+        let operation_id = app.input_window.next_operation_id().expect("id");
+        app.input_window
+            .admit(operation_id, false, vec![vec![1]])
+            .expect("admitted");
+        app.apply_wake(routed_at_epoch("route-1", 1, 1, resync_frame(0, 1)));
+        let result = InputResultBody {
+            operation_id,
+            outcome: InputOutcome::Written,
+            accepted_payload_bytes: Some(1),
+            written_pty_bytes: Some(1),
+            mode_bits: mode_bits::KITTY_KEYBOARD,
+            detail: String::new(),
+        };
+        app.apply_wake(routed_at_epoch(
+            "route-1",
+            1,
+            0,
+            botster_terminal_protocol_client::encode_input_result(&result).expect("result frame"),
+        ));
+        assert_eq!(app.input_window.in_flight_len(), 0);
+        // Mode bits from a result never become current renderer state.
+        assert_eq!(app.current_mode_bits(), 0);
+    }
+
+    #[test]
+    fn closing_a_route_resolves_in_flight_operations_as_unknown() {
+        let mut app = workspace_fixture();
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        let operation_id = app.input_window.next_operation_id().expect("id");
+        app.input_window
+            .admit(operation_id, false, vec![vec![1]])
+            .expect("admitted");
+        app.retire_subscription("route-1");
+        assert_eq!(app.input_window.in_flight_len(), 0);
+        assert!(
+            app.action_feedback.as_deref().is_some_and(
+                |feedback| feedback.contains("1 terminal input operation(s) unresolved")
+            )
+        );
     }
 
     fn attach_state_frame(
@@ -16122,69 +16413,6 @@ mod tests {
             cols: 80,
         })
         .expect("modes frame")
-    }
-
-    #[test]
-    fn terminal_frames_adopt_generation_only_from_attach_state_and_drop_others() {
-        let mut app = workspace_fixture();
-        app.begin_attach_hydration("session-alpha", "route-1");
-        // MODES before any ATTACH_STATE adopts nothing and is dropped.
-        app.apply_wake(routed("route-1", 4, modes_frame(mode_bits::MOUSE_NORMAL)));
-        assert_eq!(app.route_generation, None);
-        assert!(app.terminal_modes.is_none());
-        app.apply_wake(routed(
-            "route-1",
-            4,
-            attach_state_frame(AttachStateCode::Attached),
-        ));
-        assert_eq!(app.route_generation, Some(4));
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|hydration| hydration.attached_seen)
-        );
-        // A different generation on a non-adopting frame is dropped.
-        app.apply_wake(routed("route-1", 3, modes_frame(mode_bits::MOUSE_NORMAL)));
-        assert!(app.terminal_modes.is_none());
-        app.apply_wake(routed("route-1", 4, modes_frame(mode_bits::MOUSE_NORMAL)));
-        assert_eq!(
-            app.terminal_modes
-                .as_ref()
-                .map(|state| state.modes.mode_bits),
-            Some(mode_bits::MOUSE_NORMAL)
-        );
-        // Frames for a foreign route never touch the campaign.
-        app.apply_wake(routed(
-            "route-9",
-            4,
-            attach_state_frame(AttachStateCode::Detached),
-        ));
-        assert!(app.attach_hydration.is_some());
-    }
-
-    #[test]
-    fn route_resync_raises_generation_and_restarts_hydration() {
-        let mut app = workspace_fixture();
-        app.begin_attach_hydration("session-alpha", "route-1");
-        app.apply_wake(routed(
-            "route-1",
-            1,
-            attach_state_frame(AttachStateCode::Attached),
-        ));
-        app.apply_wake(routed(
-            "route-1",
-            2,
-            botster_terminal_protocol_client::encode_route_resync().expect("resync frame"),
-        ));
-        assert_eq!(app.route_generation, Some(2));
-        let hydration = app
-            .attach_hydration
-            .as_ref()
-            .expect("hydration restarts at SNAPSHOT_READY");
-        assert!(hydration.attached_seen);
-        assert!(!hydration.snapshot_ready);
-        assert!(app.attached.is_none());
-        assert!(app.ghostty_projection.is_none());
     }
 
     #[test]
@@ -16233,6 +16461,7 @@ mod tests {
     fn attach_failed_before_ready_recovers_once_with_a_fresh_route() {
         let mut app = workspace_fixture();
         app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 1);
         app.apply_wake(routed(
             "route-1",
             1,
@@ -16251,14 +16480,15 @@ mod tests {
             .map(|hydration| hydration.route.clone())
             .expect("one fresh attach campaign");
         assert_ne!(replacement, "route-1");
+        complete_attach(&mut app, "session-alpha", &replacement, 2);
         app.apply_wake(routed(
             &replacement,
-            1,
+            2,
             attach_state_frame(AttachStateCode::Attached),
         ));
         app.apply_wake(routed(
             &replacement,
-            1,
+            2,
             attach_state_frame(AttachStateCode::Failed),
         ));
         assert!(app.attach_hydration.is_none());
@@ -16273,6 +16503,7 @@ mod tests {
     fn history_unavailable_before_ready_is_a_phase_gap_and_after_ready_keeps_the_route() {
         let mut app = workspace_fixture();
         app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 1);
         app.apply_wake(routed(
             "route-1",
             1,
@@ -16293,9 +16524,10 @@ mod tests {
             .as_ref()
             .map(|hydration| hydration.route.clone())
             .expect("recovery campaign");
+        complete_attach(&mut app, "session-alpha", &replacement, 2);
         app.apply_wake(routed(
             &replacement,
-            1,
+            2,
             attach_state_frame(AttachStateCode::Attached),
         ));
         if let Some(hydration) = app.attach_hydration.as_mut() {
@@ -16303,7 +16535,7 @@ mod tests {
         }
         app.apply_wake(routed(
             &replacement,
-            1,
+            2,
             botster_terminal_protocol_client::encode_history_unavailable(
                 HistoryUnavailableReason::CaptureFailed,
             )
@@ -16363,7 +16595,7 @@ mod tests {
     }
 
     #[test]
-    fn input_result_for_unknown_operation_reports_and_updates_modes() {
+    fn input_result_for_unknown_operation_is_reported_without_touching_modes() {
         let mut app = workspace_fixture();
         app.attached = Some(AttachedRoute {
             session_id: "session-alpha".to_string(),
@@ -16387,7 +16619,7 @@ mod tests {
             1,
             botster_terminal_protocol_client::encode_input_result(&result).expect("result frame"),
         ));
-        assert_eq!(app.current_mode_bits(), mode_bits::KITTY_KEYBOARD);
+        assert_eq!(app.current_mode_bits(), 0);
         assert!(
             app.error
                 .as_deref()
