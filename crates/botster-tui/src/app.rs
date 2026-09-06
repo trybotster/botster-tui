@@ -16213,13 +16213,8 @@ mod tests {
         from_epoch: u32,
         to_epoch: u32,
     ) -> botster_terminal_protocol_client::TerminalFrame {
-        botster_terminal_protocol_client::encode_route_resync(
-            botster_terminal_protocol_client::RouteResyncBody {
-                from_epoch,
-                to_epoch,
-            },
-        )
-        .expect("resync frame")
+        botster_terminal_protocol_client::encode_route_resync(from_epoch, to_epoch)
+            .expect("resync frame")
     }
 
     /// Complete the Attach request for `route` with the trusted generation.
