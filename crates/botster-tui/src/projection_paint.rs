@@ -37,8 +37,7 @@ impl Widget for ProjectionWidget<'_> {
                 let x = area.x + col as u16;
                 let y = area.y + row as u16;
                 let buffer_cell = &mut buf[(x, y)];
-                let symbol = projected_symbol(cell);
-                buffer_cell.set_symbol(&symbol);
+                buffer_cell.set_symbol(projected_symbol(cell));
                 buffer_cell.set_style(projected_style(cell));
             }
         }
@@ -58,11 +57,12 @@ impl Widget for ProjectionWidget<'_> {
     }
 }
 
-fn projected_symbol(cell: &ProjectedCell) -> String {
+/// Borrow the cell grapheme; an empty grapheme paints as one space.
+fn projected_symbol(cell: &ProjectedCell) -> &str {
     if cell.grapheme.is_empty() {
-        " ".to_string()
+        " "
     } else {
-        cell.grapheme.clone()
+        cell.grapheme.as_str()
     }
 }
 
