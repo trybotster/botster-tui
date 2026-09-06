@@ -99,7 +99,7 @@ const SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 48;
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const TERMINAL_INPUT_WRITE_BOUND: Duration = DETACH_ON_DISCONNECT_BOUND;
-// Core INPUT_QUEUE_CAPACITY is 256 at 93acae3f98adbc21dc981d113c4eb2f31ead4ad0.
+// Core INPUT_QUEUE_CAPACITY is 256 at bf6e7d996bca2786ad4142c870a13c57a490e241.
 const TERMINAL_INPUT_INFLIGHT_CAPACITY: usize = 64;
 const TERMINAL_INPUT_INFLIGHT_BYTES: usize = 256 * 1024;
 const _: () = assert!(TERMINAL_INPUT_INFLIGHT_CAPACITY < 256);
@@ -23501,7 +23501,7 @@ mod tests {
     #[test]
     fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
         // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub 9a02e55 and Core 93acae3. Export
+        // Build matching binaries from Hub 1a0df65 and Core bf6e7d9. Export
         // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
         // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
         let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
@@ -23520,9 +23520,9 @@ mod tests {
             "BOTSTER_SESSION_WORKER_BIN must exist"
         );
         let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "9a02e55f06ac269188a7d81604eda6efd9584a13".to_string());
+            .unwrap_or_else(|_| "1a0df65230a476cfea362fdc5131e035d303a928".to_string());
         let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "93acae3f98adbc21dc981d113c4eb2f31ead4ad0".to_string());
+            .unwrap_or_else(|_| "bf6e7d996bca2786ad4142c870a13c57a490e241".to_string());
         let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
         let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
         assert_eq!(

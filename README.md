@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `9a02e55f06ac269188a7d81604eda6efd9584a13` |
+| `botster-hub-client` / live hub | Hub `1a0df65230a476cfea362fdc5131e035d303a928` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `9a02e55f06ac269188a7d81604eda6efd9584a13` (`@trybotster/hub-test-support@0.1.43`) |
+| `botster-hub-test-support` package | Hub git `1a0df65230a476cfea362fdc5131e035d303a928` (`@trybotster/hub-test-support@0.1.43`) |
 | `botster-tui-kit` | `7940306b0d7461a12575b3856a96c0fbb23784f3` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `93acae3f98adbc21dc981d113c4eb2f31ead4ad0` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `bf6e7d996bca2786ad4142c870a13c57a490e241` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -169,7 +169,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`9a02e55f06ac269188a7d81604eda6efd9584a13` (same Hub pin as Foundation above).
+`1a0df65230a476cfea362fdc5131e035d303a928` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -196,15 +196,15 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 ```
 
 Incremental Ghostty live proof (protocol 8 / floor 48). Build Hub
-`9a02e55f06ac269188a7d81604eda6efd9584a13` and Core worker
-`93acae3f98adbc21dc981d113c4eb2f31ead4ad0` into a fresh target directory,
+`1a0df65230a476cfea362fdc5131e035d303a928` and Core worker
+`bf6e7d996bca2786ad4142c870a13c57a490e241` into a fresh target directory,
 then:
 
 ```sh
 export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
 export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=9a02e55f06ac269188a7d81604eda6efd9584a13
-export BOTSTER_SESSION_WORKER_BIN_REV=93acae3f98adbc21dc981d113c4eb2f31ead4ad0
+export BOTSTER_HUB_BIN_REV=1a0df65230a476cfea362fdc5131e035d303a928
+export BOTSTER_SESSION_WORKER_BIN_REV=bf6e7d996bca2786ad4142c870a13c57a490e241
 script/test-live-hub ghostty
 ```
 
@@ -273,8 +273,8 @@ Session types are authoritative Hub descriptors consumed through the
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 48` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `9a02e55f06ac269188a7d81604eda6efd9584a13`, Core crates
-  `93acae3f98adbc21dc981d113c4eb2f31ead4ad0`, Ghostty
+- Pins: Hub crates `1a0df65230a476cfea362fdc5131e035d303a928`, Core crates
+  `bf6e7d996bca2786ad4142c870a13c57a490e241`, Ghostty
   `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
   `botster-ui-contract-v0.3.3`, and kit
   `7940306b0d7461a12575b3856a96c0fbb23784f3`.
@@ -282,7 +282,7 @@ Session types are authoritative Hub descriptors consumed through the
 Live proof (independent of contract-matrix):
 
 ```sh
-# Use Hub 9a02e55 and Core 93acae3 binaries (same pins as Foundation).
+# Use Hub 1a0df65 and Core bf6e7d9 binaries (same pins as Foundation).
 # In pipeline worktrees whose path contains `:`, set a colon-free target dir:
 export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
 export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
@@ -305,7 +305,7 @@ list-for-target for a real admitted spawn point `T` (not `device:local`).
 are the repository-owned runtime proof that the installed Workspaces package,
 including the spawn-form `session_type_id` field and lifecycle bindings, works
 against a protocol-7 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `9a02e55f06ac269188a7d81604eda6efd9584a13`) and an
+this crate pins, currently `1a0df65230a476cfea362fdc5131e035d303a928`) and an
 explicit clean post-migration `botster-workspaces` package path via
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
 also pins the acceptance driver field key so a silent `template_id` revert
