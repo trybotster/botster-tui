@@ -1,10 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    io::{self, Read, Stdout},
-    net::Shutdown,
+    io::{self, Stdout},
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,48 +9,38 @@ use crate::entity_options::{
     EntityOptionsStore, demanded_entity_option_families, is_process_wide_entity_family,
     materialize_entity_options_selects,
 };
+use crate::hub_io::{AppWake, HubIo};
+use crate::terminal_input::{self, InputWindow};
 use botster_core::{
     RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport,
     contract::terminal_screen::TerminalScreenSize,
 };
 use botster_hub_client::{
-    ATTACH_STATE_ATTACH_FAILED, ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE, DaemonApp,
-    DaemonAvailablePackage, DaemonCaptureSnapshot, DaemonCompatibility, DaemonCompatibilityError,
+    DaemonApp, DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityError,
     DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
     DaemonEntityFrame, DaemonEvent, DaemonHelloAck, DaemonPackage, DaemonPackageAvailabilityReason,
     DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
-    DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
-    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
-    DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
-    DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
-    DaemonUnixMuxFrame, DaemonUnixTerminalEnvelope, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+    DaemonRequest, DaemonRequestError, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
+    DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
+    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
+    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
+    DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
     FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
     FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
     FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
     FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
-    connect_and_hello_with_terminal_requirement, ensure_terminal_compatible, parse_unix_mux_value,
-    subscribe_entities, subscribe_session_entities, write_frame,
+    ensure_terminal_compatible,
 };
-#[cfg(test)]
-use botster_hub_client::{
-    DaemonLiveOutputPayload, DaemonOpaqueHistoryPayload, FEATURE_ATTACH_OCCUPANCY,
-};
-#[cfg(test)]
-use botster_hub_client::{TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, TerminalCompatibility};
 use botster_terminal_ghostty::{
     GhosttyAdapterConfig, GhosttyClientProjection, GhosttySnapshotDecodeProgress, ScrollOp,
     ViewportProjection,
 };
 #[cfg(test)]
+use botster_terminal_protocol_client::decode_terminal_input;
 use botster_terminal_protocol_client::{
-    AttachState, MAX_PASTE_CHUNK_DATA_BYTES, ProcessExit, Snapshot, TerminalInputFrame,
-    TerminalOutput, decode_terminal_input,
-};
-use botster_terminal_protocol_client::{
-    AttachStateKind, MAX_INPUT_DATA_BYTES, MAX_MODE_GATED_DATA_BYTES, MAX_PASTE_BYTES,
-    SnapshotPhase, TerminalEvent, TerminalFrame, TerminalInputCommand, TerminalInputKind,
-    TerminalInputRejection, TerminalInputResult, TerminalModeFlags, encode_paste,
+    AttachStateCode, HistoryUnavailableReason, InputOutcome, InputResultBody, ModesBody, RouteId,
+    RoutedTerminalFrame, TerminalEvent, TerminalInputCommand, decode_terminal_event, encode_paste,
     encode_terminal_input,
 };
 use botster_ui_contract::{
@@ -65,8 +52,9 @@ use botster_ui_contract::{
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -84,6 +72,7 @@ use crate::acceptance::{
     AcceptanceMode, CLAIM_SCHEMA, ClaimConfig, Config as AcceptanceConfig, EvidenceWriter,
     FailureContext, SCHEMA, ScenarioCase, verify_claim_pins,
 };
+use crate::projection_paint::tui_terminal_region;
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
@@ -91,24 +80,25 @@ const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r
 const HEADLESS_INPUT: &str = "botster-tui-headless\n";
 const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
-const TERMINAL_MOUSE_MODE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const SESSION_ENTITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
-const SESSION_ENTITY_STOP_TIMEOUT: Duration = Duration::from_millis(750);
-#[cfg(test)]
-const SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 48;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 49;
+/// Absolute deadline for an ordinary host-control request.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// Absolute deadline for Detach and for connection teardown.
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
-const TERMINAL_INPUT_WRITE_BOUND: Duration = DETACH_ON_DISCONNECT_BOUND;
-// Core INPUT_QUEUE_CAPACITY is 256 at bf6e7d996bca2786ad4142c870a13c57a490e241.
-const TERMINAL_INPUT_INFLIGHT_CAPACITY: usize = 64;
-const TERMINAL_INPUT_INFLIGHT_BYTES: usize = 256 * 1024;
-const _: () = assert!(TERMINAL_INPUT_INFLIGHT_CAPACITY < 256);
-const _: () = assert!(
-    TERMINAL_INPUT_INFLIGHT_BYTES < TERMINAL_INPUT_INFLIGHT_CAPACITY * MAX_INPUT_DATA_BYTES
-);
-const MUX_POLL_TIMEOUT: Duration = Duration::from_millis(1);
-const MUX_POLL_BATCH_FRAMES: usize = 32;
-const MUX_APPLY_BATCH_FRAMES: usize = 32;
+/// Bound for stopping the I/O owner at exit.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
+/// Connection deadline for the headless live runtime smoke.
+const HEADLESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(8);
+/// Live OUTPUT retained while SNAPSHOT_HISTORY is still arriving for a route.
+const MAX_HYDRATION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Encoded input retained while a route is still attaching.
+const MAX_PENDING_HYDRATION_INPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Package events parked per candidate subscription until EventSubscribed lands.
+const MAX_PARKED_NOTICE_EVENTS: usize = 8;
+/// Wakes applied per loop turn before one paint.
+const WAKE_BATCH: usize = 64;
 const MAX_NOTICE_SUBSCRIPTIONS: usize = 64;
 const ENTITY_OPTIONS_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
 const ENTITY_OPTIONS_BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -295,45 +285,93 @@ struct SessionRow {
     session_type_lifecycle: Option<String>,
 }
 
+/// One attach campaign between the Attach request and the open live path.
+///
+/// Scheme 2 ordering per route: ATTACH_STATE attached, MODES, SNAPSHOT_READY,
+/// live OUTPUT interleaved with SNAPSHOT_HISTORY, SNAPSHOT_FINISH, then OUTPUT.
+/// Live OUTPUT that arrives before SNAPSHOT_FINISH is retained here (bounded)
+/// and applied after the last history page.
 #[derive(Clone, Debug)]
 struct AttachHydration {
     session_id: String,
-    subscription_id: String,
+    route: String,
     buffered_live_output: Vec<u8>,
     pending_input: Vec<PendingTerminalInput>,
+    pending_input_bytes: usize,
     pending_resize: Option<TerminalScreenSize>,
     /// True after the incremental decoder validates READY.
     snapshot_ready: bool,
-    /// True after FINISH NO_VALUE or a post-READY history failure.
+    /// True after SNAPSHOT_FINISH or HISTORY_UNAVAILABLE after READY.
     snapshot_finished: bool,
     /// True after the matching attached state arrives.
     attached_seen: bool,
 }
 
+impl AttachHydration {
+    fn new(session_id: &str, route: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            route: route.to_string(),
+            buffered_live_output: Vec::new(),
+            pending_input: Vec::new(),
+            pending_input_bytes: 0,
+            pending_resize: None,
+            snapshot_ready: false,
+            snapshot_finished: false,
+            attached_seen: false,
+        }
+    }
+}
+
+/// Input captured while a route is still attaching. Operation ids are
+/// assigned when the live path opens so they stay strictly increasing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingTerminalInput {
-    Bytes(Vec<u8>),
-    Paste { operation_id: u32, data: Vec<u8> },
+    Key(KeyEvent),
+    Focus(bool),
+    Paste(Vec<u8>),
 }
 
+impl PendingTerminalInput {
+    /// Bytes retained by the client for this pending input.
+    fn retained_bytes(&self) -> usize {
+        match self {
+            // KEY body prefix plus at most one UTF-8 scalar of text.
+            Self::Key(_) => 16,
+            Self::Focus(_) => 1,
+            Self::Paste(data) => data.len(),
+        }
+    }
+}
+
+/// Whether a kit node id names the production terminal view.
+fn is_terminal_node(node_id: Option<&str>) -> bool {
+    matches!(node_id, Some("tui-terminal" | "tui-terminal-output"))
+}
+
+/// Entity family of one subscription frame.
+fn entity_frame_type(frame: &DaemonEntityFrame) -> &str {
+    match frame {
+        DaemonEntityFrame::Snapshot { entity_type, .. }
+        | DaemonEntityFrame::Upsert { entity_type, .. }
+        | DaemonEntityFrame::Patch { entity_type, .. }
+        | DaemonEntityFrame::Remove { entity_type, .. }
+        | DaemonEntityFrame::Error { entity_type, .. } => entity_type,
+    }
+}
+
+/// The attached route and its adopted stream generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct InFlightTerminalInput {
-    kind: TerminalInputKind,
-    data: Vec<u8>,
-    operation_id: Option<u32>,
-    retried: bool,
+struct AttachedRoute {
+    session_id: String,
+    route: RouteId,
 }
 
-/// Attachment-scoped Hub mode flags used for ModeGatedInput freshness.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct TerminalModeShadow {
-    session_id: String,
-    subscription_id: String,
-    kitty_enabled: bool,
-    bracketed_paste: bool,
-    mouse_mode: u8,
-    mode_generation: u64,
-    mode_revision: u64,
+/// Last MODES frame for the current route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalModeState {
+    route: String,
+    modes: ModesBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -342,9 +380,40 @@ enum DestructiveAction {
     Remove(String),
 }
 
-#[derive(Default)]
-struct HydrationEvidence {
-    lifecycle_ended: bool,
+/// What the application does with one host-control completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingReply {
+    /// Apply the response to read models and diagnostics.
+    Apply,
+    /// Session types for the target-first spawn picker (flow-local only).
+    ListForTarget {
+        target_id: String,
+        target_label: String,
+    },
+    /// SpawnSessionType or freeform Spawn for a locally pending row.
+    Spawn { session_id: String },
+    /// ShowSessionTypeDefinition for the edit form.
+    ShowSessionTypeDefinition { session_type_id: String },
+    /// CreateSessionType or UpdateSessionType from the form.
+    SessionTypeForm,
+    /// Attach for the campaign on `route`.
+    Attach { session_id: String, route: String },
+    /// Detach for a retired route; the response only updates diagnostics.
+    Detach,
+    /// SubscribeEvents candidate for one notice descriptor.
+    SubscribeEvents {
+        key: NoticeSubscriptionKey,
+        subscription_id: String,
+    },
+    /// UnsubscribeEvents; the response is informational.
+    Unsubscribe,
+}
+
+/// Parked package events for a candidate notice subscription.
+#[derive(Clone, Debug, Default)]
+struct ParkedNoticeEvents {
+    events: VecDeque<(String, String, Value)>,
+    gap: bool,
 }
 
 impl SessionRow {
@@ -1072,50 +1141,6 @@ fn session_binding_reference_row() -> serde_json::Map<String, Value> {
     .clone()
 }
 
-enum SessionSubscriptionMessage {
-    Frame(DaemonEntityFrame),
-    Disconnected {
-        subscription_id: String,
-        error: String,
-    },
-}
-
-struct SessionSubscriptionPump {
-    messages: Receiver<SessionSubscriptionMessage>,
-    cancel: Option<mpsc::Sender<()>>,
-    stopped: Receiver<()>,
-    stop_attempted: bool,
-    stopped_confirmed: bool,
-}
-
-impl SessionSubscriptionPump {
-    fn stop(&mut self) -> bool {
-        if self.stopped_confirmed {
-            return true;
-        }
-        if self.stop_attempted {
-            return false;
-        }
-        self.stop_attempted = true;
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(());
-        }
-        self.stopped_confirmed = self
-            .stopped
-            .recv_timeout(SESSION_ENTITY_STOP_TIMEOUT)
-            .is_ok();
-        self.stopped_confirmed
-    }
-}
-
-impl Drop for SessionSubscriptionPump {
-    fn drop(&mut self) {
-        if !self.stop_attempted {
-            let _ = self.stop();
-        }
-    }
-}
-
 pub fn run(args: AppArgs) -> io::Result<()> {
     match AcceptanceMode::from_environment()? {
         Some(AcceptanceMode::Spawn(config)) => return run_workspaces_acceptance(args, config),
@@ -1129,8 +1154,9 @@ pub fn run(args: AppArgs) -> io::Result<()> {
             .map_err(|error| io::Error::other(format!("headless live runtime failed: {error}")));
     }
 
+    let hub_io = HubIo::with_terminal_input()?;
     let mut terminal = setup_terminal()?;
-    let run_result = run_loop(&mut terminal, args);
+    let run_result = run_loop(&mut terminal, args, hub_io);
     let restore_result = restore_terminal(&mut terminal);
 
     match (run_result, restore_result) {
@@ -1144,7 +1170,13 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        EnableFocusChange
+    ) {
         let _ = disable_raw_mode();
         return Err(error);
     }
@@ -1153,7 +1185,14 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen,
+                Show
+            );
             let _ = disable_raw_mode();
             Err(error)
         }
@@ -1163,6 +1202,8 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let leave_result = execute!(
         terminal.backend_mut(),
+        DisableFocusChange,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
         Show
@@ -1175,16 +1216,29 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
     cursor_result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) -> io::Result<()> {
+/// The interactive event loop.
+///
+/// One wait per turn: `HubIo::next_wake` blocks until an input event, a Hub
+/// frame, a request completion, or the earliest absolute deadline. Every wake
+/// that is already available is applied before one paint. There is no
+/// periodic poll.
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    args: AppArgs,
+    hub_io: HubIo,
+) -> io::Result<()> {
     let mut app = TuiApp::new_with_runtime_context(
         args.daemon_endpoint(),
         args.connection_error,
         args.hub_data_dir.is_some(),
+        hub_io,
     );
+    app.connect();
     let mut router = InputRouter::new(renderer::action_request_context());
     let mut routed_surface_id = None;
-    loop {
-        app.poll_hub();
+    let mut hit_map = HitMap::default();
+    let mut running = true;
+    while running {
         let active_surface_id = app.active_plugin_surface_id().map(ToOwned::to_owned);
         if active_surface_id != routed_surface_id {
             router = InputRouter::new(match active_surface_id.as_deref() {
@@ -1195,24 +1249,38 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, args: AppArgs) ->
         }
         app.set_drafts(router.draft_values());
 
-        let mut hit_map = HitMap::default();
         let render_state = router.render_state();
-        // Refresh projection paint cache immediately before draw so the frame
-        // reflects install/apply/scroll without requiring &mut during paint.
-        app.refresh_ghostty_viewport_cache();
+        hit_map = HitMap::default();
+        app.prepare_paint();
         terminal.draw(|frame| draw(frame, &mut hit_map, &app, &render_state))?;
         app.apply_terminal_mouse_mode(&mut hit_map);
         router.reconcile(&hit_map);
 
-        if event::poll(Duration::from_millis(100))? {
-            let event = event::read()?;
-            if !route_input_event(&mut app, &mut router, &hit_map, event) {
+        let wake = app.next_wake();
+        running = apply_wake(&mut app, &mut router, &hit_map, wake);
+        let mut applied = 1;
+        while running && applied < WAKE_BATCH {
+            let Some(wake) = app.try_next_wake() else {
                 break;
-            }
+            };
+            running = apply_wake(&mut app, &mut router, &hit_map, wake);
+            applied += 1;
         }
     }
-
+    app.shutdown();
     Ok(())
+}
+
+/// Apply one wake. Returns false when the application should exit.
+fn apply_wake(app: &mut TuiApp, router: &mut InputRouter, hit_map: &HitMap, wake: AppWake) -> bool {
+    match wake {
+        AppWake::Input(event) => route_input_event(app, router, hit_map, event),
+        AppWake::Shutdown => false,
+        other => {
+            app.apply_wake(other);
+            true
+        }
+    }
 }
 
 fn route_input_event(
@@ -1228,6 +1296,10 @@ fn route_input_event(
         Event::Key(key) if app.handle_focused_terminal_key(key, router.focused_node_id()) => {}
         Event::Paste(ref text)
             if app.handle_focused_terminal_paste(text, router.focused_node_id()) => {}
+        Event::Mouse(mouse)
+            if app.handle_focused_terminal_mouse(mouse, router.focused_node_id(), hit_map) => {}
+        Event::FocusGained => app.handle_host_focus(true),
+        Event::FocusLost => app.handle_host_focus(false),
         Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => return false,
         event => {
             let dispatch = router.dispatch_event(event, hit_map);
@@ -1455,43 +1527,67 @@ fn should_quit(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn terminal_input_rejection_message(
-    rejection: Option<TerminalInputRejection>,
-    bytes_written: usize,
-) -> String {
-    match rejection {
-        Some(TerminalInputRejection::StaleMode) => {
-            "terminal input rejected: stale mode".to_string()
+/// User-facing text for an INPUT_RESULT that is not `Written`.
+fn input_outcome_message(result: &InputResultBody) -> String {
+    let written = result
+        .written_pty_bytes
+        .map(|bytes| format!(" after {bytes} bytes"))
+        .unwrap_or_default();
+    let detail = if result.detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", result.detail)
+    };
+    let operation = result.operation_id;
+    match result.outcome {
+        InputOutcome::Written => format!("terminal input {operation} written"),
+        InputOutcome::PartialWrite => {
+            format!("terminal input {operation} partially written{written}{detail}")
         }
-        Some(TerminalInputRejection::PartialWrite) => {
-            format!("terminal input rejected: partial write after {bytes_written} bytes")
+        InputOutcome::WriteFailed => format!("terminal input {operation} write failed{detail}"),
+        InputOutcome::Cancelled => format!("terminal input {operation} cancelled{written}"),
+        InputOutcome::RejectedNotWritable => {
+            format!("terminal input {operation} rejected: session is not writable{detail}")
         }
-        Some(TerminalInputRejection::Timeout) => {
-            "terminal input rejected: mode wait timed out".to_string()
+        InputOutcome::RejectedTooLarge => {
+            format!("terminal input {operation} rejected: payload too large{detail}")
         }
-        Some(TerminalInputRejection::SessionNotWritable) => {
-            "terminal input rejected: session is not writable".to_string()
+        InputOutcome::RejectedUnsafePaste => {
+            format!("terminal paste {operation} rejected: unsafe paste{detail}")
         }
-        Some(TerminalInputRejection::OperationInFlight) => {
-            "terminal paste rejected: another operation is in flight".to_string()
+        InputOutcome::RejectedLaneFull => {
+            format!("terminal input {operation} rejected: input lane full{detail}")
         }
-        Some(TerminalInputRejection::OperationOutOfBounds) => {
-            "terminal paste rejected: operation is out of bounds".to_string()
+        InputOutcome::RejectedProtocol => {
+            format!("terminal input {operation} rejected: protocol error{detail}")
         }
-        Some(TerminalInputRejection::OperationIncomplete) => {
-            "terminal paste rejected: operation is incomplete".to_string()
+        InputOutcome::SessionEnded => format!("terminal input {operation} rejected: session ended"),
+        InputOutcome::OutcomeUnknown => {
+            format!("terminal input {operation} outcome unknown: worker link failed{detail}")
         }
-        Some(TerminalInputRejection::Aborted) => {
-            "terminal paste rejected: operation was aborted".to_string()
-        }
-        None => "terminal input rejected without a reason".to_string(),
     }
+}
+
+/// Reconnect delay after `failures` consecutive connection failures.
+fn reconnect_backoff_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(8);
+    RECONNECT_BACKOFF_INITIAL
+        .saturating_mul(1_u32 << exponent)
+        .min(RECONNECT_BACKOFF_CAP)
 }
 
 struct TuiApp {
     endpoint: Option<DaemonEndpoint>,
     host_requirement: DaemonCompatibilityRequirement,
-    client: Option<HubConnection>,
+    /// The single I/O owner: input thread, socket threads, request deadlines.
+    hub_io: HubIo,
+    /// Generation of the connection that completed Hello, when connected.
+    connected_generation: Option<u64>,
+    /// Absolute time of the next reconnect attempt, when scheduled.
+    reconnect_at: Option<Instant>,
+    reconnect_failures: u32,
+    /// Continuation for every outstanding host-control request.
+    pending_requests: BTreeMap<u64, PendingReply>,
     status: String,
     connection_error: Option<String>,
     error: Option<String>,
@@ -1516,20 +1612,20 @@ struct TuiApp {
     pending_plugin_request: Option<UiActionRequest>,
     session_entities: SessionEntityState,
     pending_sessions: BTreeMap<String, SessionRow>,
-    session_subscription: Option<SessionSubscriptionPump>,
     session_type_entities: SessionTypeEntityState,
-    session_type_subscription: Option<SessionSubscriptionPump>,
     session_type_subscription_error: Option<String>,
     /// Multi-family entity-options store (non-process-wide families + generation).
     entity_options: EntityOptionsStore,
-    /// Per-family SubscribeEntities pumps for entity-options demand.
-    entity_options_subscriptions: BTreeMap<String, SessionSubscriptionPump>,
+    /// Entity-options families with an open or requested SubscribeEntities.
+    entity_options_subscriptions: BTreeSet<String>,
     /// Per-family backoff for optional entity-options subscribe admission.
     entity_options_retry: BTreeMap<String, EntityOptionsRetryState>,
     /// Field names whose entity-backed selection was invalidated (visible error).
     entity_options_invalid_fields: BTreeSet<String>,
     notice_subscriptions: BTreeMap<NoticeSubscriptionKey, NoticeSubscriptionEntry>,
     notice_subscription_by_id: BTreeMap<String, NoticeSubscriptionKey>,
+    /// Package events that arrived before EventSubscribed for a candidate.
+    notice_parked: BTreeMap<String, ParkedNoticeEvents>,
     notice_overflow_dropped: usize,
     transient_notice: Option<TransientNotice>,
     session_types_supported: bool,
@@ -1539,34 +1635,33 @@ struct TuiApp {
     target_first_spawn: Option<TargetFirstSpawnFlow>,
     sessions: Vec<SessionRow>,
     selected_session: Option<String>,
-    attached_session: Option<String>,
-    attached_subscription_id: Option<String>,
+    /// Live attached route after SNAPSHOT_FINISH and attached state.
+    attached: Option<AttachedRoute>,
     schema_version: Option<u16>,
+    /// Route id of the current attach campaign or attachment.
     subscription_id: String,
     next_terminal_subscription_sequence: u64,
-    terminal_output: String,
-    terminal_output_session_id: Option<String>,
+    /// Adopted stream generation for the current route; lower generations are
+    /// stale and dropped, a higher generation is a resync boundary.
+    route_generation: Option<u64>,
     /// Core-owned Ghostty projection for incremental GHOSTSNP and live output.
     ghostty_projection: Option<GhosttyClientProjection>,
     ghostty_projection_session_id: Option<String>,
     /// Last projected viewport for immutable frame paint after kit TerminalView.
     ghostty_viewport_cache: Option<ViewportProjection>,
-    snapshot_metadata: Option<DaemonCaptureSnapshot>,
+    /// True when the projection changed since the last `project_viewport`.
+    projection_dirty: bool,
     attach_hydration: Option<AttachHydration>,
     /// One automatic recovery already used for the current attach campaign.
     attach_recovery_used: bool,
-    /// Retired subscription ids whose late close events must be ignored.
+    /// Retired route ids whose late frames and close events must be ignored.
     retired_subscription_ids: BTreeSet<String>,
     /// Close-event evidence from `TerminalSubscriptionClosed` (generation, reason).
     terminal_close_evidence: Option<(u64, String)>,
-    terminal_mouse_mode: u8,
-    terminal_mouse_mode_attachment: Option<(String, String)>,
-    terminal_mode_shadow: Option<TerminalModeShadow>,
-    terminal_input_in_flight: VecDeque<InFlightTerminalInput>,
-    terminal_input_in_flight_bytes: usize,
-    next_paste_operation_id: u32,
-    terminal_mouse_mode_refresh_due: bool,
-    last_terminal_mouse_mode_probe: Option<Instant>,
+    /// Last MODES frame for the current route.
+    terminal_modes: Option<TerminalModeState>,
+    /// Client-side input window for the current route generation.
+    input_window: InputWindow,
     terminal_viewport_size: TerminalScreenSize,
     drafts: BTreeMap<String, Value>,
     system_details_visible: bool,
@@ -1574,7 +1669,6 @@ struct TuiApp {
     confirmation: Option<DestructiveAction>,
     #[cfg(test)]
     workspace_test_mode: bool,
-    last_reconnect_attempt: Option<Instant>,
     acceptance_audit: Option<AcceptanceRequestAudit>,
     #[cfg(test)]
     observed_requests: Vec<ObservedRequest>,
@@ -1582,16 +1676,6 @@ struct TuiApp {
     observed_terminal_inputs: Vec<TerminalInputCommand>,
     #[cfg(test)]
     list_for_target_stub: Option<ListForTargetStub>,
-    /// When true, entity-options SubscribeEntities uses local pumps (no network).
-    /// Production path tests inject frames through drain without a live Hub.
-    #[cfg(test)]
-    entity_options_local_pumps: bool,
-    /// Senders for local entity-options pumps (test injection only).
-    #[cfg(test)]
-    entity_options_frame_injectors: BTreeMap<String, mpsc::Sender<SessionSubscriptionMessage>>,
-    /// Skip the socket for notice SubscribeEvents / UnsubscribeEvents (unit tests).
-    #[cfg(test)]
-    notice_subscriptions_local: bool,
     /// Exact live payloads passed to the Ghostty apply path (test observer only).
     #[cfg(test)]
     applied_live_payloads: Vec<Vec<u8>>,
@@ -1602,6 +1686,8 @@ struct TuiApp {
 }
 
 impl TuiApp {
+    /// Application state without a terminal input thread. The caller starts
+    /// the connection with `connect`.
     fn new(endpoint: Option<DaemonEndpoint>) -> Self {
         Self::new_with_connection(endpoint, None)
     }
@@ -1610,7 +1696,7 @@ impl TuiApp {
         endpoint: Option<DaemonEndpoint>,
         connection_error: Option<String>,
     ) -> Self {
-        Self::new_with_runtime_context(endpoint, connection_error, false)
+        Self::new_with_runtime_context(endpoint, connection_error, false, HubIo::new())
     }
 
     #[cfg(test)]
@@ -1620,6 +1706,7 @@ impl TuiApp {
             None,
             true,
             tui_attach_occupancy_requirement(),
+            HubIo::new(),
         )
     }
 
@@ -1627,12 +1714,14 @@ impl TuiApp {
         endpoint: Option<DaemonEndpoint>,
         connection_error: Option<String>,
         package_storage_context_configured: bool,
+        hub_io: HubIo,
     ) -> Self {
         Self::new_with_runtime_context_and_requirement(
             endpoint,
             connection_error,
             package_storage_context_configured,
             tui_compatibility_requirement(),
+            hub_io,
         )
     }
 
@@ -1641,11 +1730,16 @@ impl TuiApp {
         connection_error: Option<String>,
         package_storage_context_configured: bool,
         host_requirement: DaemonCompatibilityRequirement,
+        hub_io: HubIo,
     ) -> Self {
-        let mut app = Self {
+        Self {
             endpoint,
             host_requirement,
-            client: None,
+            hub_io,
+            connected_generation: None,
+            reconnect_at: None,
+            reconnect_failures: 0,
+            pending_requests: BTreeMap::new(),
             status: "disconnected".to_string(),
             connection_error,
             error: None,
@@ -1668,16 +1762,15 @@ impl TuiApp {
             pending_plugin_request: None,
             session_entities: SessionEntityState::default(),
             pending_sessions: BTreeMap::new(),
-            session_subscription: None,
             session_type_entities: SessionTypeEntityState::default(),
-            session_type_subscription: None,
             session_type_subscription_error: None,
             entity_options: EntityOptionsStore::default(),
-            entity_options_subscriptions: BTreeMap::new(),
+            entity_options_subscriptions: BTreeSet::new(),
             entity_options_retry: BTreeMap::new(),
             entity_options_invalid_fields: BTreeSet::new(),
             notice_subscriptions: BTreeMap::new(),
             notice_subscription_by_id: BTreeMap::new(),
+            notice_parked: BTreeMap::new(),
             notice_overflow_dropped: 0,
             transient_notice: None,
             session_types_supported: true,
@@ -1687,29 +1780,21 @@ impl TuiApp {
             target_first_spawn: None,
             sessions: Vec::new(),
             selected_session: None,
-            attached_session: None,
-            attached_subscription_id: None,
+            attached: None,
             schema_version: None,
             subscription_id: format!("btui-sub-{}", short_suffix()),
             next_terminal_subscription_sequence: 1,
-            terminal_output: String::new(),
-            terminal_output_session_id: None,
+            route_generation: None,
             ghostty_projection: None,
             ghostty_projection_session_id: None,
             ghostty_viewport_cache: None,
-            snapshot_metadata: None,
+            projection_dirty: false,
             attach_hydration: None,
             attach_recovery_used: false,
             retired_subscription_ids: BTreeSet::new(),
             terminal_close_evidence: None,
-            terminal_mouse_mode: 0,
-            terminal_mouse_mode_attachment: None,
-            terminal_mode_shadow: None,
-            terminal_input_in_flight: VecDeque::new(),
-            terminal_input_in_flight_bytes: 0,
-            next_paste_operation_id: 1,
-            terminal_mouse_mode_refresh_due: false,
-            last_terminal_mouse_mode_probe: None,
+            terminal_modes: None,
+            input_window: InputWindow::new(),
             terminal_viewport_size: TerminalScreenSize::new(
                 DEFAULT_TERMINAL_ROWS,
                 DEFAULT_TERMINAL_COLS,
@@ -1720,7 +1805,6 @@ impl TuiApp {
             confirmation: None,
             #[cfg(test)]
             workspace_test_mode: false,
-            last_reconnect_attempt: None,
             acceptance_audit: None,
             #[cfg(test)]
             observed_requests: Vec::new(),
@@ -1729,20 +1813,183 @@ impl TuiApp {
             #[cfg(test)]
             list_for_target_stub: None,
             #[cfg(test)]
-            entity_options_local_pumps: false,
-            #[cfg(test)]
-            entity_options_frame_injectors: BTreeMap::new(),
-            #[cfg(test)]
-            notice_subscriptions_local: false,
-            #[cfg(test)]
             applied_live_payloads: Vec::new(),
             #[cfg(test)]
             entity_options_forced_subscribe_error: None,
             #[cfg(test)]
             entity_options_subscribe_attempts: BTreeMap::new(),
+        }
+    }
+
+    /// Whether a Hello-complete connection is installed.
+    fn is_connected(&self) -> bool {
+        self.connected_generation.is_some() && self.hub_io.is_connected()
+    }
+
+    /// Session id of the live attached route.
+    fn attached_session_id(&self) -> Option<&str> {
+        self.attached
+            .as_ref()
+            .map(|attached| attached.session_id.as_str())
+    }
+
+    /// Harness helper: apply wakes until `ready` holds or `deadline` passes.
+    ///
+    /// Input events are ignored here; harness drivers dispatch their own
+    /// synthetic events. Returns whether `ready` held.
+    fn pump_until(&mut self, deadline: Instant, mut ready: impl FnMut(&mut Self) -> bool) -> bool {
+        loop {
+            if ready(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let until = self
+                .next_deadline()
+                .map_or(deadline, |candidate| candidate.min(deadline));
+            match self.hub_io.next_wake(Some(until)) {
+                AppWake::Input(_) => {}
+                AppWake::Shutdown => return ready(self),
+                other => self.apply_wake(other),
+            }
+        }
+    }
+
+    /// Harness helper: wait at most until `until` for one wake and apply it.
+    fn pump_once(&mut self, until: Instant) {
+        let until = self
+            .next_deadline()
+            .map_or(until, |candidate| candidate.min(until));
+        match self.hub_io.next_wake(Some(until)) {
+            AppWake::Input(_) | AppWake::Shutdown => {}
+            other => self.apply_wake(other),
+        }
+        while let Some(wake) = self.hub_io.try_next_wake() {
+            match wake {
+                AppWake::Input(_) | AppWake::Shutdown => {}
+                other => self.apply_wake(other),
+            }
+        }
+    }
+
+    /// Harness helper: apply wakes until no host-control request is outstanding.
+    fn settle(&mut self, deadline: Instant) -> bool {
+        self.pump_until(deadline, |app| app.pending_requests.is_empty())
+    }
+
+    /// Text of the projected viewport, rows joined by newlines.
+    fn viewport_text(&mut self) -> String {
+        self.prepare_paint();
+        let Some(viewport) = self.ghostty_viewport_cache.as_ref() else {
+            return String::new();
         };
-        app.try_connect();
-        app
+        let cols = viewport.cols as usize;
+        if cols == 0 {
+            return String::new();
+        }
+        let mut text = String::new();
+        for (index, cell) in viewport.cells.iter().enumerate() {
+            if index > 0 && index % cols == 0 {
+                text.push('\n');
+            }
+            if cell.grapheme.is_empty() {
+                text.push(' ');
+            } else {
+                text.push_str(&cell.grapheme);
+            }
+        }
+        text
+    }
+
+    /// Earliest absolute deadline the loop must wake for.
+    fn next_deadline(&self) -> Option<Instant> {
+        let mut deadline = self.hub_io.earliest_deadline();
+        let mut consider = |candidate: Option<Instant>| {
+            if let Some(candidate) = candidate {
+                deadline = Some(deadline.map_or(candidate, |current| current.min(candidate)));
+            }
+        };
+        consider(self.reconnect_at);
+        consider(self.transient_notice.as_ref().map(|notice| notice.deadline));
+        consider(
+            self.entity_options_retry
+                .values()
+                .map(|state| state.next_attempt_at)
+                .min(),
+        );
+        deadline
+    }
+
+    /// Block for the next wake or the earliest deadline.
+    fn next_wake(&mut self) -> AppWake {
+        let until = self.next_deadline();
+        self.hub_io.next_wake(until)
+    }
+
+    /// Take one wake without blocking.
+    fn try_next_wake(&mut self) -> Option<AppWake> {
+        self.hub_io.try_next_wake()
+    }
+
+    /// Apply one non-input wake.
+    fn apply_wake(&mut self, wake: AppWake) {
+        match wake {
+            AppWake::Input(_) | AppWake::Shutdown => {}
+            AppWake::Terminal(routed) => self.apply_routed_terminal_frame(routed),
+            AppWake::Completed { request_id, result } => self.complete_request(request_id, result),
+            AppWake::Event(event) => self.apply_mux_event(event),
+            AppWake::Entity {
+                subscription_id,
+                frame,
+            } => self.apply_entity_frame(&subscription_id, frame),
+            AppWake::EntitySubscribed {
+                subscription_id,
+                result,
+            } => self.apply_entity_subscribed(&subscription_id, result),
+            AppWake::EntityClosed {
+                subscription_id,
+                error,
+            } => self.apply_entity_closed(&subscription_id, error),
+            AppWake::Connected { generation, ack } => self.apply_connected(generation, *ack),
+            AppWake::Disconnected { generation, error } => {
+                self.apply_disconnected(generation, error);
+            }
+            AppWake::RouteFault {
+                route,
+                generation,
+                reason,
+            } => self.apply_route_fault(route, generation, &reason),
+            AppWake::Deadline => self.apply_deadlines(),
+        }
+    }
+
+    /// Run every absolute-deadline action that is due.
+    fn apply_deadlines(&mut self) {
+        let now = Instant::now();
+        self.expire_transient_notice();
+        if self.reconnect_at.is_some_and(|at| at <= now) {
+            self.reconnect_at = None;
+            self.connect();
+        }
+        if self.is_connected() {
+            self.heal_entity_options_subscriptions();
+        }
+    }
+
+    /// Project the viewport once when the projection changed since last paint.
+    fn prepare_paint(&mut self) {
+        self.expire_transient_notice();
+        if self.projection_dirty {
+            self.refresh_ghostty_viewport_cache();
+        }
+    }
+
+    /// Stop the I/O owner within the shutdown bound.
+    fn shutdown(self) {
+        let mut app = self;
+        app.detach_owner_if_writable();
+        app.hub_io.shutdown(SHUTDOWN_BOUND);
     }
 
     fn set_drafts(&mut self, drafts: BTreeMap<String, Value>) {
@@ -1774,26 +2021,6 @@ impl TuiApp {
         }
     }
 
-    fn poll_hub(&mut self) {
-        self.expire_transient_notice();
-        if self.drain_session_subscription() {
-            return;
-        }
-        if self.drain_session_type_subscription() {
-            return;
-        }
-        if self.drain_entity_options_subscriptions() {
-            return;
-        }
-        if self.client.is_none() {
-            self.try_connect_throttled();
-            return;
-        }
-
-        self.poll_and_apply_mux_frames();
-        self.refresh_terminal_mouse_mode_if_due();
-    }
-
     fn handle_dispatch(&mut self, dispatch: InputDispatch) {
         match dispatch {
             InputDispatch::Action(request) => {
@@ -1803,60 +2030,149 @@ impl TuiApp {
                     self.handle_action(request.action_id.0, request.values, request.payload);
                 }
             }
-            InputDispatch::TerminalForward { bytes, .. } => {
-                if let Some(hydration) = self.attach_hydration.as_mut() {
-                    hydration
-                        .pending_input
-                        .push(PendingTerminalInput::Bytes(bytes));
-                    self.error = None;
-                    return;
-                }
-                let Some(session_id) = self.attached_session.clone() else {
-                    self.error = Some(
-                        "terminal stream unavailable: attach a session before sending terminal input"
-                            .to_string(),
-                    );
-                    return;
-                };
-                if self.attached_subscription_id.as_deref() != Some(self.subscription_id.as_str()) {
-                    self.error = Some(
-                        "terminal stream unavailable: current subscription is not attached"
-                            .to_string(),
-                    );
-                    return;
-                }
-                self.error = None;
-                self.forward_terminal_input(session_id, bytes);
-            }
             InputDispatch::TerminalResize { rows, cols, .. } => {
+                let size = TerminalScreenSize::new(rows, cols);
                 if let Some(hydration) = self.attach_hydration.as_mut() {
-                    hydration.pending_resize = Some(TerminalScreenSize::new(rows, cols));
+                    hydration.pending_resize = Some(size);
                     return;
                 }
-                self.terminal_viewport_size = TerminalScreenSize::new(rows, cols);
-                if let Some(projection) = self.ghostty_projection.as_mut() {
-                    let _ = projection.resize(self.terminal_viewport_size);
-                }
-                self.refresh_ghostty_viewport_cache();
-                if let Some(session_id) = self.attached_session.clone() {
-                    self.forward_terminal_command(
-                        session_id,
-                        TerminalInputCommand::Resize { rows, cols },
-                        Vec::new(),
-                        None,
-                        false,
-                    );
-                }
+                self.apply_local_resize(size);
+                self.send_resize(size);
             }
             InputDispatch::Scroll { node_id, lines } => {
                 // Map kit scroll deltas on the terminal node to Ghostty ScrollOp.
                 // Non-terminal scroll areas are kit-owned presentation scroll.
-                if (node_id == "tui-terminal" || node_id == "tui-terminal-output") && lines != 0 {
+                if is_terminal_node(Some(node_id.as_str())) && lines != 0 {
                     self.scroll_projection(ScrollOp::Delta(i32::from(lines)));
                 }
             }
-            _ => {}
+            // Kit classic key bytes never reach the PTY: the TUI intercepts
+            // terminal-focused keys before the router and sends typed KEY frames.
+            InputDispatch::TerminalForward { .. }
+            | InputDispatch::Hover { .. }
+            | InputDispatch::Focus { .. }
+            | InputDispatch::Ignored => {}
         }
+    }
+
+    /// Terminal-focused keys become typed KEY frames. While a route is still
+    /// attaching the key is queued in order and released on the live path.
+    fn handle_focused_terminal_key(
+        &mut self,
+        key: KeyEvent,
+        focused_node_id: Option<&str>,
+    ) -> bool {
+        if !is_terminal_node(focused_node_id) {
+            return false;
+        }
+        if self.attach_hydration.is_some() {
+            self.queue_pending_input(PendingTerminalInput::Key(key));
+            return true;
+        }
+        if self.attached.is_none() {
+            return false;
+        }
+        self.send_key(key);
+        true
+    }
+
+    fn handle_focused_terminal_paste(&mut self, text: &str, focused_node_id: Option<&str>) -> bool {
+        if !is_terminal_node(focused_node_id) {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        let data = text.as_bytes().to_vec();
+        if self.attach_hydration.is_some() {
+            if self.input_window.has_paste()
+                || self.attach_hydration.as_ref().is_some_and(|hydration| {
+                    hydration
+                        .pending_input
+                        .iter()
+                        .any(|input| matches!(input, PendingTerminalInput::Paste(_)))
+                })
+            {
+                self.error =
+                    Some("terminal paste unavailable: another paste is in flight".to_string());
+                return true;
+            }
+            self.queue_pending_input(PendingTerminalInput::Paste(data));
+            return true;
+        }
+        if self.attached.is_none() {
+            self.error = Some(
+                "terminal stream unavailable: attach a session before sending terminal input"
+                    .to_string(),
+            );
+            return true;
+        }
+        self.send_paste(data);
+        true
+    }
+
+    /// Mouse events over the live terminal become MOUSE frames when the nested
+    /// application enabled mouse tracking. Other pointer events stay with the kit.
+    fn handle_focused_terminal_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        focused_node_id: Option<&str>,
+        hit_map: &HitMap,
+    ) -> bool {
+        if !is_terminal_node(focused_node_id) || self.attached.is_none() {
+            return false;
+        }
+        if !terminal_input::mouse_tracking_enabled(self.current_mode_bits()) {
+            return false;
+        }
+        let Some(outer) = tui_terminal_region(hit_map) else {
+            return false;
+        };
+        // Occluded points (open menus, modals) belong to the kit router.
+        if !hit_map
+            .lookup(mouse.column, mouse.row)
+            .is_some_and(|region| is_terminal_node(Some(region.node_id.as_str())))
+        {
+            return false;
+        }
+        let inner = botster_tui_kit::terminal_inner_rect(outer);
+        self.send_mouse(mouse, inner)
+    }
+
+    /// Host focus changes are forwarded as FOCUS frames on the live route.
+    fn handle_host_focus(&mut self, focused: bool) {
+        if self.attach_hydration.is_some() {
+            self.queue_pending_input(PendingTerminalInput::Focus(focused));
+            return;
+        }
+        if self.attached.is_some() {
+            self.send_focus(focused);
+        }
+    }
+
+    fn handle_plugin_action(&mut self, request: UiActionRequest) {
+        let Some(surface) = self.plugin_surface.as_ref() else {
+            return;
+        };
+        if request.surface_id.0 != surface.surface_id {
+            self.error = Some(format!(
+                "plugin action surface mismatch: active={} request={}",
+                surface.surface_id, request.surface_id.0
+            ));
+            return;
+        }
+
+        let package_name = surface.package_name.clone();
+        self.error = None;
+        self.action_feedback = Some(format!(
+            "plugin action requested: {package_name}/{}",
+            request.action_id.0
+        ));
+        self.pending_plugin_request = Some(request.clone());
+        self.submit_apply(DaemonRequest::PluginSurfaceAction {
+            package_name,
+            request,
+        });
     }
 
     fn active_plugin_surface_id(&self) -> Option<&str> {
@@ -1879,8 +2195,7 @@ impl TuiApp {
         // Terminal scroll shortcuts only when the production terminal owns focus.
         let terminal_focused = focused_node_id == Some("tui-terminal")
             || focused_node_id == Some("tui-terminal-output");
-        if terminal_focused && self.ghostty_projection.is_some() && self.attached_session.is_some()
-        {
+        if terminal_focused && self.ghostty_projection.is_some() && self.attached.is_some() {
             if key.modifiers == KeyModifiers::NONE {
                 match key.code {
                     KeyCode::PageUp => {
@@ -1922,123 +2237,6 @@ impl TuiApp {
         self.clear_active_plugin_surface()
     }
 
-    /// Own focused-terminal key encoding until ModeFlags are known.
-    ///
-    /// Kit's InputRouter classic-encodes by default. While attached and focused
-    /// on the terminal, the TUI consumes the real KeyEvent path so unknown
-    /// ModeFlags cannot fall through to classic SendInput (which would break
-    /// Kitty-enabled sessions). After a single ModeFlags probe, keys are
-    /// encoded Classic or Kitty and sent with the correct gate.
-    fn handle_focused_terminal_key(
-        &mut self,
-        key: KeyEvent,
-        focused_node_id: Option<&str>,
-    ) -> bool {
-        let terminal_focused = focused_node_id == Some("tui-terminal")
-            || focused_node_id == Some("tui-terminal-output");
-        if !terminal_focused {
-            return false;
-        }
-        let Some(session_id) = self.attached_session.clone() else {
-            return false;
-        };
-        if self.attached_subscription_id.as_deref() != Some(self.subscription_id.as_str()) {
-            return false;
-        }
-        if self.current_mode_shadow().is_none() {
-            // Single probe; fail closed if freshness is still unavailable.
-            self.probe_terminal_mouse_mode(&session_id);
-        }
-        let Some(shadow) = self.current_mode_shadow().cloned() else {
-            self.error = Some("terminal input unavailable: mode flags not ready".to_string());
-            return true;
-        };
-        let encoding = if shadow.kitty_enabled {
-            renderer::TerminalKeyEncoding::Kitty
-        } else {
-            renderer::TerminalKeyEncoding::Classic
-        };
-        let Some(bytes) = renderer::terminal_key_bytes_with(key, encoding) else {
-            // Consumed unencodable edge (e.g. classic Release has no bytes).
-            return true;
-        };
-        self.error = None;
-        if shadow.kitty_enabled {
-            self.forward_mode_gated_input(session_id, bytes, true);
-        } else {
-            self.forward_terminal_command(
-                session_id,
-                TerminalInputCommand::Input {
-                    data: bytes.clone(),
-                },
-                bytes,
-                None,
-                false,
-            );
-        }
-        true
-    }
-
-    fn handle_focused_terminal_paste(&mut self, text: &str, focused_node_id: Option<&str>) -> bool {
-        let terminal_focused = focused_node_id == Some("tui-terminal")
-            || focused_node_id == Some("tui-terminal-output");
-        if !terminal_focused {
-            return false;
-        }
-        if text.is_empty() {
-            return true;
-        }
-        let data = text.as_bytes().to_vec();
-        if data.len() > MAX_PASTE_BYTES {
-            self.error = Some(format!(
-                "terminal paste payload too large: max={MAX_PASTE_BYTES} actual={}",
-                data.len()
-            ));
-            return true;
-        }
-        if self.paste_is_pending() {
-            self.error = Some("terminal paste unavailable: another paste is in flight".to_string());
-            return true;
-        }
-        let Some(next_id) = self.next_paste_operation_id.checked_add(1) else {
-            self.error = Some("terminal paste unavailable: operation ids exhausted".to_string());
-            return true;
-        };
-        if let Some(hydration) = self.attach_hydration.as_mut() {
-            let operation_id = self.next_paste_operation_id;
-            hydration
-                .pending_input
-                .push(PendingTerminalInput::Paste { operation_id, data });
-            self.next_paste_operation_id = next_id;
-            self.error = None;
-            return true;
-        }
-        let Some(session_id) = self.attached_session.clone() else {
-            self.error = Some(
-                "terminal stream unavailable: attach a session before sending terminal input"
-                    .to_string(),
-            );
-            return true;
-        };
-        if self.attached_subscription_id.as_deref() != Some(self.subscription_id.as_str()) {
-            self.error = Some(
-                "terminal stream unavailable: current subscription is not attached".to_string(),
-            );
-            return true;
-        }
-        if self.current_mode_shadow().is_none() {
-            self.probe_terminal_mouse_mode(&session_id);
-        }
-        if self.current_mode_shadow().is_none() {
-            self.error = Some("terminal paste unavailable: mode flags not ready".to_string());
-            return true;
-        }
-        let operation_id = self.next_paste_operation_id;
-        self.next_paste_operation_id = next_id;
-        self.forward_terminal_paste(session_id, operation_id, data, false);
-        true
-    }
-
     fn reset_active_plugin_surface(&mut self) {
         self.plugin_surface = None;
         self.plugin_presentation = renderer::PresentationState::default();
@@ -2046,7 +2244,7 @@ impl TuiApp {
         self.pending_plugin_request = None;
         self.drop_entity_options_subscriptions();
         self.entity_options_invalid_fields.clear();
-        if self.client.is_some() {
+        if self.is_connected() {
             self.sync_entity_options_subscriptions();
         }
     }
@@ -2102,31 +2300,6 @@ impl TuiApp {
         }
     }
 
-    fn handle_plugin_action(&mut self, request: UiActionRequest) {
-        let Some(surface) = self.plugin_surface.as_ref() else {
-            return;
-        };
-        if request.surface_id.0 != surface.surface_id {
-            self.error = Some(format!(
-                "plugin action surface mismatch: active={} request={}",
-                surface.surface_id, request.surface_id.0
-            ));
-            return;
-        }
-
-        let package_name = surface.package_name.clone();
-        self.error = None;
-        self.action_feedback = Some(format!(
-            "plugin action requested: {package_name}/{}",
-            request.action_id.0
-        ));
-        self.pending_plugin_request = Some(request.clone());
-        self.request_and_apply(DaemonRequest::PluginSurfaceAction {
-            package_name,
-            request,
-        });
-    }
-
     fn handle_action(
         &mut self,
         action_id: String,
@@ -2179,11 +2352,11 @@ impl TuiApp {
                         DestructiveAction::Shutdown(session_id) => {
                             self.action_feedback =
                                 Some(format!("shutdown requested: {session_id}"));
-                            self.request_and_apply(DaemonRequest::ShutdownSession { session_id });
+                            self.submit_apply(DaemonRequest::ShutdownSession { session_id });
                         }
                         DestructiveAction::Remove(session_id) => {
                             self.action_feedback = Some(format!("remove requested: {session_id}"));
-                            self.request_and_apply(DaemonRequest::RemoveSession { session_id });
+                            self.submit_apply(DaemonRequest::RemoveSession { session_id });
                         }
                     }
                 }
@@ -2207,47 +2380,44 @@ impl TuiApp {
             "botster.tui.package.show" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("show requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::ShowPackage { package_name });
+                    self.submit_apply(DaemonRequest::ShowPackage { package_name });
                 }
             }
             "botster.tui.package.enable" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("enable requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::EnablePackage { package_name });
+                    self.submit_apply(DaemonRequest::EnablePackage { package_name });
                 }
             }
             "botster.tui.package.disable" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("disable requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::DisablePackage { package_name });
+                    self.submit_apply(DaemonRequest::DisablePackage { package_name });
                 }
             }
             "botster.tui.package.remove" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("remove requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::RemovePackage { package_name });
+                    self.submit_apply(DaemonRequest::RemovePackage { package_name });
                 }
             }
             "botster.tui.package.update_status" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("update status requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::CheckPackageUpdate { package_name });
+                    self.submit_apply(DaemonRequest::CheckPackageUpdate { package_name });
                 }
             }
             "botster.tui.package.update_preview" => {
                 if let Some((package_name, pin)) = package_name_and_pin_from_payload(&payload) {
                     self.action_feedback =
                         Some(format!("update preview requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::PreviewPackageUpdate {
-                        package_name,
-                        pin,
-                    });
+                    self.submit_apply(DaemonRequest::PreviewPackageUpdate { package_name, pin });
                 }
             }
             "botster.tui.package.update_apply" => {
                 if let Some((package_name, pin)) = package_name_and_pin_from_payload(&payload) {
                     self.action_feedback = Some(format!("update apply requested: {package_name}"));
-                    self.request_and_apply(DaemonRequest::ApplyPackageUpdate { package_name, pin });
+                    self.submit_apply(DaemonRequest::ApplyPackageUpdate { package_name, pin });
                 }
             }
             "botster.tui.entrypoint.start" => {
@@ -2257,7 +2427,7 @@ impl TuiApp {
                     self.action_feedback = Some(format!(
                         "entrypoint start requested: {package_name}/{entrypoint_id}"
                     ));
-                    self.request_and_apply(DaemonRequest::StartPackageEntrypoint {
+                    self.submit_apply(DaemonRequest::StartPackageEntrypoint {
                         package_name,
                         entrypoint_id,
                         environment_overrides: BTreeMap::new(),
@@ -2271,7 +2441,7 @@ impl TuiApp {
                     self.action_feedback = Some(format!(
                         "entrypoint stop requested: {package_name}/{entrypoint_id}"
                     ));
-                    self.request_and_apply(DaemonRequest::StopPackageEntrypoint {
+                    self.submit_apply(DaemonRequest::StopPackageEntrypoint {
                         package_name,
                         entrypoint_id,
                     });
@@ -2284,7 +2454,7 @@ impl TuiApp {
                     self.action_feedback = Some(format!(
                         "entrypoint restart requested: {package_name}/{entrypoint_id}"
                     ));
-                    self.request_and_apply(DaemonRequest::RestartPackageEntrypoint {
+                    self.submit_apply(DaemonRequest::RestartPackageEntrypoint {
                         package_name,
                         entrypoint_id,
                     });
@@ -2297,7 +2467,7 @@ impl TuiApp {
                     self.action_feedback = Some(format!(
                         "entrypoint status requested: {package_name}/{entrypoint_id}"
                     ));
-                    self.request_and_apply(DaemonRequest::PackageEntrypointStatus {
+                    self.submit_apply(DaemonRequest::PackageEntrypointStatus {
                         package_name,
                         entrypoint_id,
                     });
@@ -2370,64 +2540,141 @@ impl TuiApp {
         }
     }
 
-    fn try_connect_throttled(&mut self) {
-        let now = Instant::now();
-        if self
-            .last_reconnect_attempt
-            .is_some_and(|attempt| now.duration_since(attempt) < Duration::from_millis(750))
-        {
-            return;
-        }
-        self.try_connect();
-    }
-
-    fn force_reconnect(&mut self) {
-        self.detach_owner_if_writable();
-        self.client = None;
-        self.reset_active_plugin_surface();
-        if !self.invalidate_session_generation() {
-            self.error = Some("session subscription cleanup timed out".to_string());
-        }
-        if !self.invalidate_session_type_generation() {
-            self.error = Some("session type subscription cleanup timed out".to_string());
-        }
-        self.drop_entity_options_subscriptions();
-        self.clear_event_subscription_state();
-        self.attached_session = None;
-        self.attached_subscription_id = None;
-        self.attach_hydration = None;
-        self.reset_attach_campaign();
-        self.clear_terminal_mouse_mode();
-        self.try_connect();
-    }
-
-    fn try_connect(&mut self) {
-        self.last_reconnect_attempt = Some(Instant::now());
-        let Some(endpoint) = &self.endpoint else {
+    /// Start a connection attempt on the I/O owner. Hello completes as
+    /// `AppWake::Connected` or `AppWake::Disconnected`.
+    fn connect(&mut self) {
+        self.reconnect_at = None;
+        let Some(endpoint) = self.endpoint.clone() else {
             self.status = "Hub connection not configured".to_string();
             if self.connection_error.is_none() {
                 self.connection_error = Some("BOTSTER_HUB_CONNECTION is required".to_string());
             }
             return;
         };
-        match HubConnection::connect_with_host_requirement(endpoint, &self.host_requirement) {
-            Ok(client) => {
-                self.client = Some(client);
-                self.status = "connected".to_string();
-                self.connection_error = None;
-                self.refresh_read_models();
-                if let Err(error) = self.start_session_subscription() {
-                    self.record_transport_error(error);
-                    return;
-                }
-                self.start_session_type_subscription_if_supported();
-                self.sync_notice_subscriptions();
-                self.sync_entity_options_subscriptions();
+        self.connected_generation = None;
+        self.status = "connecting".to_string();
+        self.hub_io.connect(
+            endpoint,
+            self.host_requirement.clone(),
+            tui_terminal_compatibility_requirement(),
+        );
+    }
+
+    /// Schedule the next reconnect with capped exponential backoff.
+    fn schedule_reconnect(&mut self) {
+        if self.endpoint.is_none() {
+            return;
+        }
+        self.reconnect_failures = self.reconnect_failures.saturating_add(1);
+        self.reconnect_at = Some(Instant::now() + reconnect_backoff_delay(self.reconnect_failures));
+    }
+
+    /// Operator-requested reconnect: detach, drop connection state, connect now.
+    fn force_reconnect(&mut self) {
+        self.detach_owner_if_writable();
+        self.drop_connection_state();
+        self.reconnect_failures = 0;
+        self.connect();
+    }
+
+    /// Forget every connection-scoped state.
+    fn drop_connection_state(&mut self) {
+        self.hub_io.disconnect(DETACH_ON_DISCONNECT_BOUND);
+        self.connected_generation = None;
+        self.pending_requests.clear();
+        self.reset_active_plugin_surface();
+        self.invalidate_session_generation();
+        self.invalidate_session_type_generation();
+        self.drop_entity_options_subscriptions();
+        self.clear_event_subscription_state();
+        self.clear_route_state();
+        self.attach_recovery_used = false;
+        self.terminal_close_evidence = None;
+    }
+
+    /// Forget the current route: attachment, hydration, projection, modes, input window.
+    fn clear_route_state(&mut self) {
+        self.attached = None;
+        self.attach_hydration = None;
+        self.route_generation = None;
+        self.terminal_modes = None;
+        self.input_window = InputWindow::new();
+        self.clear_ghostty_projection();
+    }
+
+    fn apply_connected(&mut self, generation: u64, ack: DaemonHelloAck) {
+        if generation != self.hub_io.generation() {
+            return;
+        }
+        if let Err(error) = admit_terminal_hello(&ack) {
+            self.hub_io.disconnect(Duration::ZERO);
+            self.apply_link_failure(error);
+            return;
+        }
+        self.connected_generation = Some(generation);
+        self.reconnect_failures = 0;
+        self.reconnect_at = None;
+        self.status = "connected".to_string();
+        self.connection_error = None;
+        self.record_diagnostics(ack.diagnostics);
+        self.refresh_read_models();
+        self.start_session_subscription();
+        self.start_session_type_subscription_if_supported();
+        self.sync_notice_subscriptions();
+        self.sync_entity_options_subscriptions();
+    }
+
+    fn apply_disconnected(&mut self, generation: u64, error: DaemonTransportError) {
+        if generation != self.hub_io.generation() {
+            return;
+        }
+        self.apply_link_failure(error);
+    }
+
+    /// The connection ended. Reset connection-scoped state and schedule a reconnect.
+    fn apply_link_failure(&mut self, error: DaemonTransportError) {
+        self.drop_connection_state();
+        match error {
+            DaemonTransportError::Protocol(message) => {
+                self.status = "compatibility mismatch".to_string();
+                self.connection_error = Some(format!(
+                    "expected daemon protocol {PROTOCOL}; daemon protocol error: {message}"
+                ));
+                self.record_diagnostic(DaemonDiagnostic::compatibility_mismatch(message));
             }
-            Err(error) => {
-                self.record_transport_error(error);
+            DaemonTransportError::ProtocolViolation(code) => {
+                self.status = "protocol violation; reconnecting".to_string();
+                let message = format!("hub protocol violation: {}", code.as_str());
+                self.connection_error = Some(message.clone());
+                self.record_diagnostic(DaemonDiagnostic::disconnected(message));
+            }
+            DaemonTransportError::Compatibility(error) => {
+                self.status = "compatibility mismatch".to_string();
+                self.connection_error = Some(error.diagnostic.clone());
+                self.record_diagnostics(error.diagnostics);
+            }
+            DaemonTransportError::NotRunning => {
+                self.status = "hub unavailable; reconnecting".to_string();
+                self.connection_error = Some(DaemonTransportError::NotRunning.to_string());
+            }
+            DaemonTransportError::ClientDisconnected => {
+                self.status = "disconnected; reconnecting".to_string();
+                let message = DaemonTransportError::ClientDisconnected.to_string();
+                self.connection_error = Some(message.clone());
+                self.record_diagnostic(DaemonDiagnostic::disconnected(message));
+            }
+            DaemonTransportError::ClosedByHub(reason) => {
+                self.status = "closed by hub; reconnecting".to_string();
+                let message = format!("hub closed the connection: {reason:?}");
+                self.connection_error = Some(message.clone());
+                self.record_diagnostic(DaemonDiagnostic::disconnected(message));
+            }
+            other => {
+                self.status = "reconnecting".to_string();
+                self.connection_error = Some(other.to_string());
             }
         }
+        self.schedule_reconnect();
     }
 
     fn refresh_read_models(&mut self) {
@@ -2438,137 +2685,550 @@ impl TuiApp {
         self.refresh_spawn_targets();
     }
 
+    /// Submit one request whose response only updates read models.
+    fn submit_apply(&mut self, request: DaemonRequest) {
+        self.submit(request, PendingReply::Apply, REQUEST_DEADLINE);
+    }
+
+    /// Submit one request with a continuation. Returns the request id.
+    ///
+    /// Completion, expiry, or loss arrives as `AppWake::Completed` and is
+    /// routed through `complete_request`. Nothing waits here.
+    fn submit(&mut self, request: DaemonRequest, reply: PendingReply, deadline: Duration) -> u64 {
+        if let Some(audit) = &mut self.acceptance_audit {
+            audit.record(&request);
+        }
+        #[cfg(test)]
+        self.record_request(&request);
+        let request_id = self.hub_io.submit(&request, Instant::now() + deadline);
+        self.pending_requests.insert(request_id, reply);
+        request_id
+    }
+
+    fn complete_request(
+        &mut self,
+        request_id: u64,
+        result: Result<DaemonResponse, DaemonRequestError>,
+    ) {
+        let Some(reply) = self.pending_requests.remove(&request_id) else {
+            return;
+        };
+        match result {
+            Ok(response) => self.apply_completion(reply, response),
+            Err(error) => self.apply_request_failure(reply, error),
+        }
+    }
+
+    fn apply_completion(&mut self, reply: PendingReply, response: DaemonResponse) {
+        match reply {
+            PendingReply::Apply | PendingReply::Detach | PendingReply::Unsubscribe => {
+                self.apply_response(response);
+            }
+            PendingReply::ListForTarget {
+                target_id,
+                target_label,
+            } => self.apply_list_for_target(&target_id, &target_label, response),
+            PendingReply::Spawn { session_id } => {
+                let failed = response.error.is_some();
+                self.apply_response(response);
+                if failed {
+                    self.pending_sessions.remove(&session_id);
+                    self.rebuild_session_rows();
+                } else if self.pending_sessions.contains_key(&session_id) {
+                    self.action_feedback = Some(format!(
+                        "spawn accepted: {session_id}; waiting for authoritative session"
+                    ));
+                }
+            }
+            PendingReply::ShowSessionTypeDefinition { session_type_id } => {
+                self.apply_show_session_type_definition(&session_type_id, response);
+            }
+            PendingReply::SessionTypeForm => {
+                let failed = response.error.clone();
+                self.apply_response(response);
+                match failed {
+                    Some(error) => {
+                        if let Some(form) = self.session_type_form.as_mut() {
+                            form.error = Some(format!("{}: {}", error.code, error.message));
+                        }
+                    }
+                    None => self.session_type_form = None,
+                }
+            }
+            PendingReply::Attach { session_id, route } => {
+                let failed = response.error.clone();
+                let attached = response.terminal_attach.clone();
+                self.apply_response(response);
+                if !self.hydration_matches_route(&route) {
+                    return;
+                }
+                if let Some(error) = failed {
+                    self.fail_attach_campaign(
+                        &session_id,
+                        &route,
+                        &format!("attach rejected: {}", error.message),
+                        false,
+                    );
+                    return;
+                }
+                // The Attach response carries the attach generation. Stream
+                // frames may already have adopted it; a later ROUTE_RESYNC may
+                // replace it.
+                match attached {
+                    Some(attach) if attach.subscription_id == route => {
+                        if self.route_generation.is_none() {
+                            self.route_generation = Some(attach.generation);
+                        }
+                    }
+                    _ => self.fail_attach_campaign(
+                        &session_id,
+                        &route,
+                        "attach response omitted the terminal attachment",
+                        true,
+                    ),
+                }
+            }
+            PendingReply::SubscribeEvents {
+                key,
+                subscription_id,
+            } => self.complete_notice_subscription(&key, &subscription_id, response),
+        }
+    }
+
+    fn apply_request_failure(&mut self, reply: PendingReply, error: DaemonRequestError) {
+        let message = error.to_string();
+        match reply {
+            PendingReply::Apply => self.error = Some(format!("request failed: {message}")),
+            PendingReply::Detach | PendingReply::Unsubscribe => {}
+            PendingReply::ListForTarget { target_label, .. } => {
+                self.error = Some(format!("session types failed to load: {message}"));
+                self.action_feedback = Some(format!(
+                    "session types for {target_label} failed to load; pick another target or cancel"
+                ));
+            }
+            PendingReply::Spawn { session_id } => {
+                self.pending_sessions.remove(&session_id);
+                self.rebuild_session_rows();
+                self.error = Some(format!("spawn failed: {message}"));
+            }
+            PendingReply::ShowSessionTypeDefinition { session_type_id } => {
+                self.error = Some(format!(
+                    "show_session_type_definition failed for {session_type_id}: {message}"
+                ));
+            }
+            PendingReply::SessionTypeForm => {
+                if let Some(form) = self.session_type_form.as_mut() {
+                    form.error = Some(message);
+                }
+            }
+            PendingReply::Attach { session_id, route } => {
+                if self.hydration_matches_route(&route) {
+                    // The Hub may have attached after the deadline; retire the route
+                    // with a bounded Detach so a late attachment cannot leak.
+                    self.fail_attach_campaign(
+                        &session_id,
+                        &route,
+                        &format!("attach request failed: {message}"),
+                        true,
+                    );
+                }
+            }
+            PendingReply::SubscribeEvents {
+                subscription_id, ..
+            } => self.reject_event_subscription_candidate(
+                &subscription_id,
+                format!("event subscription failed: {message}"),
+            ),
+        }
+    }
+
     fn refresh_spawn_targets(&mut self) {
-        self.request_and_apply(DaemonRequest::ListSpawnTargets);
+        self.submit_apply(DaemonRequest::ListSpawnTargets);
     }
 
     fn refresh_status(&mut self) {
-        self.request_and_apply(DaemonRequest::Status);
+        self.submit_apply(DaemonRequest::Status);
     }
 
     fn refresh_apps(&mut self) {
-        self.request_and_apply(DaemonRequest::ListApps);
+        self.submit_apply(DaemonRequest::ListApps);
     }
 
     fn refresh_package_navigation(&mut self) {
-        self.request_and_apply(DaemonRequest::ListPackageNavigation);
+        self.submit_apply(DaemonRequest::ListPackageNavigation);
     }
 
     fn refresh_packages(&mut self) {
-        self.request_and_apply(DaemonRequest::ListPackages);
+        self.submit_apply(DaemonRequest::ListPackages);
     }
 
-    fn start_session_subscription(&mut self) -> DaemonTransportResult<()> {
-        let endpoint = self
-            .endpoint
-            .as_ref()
-            .ok_or(DaemonTransportError::NotRunning)?;
-        let subscription_id = format!("btui-sessions-{}", short_suffix());
-        let mut subscription = subscribe_session_entities(endpoint, subscription_id.clone())?;
-        subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
-        let (sender, receiver) = mpsc::channel();
-        let (cancel_sender, cancel_receiver) = mpsc::channel();
-        let (stopped_sender, stopped_receiver) = mpsc::channel();
-        let reader_subscription_id = subscription_id.clone();
+    /// Open the dedicated entity stream for one family.
+    ///
+    /// Hub converts a connection into an entity stream on `SubscribeEntities`
+    /// and refuses the request on a mux connection, so every family owns its
+    /// own connection. Admission arrives as `AppWake::EntitySubscribed`.
+    fn open_entity_stream(&mut self, entity_type: &str, subscription_id: &str) {
+        let Some(endpoint) = self.endpoint.clone() else {
+            self.fail_entity_subscription(
+                entity_type,
+                subscription_id,
+                "Hub connection not configured".to_string(),
+            );
+            return;
+        };
+        self.hub_io.subscribe_entities(
+            endpoint,
+            self.host_requirement.clone(),
+            entity_type,
+            subscription_id,
+        );
+    }
 
-        thread::Builder::new()
-            .name("botster-tui-session-entities".to_string())
-            .spawn(move || {
-                loop {
-                    if cancel_receiver.try_recv().is_ok() {
-                        let _ = subscription.unsubscribe();
-                        break;
-                    }
-                    match subscription.next_frame() {
-                        Ok(frame) => {
-                            if sender
-                                .send(SessionSubscriptionMessage::Frame(frame))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(DaemonTransportError::Io(error))
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                            ) => {}
-                        Err(error) => {
-                            let _ = sender.send(SessionSubscriptionMessage::Disconnected {
-                                subscription_id: reader_subscription_id,
-                                error: error.to_string(),
-                            });
-                            break;
-                        }
-                    }
-                }
-                let _ = stopped_sender.send(());
-            })
-            .map_err(DaemonTransportError::Io)?;
+    /// Subscribe to the built-in session family.
+    fn start_session_subscription(&mut self) {
+        let subscription_id = format!("btui-sessions-{}", short_suffix());
         self.session_entities
             .begin_generation(subscription_id.clone());
-        self.session_subscription = Some(SessionSubscriptionPump {
-            messages: receiver,
-            cancel: Some(cancel_sender),
-            stopped: stopped_receiver,
-            stop_attempted: false,
-            stopped_confirmed: false,
-        });
         self.rebuild_session_rows();
-        Ok(())
+        self.open_entity_stream("session", &subscription_id);
     }
 
-    fn drain_session_subscription(&mut self) -> bool {
-        let messages = self
-            .session_subscription
-            .as_ref()
-            .map(|pump| pump.messages.try_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for message in messages {
-            match message {
-                SessionSubscriptionMessage::Frame(frame) => {
-                    match self.session_entities.apply(frame) {
-                        Ok(true) => {
-                            self.rebuild_session_rows();
-                            // Session family feeds entity-options when demanded.
-                            self.reconcile_entity_option_drafts();
-                        }
-                        Ok(false) => {}
-                        Err(error) => self.error = Some(format!("session sync: {error}")),
-                    }
-                }
-                SessionSubscriptionMessage::Disconnected {
-                    subscription_id,
-                    error,
-                } if self.session_entities.subscription_id.as_deref()
-                    == Some(subscription_id.as_str()) =>
-                {
-                    self.client = None;
-                    if !self.invalidate_session_generation() {
-                        self.error = Some("session subscription cleanup timed out".to_string());
-                    }
-                    self.attached_session = None;
-                    self.attached_subscription_id = None;
-                    self.attach_hydration = None;
-                    self.clear_terminal_mouse_mode();
-                    self.status = "session subscription disconnected; reconnecting".to_string();
-                    self.connection_error = Some(error);
-                    return true;
-                }
-                SessionSubscriptionMessage::Disconnected { .. } => {}
-            }
+    /// Drop the session generation and end its entity stream.
+    fn invalidate_session_generation(&mut self) {
+        if let Some(subscription_id) = self.session_entities.subscription_id.take() {
+            self.hub_io
+                .unsubscribe_entities(&subscription_id, DETACH_ON_DISCONNECT_BOUND);
         }
-        false
-    }
-
-    fn invalidate_session_generation(&mut self) -> bool {
-        let stopped = self
-            .session_subscription
-            .take()
-            .is_none_or(|mut pump| pump.stop());
         self.session_entities = SessionEntityState::default();
         self.rebuild_session_rows();
-        stopped
+    }
+
+    fn start_session_type_subscription_if_supported(&mut self) {
+        self.session_types_supported =
+            Self::session_types_supported_from_compatibility(self.compatibility.as_ref());
+        if !self.session_types_supported {
+            self.invalidate_session_type_generation();
+            self.session_type_subscription_error = None;
+            return;
+        }
+        self.start_session_type_subscription();
+    }
+
+    fn start_session_type_subscription(&mut self) {
+        let subscription_id = format!("btui-session-types-{}", short_suffix());
+        self.session_type_entities
+            .begin_generation(subscription_id.clone());
+        self.session_type_subscription_error = None;
+        self.open_entity_stream("session_type", &subscription_id);
+    }
+
+    fn invalidate_session_type_generation(&mut self) {
+        if let Some(subscription_id) = self.session_type_entities.subscription_id.take() {
+            self.hub_io
+                .unsubscribe_entities(&subscription_id, DETACH_ON_DISCONNECT_BOUND);
+        }
+        self.session_type_entities = SessionTypeEntityState::default();
+        self.session_type_subscription_error = None;
+    }
+
+    /// Family that owns one live subscription id, if any.
+    fn entity_family_for_subscription(&self, subscription_id: &str) -> Option<String> {
+        if self.session_entities.subscription_id.as_deref() == Some(subscription_id) {
+            return Some("session".to_string());
+        }
+        if self.session_type_entities.subscription_id.as_deref() == Some(subscription_id) {
+            return Some("session_type".to_string());
+        }
+        self.entity_options_subscriptions
+            .iter()
+            .find(|family| {
+                self.entity_options
+                    .family(family)
+                    .and_then(|state| state.subscription_id.as_deref())
+                    == Some(subscription_id)
+            })
+            .cloned()
+    }
+
+    /// Route one entity frame from its stream to the owning family state.
+    fn apply_entity_frame(&mut self, subscription_id: &str, frame: DaemonEntityFrame) {
+        let Some(family) = self.entity_family_for_subscription(subscription_id) else {
+            return;
+        };
+        match family.as_str() {
+            "session" => match self.session_entities.apply(frame) {
+                Ok(true) => {
+                    self.rebuild_session_rows();
+                    // Session family feeds entity-options when demanded.
+                    self.reconcile_entity_option_drafts();
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.error = Some(format!("session sync: {error}"));
+                    self.invalidate_session_generation();
+                    if self.is_connected() {
+                        self.start_session_subscription();
+                    }
+                }
+            },
+            "session_type" => match self.session_type_entities.apply(frame) {
+                Ok(true) => {
+                    if self
+                        .selected_session_type_id
+                        .as_ref()
+                        .is_some_and(|id| !self.session_type_entities.entities.contains_key(id))
+                    {
+                        self.selected_session_type_id = None;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.error = Some(format!("session type sync: {error}"));
+                    self.invalidate_session_type_generation();
+                    self.session_type_subscription_error = Some(error);
+                    if self.is_connected() && self.session_types_supported {
+                        self.start_session_type_subscription();
+                    }
+                }
+            },
+            other => self.apply_entity_options_frame(other, frame),
+        }
+    }
+
+    /// SubscribeEntities admission for one stream.
+    fn apply_entity_subscribed(&mut self, subscription_id: &str, result: Result<(), String>) {
+        let Some(family) = self.entity_family_for_subscription(subscription_id) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                if !is_process_wide_entity_family(&family) {
+                    self.reset_entity_options_backoff(&family);
+                }
+            }
+            Err(detail) => self.fail_entity_subscription(
+                &family,
+                subscription_id,
+                format!("entity subscription was not accepted: {detail}"),
+            ),
+        }
+    }
+
+    /// One entity stream ended on its own. The session family is the
+    /// authoritative read model: losing it is a connection failure. Other
+    /// families re-open with backoff.
+    fn apply_entity_closed(&mut self, subscription_id: &str, error: DaemonTransportError) {
+        let Some(family) = self.entity_family_for_subscription(subscription_id) else {
+            return;
+        };
+        match family.as_str() {
+            "session" => {
+                self.session_entities.subscription_id = None;
+                self.apply_link_failure(error);
+            }
+            "session_type" => {
+                self.session_type_entities.subscription_id = None;
+                self.invalidate_session_type_generation();
+                self.session_type_subscription_error = Some(error.to_string());
+                if self.is_connected() && self.session_types_supported {
+                    self.start_session_type_subscription();
+                }
+            }
+            other => {
+                self.entity_options_subscriptions.remove(other);
+                self.entity_options.drop_family(other);
+                self.note_entity_options_admission_failure(
+                    other,
+                    format!("entity options subscription disconnected: {error}"),
+                );
+                if self.is_connected()
+                    && self.family_still_demanded(other)
+                    && self.entity_options_retry_ready(other)
+                {
+                    self.start_entity_options_subscription(other);
+                }
+            }
+        }
+    }
+
+    fn fail_entity_subscription(&mut self, family: &str, subscription_id: &str, message: String) {
+        self.hub_io
+            .unsubscribe_entities(subscription_id, DETACH_ON_DISCONNECT_BOUND);
+        match family {
+            "session" => {
+                if self.session_entities.subscription_id.as_deref() == Some(subscription_id) {
+                    self.session_entities = SessionEntityState::default();
+                    self.rebuild_session_rows();
+                    self.error = Some(format!("session subscription failed: {message}"));
+                }
+            }
+            "session_type" => {
+                if self.session_type_entities.subscription_id.as_deref() == Some(subscription_id) {
+                    self.session_type_entities = SessionTypeEntityState::default();
+                    self.session_type_subscription_error = Some(message.clone());
+                    self.error = Some(format!("session type subscription failed: {message}"));
+                }
+            }
+            other => {
+                let matches = self
+                    .entity_options
+                    .family(other)
+                    .and_then(|state| state.subscription_id.as_deref())
+                    == Some(subscription_id);
+                if matches {
+                    self.entity_options_subscriptions.remove(other);
+                    self.entity_options.drop_family(other);
+                    self.note_entity_options_admission_failure(other, message);
+                }
+            }
+        }
+    }
+
+    /// End one entity-options family stream and forget its generation.
+    fn stop_entity_options_subscription(&mut self, family: &str) {
+        self.entity_options_subscriptions.remove(family);
+        let subscription_id = self
+            .entity_options
+            .family(family)
+            .and_then(|state| state.subscription_id.clone());
+        if let Some(subscription_id) = subscription_id {
+            self.hub_io
+                .unsubscribe_entities(&subscription_id, DETACH_ON_DISCONNECT_BOUND);
+        }
+        self.entity_options.drop_family(family);
+        self.entity_options_retry.remove(family);
+    }
+
+    fn start_entity_options_subscription(&mut self, entity_type: &str) {
+        #[cfg(test)]
+        {
+            *self
+                .entity_options_subscribe_attempts
+                .entry(entity_type.to_string())
+                .or_insert(0) += 1;
+            if let Some(message) = self.entity_options_forced_subscribe_error {
+                self.note_entity_options_admission_failure(entity_type, message.to_string());
+                return;
+            }
+        }
+        let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
+        self.entity_options
+            .begin_generation(entity_type, subscription_id.clone());
+        self.entity_options_subscriptions
+            .insert(entity_type.to_string());
+        self.open_entity_stream(entity_type, &subscription_id);
+    }
+
+    fn drop_entity_options_subscriptions(&mut self) {
+        self.drop_entity_options_families(None);
+    }
+
+    fn drop_entity_options_families(&mut self, keep: Option<BTreeSet<String>>) {
+        let keep = keep.unwrap_or_default();
+        let stale: Vec<String> = self
+            .entity_options_subscriptions
+            .iter()
+            .filter(|family| !keep.contains(*family))
+            .cloned()
+            .collect();
+        for family in stale {
+            self.stop_entity_options_subscription(&family);
+        }
+        if keep.is_empty() {
+            self.entity_options = EntityOptionsStore::default();
+            self.entity_options_retry.clear();
+        } else {
+            self.entity_options.retain_families(&keep);
+        }
+    }
+
+    /// Collect options_source families from the active plugin surface and ensure
+    /// SubscribeEntities for non-process-wide families. Process-wide families
+    /// (session, session_type) are served from the existing stores.
+    fn sync_entity_options_subscriptions(&mut self) {
+        let owned = self.demanded_entity_option_families_now();
+
+        let stale: Vec<String> = self
+            .entity_options_subscriptions
+            .iter()
+            .filter(|family| !owned.contains(*family))
+            .cloned()
+            .collect();
+        for family in stale {
+            self.stop_entity_options_subscription(&family);
+        }
+        self.entity_options.retain_families(&owned);
+
+        if !self.is_connected() {
+            self.reconcile_entity_option_drafts();
+            return;
+        }
+
+        for family in owned {
+            if self.entity_options_subscriptions.contains(&family) {
+                continue;
+            }
+            if !self.entity_options_retry_ready(&family) {
+                continue;
+            }
+            self.start_entity_options_subscription(&family);
+        }
+        self.reconcile_entity_option_drafts();
+    }
+
+    /// Re-open demanded entity-options families whose backoff expired.
+    fn heal_entity_options_subscriptions(&mut self) {
+        let demanded: Vec<String> = self
+            .demanded_entity_option_families_now()
+            .into_iter()
+            .filter(|family| !self.entity_options_subscriptions.contains(family))
+            .collect();
+        for family in demanded {
+            if !self.entity_options_retry_ready(&family) {
+                continue;
+            }
+            self.start_entity_options_subscription(&family);
+        }
+    }
+
+    fn note_entity_options_admission_failure(&mut self, family: &str, error: String) {
+        let previous = self.entity_options_retry.get(family).cloned();
+        let consecutive_failures = previous
+            .as_ref()
+            .map(|state| state.consecutive_failures.saturating_add(1))
+            .unwrap_or(1);
+        let delay = entity_options_backoff_delay(consecutive_failures);
+        self.entity_options_retry.insert(
+            family.to_string(),
+            EntityOptionsRetryState {
+                consecutive_failures,
+                next_attempt_at: Instant::now() + delay,
+            },
+        );
+        if previous.is_none() {
+            self.error = Some(format!(
+                "entity options subscription failed for {family}: {error}"
+            ));
+        }
+    }
+
+    /// Apply one entity-options frame. A sync error drops the generation and
+    /// opens a fresh SubscribeEntities when the family is still demanded.
+    fn apply_entity_options_frame(&mut self, family: &str, frame: DaemonEntityFrame) {
+        match self.entity_options.apply_daemon_frame(frame) {
+            Ok(true) => self.reconcile_entity_option_drafts(),
+            Ok(false) => {}
+            Err(error) => {
+                self.error = Some(format!("entity options sync: {error}"));
+                self.stop_entity_options_subscription(family);
+                if self.is_connected()
+                    && self.family_still_demanded(family)
+                    && self.entity_options_retry_ready(family)
+                {
+                    self.start_entity_options_subscription(family);
+                }
+            }
+        }
     }
 
     fn rebuild_session_rows(&mut self) {
@@ -2606,7 +3266,7 @@ impl TuiApp {
         self.action_feedback = Some(format!(
             "navigation open requested: {package_name} {route_id}"
         ));
-        self.request_and_apply(DaemonRequest::PluginSurfaceRender {
+        self.submit_apply(DaemonRequest::PluginSurfaceRender {
             package_name,
             surface_id,
             payload: json!({}),
@@ -2660,91 +3320,239 @@ impl TuiApp {
             self.error = Some(format!("launch target not found: {target_id}"));
             return;
         };
-        // Clear any prior picker rows before the sync list request so a failed
+        // Clear any prior picker rows before the list request so a failed
         // load cannot leave selectable stale rows from a previous target.
         self.error = None;
         self.target_first_spawn = Some(TargetFirstSpawnFlow {
             step: TargetFirstSpawnStep::PickTarget,
         });
-
-        let list_request = DaemonRequest::ListSessionTypesForTarget {
-            target_id: target.target_id.clone(),
-        };
-        #[cfg(test)]
-        self.record_request(&list_request);
-
-        let list_result = self.load_session_types_for_target(&list_request);
-        match list_result {
-            Ok(session_types) => {
-                self.target_first_spawn = Some(TargetFirstSpawnFlow {
-                    step: TargetFirstSpawnStep::PickSessionType {
-                        target_id: target.target_id.clone(),
-                        target_label: target.label.clone(),
-                        session_types,
-                    },
-                });
-                self.action_feedback = Some(format!("select a session type for {}", target.label));
-            }
-            Err(ListForTargetLoadError::Operator {
-                code,
-                operation,
-                message,
-            }) => {
-                self.error = Some(format!("{message} (code={code} operation={operation})"));
-                self.action_feedback = Some(format!(
-                    "session types for {} unavailable; pick another target or cancel",
-                    target.label
-                ));
-            }
-            Err(ListForTargetLoadError::Transport(error)) => {
-                self.record_transport_error(error);
-                self.action_feedback = Some(format!(
-                    "session types for {} failed to load; pick another target or cancel",
-                    target.label
-                ));
-            }
-        }
-    }
-
-    fn load_session_types_for_target(
-        &mut self,
-        list_request: &DaemonRequest,
-    ) -> Result<Vec<DaemonSessionType>, ListForTargetLoadError> {
         #[cfg(test)]
         if let Some(stub) = self.list_for_target_stub.take() {
-            return match stub {
-                ListForTargetStub::Ok(session_types) => Ok(session_types),
+            match stub {
+                ListForTargetStub::Ok(session_types) => {
+                    self.target_first_spawn = Some(TargetFirstSpawnFlow {
+                        step: TargetFirstSpawnStep::PickSessionType {
+                            target_id: target.target_id.clone(),
+                            target_label: target.label.clone(),
+                            session_types,
+                        },
+                    });
+                    self.action_feedback =
+                        Some(format!("select a session type for {}", target.label));
+                }
                 ListForTargetStub::OperatorError {
                     code,
                     operation,
                     message,
-                } => Err(ListForTargetLoadError::Operator {
-                    code,
-                    operation,
-                    message,
-                }),
-                ListForTargetStub::TransportError => Err(ListForTargetLoadError::Transport(
-                    DaemonTransportError::NotRunning,
-                )),
-            };
-        }
-
-        match self.request(list_request.clone()) {
-            Ok(response) => {
-                if let Some(error) = response.error {
-                    self.record_diagnostics(error.diagnostics.clone());
-                    Err(ListForTargetLoadError::Operator {
-                        code: error.code,
-                        operation: error.operation,
-                        message: error.message,
-                    })
-                } else {
-                    // Flow-local only: do not apply_response / entity store.
-                    Ok(response.session_types)
+                } => {
+                    self.error = Some(format!("{message} (code={code} operation={operation})"));
+                    self.action_feedback = Some(format!(
+                        "session types for {} unavailable; pick another target or cancel",
+                        target.label
+                    ));
                 }
+                ListForTargetStub::TransportError => self.apply_request_failure(
+                    PendingReply::ListForTarget {
+                        target_id: target.target_id.clone(),
+                        target_label: target.label.clone(),
+                    },
+                    DaemonRequestError::ConnectionClosed,
+                ),
             }
-            Err(error) => Err(ListForTargetLoadError::Transport(error)),
+            return;
         }
+        self.submit(
+            DaemonRequest::ListSessionTypesForTarget {
+                target_id: target.target_id.clone(),
+            },
+            PendingReply::ListForTarget {
+                target_id: target.target_id,
+                target_label: target.label,
+            },
+            REQUEST_DEADLINE,
+        );
+    }
+
+    /// ListSessionTypesForTarget completed. Flow-local only: the entity store
+    /// is not touched.
+    fn apply_list_for_target(
+        &mut self,
+        target_id: &str,
+        target_label: &str,
+        response: DaemonResponse,
+    ) {
+        let picking = matches!(
+            self.target_first_spawn.as_ref().map(|flow| &flow.step),
+            Some(TargetFirstSpawnStep::PickTarget)
+        );
+        if !picking {
+            return;
+        }
+        if let Some(error) = response.error {
+            self.record_diagnostics(error.diagnostics);
+            self.error = Some(format!(
+                "{} (code={} operation={})",
+                error.message, error.code, error.operation
+            ));
+            self.action_feedback = Some(format!(
+                "session types for {target_label} unavailable; pick another target or cancel"
+            ));
+            return;
+        }
+        self.target_first_spawn = Some(TargetFirstSpawnFlow {
+            step: TargetFirstSpawnStep::PickSessionType {
+                target_id: target_id.to_string(),
+                target_label: target_label.to_string(),
+                session_types: response.session_types,
+            },
+        });
+        self.action_feedback = Some(format!("select a session type for {target_label}"));
+    }
+
+    fn execute_spawn_session_type(
+        &mut self,
+        session_type_id: &str,
+        request: DaemonSessionTypeRequest,
+    ) {
+        self.error = None;
+        self.target_first_spawn = None;
+        let session_id = format!("btui-{}", short_suffix());
+        self.pending_sessions
+            .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
+        self.set_selected_session(Some(session_id.clone()));
+        self.rebuild_session_rows();
+        self.action_feedback = Some(format!("spawn pending: {session_id} via {session_type_id}"));
+        self.submit(
+            DaemonRequest::SpawnSessionType {
+                session_type_id: session_type_id.to_string(),
+                session_id: session_id.clone(),
+                request,
+            },
+            PendingReply::Spawn { session_id },
+            REQUEST_DEADLINE,
+        );
+    }
+
+    fn open_session_type_edit(&mut self, session_type_id: &str) {
+        self.error = None;
+        self.action_feedback = Some(format!("loading authoring definition: {session_type_id}"));
+        self.submit(
+            DaemonRequest::ShowSessionTypeDefinition {
+                session_type_id: session_type_id.to_string(),
+            },
+            PendingReply::ShowSessionTypeDefinition {
+                session_type_id: session_type_id.to_string(),
+            },
+            REQUEST_DEADLINE,
+        );
+    }
+
+    fn apply_show_session_type_definition(
+        &mut self,
+        session_type_id: &str,
+        response: DaemonResponse,
+    ) {
+        if let Some(error) = response.error.clone() {
+            self.apply_response(response);
+            self.error = Some(format!("{}: {}", error.code, error.message));
+            return;
+        }
+        let definition = response.session_type_definition.clone();
+        self.apply_response(response);
+        match definition {
+            Some(editable) => {
+                self.session_type_form = Some(SessionTypeFormDraft::from_authoring(editable));
+                self.action_feedback = Some(format!("edit ready: {session_type_id}"));
+            }
+            None => {
+                self.error =
+                    Some("show_session_type_definition returned no definition".to_string());
+            }
+        }
+    }
+
+    fn delete_session_type(&mut self, session_type_id: &str) {
+        let Some(entity) = self
+            .session_type_entities
+            .entities
+            .get(session_type_id)
+            .cloned()
+        else {
+            self.error = Some(format!("session type not found: {session_type_id}"));
+            return;
+        };
+        if !entity.editable {
+            self.error = Some(format!("session type is not editable: {session_type_id}"));
+            return;
+        }
+        // Prefer source_name (owning source) over target_id (eligibility stamp),
+        // matching Hub show_session_type_definition mutation source construction.
+        let source = match entity.source.as_str() {
+            "device" => DaemonSessionTypeMutationSource::Device,
+            "repo" => DaemonSessionTypeMutationSource::Repo {
+                target_id: if !entity.source_name.is_empty() {
+                    entity.source_name.clone()
+                } else {
+                    entity.target_id.clone()
+                },
+            },
+            other => {
+                self.error = Some(format!("cannot delete session type source: {other}"));
+                return;
+            }
+        };
+        self.action_feedback = Some(format!("delete requested: {session_type_id}"));
+        self.submit_apply(DaemonRequest::DeleteSessionType {
+            source,
+            session_type_id: entity.id.clone(),
+        });
+    }
+
+    fn submit_session_type_form(&mut self) {
+        let Some(form) = self.session_type_form.clone() else {
+            return;
+        };
+        if form.id.trim().is_empty()
+            || form.label.trim().is_empty()
+            || form.role.trim().is_empty()
+            || form.interaction.trim().is_empty()
+            || form.lifecycle.trim().is_empty()
+            || form.command.trim().is_empty()
+        {
+            if let Some(form) = self.session_type_form.as_mut() {
+                form.error = Some(
+                    "id, label, role, interaction, lifecycle, and command are required".to_string(),
+                );
+            }
+            return;
+        }
+        let source = match mutation_source_from_form(&form) {
+            Ok(source) => source,
+            Err(error) => {
+                if let Some(form) = self.session_type_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return;
+            }
+        };
+        let definition = match definition_from_session_type_form(&form) {
+            Ok(definition) => definition,
+            Err(error) => {
+                if let Some(form) = self.session_type_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return;
+            }
+        };
+        let request = match form.mode {
+            SessionTypeFormMode::Create => DaemonRequest::CreateSessionType { source, definition },
+            SessionTypeFormMode::Edit => DaemonRequest::UpdateSessionType { source, definition },
+        };
+        self.action_feedback = Some(match form.mode {
+            SessionTypeFormMode::Create => "create session type requested".to_string(),
+            SessionTypeFormMode::Edit => "update session type requested".to_string(),
+        });
+        self.submit(request, PendingReply::SessionTypeForm, REQUEST_DEADLINE);
     }
 
     fn spawn_pick_session_type(&mut self, session_type_id: &str) {
@@ -2827,120 +3635,6 @@ impl TuiApp {
         }
     }
 
-    fn execute_spawn_session_type(
-        &mut self,
-        session_type_id: &str,
-        request: DaemonSessionTypeRequest,
-    ) {
-        self.error = None;
-        self.target_first_spawn = None;
-        let session_id = format!("btui-{}", short_suffix());
-        self.pending_sessions
-            .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
-        self.set_selected_session(Some(session_id.clone()));
-        self.rebuild_session_rows();
-        self.action_feedback = Some(format!("spawn pending: {session_id} via {session_type_id}"));
-        let spawn_request = DaemonRequest::SpawnSessionType {
-            session_type_id: session_type_id.to_string(),
-            session_id: session_id.clone(),
-            request,
-        };
-        #[cfg(test)]
-        self.record_request(&spawn_request);
-        match self.request(spawn_request) {
-            Ok(response) => {
-                let failed = response.error.is_some();
-                self.apply_response(response);
-                if failed {
-                    self.pending_sessions.remove(&session_id);
-                    self.rebuild_session_rows();
-                }
-            }
-            Err(error) => {
-                self.pending_sessions.remove(&session_id);
-                self.rebuild_session_rows();
-                self.record_transport_error(error);
-                return;
-            }
-        }
-        if self.pending_sessions.contains_key(&session_id) {
-            self.action_feedback = Some(format!(
-                "spawn accepted: {session_id}; waiting for authoritative session"
-            ));
-        }
-    }
-
-    /// Test/live-harness helper: write a device-root shell script and CreateSessionType.
-    ///
-    /// Not a product path — production headless-live-runtime uses freeform Spawn for
-    /// smoke only; product launch is SpawnSessionType via the toolbar dialog.
-    #[cfg(test)]
-    fn ensure_headless_shell_session_type(
-        &mut self,
-        hub_data_dir: &std::path::Path,
-        script_body: &str,
-    ) -> Result<String, String> {
-        let id = format!("btui-shell-{}", short_suffix() % 1_000_000);
-        let script_name = format!("{id}.sh");
-        let source_root = hub_data_dir.join("session-types");
-        std::fs::create_dir_all(&source_root).map_err(|error| error.to_string())?;
-        let script_path = source_root.join(&script_name);
-        std::fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh
-{script_body}
-"
-            ),
-        )
-        .map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&script_path)
-                .map_err(|error| error.to_string())?
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&script_path, permissions)
-                .map_err(|error| error.to_string())?;
-        }
-        let definition = DaemonSessionTypeDefinition {
-            id: id.clone(),
-            label: "Botster TUI headless shell".to_string(),
-            description: None,
-            icon: None,
-            role: "botster.agent".to_string(),
-            interaction: "interactive".to_string(),
-            traits: Vec::new(),
-            lifecycle: "task".to_string(),
-            execution: DaemonSessionTypeExecution::RelativeExecutable,
-            command: script_name,
-            args: Vec::new(),
-            working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
-            environment: BTreeMap::new(),
-            allowed_environment_overrides: Vec::new(),
-            context: Vec::new(),
-            target_id: None,
-        };
-        match self.request(DaemonRequest::CreateSessionType {
-            source: DaemonSessionTypeMutationSource::Device,
-            definition,
-        }) {
-            Ok(response) => {
-                let failed = response.error.clone();
-                self.apply_response(response);
-                if let Some(error) = failed {
-                    return Err(error.message);
-                }
-            }
-            Err(error) => {
-                self.record_transport_error(error);
-                return Err("create session type transport failed".to_string());
-            }
-        }
-        Ok(format!("device/{id}"))
-    }
-
     fn session_types_supported_from_compatibility(
         compatibility: Option<&DaemonCompatibility>,
     ) -> bool {
@@ -2949,209 +3643,6 @@ impl TuiApp {
             return true;
         };
         compatibility.supports_feature(FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
-    }
-
-    fn start_session_type_subscription_if_supported(&mut self) {
-        self.session_types_supported =
-            Self::session_types_supported_from_compatibility(self.compatibility.as_ref());
-        if !self.session_types_supported {
-            let _ = self.invalidate_session_type_generation();
-            self.session_type_subscription_error = None;
-            return;
-        }
-        if let Err(error) = self.start_session_type_subscription() {
-            self.session_type_subscription_error = Some(error.to_string());
-            self.error = Some(format!("session type subscription failed: {error}"));
-        }
-    }
-
-    fn start_session_type_subscription(&mut self) -> DaemonTransportResult<()> {
-        let endpoint = self
-            .endpoint
-            .as_ref()
-            .ok_or(DaemonTransportError::NotRunning)?;
-        let subscription_id = format!("btui-session-types-{}", short_suffix());
-        let mut subscription =
-            subscribe_entities(endpoint, "session_type", subscription_id.clone())?;
-        subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
-        let (sender, receiver) = mpsc::channel();
-        let (cancel_sender, cancel_receiver) = mpsc::channel();
-        let (stopped_sender, stopped_receiver) = mpsc::channel();
-        let reader_subscription_id = subscription_id.clone();
-
-        thread::Builder::new()
-            .name("botster-tui-session-type-entities".to_string())
-            .spawn(move || {
-                loop {
-                    if cancel_receiver.try_recv().is_ok() {
-                        let _ = subscription.unsubscribe();
-                        break;
-                    }
-                    match subscription.next_frame() {
-                        Ok(frame) => {
-                            if sender
-                                .send(SessionSubscriptionMessage::Frame(frame))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(DaemonTransportError::Io(error))
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                            ) => {}
-                        Err(error) => {
-                            let _ = sender.send(SessionSubscriptionMessage::Disconnected {
-                                subscription_id: reader_subscription_id,
-                                error: error.to_string(),
-                            });
-                            break;
-                        }
-                    }
-                }
-                let _ = stopped_sender.send(());
-            })
-            .map_err(DaemonTransportError::Io)?;
-        self.session_type_entities.begin_generation(subscription_id);
-        self.session_type_subscription = Some(SessionSubscriptionPump {
-            messages: receiver,
-            cancel: Some(cancel_sender),
-            stopped: stopped_receiver,
-            stop_attempted: false,
-            stopped_confirmed: false,
-        });
-        self.session_type_subscription_error = None;
-        Ok(())
-    }
-
-    fn drain_session_type_subscription(&mut self) -> bool {
-        let messages = self
-            .session_type_subscription
-            .as_ref()
-            .map(|pump| pump.messages.try_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for message in messages {
-            match message {
-                SessionSubscriptionMessage::Frame(frame) => {
-                    match self.session_type_entities.apply(frame) {
-                        Ok(true) => {
-                            if self.selected_session_type_id.as_ref().is_some_and(|id| {
-                                !self.session_type_entities.entities.contains_key(id)
-                            }) {
-                                self.selected_session_type_id = None;
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            self.session_type_subscription_error = Some(error.clone());
-                            self.error = Some(format!("session type sync: {error}"));
-                        }
-                    }
-                }
-                SessionSubscriptionMessage::Disconnected {
-                    subscription_id,
-                    error,
-                } if self.session_type_entities.subscription_id.as_deref()
-                    == Some(subscription_id.as_str()) =>
-                {
-                    if !self.invalidate_session_type_generation() {
-                        self.error =
-                            Some("session type subscription cleanup timed out".to_string());
-                    }
-                    self.session_type_subscription_error = Some(error);
-                    return true;
-                }
-                SessionSubscriptionMessage::Disconnected { .. } => {}
-            }
-        }
-        false
-    }
-
-    fn invalidate_session_type_generation(&mut self) -> bool {
-        let stopped = self
-            .session_type_subscription
-            .take()
-            .is_none_or(|mut pump| pump.stop());
-        self.session_type_entities = SessionTypeEntityState::default();
-        self.session_type_subscription_error = None;
-        stopped
-    }
-
-    /// IsolatedHub session-types live harness only. Stop the current pump, then
-    /// start a new production `subscribe_entities` so Hub sends a request-path
-    /// snapshot. Production Create / Update / Delete must not call this.
-    #[cfg(test)]
-    fn refresh_session_type_subscription_for_test(&mut self) -> Result<(), String> {
-        let previous_subscription_id = self.session_type_entities.subscription_id.clone();
-        if !self.invalidate_session_type_generation() {
-            return Err(format!(
-                "session type subscription stop timed out; previous_subscription_id={previous_subscription_id:?}"
-            ));
-        }
-        self.start_session_type_subscription()
-            .map_err(|error| format!("session type subscribe after stop failed: {error}"))?;
-        let new_id = self.session_type_entities.subscription_id.clone();
-        if self.session_type_subscription.is_none() {
-            return Err("refresh must leave one live session_type pump".to_string());
-        }
-        if new_id == previous_subscription_id {
-            return Err(format!(
-                "refresh must start a new subscription_id; previous={previous_subscription_id:?} new={new_id:?}"
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn wait_for_session_type_after_subscribe_refresh(
-        &mut self,
-        expected_id: &str,
-        expect_present: bool,
-    ) {
-        if let Err(error) = self.refresh_session_type_subscription_for_test() {
-            panic!(
-                "{error}; expected_id={expected_id} expect_present={expect_present} keys={:?} has_snapshot={} snapshot_seq={:?} subscription_id={:?} error={:?} session_type_subscription_error={:?}",
-                self.session_type_entities
-                    .entities
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                self.session_type_entities.has_snapshot,
-                self.session_type_entities.snapshot_seq,
-                self.session_type_entities.subscription_id,
-                self.error,
-                self.session_type_subscription_error,
-            );
-        }
-        let deadline = Instant::now() + SESSION_TYPE_SUBSCRIBE_SNAPSHOT_DEADLINE;
-        while Instant::now() < deadline {
-            self.poll_hub();
-            let present = self
-                .session_type_entities
-                .entities
-                .contains_key(expected_id);
-            if expect_present && present {
-                return;
-            }
-            if !expect_present && !present && self.session_type_entities.has_snapshot {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!(
-            "session type subscribe snapshot missed expected_id={expected_id} expect_present={expect_present} keys={:?} has_snapshot={} snapshot_seq={:?} subscription_id={:?} error={:?} session_type_subscription_error={:?}",
-            self.session_type_entities
-                .entities
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            self.session_type_entities.has_snapshot,
-            self.session_type_entities.snapshot_seq,
-            self.session_type_entities.subscription_id,
-            self.error,
-            self.session_type_subscription_error,
-        );
     }
 
     /// Build the multi-family store for shared projection, injecting process-wide
@@ -3182,37 +3673,6 @@ impl TuiApp {
             .projection_store_with_process_wide(&process_wide)
     }
 
-    fn drop_entity_options_subscriptions(&mut self) {
-        self.drop_entity_options_families(None);
-    }
-
-    fn drop_entity_options_families(&mut self, keep: Option<BTreeSet<String>>) {
-        let keep = keep.unwrap_or_default();
-        let stale: Vec<String> = self
-            .entity_options_subscriptions
-            .keys()
-            .filter(|family| !keep.contains(*family))
-            .cloned()
-            .collect();
-        for family in stale {
-            if let Some(mut pump) = self.entity_options_subscriptions.remove(&family) {
-                let _ = pump.stop();
-            }
-            self.entity_options.drop_family(&family);
-            self.entity_options_retry.remove(&family);
-            #[cfg(test)]
-            self.entity_options_frame_injectors.remove(&family);
-        }
-        if keep.is_empty() {
-            self.entity_options = EntityOptionsStore::default();
-            self.entity_options_retry.clear();
-            #[cfg(test)]
-            self.entity_options_frame_injectors.clear();
-        } else {
-            self.entity_options.retain_families(&keep);
-        }
-    }
-
     fn demanded_entity_option_families_now(&self) -> BTreeSet<String> {
         let mut owned = BTreeSet::new();
         if let Some(surface) = self.plugin_surface.as_ref() {
@@ -3225,179 +3685,6 @@ impl TuiApp {
         owned
     }
 
-    /// Collect options_source families from the active plugin surface and ensure
-    /// SubscribeEntities for non-process-wide families. Process-wide families
-    /// (session / session_type) reuse the existing navigator subscriptions.
-    fn sync_entity_options_subscriptions(&mut self) {
-        let owned = self.demanded_entity_option_families_now();
-
-        let stale: Vec<String> = self
-            .entity_options_subscriptions
-            .keys()
-            .filter(|family| !owned.contains(*family))
-            .cloned()
-            .collect();
-        for family in stale {
-            if let Some(mut pump) = self.entity_options_subscriptions.remove(&family) {
-                let _ = pump.stop();
-            }
-            self.entity_options.drop_family(&family);
-            self.entity_options_retry.remove(&family);
-            #[cfg(test)]
-            self.entity_options_frame_injectors.remove(&family);
-        }
-        self.entity_options.retain_families(&owned);
-
-        if self.client.is_none() {
-            self.reconcile_entity_option_drafts();
-            return;
-        }
-
-        for family in owned {
-            if self.entity_options_subscriptions.contains_key(&family) {
-                continue;
-            }
-            if !self.entity_options_retry_ready(&family) {
-                continue;
-            }
-            if let Err(error) = self.start_entity_options_subscription(&family) {
-                self.note_entity_options_admission_failure(&family, error);
-            }
-        }
-        self.reconcile_entity_option_drafts();
-    }
-
-    fn start_entity_options_subscription(
-        &mut self,
-        entity_type: &str,
-    ) -> DaemonTransportResult<()> {
-        #[cfg(test)]
-        {
-            *self
-                .entity_options_subscribe_attempts
-                .entry(entity_type.to_string())
-                .or_insert(0) += 1;
-            if let Some(message) = self.entity_options_forced_subscribe_error {
-                return Err(DaemonTransportError::Protocol(message));
-            }
-        }
-        let subscription_id = format!("btui-entity-options-{entity_type}-{}", short_suffix());
-        #[cfg(test)]
-        if self.entity_options_local_pumps {
-            let result = self.install_local_entity_options_pump(entity_type, subscription_id);
-            if result.is_ok() {
-                self.reset_entity_options_backoff(entity_type);
-            }
-            return result;
-        }
-        let endpoint = self
-            .endpoint
-            .as_ref()
-            .ok_or(DaemonTransportError::NotRunning)?;
-        let mut subscription = subscribe_entities(endpoint, entity_type, subscription_id.clone())?;
-        subscription.set_read_timeout(Some(SESSION_ENTITY_READ_TIMEOUT))?;
-        let (sender, receiver) = mpsc::channel();
-        let (cancel_sender, cancel_receiver) = mpsc::channel();
-        let (stopped_sender, stopped_receiver) = mpsc::channel();
-        let reader_subscription_id = subscription_id.clone();
-        let thread_name = format!("botster-tui-entity-options-{entity_type}");
-
-        thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                loop {
-                    if cancel_receiver.try_recv().is_ok() {
-                        let _ = subscription.unsubscribe();
-                        break;
-                    }
-                    match subscription.next_frame() {
-                        Ok(frame) => {
-                            if sender
-                                .send(SessionSubscriptionMessage::Frame(frame))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(DaemonTransportError::Io(error))
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                            ) => {}
-                        Err(error) => {
-                            let _ = sender.send(SessionSubscriptionMessage::Disconnected {
-                                subscription_id: reader_subscription_id,
-                                error: error.to_string(),
-                            });
-                            break;
-                        }
-                    }
-                }
-                let _ = stopped_sender.send(());
-            })
-            .map_err(DaemonTransportError::Io)?;
-
-        self.entity_options
-            .begin_generation(entity_type, subscription_id);
-        self.entity_options_subscriptions.insert(
-            entity_type.to_string(),
-            SessionSubscriptionPump {
-                messages: receiver,
-                cancel: Some(cancel_sender),
-                stopped: stopped_receiver,
-                stop_attempted: false,
-                stopped_confirmed: false,
-            },
-        );
-        self.reset_entity_options_backoff(entity_type);
-        Ok(())
-    }
-
-    /// Install a local (non-network) entity-options pump and begin a generation.
-    /// Used by production-path unit tests and offline start stubs.
-    #[cfg(test)]
-    fn install_local_entity_options_pump(
-        &mut self,
-        entity_type: &str,
-        subscription_id: String,
-    ) -> DaemonTransportResult<()> {
-        let (sender, receiver) = mpsc::channel();
-        let (cancel_sender, _cancel_receiver) = mpsc::channel();
-        let (_stopped_sender, stopped_receiver) = mpsc::channel();
-        self.entity_options
-            .begin_generation(entity_type, subscription_id);
-        self.entity_options_frame_injectors
-            .insert(entity_type.to_string(), sender);
-        self.entity_options_subscriptions.insert(
-            entity_type.to_string(),
-            SessionSubscriptionPump {
-                messages: receiver,
-                cancel: Some(cancel_sender),
-                stopped: stopped_receiver,
-                stop_attempted: false,
-                stopped_confirmed: false,
-            },
-        );
-        Ok(())
-    }
-
-    /// Re-open demanded entity-options pumps that are missing after a failed recovery.
-    fn heal_entity_options_subscriptions(&mut self) {
-        let demanded: Vec<String> = self
-            .demanded_entity_option_families_now()
-            .into_iter()
-            .filter(|family| !self.entity_options_subscriptions.contains_key(family))
-            .collect();
-        for family in demanded {
-            if !self.entity_options_retry_ready(&family) {
-                continue;
-            }
-            if let Err(error) = self.start_entity_options_subscription(&family) {
-                self.note_entity_options_admission_failure(&family, error);
-            }
-        }
-    }
-
     fn entity_options_retry_ready(&self, family: &str) -> bool {
         self.entity_options_retry
             .get(family)
@@ -3408,114 +3695,8 @@ impl TuiApp {
         self.entity_options_retry.remove(family);
     }
 
-    fn note_entity_options_admission_failure(&mut self, family: &str, error: DaemonTransportError) {
-        let previous = self.entity_options_retry.get(family).cloned();
-        let consecutive_failures = previous
-            .as_ref()
-            .map(|state| state.consecutive_failures.saturating_add(1))
-            .unwrap_or(1);
-        let delay = entity_options_backoff_delay(consecutive_failures);
-        self.entity_options_retry.insert(
-            family.to_string(),
-            EntityOptionsRetryState {
-                consecutive_failures,
-                next_attempt_at: Instant::now() + delay,
-            },
-        );
-        if previous.is_none() {
-            self.error = Some(format!(
-                "entity options subscription failed for {family}: {error}"
-            ));
-        }
-    }
-
     fn family_still_demanded(&self, family: &str) -> bool {
         self.demanded_entity_option_families_now().contains(family)
-    }
-
-    /// Drain entity-options family pumps. Returns true when a disconnect forces reconnect.
-    fn drain_entity_options_subscriptions(&mut self) -> bool {
-        let families: Vec<String> = self.entity_options_subscriptions.keys().cloned().collect();
-        let mut force_reconnect = false;
-        let mut mutated = false;
-        for family in families {
-            let messages = self
-                .entity_options_subscriptions
-                .get(&family)
-                .map(|pump| pump.messages.try_iter().collect::<Vec<_>>())
-                .unwrap_or_default();
-            for message in messages {
-                match message {
-                    SessionSubscriptionMessage::Frame(frame) => {
-                        match self.entity_options.apply_daemon_frame(frame) {
-                            Ok(true) => mutated = true,
-                            Ok(false) => {}
-                            Err(error) => {
-                                self.error = Some(format!("entity options sync: {error}"));
-                                // Gap recovery: drop the generation and open a fresh SubscribeEntities.
-                                if let Some(mut pump) =
-                                    self.entity_options_subscriptions.remove(&family)
-                                {
-                                    let _ = pump.stop();
-                                }
-                                #[cfg(test)]
-                                self.entity_options_frame_injectors.remove(&family);
-                                self.entity_options.drop_family(&family);
-                                let still_demanded = self.family_still_demanded(&family);
-                                if still_demanded
-                                    && self.entity_options_retry_ready(&family)
-                                    && let Err(start_error) =
-                                        self.start_entity_options_subscription(&family)
-                                {
-                                    self.note_entity_options_admission_failure(
-                                        &family,
-                                        start_error,
-                                    );
-                                    if self.endpoint.is_none() || self.client.is_none() {
-                                        force_reconnect = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    SessionSubscriptionMessage::Disconnected {
-                        subscription_id,
-                        error,
-                    } => {
-                        let matches = self
-                            .entity_options
-                            .family(&family)
-                            .and_then(|state| state.subscription_id.as_deref())
-                            == Some(subscription_id.as_str());
-                        if matches {
-                            if let Some(mut pump) =
-                                self.entity_options_subscriptions.remove(&family)
-                            {
-                                let _ = pump.stop();
-                            }
-                            self.entity_options.drop_family(&family);
-                            self.error = Some(format!(
-                                "entity options subscription disconnected ({family}): {error}"
-                            ));
-                            if self.family_still_demanded(&family)
-                                && self.entity_options_retry_ready(&family)
-                                && let Err(start_error) =
-                                    self.start_entity_options_subscription(&family)
-                            {
-                                self.note_entity_options_admission_failure(&family, start_error);
-                                force_reconnect = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if mutated {
-            self.reconcile_entity_option_drafts();
-        }
-        // Retry any demanded family left without a pump after gap recovery failure.
-        self.heal_entity_options_subscriptions();
-        force_reconnect
     }
 
     /// Clear drafts whose selected values disappeared or became excluded.
@@ -3529,133 +3710,6 @@ impl TuiApp {
         for field in &invalid {
             self.drafts.remove(field);
             self.entity_options_invalid_fields.insert(field.clone());
-        }
-    }
-
-    fn open_session_type_edit(&mut self, session_type_id: &str) {
-        self.error = None;
-        self.action_feedback = Some(format!("loading authoring definition: {session_type_id}"));
-        match self.request(DaemonRequest::ShowSessionTypeDefinition {
-            session_type_id: session_type_id.to_string(),
-        }) {
-            Ok(response) => {
-                if let Some(error) = response.error.clone() {
-                    self.apply_response(response);
-                    self.error = Some(format!("{}: {}", error.code, error.message));
-                    return;
-                }
-                let definition = response.session_type_definition.clone();
-                self.apply_response(response);
-                match definition {
-                    Some(editable) => {
-                        self.session_type_form =
-                            Some(SessionTypeFormDraft::from_authoring(editable));
-                        self.action_feedback = Some(format!("edit ready: {session_type_id}"));
-                    }
-                    None => {
-                        self.error =
-                            Some("show_session_type_definition returned no definition".to_string());
-                    }
-                }
-            }
-            Err(error) => self.record_transport_error(error),
-        }
-    }
-
-    fn delete_session_type(&mut self, session_type_id: &str) {
-        let Some(entity) = self
-            .session_type_entities
-            .entities
-            .get(session_type_id)
-            .cloned()
-        else {
-            self.error = Some(format!("session type not found: {session_type_id}"));
-            return;
-        };
-        if !entity.editable {
-            self.error = Some(format!("session type is not editable: {session_type_id}"));
-            return;
-        }
-        // Prefer source_name (owning source) over target_id (eligibility stamp),
-        // matching Hub show_session_type_definition mutation source construction.
-        let source = match entity.source.as_str() {
-            "device" => DaemonSessionTypeMutationSource::Device,
-            "repo" => DaemonSessionTypeMutationSource::Repo {
-                target_id: if !entity.source_name.is_empty() {
-                    entity.source_name.clone()
-                } else {
-                    entity.target_id.clone()
-                },
-            },
-            other => {
-                self.error = Some(format!("cannot delete session type source: {other}"));
-                return;
-            }
-        };
-        self.action_feedback = Some(format!("delete requested: {session_type_id}"));
-        self.request_and_apply(DaemonRequest::DeleteSessionType {
-            source,
-            session_type_id: entity.id.clone(),
-        });
-    }
-
-    fn submit_session_type_form(&mut self) {
-        let Some(form) = self.session_type_form.clone() else {
-            return;
-        };
-        if form.id.trim().is_empty()
-            || form.label.trim().is_empty()
-            || form.role.trim().is_empty()
-            || form.interaction.trim().is_empty()
-            || form.lifecycle.trim().is_empty()
-            || form.command.trim().is_empty()
-        {
-            if let Some(form) = self.session_type_form.as_mut() {
-                form.error = Some(
-                    "id, label, role, interaction, lifecycle, and command are required".to_string(),
-                );
-            }
-            return;
-        }
-        let source = match mutation_source_from_form(&form) {
-            Ok(source) => source,
-            Err(error) => {
-                if let Some(form) = self.session_type_form.as_mut() {
-                    form.error = Some(error);
-                }
-                return;
-            }
-        };
-        let definition = match definition_from_session_type_form(&form) {
-            Ok(definition) => definition,
-            Err(error) => {
-                if let Some(form) = self.session_type_form.as_mut() {
-                    form.error = Some(error);
-                }
-                return;
-            }
-        };
-        let request = match form.mode {
-            SessionTypeFormMode::Create => DaemonRequest::CreateSessionType { source, definition },
-            SessionTypeFormMode::Edit => DaemonRequest::UpdateSessionType { source, definition },
-        };
-        self.action_feedback = Some(match form.mode {
-            SessionTypeFormMode::Create => "create session type requested".to_string(),
-            SessionTypeFormMode::Edit => "update session type requested".to_string(),
-        });
-        match self.request(request) {
-            Ok(response) => {
-                if let Some(error) = response.error.clone() {
-                    self.apply_response(response);
-                    if let Some(form) = self.session_type_form.as_mut() {
-                        form.error = Some(format!("{}: {}", error.code, error.message));
-                    }
-                } else {
-                    self.apply_response(response);
-                    self.session_type_form = None;
-                }
-            }
-            Err(error) => self.record_transport_error(error),
         }
     }
 
@@ -3715,13 +3769,110 @@ impl TuiApp {
         self.error = None;
         self.set_selected_session(Some(session_id.clone()));
         self.action_feedback = Some(format!("attach requested: {session_id}"));
+        self.detach_owner_if_writable();
         self.reset_attach_campaign();
-        let subscription_id = self.mint_subscription_id();
-        self.begin_attach_hydration(&session_id, &subscription_id);
-        self.request_and_apply(DaemonRequest::Attach {
-            session_id,
-            subscription_id,
-        });
+        let route = self.mint_subscription_id();
+        self.begin_attach_hydration(&session_id, &route);
+        self.submit(
+            DaemonRequest::Attach {
+                session_id: session_id.clone(),
+                subscription_id: route.clone(),
+            },
+            PendingReply::Attach { session_id, route },
+            REQUEST_DEADLINE,
+        );
+    }
+
+    fn begin_attach_hydration(&mut self, session_id: &str, route: &str) {
+        // Every Attach owns a unique route and one incremental decoder.
+        self.subscription_id = route.to_string();
+        self.attached = None;
+        self.route_generation = None;
+        self.input_window = InputWindow::new();
+        self.terminal_modes = None;
+        self.clear_ghostty_projection();
+        self.attach_hydration = Some(AttachHydration::new(session_id, route));
+    }
+
+    /// The Attach request itself failed. Close the campaign without a retry.
+    fn fail_attach_campaign(&mut self, session_id: &str, route: &str, reason: &str, detach: bool) {
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.clear_route_state();
+        self.retire_subscription(route);
+        if detach && self.is_connected() {
+            self.send_bounded_detach(session_id.to_string(), route.to_string());
+        }
+        self.error = Some(format!("attach failed (closed): {reason}: {session_id}"));
+    }
+
+    fn detach_attached(&mut self) {
+        let cancelling_hydration = self.attach_hydration.is_some();
+        let Some((session_id, route)) = self.current_owner_pair() else {
+            self.error = Some("no attached terminal stream to detach".to_string());
+            return;
+        };
+        self.error = None;
+        self.action_feedback = Some(format!("detach requested: {session_id}"));
+        if cancelling_hydration && let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        // A detached projection stays readable for scrollback; hydration state does not.
+        if cancelling_hydration {
+            self.clear_ghostty_projection();
+        }
+        self.retire_subscription(&route);
+        self.attach_hydration = None;
+        self.attached = None;
+        self.terminal_modes = None;
+        self.send_bounded_detach(session_id, route);
+    }
+
+    fn send_bounded_detach(&mut self, session_id: String, route: String) {
+        self.submit(
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id: route,
+            },
+            PendingReply::Detach,
+            DETACH_ON_DISCONNECT_BOUND,
+        );
+    }
+
+    /// Retire the current route and send a bounded Detach when connected.
+    fn detach_owner_if_writable(&mut self) {
+        let Some((session_id, route)) = self.current_owner_pair() else {
+            return;
+        };
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.retire_subscription(&route);
+        if !self.is_connected() {
+            return;
+        }
+        self.send_bounded_detach(session_id, route);
+    }
+
+    /// Retired routes ignore late frames and close events. The input window
+    /// and adopted generation belong to the route and are dropped with it.
+    fn retire_subscription(&mut self, route: &str) {
+        self.retired_subscription_ids.insert(route.to_string());
+        self.hub_io.forget_route(route);
+        self.input_window = InputWindow::new();
+        self.route_generation = None;
+    }
+
+    fn current_owner_pair(&self) -> Option<(String, String)> {
+        self.attach_hydration
+            .as_ref()
+            .map(|hydration| (hydration.session_id.clone(), hydration.route.clone()))
+            .or_else(|| {
+                self.attached
+                    .as_ref()
+                    .map(|attached| (attached.session_id.clone(), attached.route.clone()))
+            })
     }
 
     fn reset_attach_campaign(&mut self) {
@@ -3734,30 +3885,6 @@ impl TuiApp {
         let sequence = self.next_terminal_subscription_sequence;
         self.next_terminal_subscription_sequence = sequence.saturating_add(1);
         format!("btui-sub-{}-{sequence}", short_suffix())
-    }
-
-    fn begin_attach_hydration(&mut self, session_id: &str, subscription_id: &str) {
-        // Every Attach owns a unique subscription_id and one incremental
-        // decoder. ReadScreen remains optional diagnostic text only.
-        self.subscription_id = subscription_id.to_string();
-        self.attached_session = None;
-        self.attached_subscription_id = None;
-        self.clear_terminal_input_queue();
-        self.clear_terminal_mouse_mode();
-        self.clear_ghostty_projection();
-        self.terminal_output.clear();
-        self.snapshot_metadata = None;
-        self.terminal_output_session_id = Some(session_id.to_string());
-        self.attach_hydration = Some(AttachHydration {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-            buffered_live_output: Vec::new(),
-            pending_input: Vec::new(),
-            pending_resize: None,
-            snapshot_ready: false,
-            snapshot_finished: false,
-            attached_seen: false,
-        });
     }
 
     fn selected_attachable_session_id(&mut self) -> Option<String> {
@@ -3789,44 +3916,6 @@ impl TuiApp {
             session.session_id, session.lifecycle
         ));
         None
-    }
-
-    fn detach_attached(&mut self) {
-        let cancelling_hydration = self.attach_hydration.is_some();
-        let attachment = self
-            .attach_hydration
-            .as_ref()
-            .map(|hydration| {
-                (
-                    hydration.session_id.clone(),
-                    hydration.subscription_id.clone(),
-                )
-            })
-            .or_else(|| {
-                Some((
-                    self.attached_session.clone()?,
-                    self.attached_subscription_id.clone()?,
-                ))
-            });
-        let Some((session_id, subscription_id)) = attachment else {
-            self.error = Some("no attached terminal stream to detach".to_string());
-            return;
-        };
-        self.error = None;
-        self.action_feedback = Some(format!("detach requested: {session_id}"));
-        if cancelling_hydration {
-            if let Some(projection) = self.ghostty_projection.as_mut() {
-                projection.abort_ghostsnp_history();
-            }
-            self.clear_ghostty_projection();
-        }
-        self.retire_subscription(&subscription_id);
-        self.attach_hydration = None;
-        self.clear_terminal_mouse_mode();
-        if let Some(client) = self.client.as_mut() {
-            client.drop_terminal_frames_for(&session_id, &subscription_id);
-        }
-        self.send_bounded_detach(session_id, subscription_id);
     }
 
     fn submit_package_configuration(&mut self, package_name: &str, values: Option<&UiFormValues>) {
@@ -3861,205 +3950,10 @@ impl TuiApp {
 
         self.error = None;
         self.action_feedback = Some(format!("configuration update requested: {package_name}"));
-        self.request_and_apply(DaemonRequest::SetPackageConfiguration {
+        self.submit_apply(DaemonRequest::SetPackageConfiguration {
             package_name: package_name.to_string(),
             values: updates,
         });
-    }
-
-    fn request_and_apply(&mut self, request: DaemonRequest) {
-        #[cfg(test)]
-        self.record_request(&request);
-        match self.request(request) {
-            Ok(response) => {
-                self.apply_response(response);
-                self.apply_pending_mux_frames();
-            }
-            Err(error) => self.record_transport_error(error),
-        }
-    }
-
-    fn request(&mut self, request: DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
-        if let Some(audit) = &mut self.acceptance_audit {
-            audit.record(&request);
-        }
-        match &mut self.client {
-            Some(client) => client.request(&request),
-            None => Err(DaemonTransportError::NotRunning),
-        }
-    }
-
-    fn request_with_deadline(
-        &mut self,
-        request: DaemonRequest,
-        deadline: Instant,
-    ) -> DaemonTransportResult<DaemonResponse> {
-        if let Some(audit) = &mut self.acceptance_audit {
-            audit.record(&request);
-        }
-        #[cfg(test)]
-        self.record_request(&request);
-        match &mut self.client {
-            Some(client) => client.request_with_deadline(&request, deadline),
-            None => Err(DaemonTransportError::NotRunning),
-        }
-    }
-
-    fn send_bounded_detach(&mut self, session_id: String, subscription_id: String) {
-        let deadline = Instant::now() + DETACH_ON_DISCONNECT_BOUND;
-        match self.request_with_deadline(
-            DaemonRequest::Detach {
-                session_id,
-                subscription_id,
-            },
-            deadline,
-        ) {
-            Ok(response) => {
-                self.apply_response(response);
-                self.apply_pending_mux_frames();
-            }
-            Err(error) => {
-                if let Some(client) = self.client.as_mut() {
-                    client.hard_close();
-                }
-                self.apply_transport_failure(error);
-            }
-        }
-    }
-
-    fn detach_owner_if_writable(&mut self) {
-        let Some((session_id, subscription_id)) = self.current_owner_pair() else {
-            return;
-        };
-        if let Some(projection) = self.ghostty_projection.as_mut() {
-            projection.abort_ghostsnp_history();
-        }
-        self.retire_subscription(&subscription_id);
-        if let Some(client) = self.client.as_mut() {
-            client.drop_terminal_frames_for(&session_id, &subscription_id);
-        }
-        if self.client.is_none() {
-            return;
-        }
-        let deadline = Instant::now() + DETACH_ON_DISCONNECT_BOUND;
-        match self.request_with_deadline(
-            DaemonRequest::Detach {
-                session_id,
-                subscription_id,
-            },
-            deadline,
-        ) {
-            Ok(response) => {
-                self.apply_response(response);
-            }
-            Err(_) => {
-                if let Some(client) = self.client.as_mut() {
-                    client.hard_close();
-                }
-            }
-        }
-    }
-
-    fn retire_subscription(&mut self, subscription_id: &str) {
-        self.retired_subscription_ids
-            .insert(subscription_id.to_string());
-        self.clear_terminal_input_queue();
-    }
-
-    fn current_owner_pair(&self) -> Option<(String, String)> {
-        self.attach_hydration
-            .as_ref()
-            .map(|hydration| {
-                (
-                    hydration.session_id.clone(),
-                    hydration.subscription_id.clone(),
-                )
-            })
-            .or_else(|| {
-                Some((
-                    self.attached_session.clone()?,
-                    self.attached_subscription_id.clone()?,
-                ))
-            })
-    }
-
-    fn poll_and_apply_mux_frames(&mut self) {
-        let frames = match self.client.as_mut() {
-            Some(client) => match client.poll_mux_frames() {
-                Ok(frames) => frames,
-                Err(error) => {
-                    self.record_transport_error(error);
-                    return;
-                }
-            },
-            None => return,
-        };
-        self.apply_mux_frames(frames);
-    }
-
-    fn apply_pending_mux_frames(&mut self) {
-        let frames = match self.client.as_mut() {
-            Some(client) => client.take_pending_mux_frames(),
-            None => return,
-        };
-        self.apply_mux_frames(frames);
-    }
-
-    fn apply_mux_frames(&mut self, frames: Vec<DaemonUnixMuxFrame>) {
-        for frame in frames {
-            match frame {
-                DaemonUnixMuxFrame::Response(response) => self.apply_response(*response),
-                DaemonUnixMuxFrame::Terminal(envelope) => {
-                    self.apply_unix_terminal_envelope(envelope);
-                }
-                DaemonUnixMuxFrame::Event(event) => self.apply_mux_event(event),
-            }
-        }
-    }
-
-    fn apply_unix_terminal_envelope(&mut self, envelope: DaemonUnixTerminalEnvelope) {
-        if !envelope.is_unix_terminal_plane() {
-            return;
-        }
-        if self
-            .retired_subscription_ids
-            .contains(&envelope.subscription_id)
-        {
-            return;
-        }
-        if !self.hydration_matches(&envelope.session_id, &envelope.subscription_id)
-            && !self.attached_matches(&envelope.session_id, &envelope.subscription_id)
-        {
-            return;
-        }
-        let bytes = match envelope.payload_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.recover_from_decode_or_phase_gap(&format!(
-                    "unix terminal payload decode failed: {error}"
-                ));
-                return;
-            }
-        };
-        let frame = match TerminalFrame::from_bytes(&bytes) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.recover_from_decode_or_phase_gap(&format!(
-                    "terminal frame decode failed: {error}"
-                ));
-                return;
-            }
-        };
-        let event = match TerminalEvent::from_frame(&frame) {
-            Ok(event) => event,
-            Err(error) => {
-                self.recover_from_decode_or_phase_gap(&format!(
-                    "terminal event decode failed: {error}"
-                ));
-                return;
-            }
-        };
-        self.apply_terminal_event(event);
     }
 
     fn apply_mux_event(&mut self, event: DaemonEvent) {
@@ -4195,57 +4089,57 @@ impl TuiApp {
         self.notice_subscription_by_id
             .insert(subscription_id.clone(), key.clone());
         self.notice_subscriptions.insert(key.clone(), entry.clone());
-        let request = DaemonRequest::SubscribeEvents {
-            subscription_id: subscription_id.clone(),
-            owner: entry.descriptor.owner.clone(),
-            name: entry.descriptor.name.clone(),
-            subjects: vec![entry.subject.clone()],
-        };
-        #[cfg(test)]
-        self.record_request(&request);
-        #[cfg(test)]
-        if self.notice_subscriptions_local {
-            if let Some(current) = self.notice_subscriptions.get_mut(&key) {
-                current.state = EventSubscriptionState::Active(subscription_id);
+        self.submit(
+            DaemonRequest::SubscribeEvents {
+                subscription_id: subscription_id.clone(),
+                owner: entry.descriptor.owner.clone(),
+                name: entry.descriptor.name.clone(),
+                subjects: vec![entry.subject.clone()],
+            },
+            PendingReply::SubscribeEvents {
+                key,
+                subscription_id,
+            },
+            REQUEST_DEADLINE,
+        );
+    }
+
+    /// EventSubscribed promotes the candidate and replays events parked while
+    /// the response was outstanding.
+    fn complete_notice_subscription(
+        &mut self,
+        key: &NoticeSubscriptionKey,
+        subscription_id: &str,
+        response: DaemonResponse,
+    ) {
+        self.record_diagnostics(response.diagnostics);
+        if response.kind == DaemonResponseKind::EventSubscribed && response.error.is_none() {
+            let promoted = match self.notice_subscriptions.get_mut(key) {
+                Some(current) if current.state.candidate_id() == Some(subscription_id) => {
+                    current.state = EventSubscriptionState::Active(subscription_id.to_string());
+                    true
+                }
+                _ => false,
+            };
+            if promoted {
+                self.promote_parked_notice_events(subscription_id);
+            } else {
+                self.notice_parked.remove(subscription_id);
             }
-            self.apply_pending_mux_frames();
             return;
         }
-        match self.request(request) {
-            Ok(response) if response.kind == DaemonResponseKind::EventSubscribed => {
-                if let Some(current) = self.notice_subscriptions.get_mut(&key)
-                    && current.state.candidate_id() == Some(subscription_id.as_str())
-                {
-                    current.state = EventSubscriptionState::Active(subscription_id);
-                }
-                self.apply_pending_mux_frames();
-            }
-            Ok(response) => {
-                let detail = response
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.clone())
-                    .unwrap_or_else(|| format!("{:?}", response.kind));
-                self.reject_event_subscription_candidate(
-                    &subscription_id,
-                    format!("event subscription was not accepted: {detail}"),
-                );
-            }
-            Err(error) => {
-                self.reject_event_subscription_candidate(
-                    &subscription_id,
-                    format!("event subscription failed: {error}"),
-                );
-                if matches!(
-                    error,
-                    DaemonTransportError::ClientDisconnected
-                        | DaemonTransportError::NotRunning
-                        | DaemonTransportError::Io(_)
-                ) {
-                    self.record_transport_error(error);
-                }
-            }
+        let detail = response
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| format!("{:?}", response.kind));
+        if let Some(error) = response.error {
+            self.record_diagnostics(error.diagnostics);
         }
+        self.reject_event_subscription_candidate(
+            subscription_id,
+            format!("event subscription was not accepted: {detail}"),
+        );
     }
 
     fn unsubscribe_notice_entry(&mut self, key: &NoticeSubscriptionKey) {
@@ -4260,20 +4154,13 @@ impl TuiApp {
         };
         if let Some(subscription_id) = subscription_id {
             self.notice_subscription_by_id.remove(&subscription_id);
-            if let Some(client) = self.client.as_mut() {
-                client.drop_event_frames_for(&subscription_id);
-            }
-            if !matches!(entry.state, EventSubscriptionState::Idle) {
-                let request = DaemonRequest::UnsubscribeEvents {
-                    subscription_id: subscription_id.clone(),
-                };
-                #[cfg(test)]
-                self.record_request(&request);
-                #[cfg(test)]
-                if self.notice_subscriptions_local {
-                    return;
-                }
-                let _ = self.request(request);
+            self.notice_parked.remove(&subscription_id);
+            if !matches!(entry.state, EventSubscriptionState::Idle) && self.is_connected() {
+                self.submit(
+                    DaemonRequest::UnsubscribeEvents { subscription_id },
+                    PendingReply::Unsubscribe,
+                    REQUEST_DEADLINE,
+                );
             }
         }
     }
@@ -4286,17 +4173,115 @@ impl TuiApp {
             entry.state = EventSubscriptionState::Idle;
             self.notice_subscription_by_id.remove(subscription_id);
         }
-        if let Some(client) = self.client.as_mut() {
-            client.drop_event_frames_for(subscription_id);
-        }
+        self.notice_parked.remove(subscription_id);
         self.error = Some(message);
     }
 
     fn clear_event_subscription_state(&mut self) {
         self.notice_subscriptions.clear();
         self.notice_subscription_by_id.clear();
+        self.notice_parked.clear();
         self.notice_overflow_dropped = 0;
         self.transient_notice = None;
+    }
+
+    fn candidate_notice_entry(&self, subscription_id: &str) -> Option<&NoticeSubscriptionEntry> {
+        let key = self.notice_subscription_by_id.get(subscription_id)?;
+        let entry = self.notice_subscriptions.get(key)?;
+        (entry.state.candidate_id() == Some(subscription_id)).then_some(entry)
+    }
+
+    fn handle_package_event(
+        &mut self,
+        subscription_id: String,
+        owner: String,
+        name: String,
+        payload: Value,
+    ) {
+        if self.active_notice_entry(&subscription_id).is_some() {
+            self.apply_active_package_event(&subscription_id, &owner, &name, &payload);
+            return;
+        }
+        // Hub may complete SubscribeEvents after the first event on the new
+        // subscription is already delivered. Park a bounded tail until
+        // EventSubscribed promotes the candidate.
+        if self.candidate_notice_entry(&subscription_id).is_some() {
+            let parked = self.notice_parked.entry(subscription_id).or_default();
+            if parked.events.len() >= MAX_PARKED_NOTICE_EVENTS {
+                parked.events.pop_front();
+                parked.gap = true;
+            }
+            parked.events.push_back((owner, name, payload));
+        }
+    }
+
+    fn apply_active_package_event(
+        &mut self,
+        subscription_id: &str,
+        owner: &str,
+        name: &str,
+        payload: &Value,
+    ) {
+        let Some(entry) = self.active_notice_entry(subscription_id) else {
+            return;
+        };
+        if entry.descriptor.owner != owner || entry.descriptor.name != name {
+            return;
+        }
+        let text_pointer = entry.descriptor.text_pointer.clone();
+        let ttl_ms = entry.descriptor.ttl_ms;
+        match resolve_notice_text(payload, &text_pointer) {
+            Ok(text) => {
+                self.transient_notice = Some(TransientNotice {
+                    text: text.to_string(),
+                    deadline: Instant::now() + Duration::from_millis(u64::from(ttl_ms)),
+                });
+            }
+            Err(error) => {
+                self.transient_notice = None;
+                self.error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn handle_event_gap(&mut self, subscription_id: String, owner: String, name: String) {
+        if self.active_notice_entry(&subscription_id).is_some() {
+            self.apply_active_event_gap(&subscription_id, &owner, &name);
+            return;
+        }
+        if self.candidate_notice_entry(&subscription_id).is_some() {
+            self.notice_parked.entry(subscription_id).or_default().gap = true;
+        }
+    }
+
+    fn apply_active_event_gap(&mut self, subscription_id: &str, owner: &str, name: &str) {
+        let Some(entry) = self.active_notice_entry(subscription_id) else {
+            return;
+        };
+        if entry.descriptor.owner != owner || entry.descriptor.name != name {
+            return;
+        }
+        self.transient_notice = None;
+        self.error = Some("package event gap; durable package state is unchanged".to_string());
+    }
+
+    fn promote_parked_notice_events(&mut self, subscription_id: &str) {
+        let Some(parked) = self.notice_parked.remove(subscription_id) else {
+            return;
+        };
+        let (owner, name) = match self.active_notice_entry(subscription_id) {
+            Some(entry) => (
+                entry.descriptor.owner.clone(),
+                entry.descriptor.name.clone(),
+            ),
+            None => return,
+        };
+        if parked.gap {
+            self.apply_active_event_gap(subscription_id, &owner, &name);
+        }
+        for (event_owner, event_name, payload) in parked.events {
+            self.apply_active_package_event(subscription_id, &event_owner, &event_name, &payload);
+        }
     }
 
     fn expire_transient_notice(&mut self) {
@@ -4319,46 +4304,6 @@ impl TuiApp {
         }
     }
 
-    fn handle_package_event(
-        &mut self,
-        subscription_id: String,
-        owner: String,
-        name: String,
-        payload: Value,
-    ) {
-        let Some(entry) = self.active_notice_entry(&subscription_id) else {
-            return;
-        };
-        if entry.descriptor.owner != owner || entry.descriptor.name != name {
-            return;
-        }
-        let text_pointer = entry.descriptor.text_pointer.clone();
-        let ttl_ms = entry.descriptor.ttl_ms;
-        match resolve_notice_text(&payload, &text_pointer) {
-            Ok(text) => {
-                self.transient_notice = Some(TransientNotice {
-                    text: text.to_string(),
-                    deadline: Instant::now() + Duration::from_millis(u64::from(ttl_ms)),
-                });
-            }
-            Err(error) => {
-                self.transient_notice = None;
-                self.error = Some(error.to_string());
-            }
-        }
-    }
-
-    fn handle_event_gap(&mut self, subscription_id: String, owner: String, name: String) {
-        let Some(entry) = self.active_notice_entry(&subscription_id) else {
-            return;
-        };
-        if entry.descriptor.owner != owner || entry.descriptor.name != name {
-            return;
-        }
-        self.transient_notice = None;
-        self.error = Some("package event gap; durable package state is unchanged".to_string());
-    }
-
     fn transient_notice_band(&self) -> Option<UiNode> {
         let notice = self.transient_notice.as_ref()?;
         if Instant::now() >= notice.deadline {
@@ -4371,53 +4316,118 @@ impl TuiApp {
         ))
     }
 
-    fn apply_terminal_event(&mut self, event: TerminalEvent) {
-        match event {
-            TerminalEvent::Snapshot(snapshot) => {
-                if !self.hydration_matches(&snapshot.session_id, &snapshot.subscription_id) {
-                    return;
-                }
-                match snapshot.decoded_bytes() {
-                    Ok(bytes) => {
-                        self.apply_incremental_snapshot_with_phase(
-                            &snapshot.session_id,
-                            bytes,
-                            snapshot.phase,
-                        );
-                    }
-                    Err(error) => {
-                        self.recover_from_decode_or_phase_gap(&format!(
-                            "snapshot history decode failed: {error}"
-                        ));
-                    }
-                }
+    /// One routed scheme 2 frame from the connection.
+    ///
+    /// Frames for retired or foreign routes are dropped. The first frame adopts
+    /// the stream generation; a lower generation is stale and dropped; a higher
+    /// generation is a resync boundary and the route restarts at SNAPSHOT_READY.
+    fn apply_routed_terminal_frame(&mut self, routed: RoutedTerminalFrame) {
+        let route = routed.route.as_str().to_string();
+        if self.retired_subscription_ids.contains(&route) {
+            return;
+        }
+        if !self.hydration_matches_route(&route) && !self.attached_matches_route(&route) {
+            return;
+        }
+        let event = match decode_terminal_event(&routed.frame) {
+            Ok(event) => event,
+            Err(error) => {
+                self.recover_from_decode_or_phase_gap(&format!(
+                    "terminal event decode failed: {error}"
+                ));
+                return;
             }
-            TerminalEvent::TerminalOutput(output) => {
-                let data = match output.decoded_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        self.recover_from_decode_or_phase_gap(&format!(
-                            "terminal output decode failed: {error}"
-                        ));
+        };
+        // Adopt a generation only from ATTACH_STATE attached or ROUTE_RESYNC on
+        // the current route; every other frame must carry the adopted value.
+        // Frames on one route arrive in order, so no ordering comparison is
+        // needed, and retired routes were already dropped above. Input
+        // operation ids are per attach and do not restart on resync.
+        let adopts = matches!(
+            event,
+            TerminalEvent::AttachState(AttachStateCode::Attached) | TerminalEvent::RouteResync
+        );
+        match self.route_generation {
+            Some(current) if routed.generation == current => {}
+            _ if adopts => self.route_generation = Some(routed.generation),
+            _ => return,
+        }
+        self.apply_terminal_event(&route, event);
+    }
+
+    /// The route restarts from a fresh SNAPSHOT_READY. The decoder state is
+    /// reset, never continued. Input captured so far stays queued.
+    fn begin_route_resync(&mut self) {
+        let Some((session_id, route)) = self.current_owner_pair() else {
+            return;
+        };
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.clear_ghostty_projection();
+        let was_attached = self.attached.take().is_some();
+        let mut hydration = AttachHydration::new(&session_id, &route);
+        if let Some(previous) = self.attach_hydration.take() {
+            hydration.attached_seen = previous.attached_seen;
+            hydration.pending_input = previous.pending_input;
+            hydration.pending_input_bytes = previous.pending_input_bytes;
+            hydration.pending_resize = previous.pending_resize;
+        }
+        hydration.attached_seen |= was_attached;
+        self.attach_hydration = Some(hydration);
+        self.action_feedback = Some(format!("terminal route resync: {session_id}"));
+    }
+
+    fn apply_terminal_event(&mut self, route: &str, event: TerminalEvent) {
+        let Some((session_id, _)) = self.current_owner_pair() else {
+            return;
+        };
+        match event {
+            TerminalEvent::Output(frame) => {
+                let bytes = frame.body();
+                if let Some(hydration) = self.attach_hydration.as_mut() {
+                    if hydration
+                        .buffered_live_output
+                        .len()
+                        .saturating_add(bytes.len())
+                        > MAX_HYDRATION_OUTPUT_BYTES
+                    {
+                        self.recover_current_subscription(
+                            &session_id,
+                            route,
+                            "live output exceeded the attach buffer bound",
+                        );
                         return;
                     }
-                };
-                if self.hydration_matches(&output.session_id, &output.subscription_id) {
-                    if let Some(hydration) = self.attach_hydration.as_mut() {
-                        hydration.buffered_live_output.extend_from_slice(&data);
-                    }
-                } else if self.attached_matches(&output.session_id, &output.subscription_id) {
-                    self.apply_live_terminal_output(&data);
-                    self.terminal_mouse_mode_refresh_due = true;
+                    hydration.buffered_live_output.extend_from_slice(bytes);
+                } else {
+                    self.apply_live_terminal_output(bytes);
                 }
             }
+            TerminalEvent::SnapshotReady(frame) => {
+                self.apply_snapshot_ready(&session_id, frame.body());
+            }
+            TerminalEvent::SnapshotHistory(frame) => {
+                self.apply_snapshot_history(&session_id, frame.body());
+            }
+            TerminalEvent::SnapshotFinish => self.apply_snapshot_finish(&session_id),
             TerminalEvent::ProcessExit(exit) => {
-                self.apply_process_exit(exit.session_id, exit.subscription_id, exit.code);
+                self.apply_process_exit(session_id, route.to_string(), exit.code);
+            }
+            TerminalEvent::Modes(modes) => {
+                self.terminal_modes = Some(TerminalModeState {
+                    route: route.to_string(),
+                    modes,
+                });
             }
             TerminalEvent::AttachState(state) => {
-                self.apply_attach_state_kind(state.session_id, state.subscription_id, state.state);
+                self.apply_attach_state_kind(session_id, route.to_string(), state);
             }
-            TerminalEvent::InputResult(result) => self.apply_terminal_input_result(result),
+            TerminalEvent::InputResult(result) => self.apply_terminal_input_result(route, result),
+            TerminalEvent::HistoryUnavailable(reason) => {
+                self.apply_history_unavailable(&session_id, reason);
+            }
+            TerminalEvent::RouteResync => self.begin_route_resync(),
         }
     }
 
@@ -4431,8 +4441,8 @@ impl TuiApp {
         if self.retired_subscription_ids.contains(&subscription_id) {
             return;
         }
-        if !self.hydration_matches(&session_id, &subscription_id)
-            && !self.attached_matches(&session_id, &subscription_id)
+        if !self.hydration_matches_route(&subscription_id)
+            && !self.attached_matches_route(&subscription_id)
         {
             return;
         }
@@ -4447,53 +4457,46 @@ impl TuiApp {
         );
     }
 
+    /// The client queue shed frames for a route or a frame failed to decode.
+    /// Byte continuity is gone: detach and re-attach that route only.
+    fn apply_route_fault(&mut self, route: RouteId, generation: u64, reason: &str) {
+        let route = route.as_str().to_string();
+        if self.retired_subscription_ids.contains(&route) {
+            return;
+        }
+        if !self.hydration_matches_route(&route) && !self.attached_matches_route(&route) {
+            return;
+        }
+        if self
+            .route_generation
+            .is_some_and(|current| generation < current)
+        {
+            return;
+        }
+        let Some((session_id, _)) = self.current_owner_pair() else {
+            return;
+        };
+        self.recover_current_subscription(&session_id, &route, reason);
+    }
+
     fn recover_from_decode_or_phase_gap(&mut self, reason: &str) {
-        let Some((session_id, subscription_id)) = self.current_owner_pair() else {
+        let Some((session_id, route)) = self.current_owner_pair() else {
             self.error = Some(reason.to_string());
             return;
         };
-        self.recover_current_subscription(&session_id, &subscription_id, reason);
+        self.recover_current_subscription(&session_id, &route, reason);
     }
 
-    fn recover_current_subscription(
-        &mut self,
-        session_id: &str,
-        subscription_id: &str,
-        reason: &str,
-    ) {
+    /// Retire the current route with a bounded Detach and, once per attach
+    /// campaign, re-attach with a fresh route.
+    fn recover_current_subscription(&mut self, session_id: &str, route: &str, reason: &str) {
         if let Some(projection) = self.ghostty_projection.as_mut() {
             projection.abort_ghostsnp_history();
         }
-        self.clear_ghostty_projection();
-        self.attach_hydration = None;
-        self.attached_session = None;
-        self.attached_subscription_id = None;
-        self.clear_terminal_mouse_mode();
-        self.retire_subscription(subscription_id);
-        if let Some(client) = self.client.as_mut() {
-            client.drop_terminal_frames_for(session_id, subscription_id);
-        }
-        if self.client.is_some() {
-            let deadline = Instant::now() + DETACH_ON_DISCONNECT_BOUND;
-            match self.request_with_deadline(
-                DaemonRequest::Detach {
-                    session_id: session_id.to_string(),
-                    subscription_id: subscription_id.to_string(),
-                },
-                deadline,
-            ) {
-                Ok(response) => {
-                    self.apply_response(response);
-                    self.apply_pending_mux_frames();
-                }
-                Err(error) => {
-                    if let Some(client) = self.client.as_mut() {
-                        client.hard_close();
-                    }
-                    self.apply_transport_failure(error);
-                    return;
-                }
-            }
+        self.clear_route_state();
+        self.retire_subscription(route);
+        if self.is_connected() {
+            self.send_bounded_detach(session_id.to_string(), route.to_string());
         }
         if self.attach_recovery_used {
             self.error = Some(format!(
@@ -4505,85 +4508,474 @@ impl TuiApp {
         self.error = Some(format!("terminal attach recovering: {reason}"));
         let replacement = self.mint_subscription_id();
         self.begin_attach_hydration(session_id, &replacement);
-        if self.client.is_some() {
-            self.request_and_apply(DaemonRequest::Attach {
-                session_id: session_id.to_string(),
-                subscription_id: replacement,
-            });
+        if self.is_connected() {
+            self.submit(
+                DaemonRequest::Attach {
+                    session_id: session_id.to_string(),
+                    subscription_id: replacement.clone(),
+                },
+                PendingReply::Attach {
+                    session_id: session_id.to_string(),
+                    route: replacement,
+                },
+                REQUEST_DEADLINE,
+            );
         }
     }
 
-    fn apply_process_exit(
-        &mut self,
-        session_id: String,
-        subscription_id: String,
-        code: Option<i32>,
-    ) {
-        let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
-        if !hydration_matches && !self.attached_matches(&session_id, &subscription_id) {
+    fn apply_process_exit(&mut self, session_id: String, route: String, code: Option<i32>) {
+        let hydration_matches = self.hydration_matches_route(&route);
+        if !hydration_matches && !self.attached_matches_route(&route) {
             return;
         }
         self.status = format!("process exited {}", code.unwrap_or_default());
-        self.retire_subscription(&subscription_id);
-        self.attached_session = None;
-        self.attached_subscription_id = None;
-        self.clear_terminal_mouse_mode();
+        self.retire_subscription(&route);
+        self.attached = None;
+        self.terminal_modes = None;
         self.clear_ghostty_projection();
-        self.clear_snapshot_metadata_for(&session_id);
         if hydration_matches {
             self.attach_hydration = None;
         }
+        let _ = session_id;
     }
 
     fn apply_attach_state_kind(
         &mut self,
         session_id: String,
-        subscription_id: String,
-        state: AttachStateKind,
+        route: String,
+        state: AttachStateCode,
     ) {
-        let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
-        let attached_matches = self.attached_matches(&session_id, &subscription_id);
+        let hydration_matches = self.hydration_matches_route(&route);
+        let attached_matches = self.attached_matches_route(&route);
         if !hydration_matches && !attached_matches {
             return;
         }
         self.action_feedback = Some(format!("attach {state:?}: {session_id}"));
         match state {
-            AttachStateKind::Attached if hydration_matches => {
+            AttachStateCode::Attached if hydration_matches => {
                 if let Some(hydration) = self.attach_hydration.as_mut() {
                     hydration.attached_seen = true;
                 }
                 self.maybe_open_attach_live_path(&session_id);
             }
-            AttachStateKind::SnapshotHistoryIncomplete if hydration_matches => {
+            AttachStateCode::Detached => {
                 if let Some(projection) = self.ghostty_projection.as_mut() {
                     projection.abort_ghostsnp_history();
                 }
-                if let Some(hydration) = self
-                    .attach_hydration
-                    .as_mut()
-                    .filter(|hydration| hydration.snapshot_ready)
-                {
-                    hydration.snapshot_finished = true;
-                } else {
-                    self.error = Some("snapshot history failed before READY (closed)".to_string());
-                    return;
-                }
-                self.action_feedback =
-                    Some(format!("attach snapshot history incomplete: {session_id}"));
-                self.maybe_open_attach_live_path(&session_id);
-            }
-            AttachStateKind::AttachFailed if hydration_matches => {
-                if let Some(projection) = self.ghostty_projection.as_mut() {
-                    projection.abort_ghostsnp_history();
-                }
+                self.retire_subscription(&route);
+                self.attached = None;
                 self.attach_hydration = None;
+                self.terminal_modes = None;
                 self.clear_ghostty_projection();
-                self.error = Some(format!("attach failed before READY (closed): {session_id}"));
             }
-            AttachStateKind::Attaching
-            | AttachStateKind::Attached
-            | AttachStateKind::SnapshotHistoryIncomplete
-            | AttachStateKind::AttachFailed => {}
+            AttachStateCode::Failed if hydration_matches => {
+                // Capture failed before READY; Hub tears the route down. One
+                // fresh attach with a new route is the allowed recovery, with no
+                // input replay.
+                self.recover_current_subscription(
+                    &session_id,
+                    &route,
+                    "attach failed before READY",
+                );
+            }
+            AttachStateCode::Attaching | AttachStateCode::Attached | AttachStateCode::Failed => {}
+        }
+    }
+
+    /// HISTORY_UNAVAILABLE on the stream: the remaining history pages are
+    /// replaced and SNAPSHOT_FINISH still follows.
+    ///
+    /// Core guarantees SNAPSHOT_READY precedes HISTORY_UNAVAILABLE on a live
+    /// attach, so the live screen is already authoritative and only retained
+    /// history is missing. Before READY the frame is a phase gap; a capture
+    /// failure before READY arrives as ATTACH_STATE failed instead.
+    fn apply_history_unavailable(&mut self, session_id: &str, reason: HistoryUnavailableReason) {
+        let ready = self
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready);
+        if self.attach_hydration.is_some() && !ready {
+            self.recover_from_decode_or_phase_gap(&format!(
+                "GHOSTSNP phase gap (closed): HISTORY_UNAVAILABLE ({reason:?}) before SNAPSHOT_READY"
+            ));
+            return;
+        }
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.action_feedback = Some(format!(
+            "terminal history unavailable ({reason:?}): {session_id}"
+        ));
+    }
+
+    fn hydration_matches_route(&self, route: &str) -> bool {
+        self.attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.route == route)
+    }
+
+    fn attached_matches_route(&self, route: &str) -> bool {
+        self.attached
+            .as_ref()
+            .is_some_and(|attached| attached.route == route)
+    }
+
+    fn apply_snapshot_ready(&mut self, session_id: &str, bytes: &[u8]) {
+        if self
+            .attach_hydration
+            .as_ref()
+            .is_none_or(|hydration| hydration.snapshot_ready)
+        {
+            self.recover_from_decode_or_phase_gap(
+                "GHOSTSNP phase gap (closed): unexpected SNAPSHOT_READY",
+            );
+            return;
+        }
+        self.ensure_ghostty_projection(session_id);
+        let Some(projection) = self.ghostty_projection.as_mut() else {
+            return;
+        };
+        match projection.install_ghostsnp_ready(bytes) {
+            Ok(GhosttySnapshotDecodeProgress::Ready) => {
+                if let Some(hydration) = self.attach_hydration.as_mut() {
+                    hydration.snapshot_ready = true;
+                }
+                self.ghostty_projection_session_id = Some(session_id.to_string());
+                self.terminal_viewport_size = projection.dimensions();
+                self.projection_dirty = true;
+            }
+            Ok(progress) => self.recover_from_decode_or_phase_gap(&format!(
+                "GHOSTSNP incremental sequence failed (closed): unexpected {progress:?}"
+            )),
+            Err(error) => self.recover_from_decode_or_phase_gap(&format!(
+                "GHOSTSNP incremental apply failed (closed): {error}"
+            )),
+        }
+    }
+
+    fn apply_snapshot_history(&mut self, session_id: &str, bytes: &[u8]) {
+        let ready = self
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready && !hydration.snapshot_finished);
+        if !ready {
+            self.recover_from_decode_or_phase_gap(
+                "GHOSTSNP phase gap (closed): unexpected SNAPSHOT_HISTORY",
+            );
+            return;
+        }
+        let _ = session_id;
+        let Some(projection) = self.ghostty_projection.as_mut() else {
+            return;
+        };
+        match projection.apply_ghostsnp_history(bytes) {
+            // One SNAPSHOT_HISTORY frame carries one page; the GHOSTSNP finish
+            // record is the last page. Paint the new retained history at the
+            // next paint. The live path opens on the SNAPSHOT_FINISH frame.
+            Ok(GhosttySnapshotDecodeProgress::History | GhosttySnapshotDecodeProgress::Finish) => {
+                self.projection_dirty = true;
+            }
+            Ok(progress) => self.recover_from_decode_or_phase_gap(&format!(
+                "GHOSTSNP incremental sequence failed (closed): unexpected {progress:?}"
+            )),
+            Err(error) => self.recover_from_decode_or_phase_gap(&format!(
+                "GHOSTSNP incremental apply failed (closed): {error}"
+            )),
+        }
+    }
+
+    fn apply_snapshot_finish(&mut self, session_id: &str) {
+        let ready = self
+            .attach_hydration
+            .as_ref()
+            .is_some_and(|hydration| hydration.snapshot_ready && !hydration.snapshot_finished);
+        if !ready {
+            self.recover_from_decode_or_phase_gap(
+                "GHOSTSNP phase gap (closed): unexpected SNAPSHOT_FINISH",
+            );
+            return;
+        }
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        if let Some(hydration) = self.attach_hydration.as_mut() {
+            hydration.snapshot_finished = true;
+        }
+        self.projection_dirty = true;
+        self.maybe_open_attach_live_path(session_id);
+    }
+
+    fn apply_live_terminal_output(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        self.applied_live_payloads.push(data.to_vec());
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.apply_terminal_output(data);
+            self.projection_dirty = true;
+        }
+    }
+
+    fn maybe_open_attach_live_path(&mut self, session_id: &str) {
+        let Some(hydration) = self.attach_hydration.as_ref() else {
+            return;
+        };
+        if hydration.session_id != session_id
+            || !hydration.snapshot_finished
+            || !hydration.attached_seen
+        {
+            return;
+        }
+        self.open_attach_live_path(session_id);
+    }
+
+    /// Open the post-barrier live path and release queued client operations.
+    fn open_attach_live_path(&mut self, session_id: &str) {
+        let Some(hydration) = self.attach_hydration.take() else {
+            return;
+        };
+        if hydration.session_id != session_id
+            || hydration.route != self.subscription_id
+            || !hydration.snapshot_finished
+            || !hydration.attached_seen
+        {
+            self.attach_hydration = Some(hydration);
+            return;
+        }
+        self.attached = Some(AttachedRoute {
+            session_id: session_id.to_string(),
+            route: hydration.route.clone(),
+        });
+        if !hydration.buffered_live_output.is_empty() {
+            self.apply_live_terminal_output(&hydration.buffered_live_output);
+        }
+        let size = hydration
+            .pending_resize
+            .unwrap_or(self.terminal_viewport_size);
+        self.apply_local_resize(size);
+        self.send_resize(size);
+        for input in hydration.pending_input {
+            match input {
+                PendingTerminalInput::Key(key) => self.send_key(key),
+                PendingTerminalInput::Focus(focused) => self.send_focus(focused),
+                PendingTerminalInput::Paste(data) => self.send_paste(data),
+            }
+        }
+    }
+
+    fn apply_local_resize(&mut self, size: TerminalScreenSize) {
+        self.terminal_viewport_size = size;
+        if let Some(projection) = self.ghostty_projection.as_mut()
+            && let Err(error) = projection.resize(size)
+        {
+            self.error = Some(format!("terminal resize failed: {error}"));
+        }
+        self.projection_dirty = true;
+    }
+
+    fn scroll_projection(&mut self, op: ScrollOp) {
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.scroll(op);
+            self.projection_dirty = true;
+        }
+    }
+
+    /// Project the viewport once. Called from `prepare_paint` when dirty and
+    /// from tests that inspect the cache directly.
+    fn refresh_ghostty_viewport_cache(&mut self) {
+        self.projection_dirty = false;
+        let Some(projection) = self.ghostty_projection.as_mut() else {
+            self.ghostty_viewport_cache = None;
+            return;
+        };
+        self.ghostty_viewport_cache = projection.project_viewport().ok();
+    }
+
+    /// MODES bits for the live route, or zero.
+    fn current_mode_bits(&self) -> u32 {
+        match (self.terminal_modes.as_ref(), self.attached.as_ref()) {
+            (Some(state), Some(attached)) if state.route == attached.route => state.modes.mode_bits,
+            _ => 0,
+        }
+    }
+
+    fn apply_terminal_mouse_mode(&self, hit_map: &mut HitMap) {
+        hit_map.set_terminal_mouse_mode(
+            "tui-terminal",
+            terminal_input::kit_mouse_bits(self.current_mode_bits()),
+        );
+    }
+
+    /// Reserve the next operation id for the live route.
+    fn next_input_operation_id(&mut self) -> Option<u64> {
+        match self.input_window.next_operation_id() {
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    /// Encode one typed command, admit it into the window, and write it.
+    fn send_command(&mut self, operation_id: u64, command: TerminalInputCommand) {
+        let frame = match encode_terminal_input(&command) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        #[cfg(test)]
+        self.observed_terminal_inputs.push(command);
+        self.send_operation_frames(operation_id, false, vec![frame.into_bytes()]);
+    }
+
+    /// Admit one operation of encoded frames into the window and write what
+    /// the window releases, in order.
+    fn send_operation_frames(&mut self, operation_id: u64, paste: bool, frames: Vec<Vec<u8>>) {
+        match self.input_window.admit(operation_id, paste, frames) {
+            Ok(ready) => self.send_encoded_frames(ready),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn send_encoded_frames(&mut self, frames: Vec<Vec<u8>>) {
+        if frames.is_empty() {
+            return;
+        }
+        let Some(route) = self
+            .attached
+            .as_ref()
+            .map(|attached| attached.route.clone())
+        else {
+            self.error = Some("terminal stream unavailable: no attached route".to_string());
+            return;
+        };
+        let Some(generation) = self.route_generation else {
+            self.error = Some("terminal stream unavailable: route generation unknown".to_string());
+            return;
+        };
+        for frame in frames {
+            if !self.hub_io.send_terminal(&route, generation, &frame) {
+                self.error = Some("terminal stream unavailable: not connected".to_string());
+                return;
+            }
+        }
+        self.error = None;
+    }
+
+    fn send_key(&mut self, key: KeyEvent) {
+        let Some(operation_id) = self.next_input_operation_id() else {
+            return;
+        };
+        let Some(command) = terminal_input::key_command(key, operation_id) else {
+            return;
+        };
+        self.send_command(operation_id, command);
+    }
+
+    fn send_focus(&mut self, focused: bool) {
+        let Some(operation_id) = self.next_input_operation_id() else {
+            return;
+        };
+        let command = terminal_input::focus_command(focused, operation_id);
+        self.send_command(operation_id, command);
+    }
+
+    fn send_resize(&mut self, size: TerminalScreenSize) {
+        if self.attached.is_none() {
+            return;
+        }
+        let Some(operation_id) = self.next_input_operation_id() else {
+            return;
+        };
+        let command = terminal_input::resize_command(size.rows, size.cols, operation_id);
+        self.send_command(operation_id, command);
+    }
+
+    fn send_paste(&mut self, data: Vec<u8>) {
+        if self.input_window.has_paste() {
+            self.error = Some("terminal paste unavailable: another paste is in flight".to_string());
+            return;
+        }
+        let Some(operation_id) = self.next_input_operation_id() else {
+            return;
+        };
+        let frames = match encode_paste(operation_id, false, &data) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        #[cfg(test)]
+        self.observed_terminal_inputs.extend(
+            frames
+                .iter()
+                .filter_map(|frame| decode_terminal_input(frame).ok()),
+        );
+        let frames = frames
+            .into_iter()
+            .map(botster_terminal_protocol_client::TerminalInputFrame::into_bytes)
+            .collect();
+        self.send_operation_frames(operation_id, true, frames);
+    }
+
+    fn send_mouse(&mut self, mouse: MouseEvent, inner: Rect) -> bool {
+        let Some(operation_id) = self.next_input_operation_id() else {
+            return true;
+        };
+        let Some(command) = terminal_input::mouse_command(mouse, inner, operation_id) else {
+            return false;
+        };
+        self.send_command(operation_id, command);
+        true
+    }
+
+    /// Queue input for a route that is still attaching, bounded by bytes.
+    fn queue_pending_input(&mut self, input: PendingTerminalInput) {
+        let Some(hydration) = self.attach_hydration.as_mut() else {
+            return;
+        };
+        let bytes = input.retained_bytes();
+        if hydration.pending_input_bytes.saturating_add(bytes) > MAX_PENDING_HYDRATION_INPUT_BYTES {
+            self.error = Some(format!(
+                "terminal input unavailable: {} bytes queued at the {MAX_PENDING_HYDRATION_INPUT_BYTES} byte attach bound",
+                hydration.pending_input_bytes
+            ));
+            return;
+        }
+        hydration.pending_input_bytes += bytes;
+        hydration.pending_input.push(input);
+        self.error = None;
+    }
+
+    fn apply_terminal_input_result(&mut self, route: &str, result: InputResultBody) {
+        if !self.attached_matches_route(route) {
+            return;
+        }
+        if let Some(state) = self.terminal_modes.as_mut()
+            && state.route == route
+        {
+            state.modes.mode_bits = result.mode_bits;
+        }
+        let (completed, released) = self.input_window.complete(result.operation_id);
+        if completed.is_none() {
+            self.error = Some(format!(
+                "terminal input result {} has no pending operation",
+                result.operation_id
+            ));
+        }
+        self.send_encoded_frames(released);
+        match result.outcome {
+            InputOutcome::Written => {
+                if completed.is_some() {
+                    self.error = None;
+                }
+            }
+            _ => self.error = Some(input_outcome_message(&result)),
         }
     }
 
@@ -4790,70 +5182,11 @@ impl TuiApp {
         }
     }
 
-    fn record_transport_error(&mut self, error: DaemonTransportError) {
-        self.detach_owner_if_writable();
-        self.apply_transport_failure(error);
-    }
-
-    fn apply_transport_failure(&mut self, error: DaemonTransportError) {
-        self.client = None;
-        self.clear_terminal_input_queue();
-        self.clear_event_subscription_state();
-        self.reset_active_plugin_surface();
-        if !self.invalidate_session_generation() {
-            self.error = Some("session subscription cleanup timed out".to_string());
-        }
-        if !self.invalidate_session_type_generation() {
-            self.error = Some("session type subscription cleanup timed out".to_string());
-        }
-        self.attached_session = None;
-        self.attached_subscription_id = None;
-        self.attach_hydration = None;
-        self.attach_recovery_used = false;
-        self.terminal_close_evidence = None;
-        self.clear_terminal_mouse_mode();
-        self.clear_ghostty_projection();
-        match error {
-            // Defensive for malformed protocol frames outside the hello
-            // compatibility path, which now surfaces as Compatibility below.
-            DaemonTransportError::Protocol(message) => {
-                self.status = "compatibility mismatch".to_string();
-                self.connection_error = Some(format!(
-                    "expected daemon protocol {PROTOCOL}; daemon protocol error: {message}"
-                ));
-                self.record_diagnostic(DaemonDiagnostic::compatibility_mismatch(message));
-            }
-            DaemonTransportError::Compatibility(error) => {
-                self.status = "compatibility mismatch".to_string();
-                self.connection_error = Some(error.diagnostic.clone());
-                self.record_diagnostics(error.diagnostics);
-            }
-            DaemonTransportError::NotRunning => {
-                self.status = "hub unavailable; reconnecting".to_string();
-                self.connection_error = Some(error.to_string());
-            }
-            DaemonTransportError::ClientDisconnected => {
-                self.status = "disconnected; reconnecting".to_string();
-                self.connection_error = Some(error.to_string());
-                self.record_diagnostic(DaemonDiagnostic::disconnected(error.to_string()));
-            }
-            other => {
-                self.status = "reconnecting".to_string();
-                self.connection_error = Some(other.to_string());
-            }
-        }
-    }
-
+    /// Apply one host-control response to read models and diagnostics.
+    ///
+    /// Terminal-stream events never travel in responses on v9; the terminal
+    /// plane is the only source of OUTPUT, snapshots, attach state, and results.
     fn apply_response(&mut self, response: DaemonResponse) {
-        let evidence = self.apply_response_state(response);
-        if evidence.lifecycle_ended {
-            // Live PTY bytes are not diagnostic text. Drop any unflushed buffer.
-            let _ = self.attach_hydration.take();
-        }
-    }
-
-    fn apply_response_state(&mut self, response: DaemonResponse) -> HydrationEvidence {
-        let mut hydration_evidence = HydrationEvidence::default();
         self.record_diagnostics(response.diagnostics);
 
         if let Some(error) = response.error {
@@ -4862,7 +5195,7 @@ impl TuiApp {
                 "{} (code={} operation={})",
                 error.message, error.code, error.operation
             ));
-            return hydration_evidence;
+            return;
         }
 
         if let Some(status) = response.status {
@@ -4880,11 +5213,11 @@ impl TuiApp {
             if supported != self.session_types_supported {
                 self.session_types_supported = supported;
                 if supported {
-                    if self.session_type_subscription.is_none() {
+                    if self.session_type_entities.subscription_id.is_none() {
                         self.start_session_type_subscription_if_supported();
                     }
                 } else {
-                    let _ = self.invalidate_session_type_generation();
+                    self.invalidate_session_type_generation();
                 }
             }
         }
@@ -4947,159 +5280,6 @@ impl TuiApp {
         {
             self.apply_plugin_action_result(result);
         }
-
-        for event in response.events {
-            match event {
-                DaemonEvent::TerminalOutput {
-                    session_id,
-                    subscription_id,
-                    payload,
-                } => {
-                    let data = match payload.decoded_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            self.error =
-                                Some(format!("terminal output decode failed (closed): {error}"));
-                            continue;
-                        }
-                    };
-                    if self.hydration_matches(&session_id, &subscription_id) {
-                        // Buffer live output until FINISH and attached release the barrier.
-                        if let Some(hydration) = self.attach_hydration.as_mut() {
-                            hydration.buffered_live_output.extend_from_slice(&data);
-                        }
-                    } else if self.attached_matches(&session_id, &subscription_id) {
-                        // H5: apply live bytes into the installed projection.
-                        self.apply_live_terminal_output(&data);
-                        self.terminal_mouse_mode_refresh_due = true;
-                    }
-                }
-                DaemonEvent::Snapshot {
-                    session_id,
-                    subscription_id,
-                    history,
-                } => {
-                    if self.hydration_matches(&session_id, &subscription_id) {
-                        match history.decoded_bytes() {
-                            Ok(bytes) => self.apply_incremental_snapshot(&session_id, bytes),
-                            Err(error) => {
-                                self.error = Some(format!(
-                                    "snapshot history decode failed (install closed): {error}"
-                                ));
-                            }
-                        }
-                    }
-                }
-                DaemonEvent::Scrollback {
-                    session_id,
-                    subscription_id,
-                    ..
-                } => {
-                    // Scrollback is never GHOSTSNP incremental input.
-                    let _ = (session_id, subscription_id);
-                }
-                DaemonEvent::ProcessExit {
-                    session_id,
-                    subscription_id,
-                    code,
-                } => {
-                    if self.hydration_matches(&session_id, &subscription_id) {
-                        hydration_evidence.lifecycle_ended = true;
-                    }
-                    self.apply_process_exit(session_id, subscription_id, code);
-                }
-                DaemonEvent::AttachState {
-                    session_id,
-                    subscription_id,
-                    state,
-                } => {
-                    let hydration_matches = self.hydration_matches(&session_id, &subscription_id);
-                    if state == "detached" {
-                        let attached_matches = self.attached_matches(&session_id, &subscription_id);
-                        if !hydration_matches && !attached_matches {
-                            continue;
-                        }
-                        self.attached_session = None;
-                        self.attached_subscription_id = None;
-                        self.clear_terminal_mouse_mode();
-                        self.clear_ghostty_projection();
-                        self.clear_snapshot_metadata_for(&session_id);
-                        if hydration_matches {
-                            hydration_evidence.lifecycle_ended = true;
-                        }
-                    } else if let Some(kind) = attach_state_kind_from_wire(&state) {
-                        self.apply_attach_state_kind(session_id, subscription_id, kind);
-                    }
-                }
-                _ => {}
-            }
-        }
-        hydration_evidence
-    }
-
-    fn hydration_matches(&self, session_id: &str, subscription_id: &str) -> bool {
-        self.attach_hydration.as_ref().is_some_and(|hydration| {
-            hydration.session_id == session_id && hydration.subscription_id == subscription_id
-        })
-    }
-
-    fn attached_matches(&self, session_id: &str, subscription_id: &str) -> bool {
-        self.attached_session.as_deref() == Some(session_id)
-            && self.attached_subscription_id.as_deref() == Some(subscription_id)
-    }
-
-    fn clear_snapshot_metadata_for(&mut self, session_id: &str) {
-        if self.terminal_output_session_id.as_deref() == Some(session_id) {
-            self.snapshot_metadata = None;
-        }
-    }
-
-    fn finish_attach_hydration(&mut self, _session_id: &str, restored_text: &str) {
-        // Diagnostic-only ReadScreen path. Never promotes text into projection
-        // authority or terminal_content primary paint.
-        // Keep restored text only as a detached/diagnostic fallback when there
-        // is still no Ghostty projection (non-GHOSTSNP / install-closed cases).
-        if self.ghostty_projection.is_none() && !restored_text.is_empty() {
-            self.terminal_output.clear();
-            self.append_terminal_output(restored_text);
-        }
-    }
-
-    fn probe_terminal_mouse_mode(&mut self, session_id: &str) {
-        self.last_terminal_mouse_mode_probe = Some(Instant::now());
-        self.terminal_mouse_mode_refresh_due = false;
-        self.request_optional_readback(
-            DaemonRequest::ReadModeFlags {
-                session_id: session_id.to_string(),
-            },
-            "read_mode_flags",
-        );
-    }
-
-    fn refresh_terminal_mouse_mode_if_due(&mut self) {
-        if !self.terminal_mouse_mode_refresh_due {
-            return;
-        }
-        let now = Instant::now();
-        if self
-            .last_terminal_mouse_mode_probe
-            .is_some_and(|last| now.duration_since(last) < TERMINAL_MOUSE_MODE_REFRESH_INTERVAL)
-        {
-            return;
-        }
-        let Some(session_id) = self.attached_session.clone() else {
-            self.clear_terminal_mouse_mode();
-            return;
-        };
-        self.probe_terminal_mouse_mode(&session_id);
-    }
-
-    fn clear_terminal_mouse_mode(&mut self) {
-        self.terminal_mouse_mode = 0;
-        self.terminal_mouse_mode_attachment = None;
-        self.terminal_mode_shadow = None;
-        self.terminal_mouse_mode_refresh_due = false;
-        self.last_terminal_mouse_mode_probe = None;
     }
 
     fn clear_ghostty_projection(&mut self) {
@@ -5130,663 +5310,11 @@ impl TuiApp {
         }
     }
 
-    fn apply_incremental_snapshot(&mut self, session_id: &str, bytes: Vec<u8>) {
-        let ready = self
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| hydration.snapshot_ready);
-        self.apply_incremental_snapshot_ready_state(session_id, bytes, ready);
-    }
-
-    fn apply_incremental_snapshot_with_phase(
-        &mut self,
-        session_id: &str,
-        bytes: Vec<u8>,
-        phase: SnapshotPhase,
-    ) {
-        let ready = self
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| hydration.snapshot_ready);
-        let phase_ok = matches!(
-            (phase, ready),
-            (SnapshotPhase::Ready, false)
-                | (SnapshotPhase::History, true)
-                | (SnapshotPhase::Finish, true)
-        );
-        if !phase_ok {
-            self.recover_from_decode_or_phase_gap(&format!(
-                "GHOSTSNP phase gap (closed): unexpected {phase:?} ready={ready}"
-            ));
-            return;
-        }
-        self.apply_incremental_snapshot_ready_state(session_id, bytes, ready);
-    }
-
-    fn apply_incremental_snapshot_ready_state(
-        &mut self,
-        session_id: &str,
-        bytes: Vec<u8>,
-        ready: bool,
-    ) {
-        self.ensure_ghostty_projection(session_id);
-        let Some(projection) = self.ghostty_projection.as_mut() else {
-            return;
-        };
-        let result = if ready {
-            projection.apply_ghostsnp_history(bytes)
-        } else {
-            projection.install_ghostsnp_ready(bytes)
-        };
-        match result {
-            Ok(GhosttySnapshotDecodeProgress::Ready) if !ready => {
-                if let Some(hydration) = self.attach_hydration.as_mut() {
-                    hydration.snapshot_ready = true;
-                }
-                self.ghostty_projection_session_id = Some(session_id.to_string());
-                self.terminal_viewport_size = projection.dimensions();
-                self.refresh_ghostty_viewport_cache();
-            }
-            Ok(GhosttySnapshotDecodeProgress::History) if ready => {
-                // One Snapshot carries one PAGE. Paint the new retained history now.
-                self.refresh_ghostty_viewport_cache();
-            }
-            Ok(GhosttySnapshotDecodeProgress::Finish) if ready => {
-                if let Some(hydration) = self.attach_hydration.as_mut() {
-                    hydration.snapshot_finished = true;
-                }
-                self.refresh_ghostty_viewport_cache();
-                self.maybe_open_attach_live_path(session_id);
-            }
-            Ok(progress) => {
-                self.recover_from_decode_or_phase_gap(&format!(
-                    "GHOSTSNP incremental sequence failed (closed): unexpected {progress:?}"
-                ));
-            }
-            Err(error) => {
-                self.recover_from_decode_or_phase_gap(&format!(
-                    "GHOSTSNP incremental apply failed (closed): {error}"
-                ));
-            }
-        }
-    }
-
-    fn apply_live_terminal_output(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        #[cfg(test)]
-        self.applied_live_payloads.push(data.to_vec());
-        if let Some(projection) = self.ghostty_projection.as_mut() {
-            projection.apply_terminal_output(data);
-            self.refresh_ghostty_viewport_cache();
-        }
-        // Live PTY frames are never copied into the diagnostic String.
-    }
-
-    fn maybe_open_attach_live_path(&mut self, session_id: &str) {
-        let Some(hydration) = self.attach_hydration.as_ref() else {
-            return;
-        };
-        if hydration.session_id != session_id
-            || !hydration.snapshot_finished
-            || !hydration.attached_seen
-        {
-            return;
-        }
-        self.attached_session = Some(session_id.to_string());
-        self.attached_subscription_id = Some(hydration.subscription_id.clone());
-        self.open_attach_live_path(session_id);
-    }
-
-    /// Open the post-barrier live path and release queued client operations.
-    fn open_attach_live_path(&mut self, session_id: &str) {
-        let Some(hydration) = self.attach_hydration.take() else {
-            return;
-        };
-        if hydration.session_id != session_id || hydration.subscription_id != self.subscription_id {
-            self.attach_hydration = Some(hydration);
-            return;
-        }
-        if !hydration.snapshot_finished || !hydration.attached_seen {
-            self.attach_hydration = Some(hydration);
-            return;
-        }
-        if let Some(size) = hydration.pending_resize {
-            self.terminal_viewport_size = size;
-            if let Some(projection) = self.ghostty_projection.as_mut()
-                && let Err(error) = projection.resize(size)
-            {
-                self.error = Some(format!("terminal resize failed: {error}"));
-            }
-            self.refresh_ghostty_viewport_cache();
-            self.forward_terminal_command(
-                session_id.to_string(),
-                TerminalInputCommand::Resize {
-                    rows: size.rows,
-                    cols: size.cols,
-                },
-                Vec::new(),
-                None,
-                false,
-            );
-        }
-        if !hydration.buffered_live_output.is_empty() {
-            self.apply_live_terminal_output(&hydration.buffered_live_output);
-        }
-        if self.attached_session.as_deref() == Some(session_id) {
-            self.probe_terminal_mouse_mode(session_id);
-        }
-        for input in hydration.pending_input {
-            match input {
-                PendingTerminalInput::Bytes(data) => {
-                    self.forward_terminal_input(session_id.to_string(), data);
-                }
-                PendingTerminalInput::Paste { operation_id, data } => {
-                    self.forward_terminal_paste(session_id.to_string(), operation_id, data, false);
-                }
-            }
-        }
-        // Optional diagnostic ReadScreen only — never terminal content authority.
-        self.request_optional_readback(
-            DaemonRequest::ReadScreen {
-                session_id: session_id.to_string(),
-            },
-            "read_screen_diagnostic",
-        );
-        self.request_optional_readback(
-            DaemonRequest::CaptureSnapshot {
-                session_id: session_id.to_string(),
-            },
-            "capture_snapshot",
-        );
-    }
-
-    fn scroll_projection(&mut self, op: ScrollOp) {
-        if let Some(projection) = self.ghostty_projection.as_mut() {
-            projection.scroll(op);
-        }
-        self.refresh_ghostty_viewport_cache();
-    }
-
-    fn refresh_ghostty_viewport_cache(&mut self) {
-        let Some(projection) = self.ghostty_projection.as_mut() else {
-            self.ghostty_viewport_cache = None;
-            return;
-        };
-        self.ghostty_viewport_cache = projection.project_viewport().ok();
-    }
-
     fn paint_ghostty_projection(&self, frame: &mut Frame<'_>, hit_map: &HitMap) {
         let Some(viewport) = self.ghostty_viewport_cache.as_ref() else {
             return;
         };
         crate::projection_paint::paint_projection_on_hit_map(frame, hit_map, viewport);
-    }
-
-    fn current_terminal_mouse_mode(&self) -> u8 {
-        match (
-            self.terminal_mode_shadow.as_ref(),
-            self.attached_session.as_ref(),
-            self.attached_subscription_id.as_ref(),
-        ) {
-            (Some(shadow), Some(session), Some(subscription))
-                if shadow.session_id == *session && shadow.subscription_id == *subscription =>
-            {
-                shadow.mouse_mode
-            }
-            _ => match (
-                self.terminal_mouse_mode_attachment.as_ref(),
-                self.attached_session.as_ref(),
-                self.attached_subscription_id.as_ref(),
-            ) {
-                (Some((mode_session, mode_subscription)), Some(session), Some(subscription))
-                    if mode_session == session && mode_subscription == subscription =>
-                {
-                    self.terminal_mouse_mode
-                }
-                _ => 0,
-            },
-        }
-    }
-
-    fn current_mode_shadow(&self) -> Option<&TerminalModeShadow> {
-        let shadow = self.terminal_mode_shadow.as_ref()?;
-        let session = self.attached_session.as_ref()?;
-        let subscription = self.attached_subscription_id.as_ref()?;
-        if shadow.session_id == *session && shadow.subscription_id == *subscription {
-            Some(shadow)
-        } else {
-            None
-        }
-    }
-
-    fn looks_like_mouse_report(bytes: &[u8]) -> bool {
-        bytes.starts_with(b"\x1b[<") || bytes.starts_with(b"\x1b[M")
-    }
-
-    fn mode_gated_input_required(&self, data: &[u8]) -> bool {
-        let looks_like_mouse = Self::looks_like_mouse_report(data);
-        let Some(shadow) = self.current_mode_shadow() else {
-            // Mouse reports without ModeFlags freshness must not plain-SendInput.
-            return looks_like_mouse;
-        };
-        // Kitty keyboard: all nested terminal input uses ModeGatedInput.
-        if shadow.kitty_enabled {
-            return true;
-        }
-        // Mouse tracking: only mouse reports need the gate; keys stay plain.
-        if shadow.mouse_mode != 0 && looks_like_mouse {
-            return true;
-        }
-        false
-    }
-
-    fn forward_terminal_input(&mut self, session_id: String, data: Vec<u8>) {
-        if !self.mode_gated_input_required(&data) {
-            self.forward_terminal_command(
-                session_id,
-                TerminalInputCommand::Input { data: data.clone() },
-                data,
-                None,
-                false,
-            );
-            return;
-        }
-        self.forward_mode_gated_input(session_id, data, /*allow_reprobe*/ true);
-    }
-
-    fn forward_mode_gated_input(&mut self, session_id: String, data: Vec<u8>, allow_reprobe: bool) {
-        let Some(shadow) = self.current_mode_shadow().cloned() else {
-            // No freshness yet: single re-probe then retry once.
-            if allow_reprobe {
-                self.probe_terminal_mouse_mode(&session_id);
-                if self.current_mode_shadow().is_some() {
-                    self.forward_mode_gated_input(session_id, data, false);
-                    return;
-                }
-            }
-            self.error =
-                Some("mode-gated terminal input unavailable: mode flags not ready".to_string());
-            return;
-        };
-        self.forward_terminal_command(
-            session_id,
-            TerminalInputCommand::ModeGatedInput {
-                data: data.clone(),
-                mode_generation: shadow.mode_generation,
-                mode_revision: shadow.mode_revision,
-            },
-            data,
-            None,
-            false,
-        );
-    }
-
-    fn forward_terminal_paste(
-        &mut self,
-        session_id: String,
-        operation_id: u32,
-        data: Vec<u8>,
-        retried: bool,
-    ) {
-        let Some(shadow) = self.current_mode_shadow().cloned() else {
-            self.error = Some("terminal paste unavailable: mode flags not ready".to_string());
-            return;
-        };
-        let frames = match encode_paste(
-            operation_id,
-            shadow.mode_generation,
-            shadow.mode_revision,
-            &data,
-        ) {
-            Ok(frames) => frames,
-            Err(error) => {
-                self.error = Some(error.to_string());
-                return;
-            }
-        };
-        if !self.reserve_terminal_input(InFlightTerminalInput {
-            kind: TerminalInputKind::Paste,
-            data,
-            operation_id: Some(operation_id),
-            retried,
-        }) {
-            return;
-        }
-        self.write_terminal_frames(&session_id, &frames);
-    }
-
-    fn forward_terminal_command(
-        &mut self,
-        session_id: String,
-        command: TerminalInputCommand,
-        data: Vec<u8>,
-        operation_id: Option<u32>,
-        retried: bool,
-    ) {
-        let kind = match command {
-            TerminalInputCommand::Input { .. } => TerminalInputKind::Input,
-            TerminalInputCommand::ModeGatedInput { .. } => TerminalInputKind::ModeGatedInput,
-            TerminalInputCommand::Resize { .. } => TerminalInputKind::Resize,
-            _ => TerminalInputKind::Paste,
-        };
-        let max = match kind {
-            TerminalInputKind::Input => MAX_INPUT_DATA_BYTES,
-            TerminalInputKind::ModeGatedInput => MAX_MODE_GATED_DATA_BYTES,
-            TerminalInputKind::Resize | TerminalInputKind::Paste => usize::MAX,
-        };
-        if data.len() > max {
-            self.error = Some(format!(
-                "terminal input payload too large: kind={kind:?} max={max} actual={}",
-                data.len()
-            ));
-            return;
-        }
-        let frame = match encode_terminal_input(&command) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.error = Some(error.to_string());
-                return;
-            }
-        };
-        if !self.reserve_terminal_input(InFlightTerminalInput {
-            kind,
-            data,
-            operation_id,
-            retried,
-        }) {
-            return;
-        }
-        self.write_terminal_frames(&session_id, &[frame]);
-    }
-
-    fn reserve_terminal_input(&mut self, entry: InFlightTerminalInput) -> bool {
-        let retained = if entry.kind == TerminalInputKind::Paste {
-            0
-        } else {
-            entry.data.len()
-        };
-        if self.terminal_input_in_flight.len() >= TERMINAL_INPUT_INFLIGHT_CAPACITY
-            || self.terminal_input_in_flight_bytes.saturating_add(retained)
-                > TERMINAL_INPUT_INFLIGHT_BYTES
-        {
-            self.error = Some("terminal input unavailable: client back pressure".to_string());
-            return false;
-        }
-        self.terminal_input_in_flight_bytes += retained;
-        self.terminal_input_in_flight.push_back(entry);
-        true
-    }
-
-    fn write_terminal_frames(
-        &mut self,
-        session_id: &str,
-        frames: &[botster_terminal_protocol_client::TerminalInputFrame],
-    ) {
-        #[cfg(test)]
-        for frame in frames {
-            if let Ok(command) = decode_terminal_input(frame) {
-                self.observed_terminal_inputs.push(command);
-            }
-        }
-        let Some(subscription_id) = self.attached_subscription_id.clone() else {
-            self.clear_terminal_input_queue();
-            self.error = Some("terminal stream unavailable: no attached subscription".to_string());
-            return;
-        };
-        if subscription_id != self.subscription_id
-            || self.attached_session.as_deref() != Some(session_id)
-        {
-            self.clear_terminal_input_queue();
-            self.error = Some(
-                "terminal stream unavailable: current subscription is not attached".to_string(),
-            );
-            return;
-        }
-        let result = self
-            .client
-            .as_mut()
-            .ok_or(DaemonTransportError::ClientDisconnected)
-            .and_then(|client| {
-                for frame in frames {
-                    client.write_terminal_frame(
-                        session_id,
-                        &subscription_id,
-                        frame.as_bytes(),
-                        TERMINAL_INPUT_WRITE_BOUND,
-                    )?;
-                }
-                Ok(())
-            });
-        match result {
-            Ok(()) => self.error = None,
-            Err(error) => self.record_transport_error(error),
-        }
-    }
-
-    fn paste_is_pending(&self) -> bool {
-        self.terminal_input_in_flight
-            .iter()
-            .any(|entry| entry.kind == TerminalInputKind::Paste)
-            || self.attach_hydration.as_ref().is_some_and(|hydration| {
-                hydration
-                    .pending_input
-                    .iter()
-                    .any(|input| matches!(input, PendingTerminalInput::Paste { .. }))
-            })
-    }
-
-    fn clear_terminal_input_queue(&mut self) {
-        self.terminal_input_in_flight.clear();
-        self.terminal_input_in_flight_bytes = 0;
-    }
-
-    fn apply_terminal_input_result(&mut self, result: TerminalInputResult) {
-        if self
-            .retired_subscription_ids
-            .contains(&result.subscription_id)
-            || self.attached_subscription_id.as_deref() != Some(result.subscription_id.as_str())
-        {
-            return;
-        }
-        let Some(entry) = self.terminal_input_in_flight.pop_front() else {
-            self.error = Some("terminal input result has no pending command".to_string());
-            self.terminal_mode_shadow = None;
-            return;
-        };
-        if entry.kind != TerminalInputKind::Paste {
-            self.terminal_input_in_flight_bytes = self
-                .terminal_input_in_flight_bytes
-                .saturating_sub(entry.data.len());
-        }
-        if entry.kind != result.kind
-            || (entry.kind == TerminalInputKind::Paste && entry.operation_id != result.operation_id)
-        {
-            self.clear_terminal_input_queue();
-            self.terminal_mode_shadow = None;
-            self.error =
-                Some("terminal input result did not match the pending command".to_string());
-            return;
-        }
-        let Some(session_id) = self.attached_session.clone() else {
-            self.clear_terminal_input_queue();
-            return;
-        };
-        if matches!(
-            entry.kind,
-            TerminalInputKind::ModeGatedInput | TerminalInputKind::Paste
-        ) {
-            self.apply_result_mode_shadow(&session_id, &result.mode_flags, &result);
-        }
-        if result.admitted {
-            self.error = None;
-            return;
-        }
-        if result.rejection == Some(TerminalInputRejection::StaleMode) && !entry.retried {
-            self.probe_terminal_mouse_mode(&session_id);
-            if self.current_mode_shadow().is_some() {
-                match entry.kind {
-                    TerminalInputKind::Paste => {
-                        let Some(next_id) = self.next_paste_operation_id.checked_add(1) else {
-                            self.error = Some(
-                                "terminal paste unavailable: operation ids exhausted".to_string(),
-                            );
-                            return;
-                        };
-                        let operation_id = self.next_paste_operation_id;
-                        self.next_paste_operation_id = next_id;
-                        self.forward_terminal_paste(session_id, operation_id, entry.data, true);
-                        self.move_last_retry_to_front();
-                    }
-                    TerminalInputKind::ModeGatedInput => {
-                        self.forward_mode_gated_input(session_id, entry.data, false);
-                        if let Some(retry) = self.terminal_input_in_flight.back_mut() {
-                            retry.retried = true;
-                        }
-                        self.move_last_retry_to_front();
-                    }
-                    _ => {}
-                }
-                return;
-            }
-        }
-        self.error = Some(terminal_input_rejection_message(
-            result.rejection,
-            result.bytes_written,
-        ));
-    }
-
-    fn apply_result_mode_shadow(
-        &mut self,
-        session_id: &str,
-        flags: &TerminalModeFlags,
-        result: &TerminalInputResult,
-    ) {
-        self.terminal_mode_shadow = Some(TerminalModeShadow {
-            session_id: session_id.to_string(),
-            subscription_id: result.subscription_id.clone(),
-            kitty_enabled: flags.kitty_enabled,
-            bracketed_paste: flags.bracketed_paste,
-            mouse_mode: flags.mouse_mode,
-            mode_generation: result.mode_generation,
-            mode_revision: result.mode_revision,
-        });
-        self.terminal_mouse_mode = flags.mouse_mode;
-        self.terminal_mouse_mode_attachment =
-            Some((session_id.to_string(), result.subscription_id.clone()));
-    }
-
-    fn move_last_retry_to_front(&mut self) {
-        if let Some(retry) = self.terminal_input_in_flight.pop_back() {
-            self.terminal_input_in_flight.push_front(retry);
-        }
-    }
-
-    fn apply_terminal_mouse_mode(&self, hit_map: &mut HitMap) {
-        hit_map.set_terminal_mouse_mode("tui-terminal", self.current_terminal_mouse_mode());
-    }
-
-    fn request_optional_readback(&mut self, request: DaemonRequest, operation: &str) {
-        if self.client.is_none() {
-            return;
-        }
-        #[cfg(test)]
-        self.record_request(&request);
-        match self.request(request) {
-            Ok(response) => self.apply_optional_readback_response(response, operation),
-            Err(error) => {
-                self.action_feedback = Some(format!("{operation} unavailable: {error}"));
-                self.record_transport_error(error);
-            }
-        }
-    }
-
-    fn apply_optional_readback_response(&mut self, response: DaemonResponse, operation: &str) {
-        self.record_diagnostics(response.diagnostics);
-        if let Some(error) = response.error {
-            self.record_diagnostics(error.diagnostics);
-            self.action_feedback = Some(format!("{operation} unavailable: {}", error.message));
-            if operation == "read_mode_flags" {
-                self.clear_terminal_mouse_mode();
-            }
-            if operation == "read_screen"
-                && let Some(session_id) = self
-                    .attach_hydration
-                    .as_ref()
-                    .map(|hydration| hydration.session_id.clone())
-            {
-                self.finish_attach_hydration(&session_id, "");
-            }
-            return;
-        }
-        match response.kind {
-            DaemonResponseKind::ReadScreen => {
-                if let Some(screen) = response.read_screen {
-                    // Diagnostic/compat only — never primary terminal authority.
-                    if operation == "read_screen_diagnostic" || operation == "read_screen" {
-                        self.finish_attach_hydration(&screen.session_id, &screen.text);
-                    }
-                }
-            }
-            DaemonResponseKind::CaptureSnapshot => {
-                if let Some(snapshot) = response.capture_snapshot
-                    && self.terminal_output_session_id.as_deref()
-                        == Some(snapshot.session_id.as_str())
-                {
-                    self.snapshot_metadata = Some(snapshot);
-                }
-            }
-            DaemonResponseKind::ReadModeFlags => {
-                let Some(mode_flags) = response.mode_flags else {
-                    self.clear_terminal_mouse_mode();
-                    return;
-                };
-                let Some(subscription_id) = self.attached_subscription_id.clone() else {
-                    self.clear_terminal_mouse_mode();
-                    return;
-                };
-                if self.attached_session.as_deref() != Some(mode_flags.session_id.as_str()) {
-                    self.clear_terminal_mouse_mode();
-                    return;
-                }
-                self.terminal_mouse_mode = mode_flags.mouse_mode;
-                self.terminal_mouse_mode_attachment =
-                    Some((mode_flags.session_id.clone(), subscription_id.clone()));
-                self.terminal_mode_shadow = Some(TerminalModeShadow {
-                    session_id: mode_flags.session_id,
-                    subscription_id,
-                    kitty_enabled: mode_flags.kitty_enabled,
-                    bracketed_paste: mode_flags.bracketed_paste,
-                    mouse_mode: mode_flags.mouse_mode,
-                    mode_generation: mode_flags.mode_generation,
-                    mode_revision: mode_flags.mode_revision,
-                });
-            }
-            _ => {
-                if operation == "read_mode_flags" {
-                    self.clear_terminal_mouse_mode();
-                }
-            }
-        }
-    }
-
-    fn append_terminal_output(&mut self, data: &str) {
-        if data.is_empty() {
-            return;
-        }
-        self.terminal_output.push_str(data);
-        if self.terminal_output.len() > 8_000 {
-            self.terminal_output = self
-                .terminal_output
-                .chars()
-                .rev()
-                .take(8_000)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-        }
     }
 
     fn clear_connection_diagnostics(&mut self) {
@@ -5972,7 +5500,6 @@ impl TuiApp {
             || self.install_plan.is_some()
             || self.update_status.is_some()
             || self.package_decision.is_some()
-            || self.snapshot_metadata.is_some()
             || !self.drafts.is_empty()
     }
 
@@ -5989,12 +5516,12 @@ impl TuiApp {
 
     fn status_summary_node(&self, width: UiWidthClass) -> UiNode {
         let selected = self.selected_session.as_deref().unwrap_or("none");
-        let attached = self.attached_session.as_deref().unwrap_or("none");
+        let attached = self.attached_session_id().unwrap_or("none");
         let session_count = match self.sessions.len() {
             1 => "1 session".to_string(),
             count => format!("{count} sessions"),
         };
-        let compact = match self.attached_session.as_deref() {
+        let compact = match self.attached_session_id() {
             Some(attached) => format!("Botster · {} · attached: {attached}", self.status),
             None => format!("Botster · {} · {session_count}", self.status),
         };
@@ -6042,15 +5569,14 @@ impl TuiApp {
 
     fn workspace_toolbar(&self) -> UiNode {
         let selected = self.selected_session_row();
-        let selected_is_attached = selected.is_some_and(|session| {
-            self.attached_session.as_deref() == Some(session.session_id.as_str())
-        });
+        let selected_is_attached = selected
+            .is_some_and(|session| self.attached_session_id() == Some(session.session_id.as_str()));
         let selected_is_attachable = selected.is_some_and(SessionRow::is_attachable);
         let selected_is_removable = selected.is_some_and(|session| {
             !session.pending && !matches!(session.lifecycle.as_str(), "running" | "pending")
         });
         let attach_is_primary = selected_is_attachable && !selected_is_attached;
-        let detach_is_primary = self.attached_session.is_some() && !attach_is_primary;
+        let detach_is_primary = self.attached.is_some() && !attach_is_primary;
         let spawn_is_primary = !attach_is_primary && !detach_is_primary;
         let payload = json!({ "session_id": self.selected_session });
 
@@ -6072,7 +5598,7 @@ impl TuiApp {
                 None,
             )));
         }
-        if self.attached_session.is_some() {
+        if self.attached.is_some() {
             actions.push(child(workspace_button(
                 "tui-detach",
                 "Detach",
@@ -6163,7 +5689,7 @@ impl TuiApp {
 
     fn session_navigation_row(&self, session: &SessionRow) -> UiNode {
         let selected = self.selected_session.as_deref() == Some(session.session_id.as_str());
-        let attached = self.attached_session.as_deref() == Some(session.session_id.as_str());
+        let attached = self.attached_session_id() == Some(session.session_id.as_str());
         let state = if session.pending {
             "pending spawn"
         } else if attached && session.is_attachable() {
@@ -6464,22 +5990,6 @@ impl TuiApp {
                 UiNodeKind::Text,
                 "tui-action-feedback",
                 json!({ "text": format!("action: {feedback}") }),
-            )));
-        }
-        if let Some(snapshot) = &self.snapshot_metadata {
-            children.push(child(node(
-                UiNodeKind::Text,
-                "tui-terminal-snapshot-metadata",
-                json!({
-                    "text": format!(
-                        "terminal snapshot: session={} rows={} cols={} format={} payload_bytes={}",
-                        snapshot.session_id,
-                        snapshot.rows,
-                        snapshot.cols,
-                        snapshot.payload_format.as_deref().unwrap_or("none"),
-                        snapshot.payload_bytes
-                    )
-                }),
             )));
         }
         if let Some(error) = &self.error {
@@ -7280,7 +6790,7 @@ impl TuiApp {
             "tui-terminal",
             json!({
                 "title": self.terminal_title(),
-                "session_id": self.attached_session.clone()
+                "session_id": self.attached_session_id().map(str::to_string)
                     .or_else(|| self.attach_hydration.as_ref().map(|hydration| hydration.session_id.clone()))
                     .unwrap_or_else(|| "not attached".to_string())
             }),
@@ -7295,7 +6805,7 @@ impl TuiApp {
 
     fn terminal_title(&self) -> String {
         match (
-            &self.attached_session,
+            self.attached_session_id(),
             self.attach_hydration.as_ref(),
             &self.selected_session,
         ) {
@@ -7312,7 +6822,7 @@ impl TuiApp {
         // When a Ghostty projection is installed, styled paint is authoritative.
         // Kit Text child is chrome placeholder only — not ReadScreen authority.
         if self.ghostty_projection.is_some() || self.ghostty_viewport_cache.is_some() {
-            if self.attached_session.is_some()
+            if self.attached.is_some()
                 || self
                     .attach_hydration
                     .as_ref()
@@ -7322,15 +6832,8 @@ impl TuiApp {
             }
             return "Detached · Ghostty projection retained for scrollback.".to_string();
         }
-        if self.attached_session.is_some() {
+        if self.attached.is_some() {
             return "Waiting for terminal projection.".to_string();
-        }
-        if !self.terminal_output.is_empty() {
-            // Detached diagnostic/compat fallback only (no projection).
-            return format!(
-                "Detached · terminal history is read-only.\n{}",
-                self.terminal_output
-            );
         }
         match self.selected_session_row() {
             Some(session) if session.pending => {
@@ -7747,8 +7250,13 @@ fn drive_workspaces_acceptance(
         ));
     }
 
-    let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true);
-    if app.client.is_none() {
+    let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true, HubIo::new());
+    app.connect();
+    let connect_deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
+    app.pump_until(connect_deadline, |app| {
+        app.is_connected() || app.connection_error.is_some()
+    });
+    if !app.is_connected() {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
             app.connection_error
@@ -8184,14 +7692,12 @@ fn wait_for_acceptance_state(
     mut ready: impl FnMut(&mut TuiApp, &mut AcceptanceDiagnostics) -> bool,
 ) -> io::Result<()> {
     let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
-    while Instant::now() < deadline {
-        app.drain_session_subscription();
-        let _ = app.drain_entity_options_subscriptions();
+    let observed = app.pump_until(deadline, |app| {
         diagnostics.observe_app(app);
-        if ready(app, diagnostics) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(1));
+        ready(app, diagnostics)
+    });
+    if observed {
+        return Ok(());
     }
     invalid_acceptance(format!("timed out waiting for {expectation}"))
 }
@@ -8261,8 +7767,13 @@ fn drive_workspaces_claim_acceptance(
         None,
         "caller-injected Hub connection and data directory",
     );
-    let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true);
-    if app.client.is_none() {
+    let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true, HubIo::new());
+    app.connect();
+    let connect_deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
+    app.pump_until(connect_deadline, |app| {
+        app.is_connected() || app.connection_error.is_some()
+    });
+    if !app.is_connected() {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
             app.connection_error
@@ -8440,7 +7951,7 @@ fn drive_workspaces_claim_acceptance(
                 "option present without projected compact label",
             )
         })?;
-    app.request_and_apply(DaemonRequest::ShutdownSession {
+    app.submit_apply(DaemonRequest::ShutdownSession {
         session_id: scenario.session_uuid.clone(),
     });
     wait_for_acceptance_state(
@@ -8818,8 +8329,6 @@ fn ensure_claim_option_exclusion(
     let mut reopened = false;
     let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     while Instant::now() < deadline {
-        app.drain_session_subscription();
-        let _ = app.drain_entity_options_subscriptions();
         let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
         let field = hit_map.regions().iter().find_map(|region| {
             (region.node_id == WORKSPACES_ADD_SESSION_NODE)
@@ -8882,7 +8391,7 @@ fn ensure_claim_option_exclusion(
                 return Ok(reopened);
             }
         }
-        thread::sleep(Duration::from_millis(1));
+        app.pump_once(Instant::now() + Duration::from_millis(50));
     }
     invalid_acceptance(format!(
         "timed out waiting for Available sessions to exclude {session_uuid}"
@@ -9118,6 +8627,11 @@ fn activate_acceptance_action(
         serde_json::to_value(&request).map_err(io::Error::other)?,
     )?;
     app.handle_dispatch(dispatch);
+    if !app.settle(Instant::now() + ACCEPTANCE_TIMEOUT) {
+        return invalid_acceptance(format!(
+            "action {action_id} request did not complete within the acceptance timeout"
+        ));
+    }
     if let Some(error) = app.error.as_deref() {
         return invalid_acceptance(format!("action {action_id} failed: {error}"));
     }
@@ -9460,6 +8974,20 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     {
         app.workspace_test_mode = true;
     }
+    app.connect();
+    let connect_deadline = Instant::now() + HEADLESS_CONNECT_TIMEOUT;
+    app.pump_until(connect_deadline, |app| {
+        app.is_connected() || app.connection_error.is_some()
+    });
+    if !app.is_connected() {
+        eprintln!(
+            "headless-live-runtime-error: {}",
+            app.connection_error
+                .clone()
+                .unwrap_or_else(|| "hub connection did not complete".to_string())
+        );
+        return Err(DaemonTransportError::NotRunning);
+    }
     // Harness smoke only: freeform Spawn seeds a shell session so contract-matrix /
     // attach paths can run without writing into Hub's device session-types root.
     // Product launch remains target-first SpawnSessionType (toolbar dialog).
@@ -9469,23 +8997,21 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     app.selected_session = Some(session_id.clone());
     app.rebuild_session_rows();
     app.action_feedback = Some(format!("spawn pending: {session_id}"));
-    match app.request(DaemonRequest::Spawn {
-        session_id: session_id.clone(),
-        command: DEFAULT_COMMAND.to_string(),
-    }) {
-        Ok(response) => {
-            let failed = response.error.is_some();
-            app.apply_response(response);
-            if failed {
-                app.pending_sessions.remove(&session_id);
-                app.rebuild_session_rows();
-            }
-        }
-        Err(error) => {
-            app.pending_sessions.remove(&session_id);
-            app.rebuild_session_rows();
-            app.record_transport_error(error);
-        }
+    app.submit(
+        DaemonRequest::Spawn {
+            session_id: session_id.clone(),
+            command: DEFAULT_COMMAND.to_string(),
+        },
+        PendingReply::Spawn {
+            session_id: session_id.clone(),
+        },
+        REQUEST_DEADLINE,
+    );
+    if !app.settle(Instant::now() + REQUEST_DEADLINE) {
+        eprintln!("headless-live-runtime-error: spawn request did not complete");
+        return Err(DaemonTransportError::Protocol(
+            "headless spawn request did not complete",
+        ));
     }
     if let Some(error) = &app.error {
         eprintln!("headless-live-runtime-error: {error}");
@@ -9499,7 +9025,7 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
             .0
             .join("\n");
         assert!(rendered.contains("pending spawn"));
-        assert_eq!(app.attached_session, None);
+        assert_eq!(app.attached, None);
     }
     let session_id = app
         .selected_session
@@ -9511,14 +9037,15 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
     wait_for_authoritative_session(&mut app, &session_id)?;
     app.attach_selected_or_first();
     wait_for_app_output(&mut app, "botster-tui-ready")?;
-    app.forward_terminal_command(
-        session_id.clone(),
-        TerminalInputCommand::Resize { rows: 24, cols: 80 },
-        Vec::new(),
-        None,
-        false,
-    );
-    app.forward_terminal_input(session_id.clone(), HEADLESS_INPUT.as_bytes().to_vec());
+    // The live path already sent RESIZE. The smoke input is typed as KEY frames.
+    for character in HEADLESS_INPUT.chars() {
+        let code = if character == '\n' {
+            KeyCode::Enter
+        } else {
+            KeyCode::Char(character)
+        };
+        app.send_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
     wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
     #[cfg(test)]
     {
@@ -9536,7 +9063,6 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
             FEATURE_PACKAGE_NAVIGATION,
             FEATURE_PLUGIN_SURFACE_RENDER,
             FEATURE_PLUGIN_SURFACE_ACTION,
-            FEATURE_TERMINAL_READBACK,
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
             FEATURE_UNIX_TERMINAL_ADAPTER,
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
@@ -9560,20 +9086,21 @@ fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
         );
     }
     println!("terminal-output: {HEADLESS_OUTPUT}");
-    app.request_and_apply(DaemonRequest::ShutdownSession { session_id });
+    app.submit_apply(DaemonRequest::ShutdownSession { session_id });
+    let _ = app.settle(Instant::now() + REQUEST_DEADLINE);
+    app.shutdown();
     Ok(())
 }
 
 fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonTransportResult<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        app.poll_hub();
-        if app.sessions.iter().any(|session| {
+    let ready = app.pump_until(deadline, |app| {
+        app.sessions.iter().any(|session| {
             session.session_id == session_id && session.is_attachable() && !session.pending
-        }) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
+        })
+    });
+    if ready {
+        return Ok(());
     }
     eprintln!(
         "authoritative-session-timeout: id={session_id} error={:?} connection_error={:?} status={} sessions={:?} pending={:?} has_snapshot={} sub={:?}",
@@ -9598,63 +9125,21 @@ fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonT
 
 #[cfg(test)]
 fn wait_for_attached_projection(app: &mut TuiApp, session_id: &str) {
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(180);
-    let mut last_progress = started;
-    let mut last_ready = false;
-    let mut last_finished = false;
-    let mut last_mux_frames = 0_usize;
-    while Instant::now() < deadline {
-        app.poll_hub();
-        if app.ghostty_projection.is_some() && app.attached_session.as_deref() == Some(session_id) {
-            return;
-        }
-        if app.error.is_some() || app.terminal_close_evidence.is_some() {
-            break;
-        }
-        let ready = app
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| hydration.snapshot_ready);
-        let finished = app
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| hydration.snapshot_finished);
-        let mux_frames = app
-            .client
-            .as_ref()
-            .map(|client| client.mux_terminal_frames)
-            .unwrap_or(0);
-        if ready != last_ready || finished != last_finished || mux_frames > last_mux_frames {
-            last_progress = Instant::now();
-            last_ready = ready;
-            last_finished = finished;
-            last_mux_frames = mux_frames;
-        }
-        if last_progress.elapsed() >= Duration::from_secs(20)
-            && started.elapsed() >= Duration::from_secs(5)
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+    let deadline = Instant::now() + Duration::from_secs(180);
+    app.pump_until(deadline, |app| {
+        (app.ghostty_projection.is_some() && app.attached_session_id() == Some(session_id))
+            || app.error.is_some()
+            || app.terminal_close_evidence.is_some()
+    });
 }
 
+/// Wait until the projected viewport contains `needle`.
 fn wait_for_app_output(app: &mut TuiApp, needle: &str) -> DaemonTransportResult<()> {
-    if app.terminal_output.contains(needle) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    if app.pump_until(deadline, |app| app.viewport_text().contains(needle)) {
         return Ok(());
     }
-
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        app.poll_hub();
-        if app.terminal_output.contains(needle) {
-            return Ok(());
-        }
-        thread::yield_now();
-    }
-
-    let observed_prefix = app.terminal_output.chars().take(256).collect::<String>();
+    let observed_prefix = app.viewport_text().chars().take(256).collect::<String>();
     eprintln!(
         "timed out waiting for terminal output {needle:?}; terminal-output-prefix: {observed_prefix:?}"
     );
@@ -9733,338 +9218,6 @@ pub(crate) fn short_suffix() -> u64 {
     (unique_suffix() % 1_000_000_000_000) as u64
 }
 
-struct HubConnection {
-    stream: std::os::unix::net::UnixStream,
-    mux_buf: Vec<u8>,
-    pending_mux_frames: Vec<DaemonUnixMuxFrame>,
-    #[cfg(test)]
-    mux_terminal_frames: usize,
-    #[cfg(test)]
-    mux_event_frames: usize,
-    #[cfg(test)]
-    mux_response_frames: usize,
-}
-
-impl HubConnection {
-    #[cfg(test)]
-    fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
-        Self::connect_with_host_requirement(endpoint, &tui_compatibility_requirement())
-    }
-
-    fn connect_with_host_requirement(
-        endpoint: &DaemonEndpoint,
-        host_requirement: &DaemonCompatibilityRequirement,
-    ) -> DaemonTransportResult<Self> {
-        let (stream, ack) = connect_and_hello_with_terminal_requirement(
-            endpoint,
-            host_requirement,
-            Some(&tui_terminal_compatibility_requirement()),
-        )?;
-        admit_terminal_hello(&ack)?;
-        Ok(Self {
-            stream,
-            mux_buf: Vec::new(),
-            pending_mux_frames: Vec::new(),
-            #[cfg(test)]
-            mux_terminal_frames: 0,
-            #[cfg(test)]
-            mux_event_frames: 0,
-            #[cfg(test)]
-            mux_response_frames: 0,
-        })
-    }
-
-    #[cfg(test)]
-    fn from_stream(stream: std::os::unix::net::UnixStream) -> Self {
-        Self {
-            stream,
-            mux_buf: Vec::new(),
-            pending_mux_frames: Vec::new(),
-            mux_terminal_frames: 0,
-            mux_event_frames: 0,
-            mux_response_frames: 0,
-        }
-    }
-
-    fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
-        self.stream
-            .set_read_timeout(None)
-            .map_err(DaemonTransportError::Io)?;
-        write_frame(&mut self.stream, request)?;
-        loop {
-            if let Some(response) = self.take_pending_response() {
-                return Ok(response);
-            }
-            self.fill_mux_buf()?;
-            self.decode_ready_mux_frames()?;
-        }
-    }
-
-    fn write_terminal_frame(
-        &mut self,
-        session_id: &str,
-        subscription_id: &str,
-        frame_bytes: &[u8],
-        bound: Duration,
-    ) -> DaemonTransportResult<()> {
-        if let Err(error) = self.stream.set_write_timeout(Some(bound)) {
-            self.hard_close();
-            return Err(DaemonTransportError::Io(error));
-        }
-        let envelope =
-            DaemonUnixTerminalEnvelope::from_frame_bytes(session_id, subscription_id, frame_bytes);
-        if let Err(error) = write_frame(&mut self.stream, &envelope) {
-            self.hard_close();
-            return Err(error);
-        }
-        if let Err(error) = self.stream.set_write_timeout(None) {
-            self.hard_close();
-            return Err(DaemonTransportError::Io(error));
-        }
-        Ok(())
-    }
-
-    fn request_with_deadline(
-        &mut self,
-        request: &DaemonRequest,
-        deadline: Instant,
-    ) -> DaemonTransportResult<DaemonResponse> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            self.hard_close();
-            return Err(detach_deadline_error());
-        }
-        if let Err(error) = self.stream.set_write_timeout(Some(remaining)) {
-            self.hard_close();
-            return Err(DaemonTransportError::Io(error));
-        }
-        if let Err(error) = write_frame(&mut self.stream, request) {
-            self.hard_close();
-            return Err(map_detach_timeout(error));
-        }
-        loop {
-            if let Some(response) = self.take_pending_response() {
-                let _ = self.stream.set_write_timeout(None);
-                let _ = self.stream.set_read_timeout(None);
-                return Ok(response);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                self.hard_close();
-                return Err(detach_deadline_error());
-            }
-            if let Err(error) = self.stream.set_read_timeout(Some(remaining)) {
-                self.hard_close();
-                return Err(DaemonTransportError::Io(error));
-            }
-            match self.fill_mux_buf() {
-                Ok(true) => {
-                    if let Err(error) = self.decode_ready_mux_frames() {
-                        self.hard_close();
-                        return Err(error);
-                    }
-                }
-                Ok(false) => {
-                    if Instant::now() >= deadline {
-                        self.hard_close();
-                        return Err(detach_deadline_error());
-                    }
-                }
-                Err(error) => {
-                    self.hard_close();
-                    return Err(error);
-                }
-            }
-        }
-    }
-
-    fn hard_close(&mut self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
-        let _ = self.stream.set_write_timeout(None);
-        let _ = self.stream.set_read_timeout(None);
-    }
-
-    #[cfg(test)]
-    fn fill_send_buffer_until_blocked(&mut self) {
-        use std::io::Write;
-        let mut writer = self
-            .stream
-            .try_clone()
-            .expect("clone stream to fill send buffer");
-        writer
-            .set_nonblocking(true)
-            .expect("nonblocking fill of send buffer");
-        let junk = [0_u8; 65536];
-        let fill_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < fill_deadline {
-            match writer.write(&junk) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
-                Err(error) => panic!("fill send buffer failed: {error}"),
-            }
-        }
-        let _ = writer.set_nonblocking(false);
-    }
-
-    fn poll_mux_frames(&mut self) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
-        if self.pending_mux_frames.is_empty() {
-            self.stream
-                .set_read_timeout(Some(MUX_POLL_TIMEOUT))
-                .map_err(DaemonTransportError::Io)?;
-            loop {
-                match self.fill_mux_buf() {
-                    Ok(true) => {
-                        if let Err(error) = self.decode_ready_mux_frames() {
-                            let _ = self.stream.set_read_timeout(None);
-                            return Err(error);
-                        }
-                        if self.pending_mux_frames.len() >= MUX_POLL_BATCH_FRAMES {
-                            break;
-                        }
-                    }
-                    Ok(false) => break,
-                    Err(error) => {
-                        let _ = self.stream.set_read_timeout(None);
-                        return Err(error);
-                    }
-                }
-            }
-            self.stream
-                .set_read_timeout(None)
-                .map_err(DaemonTransportError::Io)?;
-        }
-        Ok(self.take_pending_mux_frames())
-    }
-
-    fn fill_mux_buf(&mut self) -> DaemonTransportResult<bool> {
-        let mut chunk = [0_u8; 8192];
-        match self.stream.read(&mut chunk) {
-            Ok(0) => Err(DaemonTransportError::ClientDisconnected),
-            Ok(count) => {
-                self.mux_buf.extend_from_slice(&chunk[..count]);
-                Ok(true)
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(DaemonTransportError::Io(error)),
-        }
-    }
-
-    fn decode_ready_mux_frames(&mut self) -> DaemonTransportResult<()> {
-        let frames = decode_complete_mux_frames(&mut self.mux_buf)?;
-        for frame in frames {
-            self.observe_mux_frame(&frame);
-            self.pending_mux_frames.push(frame);
-        }
-        Ok(())
-    }
-
-    fn take_pending_response(&mut self) -> Option<DaemonResponse> {
-        let index = self
-            .pending_mux_frames
-            .iter()
-            .position(|frame| matches!(frame, DaemonUnixMuxFrame::Response(_)))?;
-        match self.pending_mux_frames.remove(index) {
-            DaemonUnixMuxFrame::Response(response) => Some(*response),
-            _ => None,
-        }
-    }
-
-    fn observe_mux_frame(&mut self, frame: &DaemonUnixMuxFrame) {
-        let _ = frame;
-        #[cfg(test)]
-        match frame {
-            DaemonUnixMuxFrame::Terminal(_) => self.mux_terminal_frames += 1,
-            DaemonUnixMuxFrame::Event(_) => self.mux_event_frames += 1,
-            DaemonUnixMuxFrame::Response(_) => self.mux_response_frames += 1,
-        }
-    }
-
-    fn take_pending_mux_frames(&mut self) -> Vec<DaemonUnixMuxFrame> {
-        let count = self.pending_mux_frames.len().min(MUX_APPLY_BATCH_FRAMES);
-        self.pending_mux_frames.drain(..count).collect()
-    }
-
-    fn drop_event_frames_for(&mut self, subscription_id: &str) {
-        self.pending_mux_frames.retain(|frame| match frame {
-            DaemonUnixMuxFrame::Event(DaemonEvent::PackageEvent {
-                subscription_id: event_id,
-                ..
-            })
-            | DaemonUnixMuxFrame::Event(DaemonEvent::EventGap {
-                subscription_id: event_id,
-                ..
-            }) => event_id != subscription_id,
-            _ => true,
-        });
-    }
-
-    #[cfg(test)]
-    fn enqueue_pending_mux_frame(&mut self, frame: DaemonUnixMuxFrame) {
-        self.observe_mux_frame(&frame);
-        self.pending_mux_frames.push(frame);
-    }
-
-    #[cfg(test)]
-    fn pending_mux_len(&self) -> usize {
-        self.pending_mux_frames.len()
-    }
-
-    fn drop_terminal_frames_for(&mut self, session_id: &str, subscription_id: &str) {
-        self.pending_mux_frames.retain(|frame| match frame {
-            DaemonUnixMuxFrame::Terminal(envelope) => {
-                envelope.session_id != session_id || envelope.subscription_id != subscription_id
-            }
-            DaemonUnixMuxFrame::Event(DaemonEvent::TerminalSubscriptionClosed {
-                session_id: event_session,
-                subscription_id: event_subscription,
-                ..
-            }) => event_session != session_id || event_subscription != subscription_id,
-            _ => true,
-        });
-    }
-}
-
-fn decode_complete_mux_frames(
-    buffer: &mut Vec<u8>,
-) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
-    let mut frames = Vec::new();
-    loop {
-        let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
-            break;
-        };
-        let mut line: Vec<u8> = buffer.drain(..=newline).collect();
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        frames.extend(decode_mux_line(&line)?);
-    }
-    Ok(frames)
-}
-
-fn decode_mux_line(line: &[u8]) -> DaemonTransportResult<Vec<DaemonUnixMuxFrame>> {
-    let mut frames = Vec::new();
-    let mut deserializer = serde_json::Deserializer::from_slice(line).into_iter::<Value>();
-    for value in deserializer.by_ref() {
-        let value = value.map_err(DaemonTransportError::Json)?;
-        frames.push(parse_unix_mux_value(value).map_err(DaemonTransportError::Json)?);
-    }
-    Ok(frames)
-}
-
 fn admit_terminal_hello(ack: &DaemonHelloAck) -> DaemonTransportResult<()> {
     let requirement = tui_terminal_compatibility_requirement();
     let Some(terminal_compatibility) = ack.terminal_compatibility.as_ref() else {
@@ -10125,41 +9278,10 @@ fn tui_attach_occupancy_requirement() -> DaemonCompatibilityRequirement {
     requirement
 }
 
-fn detach_deadline_error() -> DaemonTransportError {
-    DaemonTransportError::Io(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "detach deadline exceeded",
-    ))
-}
-
-fn map_detach_timeout(error: DaemonTransportError) -> DaemonTransportError {
-    match error {
-        DaemonTransportError::Io(io_error)
-            if io_error.kind() == io::ErrorKind::TimedOut
-                || io_error.kind() == io::ErrorKind::WouldBlock =>
-        {
-            detach_deadline_error()
-        }
-        other => other,
-    }
-}
-
 fn tui_terminal_compatibility_requirement() -> TerminalCompatibilityRequirement {
     let mut requirement = TerminalCompatibilityRequirement::for_ready_then_history_attach();
     requirement.client_name = "botster-tui".to_string();
     requirement
-}
-
-fn attach_state_kind_from_wire(state: &str) -> Option<AttachStateKind> {
-    match state {
-        "attaching" => Some(AttachStateKind::Attaching),
-        "attached" => Some(AttachStateKind::Attached),
-        value if value == ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE => {
-            Some(AttachStateKind::SnapshotHistoryIncomplete)
-        }
-        value if value == ATTACH_STATE_ATTACH_FAILED => Some(AttachStateKind::AttachFailed),
-        _ => None,
-    }
 }
 
 fn diagnostic_text(diagnostic: &DaemonDiagnostic) -> String {
@@ -11696,7 +10818,9 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
     use botster_ui_contract::{
         UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
     };
@@ -11712,18 +10836,6 @@ mod tests {
         UNIX_STUB_TEST
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn bind_unix_stub(label: &str) -> (PathBuf, std::os::unix::net::UnixListener) {
-        let _bind_guard = UNIX_STUB_BIND
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let sequence = UNIX_STUB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(format!("/tmp/bt-{label}-{}-{sequence}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("stub dir");
-        let listener =
-            std::os::unix::net::UnixListener::bind(root.join("hub.sock")).expect("bind Unix stub");
-        (root, listener)
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -11766,26 +10878,6 @@ mod tests {
             "subscription_id={:?} has_snapshot={} snapshot_seq={:?} expected_session_id={session_id} expected={expectation:?} observed={observed}",
             state.subscription_id, state.has_snapshot, state.snapshot_seq
         )
-    }
-
-    fn wait_for_session_entity_expectation(
-        app: &mut TuiApp,
-        session_id: &str,
-        expectation: SessionEntityExpectation<'_>,
-        context: &str,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(7);
-        while !session_entity_expectation_satisfied(&app.session_entities, session_id, expectation)
-            && Instant::now() < deadline
-        {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert!(
-            session_entity_expectation_satisfied(&app.session_entities, session_id, expectation,),
-            "{context}: {}",
-            session_entity_expectation_diagnostic(&app.session_entities, session_id, expectation,)
-        );
     }
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
@@ -11895,7 +10987,9 @@ mod tests {
     }
 
     const WORKSPACES_PACKAGE_NAME: &str = "botster-workspaces";
+
     const WORKSPACES_SURFACE_ID: &str = "workspaces";
+
     const WORKSPACES_DOWNSTREAM_TICKET: &str = "ticket_1785296184_677408";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12384,174 +11478,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn materialized_action_oracle_dispatches_the_unique_absent_branch() {
-        let session_id = "session-historical";
-        let action_id = "botster_workspaces.remove_session";
-        let body = ui_node(json!({
-            "type": "panel",
-            "id": "materialized-action-panel",
-            "props": { "title": "Materialized action" },
-            "children": [
-                {
-                    "$kind": "bind_list",
-                    "source": "/session",
-                    "where": {
-                        "session_uuid": session_id,
-                        "lifecycle_class": "current"
-                    },
-                    "item_template": {
-                        "type": "button",
-                        "id": "authored-current-remove",
-                        "props": {
-                            "label": "Remove current",
-                            "action": {
-                                "id": action_id,
-                                "payload": { "session_id": session_id }
-                            }
-                        }
-                    }
-                },
-                {
-                    "$kind": "bind_list",
-                    "source": "/session",
-                    "where": { "session_uuid": session_id },
-                    "item_template": {
-                        "type": "text",
-                        "id": "presence-detector",
-                        "props": { "text": "" }
-                    },
-                    "empty_template": {
-                        "type": "button",
-                        "id": "realized-absent-remove",
-                        "props": {
-                            "label": "Remove historical reference",
-                            "action": {
-                                "id": action_id,
-                                "payload": { "session_id": session_id }
-                            }
-                        }
-                    }
-                }
-            ]
-        }));
-        assert_eq!(
-            find_action_node(&body, action_id, "session_id", session_id)
-                .and_then(|node| node.id.as_ref())
-                .and_then(UiAuthoredNodeId::as_literal)
-                .map(|id| id.0.as_str()),
-            Some("authored-current-remove"),
-            "authored first-match traversal deliberately disagrees with the realized branch"
-        );
-
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.materialized-action",
-            body,
-        )));
-        let materialized = materialized_plugin_root(&app);
-        assert!(find_ui_node_by_id(&materialized, "realized-absent-remove").is_some());
-        let mut router = InputRouter::new(renderer::action_request_context_for(
-            "contract.materialized-action",
-        ));
-        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            120,
-            40,
-            &router.render_state(),
-            &app.plugin_presentation,
-        );
-        let (action_node_id, action) =
-            unique_hit_action(&hit_map, action_id, "session_id", session_id)
-                .expect("absent materialization has one exact production action region");
-        assert_eq!(action_node_id.0, "realized-absent-remove");
-        router.reconcile(&hit_map);
-        let region = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == action_node_id.0)
-            .expect("realized absent action is in the production hit map");
-        assert!(matches!(
-            router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    region.rect.x,
-                    region.rect.y,
-                ),
-                &hit_map,
-            ),
-            InputDispatch::Focus { .. }
-        ));
-        let dispatch = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &hit_map,
-        );
-        let InputDispatch::Action(request) = &dispatch else {
-            panic!("focused realized action must dispatch, got {dispatch:?}");
-        };
-        assert_eq!(request.node_id, Some(action_node_id));
-        assert_eq!(request.action_id, action.id);
-        assert_eq!(request.payload, action.payload);
-        let request = request.clone();
-        app.handle_dispatch(dispatch);
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: "botster.plugin-contract-matrix".to_string(),
-                    request,
-                })
-        );
-
-        let missing = unique_hit_action(&hit_map, action_id, "session_id", "missing-session")
-            .expect_err("zero production matches must fail");
-        assert!(missing.contains("found 0"), "{missing}");
-
-        let duplicate = ui_node(json!({
-            "type": "stack",
-            "id": "duplicate-actions",
-            "props": {},
-            "children": [
-                {
-                    "type": "button",
-                    "id": "duplicate-remove-one",
-                    "props": {
-                        "label": "Remove one",
-                        "action": {
-                            "id": action_id,
-                            "payload": { "session_id": session_id }
-                        }
-                    }
-                },
-                {
-                    "type": "button",
-                    "id": "duplicate-remove-two",
-                    "props": {
-                        "label": "Remove two",
-                        "action": {
-                            "id": action_id,
-                            "payload": { "session_id": session_id }
-                        }
-                    }
-                }
-            ]
-        }));
-        let (_, duplicate_hits) = renderer::render_to_lines(&duplicate, 120, 40);
-        let duplicate_error =
-            unique_hit_action(&duplicate_hits, action_id, "session_id", session_id)
-                .expect_err("duplicate production matches must fail");
-        assert!(duplicate_error.contains("found 2"), "{duplicate_error}");
-        assert!(
-            duplicate_error.contains("duplicate-remove-one"),
-            "{duplicate_error}"
-        );
-        assert!(
-            duplicate_error.contains("duplicate-remove-two"),
-            "{duplicate_error}"
-        );
-    }
-
     fn workspace_fixture() -> TuiApp {
         let mut app = TuiApp::new(None);
         app.workspace_test_mode = true;
@@ -12633,253 +11559,6 @@ mod tests {
                 .iter()
                 .any(|region| region.node_id.starts_with("tui-session-session-")),
             "short compact layout should retain a focusable session row"
-        );
-    }
-
-    #[test]
-    fn detached_terminal_marks_preserved_history_as_read_only() {
-        let mut app = workspace_fixture();
-        app.attached_session = Some("session-alpha".to_string());
-        app.terminal_output = "last visible screen".to_string();
-
-        let attached = render_app_to_lines(&app, 140, 42, &RenderState::default())
-            .0
-            .join("\n");
-        app.attached_session = None;
-        let detached = render_app_to_lines(&app, 140, 42, &RenderState::default())
-            .0
-            .join("\n");
-
-        assert!(attached.contains("Terminal · session-alpha"), "{attached}");
-        assert!(
-            !attached.contains("terminal history is read-only"),
-            "{attached}"
-        );
-        assert!(
-            detached.contains("Terminal · session-alpha · detached"),
-            "{detached}"
-        );
-        assert!(
-            detached.contains("Detached · terminal history is read-only."),
-            "{detached}"
-        );
-        assert!(detached.contains("last visible screen"), "{detached}");
-    }
-
-    #[test]
-    fn workspace_presents_empty_pending_running_attached_exited_and_unavailable_states() {
-        let mut app = workspace_fixture();
-
-        app.sessions.clear();
-        app.selected_session = None;
-        let empty = render_app_to_lines(&app, 96, 30, &RenderState::default())
-            .0
-            .join("\n");
-        assert!(empty.contains("No sessions yet"));
-
-        app.sessions = vec![SessionRow::pending("session-pending")];
-        app.selected_session = Some("session-pending".to_string());
-        let pending = render_app_to_lines(&app, 96, 30, &RenderState::default())
-            .0
-            .join("\n");
-        assert!(pending.contains("pending spawn"));
-        assert!(pending.contains("session is pending"), "{pending}");
-        assert!(pending.contains("1 session"), "{pending}");
-        assert!(!pending.contains("1 sessions"), "{pending}");
-
-        app.sessions = session_rows([("session-active", "running"), ("session-old", "exited")]);
-        app.selected_session = Some("session-active".to_string());
-        let running = render_app_to_lines(&app, 96, 30, &RenderState::default())
-            .0
-            .join("\n");
-        assert!(running.contains("session-active · running"));
-        assert!(!running.contains("running · selected"));
-        assert!(running.contains("session-old · exited"));
-
-        app.attached_session = Some("session-active".to_string());
-        app.attached_subscription_id = Some("sub-current".to_string());
-        app.subscription_id = "sub-current".to_string();
-        let attached = render_app_to_lines(&app, 96, 30, &RenderState::default())
-            .0
-            .join("\n");
-        assert!(attached.contains("session-active · attached"));
-        assert!(attached.contains("Terminal · session-active"));
-
-        app.sessions.clear();
-        app.selected_session = None;
-        app.attached_session = None;
-        app.status = "hub unavailable; reconnecting".to_string();
-        app.connection_error = Some("daemon is not running".to_string());
-        let unavailable = render_app_to_lines(&app, 96, 30, &RenderState::default())
-            .0
-            .join("\n");
-        assert!(unavailable.contains("Hub unavailable"));
-        assert!(unavailable.contains("daemon is not running"));
-    }
-
-    #[test]
-    fn never_connected_workspace_shows_connection_error_and_hub_unavailable_state() {
-        let app = TuiApp::new_with_connection(None, Some("daemon is not running".to_string()));
-
-        let surface = app.surface();
-        let alert = find_ui_node_by_id(&surface, "workspace-connection-alert")
-            .expect("never-connected workspace must include the connection alert");
-        assert!(
-            alert.props["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("daemon is not running")),
-            "connection alert must include the transport error: {:?}",
-            alert.props
-        );
-        let terminal_output = find_ui_node_by_id(&surface, "tui-terminal-output")
-            .expect("never-connected workspace must keep the terminal panel visible");
-        assert!(
-            terminal_output.props["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("Hub unavailable")),
-            "terminal panel must include the Hub unavailable state: {:?}",
-            terminal_output.props
-        );
-        assert!(
-            find_ui_node_by_id(&surface, "tui-status-panel").is_none(),
-            "connection error must not replace the workspace with System details"
-        );
-    }
-
-    #[test]
-    fn contextual_toolbar_shows_valid_actions_and_overflows_only_when_constrained() {
-        let mut app = workspace_fixture();
-        let (_wide, wide_hits) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        for action in [
-            "workspace-attach",
-            "tui-spawn",
-            "workspace-system-details",
-            "workspace-refresh",
-            "workspace-shutdown",
-        ] {
-            assert!(
-                wide_hits
-                    .regions()
-                    .iter()
-                    .any(|region| region.node_id == action),
-                "valid action {action} should render when the toolbar has room"
-            );
-        }
-        assert!(
-            !wide_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "workspace-remove")
-        );
-        assert!(
-            !wide_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == WORKSPACE_TOOLBAR_OVERFLOW_ID)
-        );
-
-        let (narrow, narrow_hits) = render_app_to_lines(&app, 40, 24, &RenderState::default());
-        assert!(narrow.iter().any(|line| line.contains("…+")));
-        assert!(
-            narrow_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "workspace-attach")
-        );
-        assert!(
-            !narrow_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "workspace-remove")
-        );
-        let overflow = narrow_hits
-            .regions()
-            .iter()
-            .find(|region| region.node_id == WORKSPACE_TOOLBAR_OVERFLOW_ID)
-            .expect("constrained shell should expose toolbar overflow")
-            .rect;
-        let mut router = InputRouter::new(renderer::action_request_context());
-        router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                overflow.x,
-                overflow.y,
-            ),
-            &narrow_hits,
-        );
-        router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                overflow.x,
-                overflow.y,
-            ),
-            &narrow_hits,
-        );
-        assert!(
-            router
-                .render_state()
-                .is_expanded(WORKSPACE_TOOLBAR_OVERFLOW_ID)
-        );
-        let (_open, open_hits) = render_app_to_lines(&app, 40, 24, &router.render_state());
-        let hidden_action = [
-            "tui-spawn",
-            "workspace-system-details",
-            "workspace-refresh",
-            "workspace-shutdown",
-        ]
-        .into_iter()
-        .find(|action| {
-            !narrow_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == *action)
-        })
-        .expect("a constrained toolbar should hide at least one automatic action");
-        assert!(
-            open_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == hidden_action)
-        );
-
-        app.sessions.clear();
-        app.selected_session = None;
-        let (_empty, empty_hits) = render_app_to_lines(&app, 72, 24, &RenderState::default());
-        assert!(
-            empty_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "tui-spawn")
-        );
-        assert!(
-            !empty_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "workspace-attach")
-        );
-
-        app.sessions = session_rows([("session-alpha", "running")]);
-        app.selected_session = Some("session-alpha".to_string());
-        app.attached_session = Some("session-alpha".to_string());
-        let (_attached, attached_hits) =
-            render_app_to_lines(&app, 240, 50, &RenderState::default());
-        assert!(
-            attached_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "tui-detach")
-        );
-        assert!(
-            !attached_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "workspace-attach")
-        );
-        assert!(
-            !attached_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == WORKSPACE_TOOLBAR_OVERFLOW_ID)
         );
     }
 
@@ -13045,20 +11724,6 @@ mod tests {
     }
 
     #[test]
-    fn interactive_system_details_show_package_storage_context_without_using_it_as_identity() {
-        let mut app = TuiApp::new_with_runtime_context(None, None, true);
-        app.workspace_test_mode = true;
-        app.system_details_visible = true;
-
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
-            .0
-            .join("\n");
-
-        assert!(rendered.contains("package storage context: configured"));
-        assert_eq!(app.endpoint, None);
-    }
-
-    #[test]
     fn canonical_invalid_hub_connection_fixtures_are_rejected() {
         for fixture in
             botster_core_test_support::fixtures::runnable_entrypoint_hub_connection::INVALID_FIXTURES
@@ -13219,184 +11884,6 @@ mod tests {
         );
     }
 
-    fn host_compatibility_omitting_terminal_mechanism_tokens() -> DaemonCompatibility {
-        let mut compatibility = DaemonCompatibility::current();
-        compatibility.features.retain(|feature| {
-            feature != botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING
-                && feature != botster_terminal_protocol_client::FEATURE_RESIZE
-                && feature
-                    != botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
-        });
-        for required in [
-            FEATURE_SESSIONS,
-            FEATURE_PACKAGE_NAVIGATION,
-            FEATURE_PLUGIN_SURFACE_RENDER,
-            FEATURE_PLUGIN_SURFACE_ACTION,
-            FEATURE_TERMINAL_READBACK,
-            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-            FEATURE_UNIX_TERMINAL_ADAPTER,
-            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-            FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
-        ] {
-            if !compatibility
-                .features
-                .iter()
-                .any(|feature| feature == required)
-            {
-                compatibility.features.push(required.to_string());
-            }
-        }
-        compatibility
-    }
-
-    fn previous_hub_descriptor_without_occupancy() -> DaemonCompatibility {
-        let mut compatibility = host_compatibility_omitting_terminal_mechanism_tokens();
-        compatibility
-            .features
-            .retain(|feature| feature != FEATURE_ATTACH_OCCUPANCY);
-        compatibility.conformance_fixture_revision = MINIMUM_CONFORMANCE_FIXTURE_REVISION;
-        compatibility
-    }
-
-    #[test]
-    fn tui_requires_protocol_8_revision_48_and_split_terminal_hello() {
-        let requirement = tui_compatibility_requirement();
-        let compatible_hub = host_compatibility_omitting_terminal_mechanism_tokens;
-
-        assert_eq!(
-            requirement.minimum_conformance_fixture_revision,
-            MINIMUM_CONFORMANCE_FIXTURE_REVISION
-        );
-        assert_eq!(
-            requirement.protocol_version,
-            botster_hub_client::PROTOCOL_VERSION
-        );
-        assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 48);
-        assert!(
-            !requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY),
-            "default Hello must not require proof-only attach_occupancy"
-        );
-        for host_feature in [
-            FEATURE_SESSIONS,
-            FEATURE_PACKAGE_NAVIGATION,
-            FEATURE_PLUGIN_SURFACE_RENDER,
-            FEATURE_PLUGIN_SURFACE_ACTION,
-            FEATURE_TERMINAL_READBACK,
-            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-            FEATURE_UNIX_TERMINAL_ADAPTER,
-            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-            FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
-        ] {
-            assert!(
-                requirement
-                    .required_features
-                    .iter()
-                    .any(|feature| feature == host_feature),
-                "host Hello must require {host_feature}"
-            );
-        }
-        for terminal_feature in [
-            botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING,
-            botster_terminal_protocol_client::FEATURE_RESIZE,
-            botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
-        ] {
-            assert!(
-                !requirement
-                    .required_features
-                    .iter()
-                    .any(|feature| feature == terminal_feature),
-                "host Hello must not require terminal token {terminal_feature}"
-            );
-        }
-
-        for revision in 16..48 {
-            let mut older_hub = compatible_hub();
-            older_hub.conformance_fixture_revision = revision;
-            let error = botster_hub_client::ensure_compatible(&requirement, &older_hub)
-                .expect_err("pre-event-plane fixture revision must be rejected");
-            assert!(error.diagnostic.contains(&format!("revision {revision}")));
-            assert!(error.diagnostic.contains("requires at least 48"));
-        }
-        // `ensure_compatible` now matches protocol version exactly rather than as a
-        // floor, so a *newer* hub is rejected as firmly as an older one. Both
-        // directions are covered deliberately: dropping the newer-protocol case
-        // would silently restore the old minimum semantics this bump replaced.
-        for protocol_version in (2..8).chain(9..11) {
-            let mut mismatched_hub = compatible_hub();
-            mismatched_hub.protocol_version = protocol_version;
-            let error = botster_hub_client::ensure_compatible(&requirement, &mismatched_hub)
-                .expect_err("protocol version must match the client exactly");
-            assert!(
-                error
-                    .diagnostic
-                    .contains(&format!("version {protocol_version}"))
-            );
-            assert!(error.diagnostic.contains("client requires 8"));
-        }
-        botster_hub_client::ensure_compatible(&requirement, &compatible_hub())
-            .expect("protocol 8 fixture revision 48 hub should connect");
-        botster_hub_client::ensure_compatible(
-            &requirement,
-            &previous_hub_descriptor_without_occupancy(),
-        )
-        .expect("default Hello must accept the previous Hub descriptor without attach_occupancy");
-        let mut future_hub = compatible_hub();
-        future_hub.conformance_fixture_revision = 49;
-        botster_hub_client::ensure_compatible(&requirement, &future_hub)
-            .expect("runtime compatibility must preserve minimum semantics for revision 49");
-    }
-
-    #[test]
-    fn attach_occupancy_requirement_is_shared_profile_only() {
-        let occupancy = tui_attach_occupancy_requirement();
-        assert_eq!(
-            occupancy.minimum_conformance_fixture_revision,
-            botster_hub_client::CONFORMANCE_FIXTURE_REVISION
-        );
-        assert!(
-            occupancy
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY)
-        );
-        botster_hub_client::ensure_compatible(
-            &occupancy,
-            &previous_hub_descriptor_without_occupancy(),
-        )
-        .expect_err("shared occupancy Hello must reject the previous Hub descriptor");
-        botster_hub_client::ensure_compatible(
-            &occupancy,
-            &host_compatibility_omitting_terminal_mechanism_tokens(),
-        )
-        .expect("shared occupancy Hello must accept a current occupancy Hub");
-    }
-
-    #[test]
-    fn host_hello_accepts_fixture_that_omits_terminal_mechanism_tokens() {
-        let requirement = tui_compatibility_requirement();
-        let host = host_compatibility_omitting_terminal_mechanism_tokens();
-        for terminal_feature in [
-            botster_terminal_protocol_client::FEATURE_TERMINAL_STREAMING,
-            botster_terminal_protocol_client::FEATURE_RESIZE,
-            botster_terminal_protocol_client::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY,
-        ] {
-            assert!(
-                !host
-                    .features
-                    .iter()
-                    .any(|feature| feature == terminal_feature),
-                "host fixture must omit {terminal_feature}"
-            );
-        }
-        botster_hub_client::ensure_compatible(&requirement, &host).expect(
-            "host Hello must succeed when the advertised host features omit terminal mechanism tokens",
-        );
-    }
-
     #[test]
     fn terminal_hello_still_requires_core_mechanism_tokens() {
         let requirement = tui_terminal_compatibility_requirement();
@@ -13413,106 +11900,6 @@ mod tests {
                 "terminal Hello must require {terminal_feature}"
             );
         }
-    }
-
-    #[test]
-    fn session_reducer_consumes_shared_lifecycle_conformance_frames() {
-        let scenario =
-            botster_hub_test_support::session_lifecycle_subscription_conformance_scenario();
-        assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
-        let generation = match &scenario.normalized_frames[0] {
-            DaemonEntityFrame::Snapshot {
-                subscription_id, ..
-            } => subscription_id.clone(),
-            other => panic!("first conformance frame must be a snapshot, got {other:?}"),
-        };
-        let mut state = SessionEntityState::default();
-        state.begin_generation(generation);
-
-        for frame in scenario.normalized_frames {
-            assert!(state.apply(frame).expect("conformance frame applies"));
-        }
-        assert!(state.entities.is_empty(), "remove deletes the session");
-        assert_eq!(state.snapshot_seq, Some(4));
-        assert!(
-            state
-                .apply(scenario.overflow.resync_snapshot)
-                .expect("overflow resync snapshot applies")
-        );
-        assert!(state.entities.is_empty());
-
-        let fresh = scenario.fresh_subscription.snapshot;
-        let fresh_generation = match &fresh {
-            DaemonEntityFrame::Snapshot {
-                subscription_id, ..
-            } => subscription_id.clone(),
-            _ => unreachable!(),
-        };
-        assert!(
-            !state
-                .apply(fresh.clone())
-                .expect("stale generation ignored")
-        );
-        state.begin_generation(fresh_generation);
-        assert!(state.apply(fresh).expect("fresh snapshot applies"));
-        assert!(state.has_snapshot);
-    }
-
-    #[test]
-    fn session_entity_readiness_requires_the_exact_expected_row() {
-        let session_id = "expected-session";
-        let mut state = SessionEntityState::default();
-        state.begin_generation("readiness-generation".to_string());
-        assert!(
-            state
-                .apply(snapshot_frame("readiness-generation", 1, Vec::new()))
-                .expect("empty authoritative snapshot applies")
-        );
-
-        assert!(state.has_snapshot);
-        assert!(!session_entity_expectation_satisfied(
-            &state,
-            session_id,
-            SessionEntityExpectation::Lifecycle("current")
-        ));
-        assert!(session_entity_expectation_satisfied(
-            &state,
-            session_id,
-            SessionEntityExpectation::Absent
-        ));
-
-        assert!(
-            state
-                .apply(snapshot_frame(
-                    "readiness-generation",
-                    2,
-                    vec![session_entity(session_id, Some("running"))],
-                ))
-                .expect("authoritative snapshot containing the expected row applies")
-        );
-        assert!(session_entity_expectation_satisfied(
-            &state,
-            session_id,
-            SessionEntityExpectation::Lifecycle("current")
-        ));
-        assert!(!session_entity_expectation_satisfied(
-            &state,
-            session_id,
-            SessionEntityExpectation::Absent
-        ));
-    }
-
-    fn canonical_surface(
-        package_name: &str,
-        surface_id: &str,
-        body: UiNode,
-    ) -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: package_name.to_string(),
-            surface_id: surface_id.to_string(),
-            body,
-            ui_tree_snapshot: None,
-        })
     }
 
     fn session_binding_values(root: &UiNode, references: &[String]) -> BTreeMap<String, String> {
@@ -13894,1469 +12281,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_session_bindings_follow_published_oracle_through_frames_and_reconnect() {
-        let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
-        assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
-        let body =
-            serde_json::from_value(scenario.surface.clone()).expect("published surface is typed");
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.sessions",
-            body,
-        )));
-
-        let generation_one = match &scenario.initial_snapshot {
-            DaemonEntityFrame::Snapshot {
-                subscription_id, ..
-            } => subscription_id.clone(),
-            _ => panic!("published initial stage must be a snapshot"),
-        };
-        app.session_entities
-            .begin_generation(generation_one.clone());
-        assert!(
-            app.session_entities
-                .apply(scenario.initial_snapshot.clone())
-                .expect("initial snapshot applies")
-        );
-        let initial_frames = vec![scenario.initial_snapshot.clone()];
-        let initial_rows = botster_hub_test_support::materialize_session_plugin_rows(
-            &scenario.surface,
-            &initial_frames,
-        )
-        .expect("producer initial rows materialize");
-        assert_eq!(initial_rows, scenario.row_expected.initial);
-        assert_eq!(
-            initial_rows.len(),
-            2,
-            "published initial oracle is multi-row"
-        );
-        assert_keyboard_and_mouse_dispatch(&mut app, &initial_rows);
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.sessions",
-            serde_json::from_value(scenario.surface.clone())
-                .expect("published surface remains typed after dispatch proof"),
-        )));
-        app.session_entities
-            .begin_generation(generation_one.clone());
-        assert!(
-            app.session_entities
-                .apply(scenario.initial_snapshot.clone())
-                .expect("initial snapshot reapplies after dispatch proof")
-        );
-        assert_session_binding_frame(
-            &app,
-            &scenario.expected.initial,
-            &scenario.references,
-            &initial_rows,
-        );
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.sessions",
-            serde_json::from_value(scenario.surface.clone())
-                .expect("published surface remains typed"),
-        )));
-        app.session_entities
-            .begin_generation(generation_one.clone());
-        assert!(
-            app.session_entities
-                .apply(scenario.initial_snapshot.clone())
-                .expect("initial snapshot reapplies after action seam proof")
-        );
-
-        let missing_uuid = scenario
-            .references
-            .last()
-            .expect("missing reference")
-            .clone();
-        assert!(
-            app.session_entities
-                .apply(DaemonEntityFrame::Upsert {
-                    subscription_id: generation_one.clone(),
-                    entity_type: "session".to_string(),
-                    snapshot_seq: 2,
-                    id: missing_uuid.clone(),
-                    entity: session_entity_value(DaemonSessionEntity {
-                        registry_state: "running".to_string(),
-                        updated_at: 2,
-                        ..session_entity(&missing_uuid, Some("running"))
-                    }),
-                })
-                .expect("authoritative upsert applies")
-        );
-        let root = materialize_plugin_surface(
-            &app.plugin_surface.as_ref().expect("active surface").body,
-            &app.session_entities,
-            &app.entity_options_projection_store(),
-            &app.drafts,
-            &app.entity_options_invalid_fields,
-        )
-        .expect("upserted bindings materialize");
-        assert_eq!(
-            session_binding_values(&root, &scenario.references)
-                .get(&missing_uuid)
-                .map(String::as_str),
-            Some("current")
-        );
-
-        app.session_entities.begin_generation(generation_one);
-        app.session_entities
-            .apply(scenario.initial_snapshot.clone())
-            .expect("initial snapshot reapplies");
-        let removed_row = initial_rows.first().expect("initial row removed by patch");
-        let removed_control = removed_row
-            .controls
-            .first()
-            .expect("removed row has identity-bearing controls");
-        let mut removal_router =
-            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
-        let (_lines, initial_removal_hits) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            180,
-            60,
-            &removal_router.render_state(),
-            &app.plugin_presentation,
-        );
-        removal_router.reconcile(&initial_removal_hits);
-        for _ in 0..=initial_removal_hits.regions().len() {
-            if removal_router.focused_node_id() == Some(removed_control.node_id.as_str()) {
-                break;
-            }
-            removal_router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &initial_removal_hits,
-            );
-        }
-        assert_eq!(
-            removal_router.focused_node_id(),
-            Some(removed_control.node_id.as_str())
-        );
-        let transition_expectations = [
-            (
-                &scenario.expected.after_ended_patch,
-                &scenario.row_expected.after_ended_patch,
-            ),
-            (
-                &scenario.expected.after_indeterminate_patch,
-                &scenario.row_expected.after_indeterminate_patch,
-            ),
-            (
-                &scenario.expected.after_remove,
-                &scenario.row_expected.after_remove,
-            ),
-        ];
-        let mut stage_frames = vec![scenario.initial_snapshot.clone()];
-        for (stage, (frame, (expected, row_expected))) in scenario
-            .transition_frames
-            .iter()
-            .zip(transition_expectations)
-            .enumerate()
-        {
-            assert!(
-                app.session_entities
-                    .apply(frame.clone())
-                    .expect("transition frame applies")
-            );
-            stage_frames.push(frame.clone());
-            let expected_rows = botster_hub_test_support::materialize_session_plugin_rows(
-                &scenario.surface,
-                &stage_frames,
-            )
-            .expect("producer transition rows materialize");
-            assert_eq!(expected_rows, *row_expected);
-            assert_session_binding_frame(&app, expected, &scenario.references, &expected_rows);
-            if stage == 0 {
-                let surviving_control = expected_rows
-                    .first()
-                    .expect("ended patch preserves one canonical row")
-                    .controls
-                    .first()
-                    .expect("surviving row retains controls");
-                let (_lines, removed_hits) = renderer::render_to_lines_with_presentation_state(
-                    &app.surface(),
-                    180,
-                    60,
-                    &removal_router.render_state(),
-                    &app.plugin_presentation,
-                );
-                assert!(
-                    !removed_hits
-                        .regions()
-                        .iter()
-                        .any(|region| region.node_id == removed_control.node_id)
-                );
-                removal_router.reconcile(&removed_hits);
-                assert_ne!(
-                    removal_router.focused_node_id(),
-                    Some(removed_control.node_id.as_str())
-                );
-                for _ in 0..=removed_hits.regions().len() {
-                    if removal_router.focused_node_id() == Some(surviving_control.node_id.as_str())
-                    {
-                        break;
-                    }
-                    removal_router.dispatch_event(
-                        Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                        &removed_hits,
-                    );
-                }
-                let dispatch = removal_router.dispatch_event(
-                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                    &removed_hits,
-                );
-                let InputDispatch::Action(request) = dispatch else {
-                    panic!("surviving row must dispatch after reconcile")
-                };
-                assert_eq!(
-                    request.node_id,
-                    Some(UiNodeId(surviving_control.node_id.clone()))
-                );
-                assert_eq!(
-                    request.payload,
-                    Some(surviving_control.action_payload.clone())
-                );
-            }
-        }
-
-        let generation_two = match &scenario.reconnect_snapshot {
-            DaemonEntityFrame::Snapshot {
-                subscription_id, ..
-            } => subscription_id.clone(),
-            _ => panic!("published reconnect stage must be a snapshot"),
-        };
-        app.session_entities.begin_generation(generation_two);
-        assert!(
-            !app.session_entities
-                .apply(scenario.transition_frames[0].clone())
-                .expect("stale prior-generation delta is ignored")
-        );
-        assert!(
-            app.session_entities
-                .apply(scenario.reconnect_snapshot.clone())
-                .expect("fresh reconnect snapshot applies")
-        );
-        let reconnect_frames = vec![scenario.reconnect_snapshot.clone()];
-        let reconnect_rows = botster_hub_test_support::materialize_session_plugin_rows(
-            &scenario.surface,
-            &reconnect_frames,
-        )
-        .expect("producer reconnect rows materialize");
-        assert_eq!(reconnect_rows, scenario.row_expected.after_reconnect);
-        assert_session_binding_frame(
-            &app,
-            &scenario.expected.after_reconnect,
-            &scenario.references,
-            &reconnect_rows,
-        );
-        assert_keyboard_and_mouse_dispatch(&mut app, &reconnect_rows);
-    }
-
-    #[test]
-    fn bound_action_materializes_payload_and_dispatches_from_real_hit_region() {
-        let body = ui_node(json!({
-            "type": "panel",
-            "id": "bound-action-panel",
-            "props": { "title": "Bound action" },
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": "session-action" },
-                "item_template": {
-                    "type": "panel",
-                    "id": "bound-session-panel",
-                    "props": { "title": "Bound session" },
-                    "slots": {
-                        "body": [{
-                            "$kind": "bind_if",
-                            "path": "@/lifecycle_class",
-                            "node": {
-                                "type": "button",
-                                "id": "bound-session-action",
-                                "props": {
-                                    "label": { "$bind": "@/lifecycle_class" },
-                                    "action": {
-                                        "id": "bound.open",
-                                        "payload": {
-                                            "session_uuid": { "$bind": "@/session_uuid" },
-                                            "lifecycle_class": { "$bind": "@/lifecycle_class" }
-                                        }
-                                    }
-                                }
-                            }
-                        }]
-                    }
-                },
-                "empty_template": {
-                    "type": "text",
-                    "id": "bound-session-unavailable",
-                    "props": { "text": "Session unavailable" }
-                }
-            }]
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.bound-action",
-            body,
-        )));
-        app.session_entities
-            .begin_generation("bound-action-generation".to_string());
-        app.session_entities
-            .apply(DaemonEntityFrame::Snapshot {
-                subscription_id: "bound-action-generation".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                items: vec![session_entity_value(DaemonSessionEntity {
-                    registry_state: "running".to_string(),
-                    ..session_entity("session-action", Some("running"))
-                })],
-                resync_reason: None,
-            })
-            .expect("snapshot applies");
-
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("current"), "{rendered}");
-        assert!(!rendered.contains("Session unavailable"), "{rendered}");
-        let dispatch = click_dispatch_for_surface(
-            &hit_map,
-            "bound-session-action",
-            Some("contract.bound-action"),
-        );
-        let InputDispatch::Action(request) = dispatch else {
-            panic!("materialized button should dispatch an action");
-        };
-        assert_eq!(
-            request.payload,
-            Some(json!({
-                "session_uuid": "session-action",
-                "lifecycle_class": "current"
-            }))
-        );
-        let surface_fixture = app.plugin_surface.clone().expect("active bound surface");
-        app.handle_dispatch(InputDispatch::Action(request.clone()));
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: "botster.plugin-contract-matrix".to_string(),
-                    request,
-                })
-        );
-        app.apply_response(plugin_surface_response(surface_fixture));
-        app.session_entities
-            .begin_generation("bound-action-generation".to_string());
-        app.session_entities
-            .apply(DaemonEntityFrame::Snapshot {
-                subscription_id: "bound-action-generation".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                items: vec![session_entity_value(DaemonSessionEntity {
-                    registry_state: "running".to_string(),
-                    ..session_entity("session-action", Some("running"))
-                })],
-                resync_reason: None,
-            })
-            .expect("focus-removal baseline applies");
-
-        let action_region = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "bound-session-action")
-            .expect("bound action region");
-        let mut router = InputRouter::new(renderer::action_request_context_for(
-            "contract.bound-action",
-        ));
-        let _ = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                action_region.rect.x,
-                action_region.rect.y,
-            ),
-            &hit_map,
-        );
-        assert_eq!(router.focused_node_id(), Some("bound-session-action"));
-        assert!(
-            app.session_entities
-                .apply(DaemonEntityFrame::Remove {
-                    subscription_id: "bound-action-generation".to_string(),
-                    entity_type: "session".to_string(),
-                    snapshot_seq: 2,
-                    id: "session-action".to_string(),
-                })
-                .expect("remove applies")
-        );
-        let (removed_lines, removed_hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
-        let removed = removed_lines.join("\n");
-        assert!(removed.contains("Session unavailable"), "{removed}");
-        assert!(
-            !removed_hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "bound-session-action")
-        );
-        router.reconcile(&removed_hit_map);
-        assert_ne!(router.focused_node_id(), Some("bound-session-action"));
-    }
-
-    #[test]
-    fn optional_session_fields_are_null_and_bind_if_preserves_the_surface() {
-        let body = ui_node(json!({
-            "type": "panel",
-            "id": "optional-field-panel",
-            "props": { "title": "Optional field" },
-            "children": [
-                {
-                    "type": "text",
-                    "id": "optional-field-surrounding-content",
-                    "props": { "text": "Surrounding content remains" }
-                },
-                {
-                    "$kind": "bind_list",
-                    "source": "/session",
-                    "where": { "session_uuid": "session-indeterminate" },
-                    "item_template": {
-                        "type": "panel",
-                        "id": "optional-field-row",
-                        "props": { "title": "Indeterminate session" },
-                        "children": [{
-                            "$kind": "bind_if",
-                            "path": "@/lifecycle",
-                            "node": {
-                                "type": "text",
-                                "id": "optional-field-lifecycle",
-                                "props": { "text": { "$bind": "@/lifecycle" } }
-                            }
-                        }]
-                    }
-                }
-            ]
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.optional-field",
-            body,
-        )));
-        app.session_entities
-            .begin_generation("optional-field-generation".to_string());
-        app.session_entities
-            .apply(snapshot_frame(
-                "optional-field-generation",
-                1,
-                vec![session_entity("session-indeterminate", None)],
-            ))
-            .expect("snapshot applies");
-
-        let rows = app
-            .session_entities
-            .binding_rows()
-            .expect("binding rows serialize");
-        let row = rows
-            .iter()
-            .find(|row| row.get("session_uuid") == Some(&json!("session-indeterminate")))
-            .expect("session binding row");
-        for field in ["lifecycle", "exit_code", "failure_reason"] {
-            assert_eq!(row.get(field), Some(&Value::Null), "{field}");
-        }
-
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.contains("Surrounding content remains"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Indeterminate session"), "{rendered}");
-        assert!(!rendered.contains("plugin surface binding:"), "{rendered}");
-        assert!(
-            !hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "optional-field-lifecycle")
-        );
-    }
-
-    #[test]
-    fn duplicate_ids_in_responsive_alternatives_are_render_scoped() {
-        let action = |id: &str| {
-            node(
-                UiNodeKind::Button,
-                id,
-                json!({
-                    "label": "Responsive action",
-                    "action": { "id": "contract.responsive" }
-                }),
-            )
-        };
-        let mut body = node(
-            UiNodeKind::Panel,
-            "responsive-panel",
-            json!({ "title": "Responsive alternatives" }),
-        );
-        body.children = vec![
-            responsive_child(UiWidthClass::Expanded, action("responsive-action")),
-            responsive_child(UiWidthClass::Compact, action("responsive-action")),
-        ];
-        materialize_plugin_surface(
-            &body,
-            &SessionEntityState::default(),
-            &EntityFamilyStore::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .expect("mutually exclusive render alternatives may reuse one node id");
-
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.responsive",
-            body,
-        )));
-        for width in [40, 180] {
-            let (lines, hit_map) = renderer::render_to_lines(&app.surface(), width, 40);
-            let rendered = lines.join("\n");
-            assert!(!rendered.contains("plugin surface binding:"), "{rendered}");
-            assert_eq!(
-                hit_map
-                    .regions()
-                    .iter()
-                    .filter(|region| region.node_id == "responsive-action")
-                    .count(),
-                1
-            );
-        }
-
-        let mut complementary = node(
-            UiNodeKind::Panel,
-            "complementary-panel",
-            json!({ "title": "Complementary conditions" }),
-        );
-        complementary.children = vec![
-            responsive_child(UiWidthClass::Expanded, action("complementary-action")),
-            UiChild::Conditional(UiConditional::Hidden {
-                condition: UiCondition {
-                    width: Some(UiWidthClass::Expanded),
-                    ..UiCondition::default()
-                },
-                node: Box::new(action("complementary-action")),
-            }),
-        ];
-        materialize_plugin_surface(
-            &complementary,
-            &SessionEntityState::default(),
-            &EntityFamilyStore::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .expect("When and Hidden with the same condition cannot coexist");
-
-        let mut presentation_alternatives = node(
-            UiNodeKind::Panel,
-            "presentation-alternatives-panel",
-            json!({ "title": "Presentation alternatives" }),
-        );
-        presentation_alternatives.children = ["first", "second"]
-            .into_iter()
-            .map(|value| {
-                UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf {
-                    predicate: botster_ui_contract::UiPresentationPredicate::Equals {
-                        key: botster_ui_contract::UiPresentationKey("dialog".to_string()),
-                        value: json!(value),
-                    },
-                    node: Box::new(action("presentation-action")),
-                })
-            })
-            .collect();
-        materialize_plugin_surface(
-            &presentation_alternatives,
-            &SessionEntityState::default(),
-            &EntityFamilyStore::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .expect("different values for one presentation key cannot render together");
-
-        let assert_collision =
-            |app: &mut TuiApp, surface_id: &str, node_id: &str, children: Vec<UiChild>| {
-                let mut overlapping = node(
-                    UiNodeKind::Panel,
-                    &format!("{node_id}-panel"),
-                    json!({ "title": "Overlapping conditions" }),
-                );
-                overlapping.children = children;
-                let diagnostic = format!("duplicate materialized node id {node_id:?}");
-                assert_eq!(
-                    materialize_plugin_surface(
-                        &overlapping,
-                        &SessionEntityState::default(),
-                        &EntityFamilyStore::new(),
-                        &BTreeMap::new(),
-                        &BTreeSet::new(),
-                    )
-                    .unwrap_err(),
-                    diagnostic
-                );
-                app.apply_response(plugin_surface_response(canonical_surface(
-                    "botster.plugin-contract-matrix",
-                    surface_id,
-                    overlapping,
-                )));
-                let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 40);
-                let rendered = lines.join("\n");
-                assert!(rendered.contains(&diagnostic), "{rendered}");
-                assert!(
-                    !hit_map
-                        .regions()
-                        .iter()
-                        .any(|region| region.node_id == node_id),
-                    "overlapping conditionals must fail before ambiguous regions reach routing"
-                );
-            };
-        assert_collision(
-            &mut app,
-            "contract.overlapping-hidden",
-            "overlapping-hidden-action",
-            vec![
-                responsive_child(UiWidthClass::Expanded, action("overlapping-hidden-action")),
-                UiChild::Conditional(UiConditional::Hidden {
-                    condition: UiCondition {
-                        width: Some(UiWidthClass::Compact),
-                        ..UiCondition::default()
-                    },
-                    node: Box::new(action("overlapping-hidden-action")),
-                }),
-            ],
-        );
-        assert_collision(
-            &mut app,
-            "contract.identical-when",
-            "identical-when-action",
-            vec![
-                responsive_child(UiWidthClass::Expanded, action("identical-when-action")),
-                responsive_child(UiWidthClass::Expanded, action("identical-when-action")),
-            ],
-        );
-        assert_collision(
-            &mut app,
-            "contract.cross-axis-when",
-            "cross-axis-when-action",
-            vec![
-                responsive_child(UiWidthClass::Expanded, action("cross-axis-when-action")),
-                UiChild::Conditional(UiConditional::When {
-                    condition: UiCondition {
-                        height: Some(botster_ui_contract::UiHeightClass::Tall),
-                        ..UiCondition::default()
-                    },
-                    node: Box::new(action("cross-axis-when-action")),
-                }),
-            ],
-        );
-        let presentation_child = |node_id: &str| {
-            UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf {
-                predicate: botster_ui_contract::UiPresentationPredicate::Equals {
-                    key: botster_ui_contract::UiPresentationKey("dialog".to_string()),
-                    value: json!("shared"),
-                },
-                node: Box::new(action(node_id)),
-            })
-        };
-        assert_collision(
-            &mut app,
-            "contract.identical-presentation",
-            "identical-presentation-action",
-            vec![
-                presentation_child("identical-presentation-action"),
-                presentation_child("identical-presentation-action"),
-            ],
-        );
-        assert_collision(
-            &mut app,
-            "contract.presentation-and-when",
-            "presentation-and-when-action",
-            vec![
-                presentation_child("presentation-and-when-action"),
-                responsive_child(
-                    UiWidthClass::Expanded,
-                    action("presentation-and-when-action"),
-                ),
-            ],
-        );
-    }
-
-    #[test]
-    fn duplicate_multi_row_identity_and_unknown_where_fields_fail_visibly() {
-        let multi_row = ui_node(json!({
-            "type": "panel",
-            "id": "multi-row-panel",
-            "props": { "title": "Multi row" },
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "registry_state": "active" },
-                "item_template": {
-                    "type": "button",
-                    "id": "multi-row-action",
-                    "props": {
-                        "label": { "$bind": "@/session_uuid" },
-                        "action": {
-                            "id": "contract.open",
-                            "payload": {
-                                "session_uuid": { "$bind": "@/session_uuid" }
-                            }
-                        }
-                    }
-                }
-            }]
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.multi-row",
-            multi_row,
-        )));
-        app.session_entities
-            .begin_generation("multi-row-generation".to_string());
-        app.session_entities
-            .apply(snapshot_frame(
-                "multi-row-generation",
-                1,
-                vec![
-                    session_entity("session-alpha", Some("running")),
-                    session_entity("session-beta", Some("running")),
-                ],
-            ))
-            .expect("snapshot applies");
-
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 40);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.contains("duplicate materialized node id \"multi-row-action\""),
-            "{rendered}"
-        );
-        assert!(
-            !hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "multi-row-action"),
-            "ambiguous actions must not reach input routing"
-        );
-
-        let static_sibling_collision = ui_node(json!({
-            "type": "panel",
-            "id": "static-sibling-panel",
-            "props": { "title": "Static sibling collision" },
-            "children": [
-                {
-                    "type": "button",
-                    "id": "session-alpha",
-                    "props": {
-                        "label": "Static sibling",
-                        "action": { "id": "contract.static" }
-                    }
-                },
-                {
-                    "$kind": "bind_list",
-                    "source": "/session",
-                    "where": { "session_uuid": "session-alpha" },
-                    "item_template": {
-                        "type": "button",
-                        "id": { "$bind": "@/session_uuid" },
-                        "props": {
-                            "label": "Bound row",
-                            "action": { "id": "contract.bound" }
-                        }
-                    }
-                }
-            ]
-        }));
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.static-sibling-collision",
-            static_sibling_collision,
-        )));
-        let (lines, collision_hits) = renderer::render_to_lines(&app.surface(), 120, 40);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.contains("duplicate materialized node id \"session-alpha\""),
-            "{rendered}"
-        );
-        assert!(
-            !collision_hits
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "session-alpha"),
-            "a row-vs-static collision must fail before either action reaches routing"
-        );
-
-        let unknown_where = ui_node(json!({
-            "type": "panel",
-            "id": "unknown-where-panel",
-            "props": { "title": "Unknown where" },
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_udid": "session-alpha" },
-                "item_template": {
-                    "type": "text",
-                    "id": "unknown-where-row",
-                    "props": { "text": "matched" }
-                },
-                "empty_template": {
-                    "type": "text",
-                    "id": "unknown-where-empty",
-                    "props": { "text": "Session unavailable" }
-                }
-            }]
-        }));
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.unknown-where",
-            unknown_where,
-        )));
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 40)
-            .0
-            .join("\n");
-        assert!(
-            rendered.contains("unsupported /session where field"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Session unavailable"), "{rendered}");
-    }
-
-    #[test]
-    fn canonical_snapshot_and_absolute_binding_fail_visibly() {
-        let body = ui_node(json!({
-            "type": "text",
-            "id": "snapshot-body",
-            "props": { "text": "body" }
-        }));
-        let mut missing_snapshot = TuiApp::new(None);
-        missing_snapshot.apply_response(plugin_surface_response(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.missing-snapshot".to_string(),
-            body,
-            ui_tree_snapshot: None,
-        }));
-        assert!(
-            missing_snapshot
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("omitted ui_tree_snapshot"))
-        );
-        assert!(missing_snapshot.plugin_surface.is_none());
-
-        let invalid_binding = ui_node(json!({
-            "type": "panel",
-            "id": "invalid-binding-panel",
-            "props": { "title": "Invalid binding" },
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": "session-invalid" },
-                "item_template": {
-                    "type": "text",
-                    "id": "invalid-bound-value",
-                    "props": {
-                        "text": { "$bind": "/session/session-invalid/lifecycle_class" }
-                    }
-                }
-            }]
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.invalid-binding",
-            invalid_binding,
-        )));
-        app.session_entities
-            .begin_generation("invalid-binding-generation".to_string());
-        app.session_entities
-            .apply(DaemonEntityFrame::Snapshot {
-                subscription_id: "invalid-binding-generation".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                items: vec![session_entity_value(DaemonSessionEntity {
-                    registry_state: "running".to_string(),
-                    ..session_entity("session-invalid", Some("running"))
-                })],
-                resync_reason: None,
-            })
-            .expect("snapshot applies");
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 40)
-            .0
-            .join("\n");
-        assert!(
-            rendered.contains("unsupported absolute binding path"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Session unavailable"), "{rendered}");
-    }
-
-    #[test]
-    fn invalid_bound_row_ids_fail_before_renderer_state() {
-        let mut state = SessionEntityState::default();
-        state.begin_generation("invalid-bound-id-generation".to_string());
-        state
-            .apply(snapshot_frame(
-                "invalid-bound-id-generation",
-                1,
-                vec![session_entity("session-alpha", Some("running"))],
-            ))
-            .expect("snapshot applies");
-
-        for (path, expected) in [
-            ("@/rows", "bound node id did not resolve to a string"),
-            (
-                "@/does_not_exist",
-                "binding path \"@/does_not_exist\" is missing from the current session row",
-            ),
-            (
-                "/session/session-alpha",
-                "unsupported absolute binding path",
-            ),
-        ] {
-            let root = ui_node(json!({
-                "type": "panel",
-                "id": "invalid-bound-id-panel",
-                "children": [{
-                    "$kind": "bind_list",
-                    "source": "/session",
-                    "where": { "session_uuid": "session-alpha" },
-                    "item_template": {
-                        "type": "button",
-                        "id": { "$bind": path },
-                        "props": {
-                            "label": "Invalid bound id",
-                            "action": { "id": "contract.invalid" }
-                        }
-                    }
-                }]
-            }));
-            let error = materialize_plugin_surface(
-                &root,
-                &state,
-                &EntityFamilyStore::new(),
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            )
-            .expect_err("invalid bound identity must not materialize");
-            assert!(error.contains(expected), "{path}: {error}");
-        }
-
-        let mut blank_state = SessionEntityState::default();
-        blank_state.begin_generation("blank-bound-id-generation".to_string());
-        blank_state
-            .apply(snapshot_frame(
-                "blank-bound-id-generation",
-                1,
-                vec![session_entity(" ", Some("running"))],
-            ))
-            .expect("blank-id snapshot applies");
-        let blank = ui_node(json!({
-            "type": "panel",
-            "id": "blank-bound-id-panel",
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "registry_state": "active" },
-                "item_template": {
-                    "type": "button",
-                    "id": { "$bind": "@/session_uuid" },
-                    "props": {
-                        "label": "Blank bound id",
-                        "action": { "id": "contract.blank" }
-                    }
-                }
-            }]
-        }));
-        assert_eq!(
-            materialize_plugin_surface(
-                &blank,
-                &blank_state,
-                &EntityFamilyStore::new(),
-                &BTreeMap::new(),
-                &BTreeSet::new()
-            )
-            .unwrap_err(),
-            "bound node id resolved to a blank string"
-        );
-    }
-
-    #[test]
-    fn authored_descendant_identity_diagnostics_precede_materialization() {
-        let invalid_cases = [
-            (
-                "blank",
-                ui_node(json!({
-                    "type": "panel",
-                    "id": "sessions",
-                    "children": [{
-                        "$kind": "bind_list",
-                        "source": "/session",
-                        "item_template": {
-                            "type": "inline",
-                            "id": { "$bind": "@/session_uuid" },
-                            "children": [{
-                                "type": "button",
-                                "id": { "$kind": "bind_list_descendant_id", "key": " \t" },
-                                "props": {
-                                    "label": "Blank",
-                                    "action": { "id": "contract.action" }
-                                }
-                            }]
-                        }
-                    }]
-                })),
-                "key cannot be blank",
-            ),
-            (
-                "misplaced",
-                ui_node(json!({
-                    "type": "button",
-                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
-                    "props": {
-                        "label": "Misplaced",
-                        "action": { "id": "contract.action" }
-                    }
-                })),
-                "valid only below a bind_list item_template root",
-            ),
-            (
-                "duplicate-siblings",
-                ui_node(json!({
-                    "type": "panel",
-                    "id": "sessions",
-                    "children": [{
-                        "$kind": "bind_list",
-                        "source": "/session",
-                        "item_template": {
-                            "type": "inline",
-                            "id": { "$bind": "@/session_uuid" },
-                            "children": [{
-                                "type": "button",
-                                "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
-                                "props": { "label": "Remove", "action": { "id": "contract.action" } }
-                            }, {
-                                "type": "button",
-                                "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
-                                "props": { "label": "Remove again", "action": { "id": "contract.action" } }
-                            }]
-                        }
-                    }]
-                })),
-                "key must be unique across the complete bind_list item template",
-            ),
-            (
-                "duplicate-exclusive-branches",
-                ui_node(json!({
-                    "type": "panel",
-                    "id": "sessions",
-                    "children": [{
-                        "$kind": "bind_list",
-                        "source": "/session",
-                        "item_template": {
-                            "type": "inline",
-                            "id": { "$bind": "@/session_uuid" },
-                            "children": [{
-                                "$kind": "when",
-                                "condition": { "width": "compact" },
-                                "node": {
-                                    "type": "button",
-                                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
-                                    "props": { "label": "Remove", "action": { "id": "contract.action" } }
-                                }
-                            }, {
-                                "$kind": "hidden",
-                                "condition": { "width": "compact" },
-                                "node": {
-                                    "type": "button",
-                                    "id": { "$kind": "bind_list_descendant_id", "key": "remove" },
-                                    "props": { "label": "Remove expanded", "action": { "id": "contract.action" } }
-                                }
-                            }]
-                        }
-                    }]
-                })),
-                "key must be unique across the complete bind_list item template",
-            ),
-        ];
-
-        for (surface_id, body, expected) in invalid_cases {
-            let error = plugin_surface_body_node(&canonical_surface(
-                "botster.plugin-contract-matrix",
-                surface_id,
-                body,
-            ))
-            .expect_err("authored descendant identity must fail before materialization");
-            assert!(error.contains(expected), "{surface_id}: {error}");
-        }
-    }
-
-    #[test]
-    fn realized_validation_rejects_surviving_sentinels_before_hit_regions() {
-        let unresolved = ui_node(json!({
-            "type": "button",
-            "id": "unresolved-required-label",
-            "props": {
-                "label": { "$bind": "@/lifecycle_class" },
-                "action": { "id": "contract.unresolved" }
-            }
-        }));
-        unresolved
-            .validate()
-            .expect("required bindable sentinel is valid authored content");
-        let surface = canonical_surface(
-            "botster.plugin-contract-matrix",
-            "contract.unresolved-realized",
-            unresolved.clone(),
-        );
-        let diagnostic = validated_materialized_plugin_surface_node(&surface, unresolved);
-        assert_eq!(
-            diagnostic
-                .id
-                .as_ref()
-                .and_then(UiAuthoredNodeId::as_literal),
-            Some(&UiNodeId(
-                "tui-plugin-surface-materialized-invalid".to_string()
-            ))
-        );
-        let (lines, hit_map) = renderer::render_to_lines(&diagnostic, 120, 20);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("failed UiNode validate"), "{rendered}");
-        assert!(
-            !hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "unresolved-required-label")
-        );
-    }
-
-    #[test]
-    fn canonical_descendant_identity_is_utf8_safe_injective_and_collision_checked() {
-        let first_row = "会話:1-😀";
-        let first_key = "remove:🧹";
-        let second_row = "会話";
-        let second_key = ":1-😀remove:🧹";
-        assert_eq!(
-            format!("{first_row}{first_key}"),
-            format!("{second_row}{second_key}")
-        );
-
-        let body = ui_node(json!({
-            "type": "panel",
-            "id": "identity-panel",
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": first_row },
-                "item_template": {
-                    "type": "inline",
-                    "id": { "$bind": "@/session_uuid" },
-                    "children": [{
-                        "type": "button",
-                        "id": { "$kind": "bind_list_descendant_id", "key": first_key },
-                        "props": { "label": "First", "action": { "id": "contract.first" } }
-                    }]
-                }
-            }, {
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": second_row },
-                "item_template": {
-                    "type": "inline",
-                    "id": { "$bind": "@/session_uuid" },
-                    "children": [{
-                        "type": "button",
-                        "id": { "$kind": "bind_list_descendant_id", "key": second_key },
-                        "props": { "label": "Second", "action": { "id": "contract.second" } }
-                    }]
-                }
-            }]
-        }));
-        body.validate().expect("authored identity tree is valid");
-        let mut state = SessionEntityState::default();
-        state.begin_generation("unicode-identity-generation".to_string());
-        state
-            .apply(snapshot_frame(
-                "unicode-identity-generation",
-                1,
-                vec![
-                    session_entity(first_row, Some("running")),
-                    session_entity(second_row, Some("running")),
-                ],
-            ))
-            .expect("unicode identity snapshot applies");
-        let materialized = materialize_plugin_surface(
-            &body,
-            &state,
-            &EntityFamilyStore::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .expect("canonical identities do not collide");
-        let first_id = realize_bind_list_descendant_id(first_row, first_key)
-            .expect("first canonical identity");
-        let second_id = realize_bind_list_descendant_id(second_row, second_key)
-            .expect("second canonical identity");
-        assert_ne!(first_id, second_id);
-        assert!(find_ui_node_by_id(&materialized, &first_id.0).is_some());
-        assert!(find_ui_node_by_id(&materialized, &second_id.0).is_some());
-
-        let collision = ui_node(json!({
-            "type": "panel",
-            "id": "collision-panel",
-            "children": [{
-                "type": "button",
-                "id": first_id.0,
-                "props": { "label": "Static", "action": { "id": "contract.static" } }
-            }, {
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": first_row },
-                "item_template": {
-                    "type": "inline",
-                    "id": { "$bind": "@/session_uuid" },
-                    "children": [{
-                        "type": "button",
-                        "id": { "$kind": "bind_list_descendant_id", "key": first_key },
-                        "props": { "label": "Bound", "action": { "id": "contract.bound" } }
-                    }]
-                }
-            }]
-        }));
-        collision
-            .validate()
-            .expect("authored identity cannot predict a realized collision");
-        assert_eq!(
-            materialize_plugin_surface(
-                &collision,
-                &state,
-                &EntityFamilyStore::new(),
-                &BTreeMap::new(),
-                &BTreeSet::new()
-            )
-            .unwrap_err(),
-            format!("duplicate materialized node id {:?}", first_id.0)
-        );
-    }
-
-    #[test]
-    fn nested_bind_lists_reset_descendant_row_identity_context() {
-        let body = ui_node(json!({
-            "type": "panel",
-            "id": "nested-identity-panel",
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": "row-a" },
-                "item_template": {
-                    "type": "inline",
-                    "id": { "$bind": "@/session_uuid" },
-                    "children": [{
-                        "type": "button",
-                        "id": { "$kind": "bind_list_descendant_id", "key": "detach" },
-                        "props": { "label": "Outer detach", "action": { "id": "contract.outer" } }
-                    }, {
-                        "$kind": "bind_list",
-                        "source": "/session",
-                        "where": { "session_uuid": "row-b" },
-                        "item_template": {
-                            "type": "inline",
-                            "id": { "$bind": "@/session_uuid" },
-                            "children": [{
-                                "type": "button",
-                                "id": { "$kind": "bind_list_descendant_id", "key": "detach" },
-                                "props": { "label": "Inner detach", "action": { "id": "contract.inner-detach" } }
-                            }, {
-                                "type": "button",
-                                "id": { "$kind": "bind_list_descendant_id", "key": "rename" },
-                                "props": { "label": "Inner rename", "action": { "id": "contract.inner-rename" } }
-                            }]
-                        }
-                    }]
-                }
-            }]
-        }));
-        body.validate()
-            .expect("nested templates own independent descendant key scopes");
-        let mut state = SessionEntityState::default();
-        state.begin_generation("nested-identity-generation".to_string());
-        state
-            .apply(snapshot_frame(
-                "nested-identity-generation",
-                1,
-                vec![
-                    session_entity("row-a", Some("running")),
-                    session_entity("row-b", Some("running")),
-                ],
-            ))
-            .expect("nested identity snapshot applies");
-        let materialized = materialize_plugin_surface(
-            &body,
-            &state,
-            &EntityFamilyStore::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .expect("nested descendant identities materialize");
-        for (row_id, key) in [
-            ("row-a", "detach"),
-            ("row-b", "detach"),
-            ("row-b", "rename"),
-        ] {
-            let expected =
-                realize_bind_list_descendant_id(row_id, key).expect("nested canonical identity");
-            assert!(
-                find_ui_node_by_id(&materialized, &expected.0).is_some(),
-                "missing {row_id}/{key} canonical identity"
-            );
-        }
-        assert!(
-            find_ui_node_by_id(
-                &materialized,
-                &realize_bind_list_descendant_id("row-a", "rename")
-                    .expect("wrong outer identity is structurally valid")
-                    .0,
-            )
-            .is_none(),
-            "inner distinct key must not inherit the outer row identity"
-        );
-
-        let invalid_empty_descendant = ui_node(json!({
-            "type": "panel",
-            "id": "nested-empty-context-panel",
-            "children": [{
-                "$kind": "bind_list",
-                "source": "/session",
-                "where": { "session_uuid": "row-a" },
-                "item_template": {
-                    "type": "inline",
-                    "id": { "$bind": "@/session_uuid" },
-                    "children": [{
-                        "$kind": "bind_list",
-                        "source": "/session",
-                        "where": { "session_uuid": "missing-row" },
-                        "item_template": {
-                            "type": "inline",
-                            "id": { "$bind": "@/session_uuid" }
-                        },
-                        "empty_template": {
-                            "type": "button",
-                            "id": { "$kind": "bind_list_descendant_id", "key": "must-not-leak" },
-                            "props": { "label": "Invalid empty descendant", "action": { "id": "contract.invalid" } }
-                        }
-                    }]
-                }
-            }]
-        }));
-        assert_eq!(
-            materialize_plugin_surface(
-                &invalid_empty_descendant,
-                &state,
-                &EntityFamilyStore::new(),
-                &BTreeMap::new(),
-                &BTreeSet::new()
-            )
-            .unwrap_err(),
-            "bound list descendant id requires a realized item template root id"
-        );
-    }
-
-    #[test]
-    fn session_reducer_requires_snapshot_and_strictly_advancing_active_generation() {
-        let mut state = SessionEntityState::default();
-        state.begin_generation("generation-2".to_string());
-        let upsert = DaemonEntityFrame::Upsert {
-            subscription_id: "generation-2".to_string(),
-            entity_type: "session".to_string(),
-            snapshot_seq: 1,
-            id: "session-alpha".to_string(),
-            entity: session_entity_value(session_entity("session-alpha", Some("running"))),
-        };
-        assert!(
-            !state
-                .apply(upsert.clone())
-                .expect("pre-snapshot delta ignored")
-        );
-        assert!(
-            state
-                .apply(snapshot_frame("generation-2", 1, Vec::new()))
-                .expect("baseline applies")
-        );
-        assert!(!state.apply(upsert).expect("duplicate sequence ignored"));
-        assert!(
-            !state
-                .apply(snapshot_frame("generation-1", 99, Vec::new()))
-                .expect("prior generation ignored")
-        );
-    }
-
-    #[test]
-    fn session_reducer_decodes_generic_entity_records_into_the_typed_projection() {
-        let mut state = SessionEntityState::default();
-        state.begin_generation("generation-decode".to_string());
-
-        assert!(
-            state
-                .apply(snapshot_frame(
-                    "generation-decode",
-                    1,
-                    vec![DaemonSessionEntity {
-                        session_type_id: Some("botster.pipeline".to_string()),
-                        session_type_source: Some("device".to_string()),
-                        role: Some("botster.agent".to_string()),
-                        traits: vec!["managed-git".to_string(), "long-lived".to_string()],
-                        interaction: Some("interactive".to_string()),
-                        session_type_lifecycle: Some("long_running".to_string()),
-                        ..session_entity("session-typed", Some("running"))
-                    }],
-                ))
-                .expect("value-carrying snapshot decodes")
-        );
-
-        let entity = state
-            .entities
-            .get("session-typed")
-            .expect("decoded entity is retained under its session uuid");
-        assert_eq!(entity.session_type_id.as_deref(), Some("botster.pipeline"));
-        assert_eq!(entity.session_type_source.as_deref(), Some("device"));
-        assert_eq!(entity.role.as_deref(), Some("botster.agent"));
-        assert_eq!(entity.traits, vec!["managed-git", "long-lived"]);
-        assert_eq!(entity.interaction.as_deref(), Some("interactive"));
-        assert_eq!(
-            entity.session_type_lifecycle.as_deref(),
-            Some("long_running")
-        );
-    }
-
-    #[test]
-    fn session_reducer_surfaces_undecodable_records_instead_of_dropping_them() {
-        let mut state = SessionEntityState::default();
-        state.begin_generation("generation-malformed".to_string());
-        state
-            .apply(snapshot_frame("generation-malformed", 1, Vec::new()))
-            .expect("baseline applies");
-
-        let error = state
-            .apply(DaemonEntityFrame::Upsert {
-                subscription_id: "generation-malformed".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 2,
-                id: "session-malformed".to_string(),
-                entity: json!({ "registry_state": "running" }),
-            })
-            .expect_err("a record without session_uuid must not be silently dropped");
-        assert!(error.contains("session entity failed to decode"));
-        assert!(state.entities.is_empty());
-    }
-
-    #[test]
     fn session_reducer_reports_matching_subscription_errors_and_ignores_foreign_ones() {
         let mut state = SessionEntityState::default();
         state.begin_generation("generation-error".to_string());
@@ -15404,162 +12328,6 @@ mod tests {
     }
 
     #[test]
-    fn session_binding_rows_carry_the_session_type_keys_for_every_entity() {
-        let mut state = SessionEntityState::default();
-        state.begin_generation("generation-binding".to_string());
-        state
-            .apply(snapshot_frame(
-                "generation-binding",
-                1,
-                vec![session_entity("session-plain", Some("running"))],
-            ))
-            .expect("baseline applies");
-
-        let rows = state.binding_rows().expect("binding rows serialize");
-        let row = rows[0].as_object().expect("binding row is an object");
-        // The Hub omits these when absent; the reference row backfills them so a
-        // template never sees a missing key for one session and a present key for
-        // another.
-        for key in [
-            "session_type_id",
-            "session_type_source",
-            "role",
-            "traits",
-            "interaction",
-            "session_type_lifecycle",
-        ] {
-            assert!(row.contains_key(key), "binding row must carry {key}");
-        }
-    }
-
-    #[test]
-    fn session_navigator_preserves_authoritative_snapshot_order() {
-        let mut app = TuiApp::new(None);
-        app.session_entities
-            .begin_generation("ordered-generation".to_string());
-        app.session_entities
-            .apply(snapshot_frame(
-                "ordered-generation",
-                1,
-                vec![
-                    session_entity("session-zeta", Some("running")),
-                    session_entity("session-alpha", Some("running")),
-                ],
-            ))
-            .expect("out-of-lexicographic-order snapshot applies");
-        app.rebuild_session_rows();
-        assert_eq!(
-            app.sessions
-                .iter()
-                .map(|session| session.session_id.as_str())
-                .collect::<Vec<_>>(),
-            ["session-zeta", "session-alpha"]
-        );
-    }
-
-    #[test]
-    fn pending_spawn_is_separate_until_authoritative_upsert_and_never_auto_attaches() {
-        let mut app = TuiApp::new(None);
-        app.pending_sessions.insert(
-            "session-alpha".to_string(),
-            SessionRow::pending("session-alpha"),
-        );
-        app.selected_session = Some("session-alpha".to_string());
-        app.session_entities
-            .begin_generation("generation-1".to_string());
-        app.rebuild_session_rows();
-        assert!(app.sessions[0].pending);
-        assert!(!app.sessions[0].is_attachable());
-
-        app.session_entities
-            .apply(snapshot_frame("generation-1", 0, Vec::new()))
-            .expect("empty baseline applies");
-        app.rebuild_session_rows();
-        assert!(
-            app.sessions[0].pending,
-            "empty baseline keeps local pending feedback"
-        );
-
-        app.session_entities
-            .apply(DaemonEntityFrame::Upsert {
-                subscription_id: "generation-1".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                id: "session-alpha".to_string(),
-                entity: session_entity_value(session_entity("session-alpha", Some("running"))),
-            })
-            .expect("authoritative upsert applies");
-        app.rebuild_session_rows();
-        assert!(app.pending_sessions.is_empty());
-        assert!(app.sessions[0].is_attachable());
-        assert_eq!(app.attached_session, None);
-    }
-
-    #[test]
-    fn active_entity_subscription_disconnect_invalidates_attachment_and_generation() {
-        let mut app = TuiApp::new(None);
-        app.session_entities
-            .begin_generation("generation-1".to_string());
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("terminal-generation".to_string());
-        app.attach_hydration = Some(AttachHydration {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "terminal-generation".to_string(),
-            buffered_live_output: Vec::new(),
-            pending_input: Vec::new(),
-            pending_resize: None,
-            snapshot_ready: false,
-            snapshot_finished: false,
-            attached_seen: false,
-        });
-        let (sender, receiver) = mpsc::channel();
-        let (cancel_sender, _cancel_receiver) = mpsc::channel();
-        let (stopped_sender, stopped_receiver) = mpsc::channel();
-        stopped_sender.send(()).expect("reader already stopped");
-        app.session_subscription = Some(SessionSubscriptionPump {
-            messages: receiver,
-            cancel: Some(cancel_sender),
-            stopped: stopped_receiver,
-            stop_attempted: false,
-            stopped_confirmed: false,
-        });
-        sender
-            .send(SessionSubscriptionMessage::Disconnected {
-                subscription_id: "generation-1".to_string(),
-                error: "closed".to_string(),
-            })
-            .expect("disconnect message sends");
-
-        assert!(app.drain_session_subscription());
-        assert_eq!(app.session_entities.subscription_id, None);
-        assert_eq!(app.attached_session, None);
-        assert_eq!(app.attached_subscription_id, None);
-        assert!(app.attach_hydration.is_none());
-    }
-
-    #[test]
-    fn session_subscription_pump_cancellation_waits_for_reader_exit() {
-        let (_message_sender, messages) = mpsc::channel();
-        let (cancel, cancelled) = mpsc::channel();
-        let (stopped, reader_stopped) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            cancelled.recv().expect("reader receives cancellation");
-            stopped.send(()).expect("reader reports exit");
-        });
-        let mut pump = SessionSubscriptionPump {
-            messages,
-            cancel: Some(cancel),
-            stopped: reader_stopped,
-            stop_attempted: false,
-            stopped_confirmed: false,
-        };
-
-        assert!(pump.stop());
-        assert!(pump.stopped_confirmed);
-        reader.join().expect("reader exits after cancellation");
-    }
-
-    #[test]
     fn compatibility_error_branch_renders_distinct_compatibility_diagnostic() {
         let mut app = TuiApp::new(None);
         let mut requirement = tui_compatibility_requirement();
@@ -15574,7 +12342,7 @@ mod tests {
         let error = botster_hub_client::ensure_compatible(&requirement, &compatibility)
             .expect_err("unsatisfied requirement should produce compatibility error");
 
-        app.record_transport_error(DaemonTransportError::Compatibility(error));
+        app.apply_link_failure(DaemonTransportError::Compatibility(error));
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
@@ -15787,71 +12555,6 @@ mod tests {
     }
 
     #[test]
-    fn show_response_is_scoped_refresh_restores_list_and_errors_preserve_other_surfaces() {
-        let mut app = TuiApp::new(None);
-        let mut shown = package(
-            "botster.plugin-contract-matrix",
-            "1.0.0",
-            "plugin",
-            "enabled",
-            Vec::new(),
-            true,
-        );
-        shown.surfaces = contract_package_surfaces();
-        let other = package("local-other", "0.1.0", "local", "enabled", Vec::new(), true);
-        let full_list = vec![shown.clone(), other];
-        app.apply_response(packages_response(full_list.clone()));
-        app.apply_response(package_navigation_response(vec![
-            plugin_contract_app_navigation(),
-        ]));
-        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
-        let owner = app.plugin_surface.clone();
-
-        app.apply_response(packages_response(vec![shown.clone()]));
-
-        assert_eq!(app.packages, vec![shown]);
-        assert_eq!(
-            app.package_navigation,
-            vec![plugin_contract_app_navigation()]
-        );
-        assert_eq!(app.plugin_surface, owner);
-
-        let mut error = base_response(DaemonResponseKind::Packages);
-        error.error = Some(botster_hub_client::DaemonOperatorError {
-            code: "package_policy_error".to_string(),
-            request_id: "show-missing".to_string(),
-            operation: "show".to_string(),
-            message: "package action failed: PackageNotInstalled".to_string(),
-            diagnostics: Vec::new(),
-        });
-        app.apply_response(error);
-        assert_eq!(app.packages.len(), 1);
-        assert_eq!(
-            app.package_navigation,
-            vec![plugin_contract_app_navigation()]
-        );
-        assert_eq!(app.plugin_surface, owner);
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("package_policy_error"))
-        );
-        let rendered_error = renderer::render_to_lines(&app.surface(), 320, 120)
-            .0
-            .join("\n");
-        assert!(rendered_error.contains("package_policy_error"));
-        assert!(rendered_error.contains("operation=show"));
-
-        app.apply_response(packages_response(full_list.clone()));
-        assert_eq!(app.packages, full_list);
-        assert_eq!(
-            app.package_navigation,
-            vec![plugin_contract_app_navigation()]
-        );
-        assert_eq!(app.plugin_surface, owner);
-    }
-
-    #[test]
     fn package_response_preserves_zero_entrypoint_package_row() {
         let mut app = TuiApp::new(None);
 
@@ -15979,754 +12682,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_surface_and_action_results_render_from_public_dtos() {
-        let mut app = TuiApp::new(None);
-
-        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
-        app.pending_plugin_request = Some(UiActionRequest {
-            request_id: UiActionRequestId("contract-action-success".to_string()),
-            surface_id: UiSurfaceId("contract.app".to_string()),
-            action_id: UiActionId("contract.action".to_string()),
-            node_id: Some(UiNodeId("contract-app-action".to_string())),
-            kind: UiActionKind::Submit,
-            values: None,
-            payload: None,
-        });
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "contract-action-success",
-            "surface_id": "contract.app",
-            "action_id": "contract.action",
-            "node_id": "contract-app-action",
-            "state": "accepted",
-            "normalized_values": {
-                "message": "hello"
-            }
-        })));
-
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix / contract.app"));
-        assert!(rendered.contains("UiNode payload delivered through plugin_surface_render."));
-        assert!(rendered.contains("Run contract action"));
-        assert_eq!(
-            app.action_feedback.as_deref(),
-            Some("state=Accepted request_id=contract-action-success")
-        );
-    }
-
-    #[test]
-    fn active_plugin_routes_arbitrary_and_colliding_actions_with_exact_identity() {
-        let mut app = TuiApp::new(None);
-        app.observed_requests.clear();
-        app.system_details_visible = false;
-        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
-        let request = UiActionRequest {
-            request_id: UiActionRequestId("request-collision".to_string()),
-            surface_id: UiSurfaceId("contract.app".to_string()),
-            action_id: UiActionId("botster.tui.toggle_system_details".to_string()),
-            node_id: Some(UiNodeId("contract-app-action".to_string())),
-            kind: UiActionKind::Submit,
-            values: Some(UiFormValues(
-                json!({ "message": "hello" })
-                    .as_object()
-                    .expect("values object")
-                    .clone(),
-            )),
-            payload: Some(json!({ "arbitrary": true })),
-        };
-
-        app.handle_dispatch(InputDispatch::Action(request.clone()));
-
-        assert_eq!(
-            app.observed_requests,
-            vec![ObservedRequest::PluginSurfaceAction {
-                package_name: "botster.plugin-contract-matrix".to_string(),
-                request,
-            }]
-        );
-        assert!(!app.system_details_visible);
-    }
-
-    #[test]
-    fn plugin_actions_require_the_active_owning_surface() {
-        let mut app = TuiApp::new(None);
-        app.observed_requests.clear();
-        let request = plugin_request(
-            "request-without-owner",
-            "contract.app",
-            "plugin.arbitrary",
-            "contract-app-action",
-        );
-
-        app.handle_dispatch(InputDispatch::Action(request));
-        assert!(app.observed_requests.is_empty());
-
-        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
-        app.handle_dispatch(InputDispatch::Action(plugin_request(
-            "request-wrong-surface",
-            "contract.other",
-            "plugin.arbitrary",
-            "contract-app-action",
-        )));
-        assert!(app.observed_requests.is_empty());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("surface mismatch"))
-        );
-        assert_eq!(app.active_plugin_surface_id(), Some("contract.app"));
-    }
-
-    #[test]
-    fn tui_owned_escape_clears_plugin_scope_without_dispatch() {
-        let mut app = TuiApp::new(None);
-        app.observed_requests.clear();
-        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
-        app.plugin_presentation.set(
-            botster_ui_contract::UiPresentationKey("contract-dialog".to_string()),
-            Value::Bool(true),
-        );
-        app.pending_plugin_request = Some(plugin_request(
-            "request-pending",
-            "contract.presentation",
-            "contract.submit",
-            "contract-form",
-        ));
-
-        assert!(app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None));
-
-        assert!(app.plugin_surface.is_none());
-        assert_eq!(
-            app.plugin_presentation,
-            renderer::PresentationState::default()
-        );
-        assert!(app.pending_plugin_request.is_none());
-        assert!(app.plugin_action_result.is_none());
-        assert!(app.observed_requests.is_empty());
-        assert!(app.system_details_visible);
-        assert!(app.surface().id == Some(UiNodeId("workspace-root".to_string()).into()));
-    }
-
-    #[test]
-    fn matching_results_apply_presentation_rejection_errors_and_replacement() {
-        let mut app = TuiApp::new(None);
-        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
-
-        app.pending_plugin_request = Some(plugin_request(
-            "request-open",
-            "contract.presentation",
-            "contract.open",
-            "contract-open",
-        ));
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "request-open",
-            "surface_id": "contract.presentation",
-            "action_id": "contract.open",
-            "node_id": "contract-open",
-            "state": "accepted",
-            "presentation": [
-                { "kind": "set", "key": "contract-dialog", "value": true },
-                { "kind": "set", "key": "selected-workspace", "value": "workspace-alpha" }
-            ]
-        })));
-
-        let (lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            160,
-            60,
-            &RenderState::default(),
-            &app.plugin_presentation,
-        );
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("Contract form"));
-        assert!(rendered.contains("Selected workspace: workspace-alpha"));
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "contract-form")
-        );
-
-        let retained_root = app.plugin_surface.as_ref().expect("owner").body.clone();
-        let retained_presentation = app.plugin_presentation.clone();
-        app.pending_plugin_request = Some(plugin_request(
-            "request-rejected",
-            "contract.presentation",
-            "contract.submit",
-            "contract-form",
-        ));
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "request-rejected",
-            "surface_id": "contract.presentation",
-            "action_id": "contract.submit",
-            "node_id": "contract-form",
-            "state": "rejected",
-            "field_errors": {
-                "contract-message": ["Message is required"]
-            },
-            "form_errors": ["Fix the highlighted fields"]
-        })));
-        assert_eq!(
-            app.plugin_surface.as_ref().expect("owner").body,
-            retained_root
-        );
-        assert_eq!(app.plugin_presentation, retained_presentation);
-        let (lines, _) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            160,
-            60,
-            &RenderState::default(),
-            &app.plugin_presentation,
-        );
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("Message is required"), "{rendered}");
-        assert!(
-            rendered.contains("error: Message is required"),
-            "{rendered}"
-        );
-        assert_eq!(
-            rendered.matches("Message is required").count(),
-            1,
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Fix the highlighted fields"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Contract form"));
-
-        app.pending_plugin_request = Some(plugin_request(
-            "request-accepted",
-            "contract.presentation",
-            "contract.submit",
-            "contract-form",
-        ));
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "request-accepted",
-            "surface_id": "contract.presentation",
-            "action_id": "contract.submit",
-            "node_id": "contract-form",
-            "state": "accepted",
-            "presentation": [
-                { "kind": "clear", "key": "contract-dialog" }
-            ],
-            "replacement": {
-                "type": "button",
-                "id": "contract-action-replacement",
-                "props": {
-                    "label": "Replacement action",
-                    "action": { "id": "contract.replacement" }
-                }
-            }
-        })));
-        let surface = app.plugin_surface.as_ref().expect("owner retained");
-        assert_eq!(
-            surface.body.id,
-            Some(UiNodeId("contract-action-replacement".to_string()).into())
-        );
-        assert!(
-            surface.ui_tree_snapshot.is_none(),
-            "an app-owned replacement must clear the stale delivered snapshot"
-        );
-        assert!(
-            app.plugin_presentation
-                .get(&botster_ui_contract::UiPresentationKey(
-                    "contract-dialog".to_string()
-                ))
-                .is_none()
-        );
-        let (replacement_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            160,
-            60,
-            &RenderState::default(),
-            &app.plugin_presentation,
-        );
-        let rendered = replacement_lines.join("\n");
-        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix"));
-        assert!(rendered.contains("Replacement action"));
-        assert!(!rendered.contains("Contract form"));
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "contract-action-replacement")
-        );
-    }
-
-    #[test]
-    fn mismatched_plugin_result_cannot_mutate_active_scope() {
-        let mut app = TuiApp::new(None);
-        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
-        app.pending_plugin_request = Some(plugin_request(
-            "request-current",
-            "contract.presentation",
-            "contract.open",
-            "contract-open",
-        ));
-        let retained_root = app.plugin_surface.as_ref().expect("owner").body.clone();
-
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "request-stale",
-            "surface_id": "contract.presentation",
-            "action_id": "contract.open",
-            "node_id": "contract-open",
-            "state": "accepted",
-            "presentation": [
-                { "kind": "set", "key": "contract-dialog", "value": true }
-            ],
-            "replacement": {
-                "type": "text",
-                "id": "stale-replacement",
-                "props": { "text": "stale" }
-            }
-        })));
-
-        assert_eq!(
-            app.plugin_surface.as_ref().expect("owner").body,
-            retained_root
-        );
-        assert_eq!(
-            app.plugin_presentation,
-            renderer::PresentationState::default()
-        );
-        assert_eq!(
-            app.pending_plugin_request
-                .as_ref()
-                .map(|request| request.request_id.0.as_str()),
-            Some("request-current")
-        );
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("mismatched"))
-        );
-        let rendered = renderer::render_to_lines(&app.surface(), 160, 60)
-            .0
-            .join("\n");
-        assert!(
-            rendered.contains("ignored mismatched plugin action result"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn rejected_dialog_fields_render_one_native_error_row_per_supported_kind() {
-        let mut app = TuiApp::new(None);
-        app.apply_response(plugin_surface_response(field_error_kinds_plugin_surface()));
-        app.pending_plugin_request = Some(plugin_request(
-            "request-field-errors",
-            "contract.field-errors",
-            "contract.submit",
-            "contract-field-error-form",
-        ));
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "request-field-errors",
-            "surface_id": "contract.field-errors",
-            "action_id": "contract.submit",
-            "node_id": "contract-field-error-form",
-            "state": "rejected",
-            "field_errors": {
-                "contract-text-input": ["Text input required"],
-                "contract-checkbox": ["Checkbox required"],
-                "contract-form-field": ["Form field required"],
-                "contract-textarea": ["Textarea required"],
-                "contract-select": ["Select required"]
-            },
-            "form_errors": ["Fix the highlighted fields"]
-        })));
-
-        let (lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            180,
-            80,
-            &RenderState::default(),
-            &app.plugin_presentation,
-        );
-        let rendered = lines.join("\n");
-
-        assert!(rendered.contains("Field error contract"), "{rendered}");
-        for message in [
-            "Text input required",
-            "Checkbox required",
-            "Form field required",
-            "Textarea required",
-            "Select required",
-        ] {
-            assert!(
-                rendered.contains(&format!("error: {message}")),
-                "{rendered}"
-            );
-            assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
-        }
-        for node_id in [
-            "contract-text-input",
-            "contract-checkbox",
-            "contract-form-field",
-            "contract-textarea",
-            "contract-select",
-        ] {
-            assert!(
-                hit_map
-                    .regions()
-                    .iter()
-                    .any(|region| region.node_id == node_id),
-                "missing hit region for {node_id}: {rendered}"
-            );
-        }
-    }
-
-    #[test]
-    fn plugin_shell_renders_action_failure_feedback_and_diagnostics() {
-        let mut app = TuiApp::new(None);
-        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
-        app.pending_plugin_request = Some(plugin_request(
-            "request-error",
-            "contract.app",
-            "contract.action",
-            "contract-app-action",
-        ));
-        let mut response = plugin_action_response(json!({
-            "request_id": "request-error",
-            "surface_id": "contract.app",
-            "action_id": "contract.action",
-            "node_id": "contract-app-action",
-            "state": "error",
-            "error": "contract action failed"
-        }));
-        response.diagnostics.push(DaemonDiagnostic {
-            kind: DaemonDiagnosticKind::ActionFailure,
-            operation: Some("plugin_surface_action".to_string()),
-            feature: Some("plugin_surface_actions".to_string()),
-            message: Some("contract action failed".to_string()),
-        });
-
-        app.apply_response(response);
-
-        let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
-        assert!(
-            rendered.contains("action: state=Error request_id=request-error"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("diagnostic: action_failure"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("operation=plugin_surface_action"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("contract action failed"), "{rendered}");
-    }
-
-    #[test]
-    fn keyboard_dialog_rejection_retains_router_draft_focus_and_submit_identity() {
-        let mut app = TuiApp::new(None);
-        app.apply_response(plugin_surface_response(presentation_plugin_surface()));
-        app.plugin_presentation.set(
-            botster_ui_contract::UiPresentationKey("contract-dialog".to_string()),
-            Value::Bool(true),
-        );
-        let mut router = InputRouter::new(renderer::action_request_context_for(
-            "contract.presentation",
-        ));
-        let (_lines, initial_hits) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            160,
-            60,
-            &router.render_state(),
-            &app.plugin_presentation,
-        );
-        router.reconcile(&initial_hits);
-        assert_eq!(
-            router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &initial_hits,
-            ),
-            InputDispatch::Focus {
-                node_id: "contract-form".to_string()
-            }
-        );
-        assert_eq!(
-            router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &initial_hits,
-            ),
-            InputDispatch::Focus {
-                node_id: "contract-message".to_string()
-            }
-        );
-        router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE)),
-            &initial_hits,
-        );
-        assert_eq!(router.draft_value("message"), Some(&json!("H")));
-
-        app.pending_plugin_request = Some(plugin_request(
-            "request-keyboard-rejected",
-            "contract.presentation",
-            "contract.submit",
-            "contract-form",
-        ));
-        app.apply_response(plugin_action_response(json!({
-            "request_id": "request-keyboard-rejected",
-            "surface_id": "contract.presentation",
-            "action_id": "contract.submit",
-            "node_id": "contract-form",
-            "state": "rejected",
-            "field_errors": {
-                "contract-message": ["Message is too short"]
-            },
-            "form_errors": ["Fix the highlighted fields"]
-        })));
-        let (_lines, rejected_hits) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            160,
-            60,
-            &router.render_state(),
-            &app.plugin_presentation,
-        );
-        router.reconcile(&rejected_hits);
-        assert_eq!(router.focused_node_id(), Some("contract-message"));
-        assert_eq!(router.draft_value("message"), Some(&json!("H")));
-
-        assert_eq!(
-            router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &rejected_hits,
-            ),
-            InputDispatch::Focus {
-                node_id: "contract-form".to_string()
-            }
-        );
-        let dispatch = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &rejected_hits,
-        );
-        assert!(matches!(
-            &dispatch,
-            InputDispatch::Action(UiActionRequest {
-                surface_id,
-                action_id,
-                node_id,
-                kind: UiActionKind::Submit,
-                values: Some(values),
-                payload: Some(payload),
-                ..
-            }) if surface_id == &UiSurfaceId("contract.presentation".to_string())
-                && action_id == &UiActionId("contract.submit".to_string())
-                && node_id == &Some(UiNodeId("contract-form".to_string()))
-                && values.0.get("message") == Some(&json!("H"))
-                && payload == &json!({ "source": "dialog" })
-        ));
-        let expected_request = match &dispatch {
-            InputDispatch::Action(request) => request.clone(),
-            other => panic!("expected action dispatch, got {other:?}"),
-        };
-        app.observed_requests.clear();
-        app.handle_dispatch(dispatch);
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: "botster.plugin-contract-matrix".to_string(),
-                    request: expected_request,
-                })
-        );
-    }
-
-    #[test]
-    fn rendered_plugin_button_mouse_activation_reaches_hub_request_seam() {
-        let mut app = TuiApp::new(None);
-        app.apply_response(plugin_surface_response(contract_app_plugin_surface()));
-        app.observed_requests.clear();
-        let mut router = InputRouter::new(renderer::action_request_context_for("contract.app"));
-        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            160,
-            60,
-            &router.render_state(),
-            &app.plugin_presentation,
-        );
-        router.reconcile(&hit_map);
-        let action = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "contract-app-action")
-            .expect("rendered plugin button should be hit-testable");
-        let (column, row) = (action.rect.x, action.rect.y);
-        assert_eq!(
-            router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    column,
-                    row,
-                ),
-                &hit_map,
-            ),
-            InputDispatch::Focus {
-                node_id: "contract-app-action".to_string()
-            }
-        );
-        let dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &hit_map,
-        );
-        let expected_request = match &dispatch {
-            InputDispatch::Action(request) => request.clone(),
-            other => panic!("expected action dispatch, got {other:?}"),
-        };
-
-        app.handle_dispatch(dispatch);
-
-        assert_eq!(
-            expected_request.surface_id,
-            UiSurfaceId("contract.app".to_string())
-        );
-        assert_eq!(
-            expected_request.action_id,
-            UiActionId("contract.action".to_string())
-        );
-        assert_eq!(
-            expected_request.node_id,
-            Some(UiNodeId("contract-app-action".to_string()))
-        );
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: "botster.plugin-contract-matrix".to_string(),
-                    request: expected_request,
-                })
-        );
-    }
-
-    #[test]
-    fn composite_application_primitives_render_through_tui_kit() {
-        let surface = composite_application_primitives_plugin_surface();
-        let node = plugin_surface_body_node(&surface).expect("composite surface validates for TUI");
-
-        let (lines, hit_map) = renderer::render_to_lines(&node, 100, 36);
-        let rendered = lines.join("\n");
-
-        assert!(rendered.contains("Project Pipeline Overview"));
-        assert!(rendered.contains("Active Runs: 3"));
-        assert!(rendered.contains("Healthy"));
-        assert!(rendered.contains("Ticket"));
-        assert!(rendered.contains("State"));
-        assert!(rendered.contains("1783529012"));
-        assert!(rendered.contains("review"));
-        assert!(rendered.contains("No blocked tickets"));
-        assert!(rendered.contains("Reviewer"));
-        assert!(rendered.contains("Notes"));
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "contract-composite-refresh")
-        );
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "contract-composite-ticket-a")
-        );
-    }
-
-    #[test]
-    fn composite_application_primitives_render_from_production_plugin_surface_path() {
-        let mut app = TuiApp::new(None);
-
-        app.apply_response(plugin_surface_response(
-            composite_application_primitives_plugin_surface(),
-        ));
-
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 420, 220);
-        let rendered = lines.join("\n");
-
-        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix / contract.composite"));
-        assert!(rendered.contains("Project Pipeline Overview"));
-        assert!(rendered.contains("Refresh"));
-    }
-
-    #[test]
-    fn composite_table_mouse_selection_dispatches_exact_row_action() {
-        let surface = composite_application_primitives_plugin_surface();
-        let node = plugin_surface_body_node(&surface).expect("composite surface validates for TUI");
-        let (_lines, frame_n_hit_map) = renderer::render_to_lines(&node, 100, 36);
-        let row = frame_n_hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "contract-composite-ticket-a")
-            .expect("bordered composite table row should be hit-testable");
-        let (column, row) = (row.rect.x, row.rect.y);
-        let mut router = InputRouter::new(renderer::action_request_context());
-
-        let down_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &frame_n_hit_map,
-        );
-        assert_eq!(
-            down_dispatch,
-            InputDispatch::Focus {
-                node_id: "contract-composite-ticket-a".to_string()
-            }
-        );
-        assert_eq!(router.selected_row("contract-composite-ticket-table"), None);
-
-        let (_lines, frame_n_plus_one_hit_map) = renderer::render_to_lines(&node, 100, 36);
-        let up_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &frame_n_plus_one_hit_map,
-        );
-
-        assert!(matches!(
-            up_dispatch,
-            InputDispatch::Action(request)
-                if request.action_id == botster_ui_contract::UiActionId("contract.ticket.open".to_string())
-                    && request.node_id == Some(UiNodeId("contract-composite-ticket-a".to_string()))
-                    && request.payload == Some(json!({ "ticket_id": "1783529012" }))
-        ));
-        assert_eq!(
-            router
-                .selected_row_value("contract-composite-ticket-table")
-                .and_then(|value| value.get("id"))
-                .and_then(Value::as_str),
-            Some("contract-composite-ticket-a")
-        );
-    }
-
-    #[test]
-    fn plugin_surface_invalid_body_diagnostic_renders_from_app_surface() {
-        let mut app = TuiApp::new(None);
-
-        app.apply_response(plugin_surface_response(invalid_table_plugin_surface()));
-
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 180);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("Plugin: botster.plugin-contract-matrix / contract.invalid"));
-        assert!(rendered.contains(
-            "plugin surface render: plugin surface botster.plugin-contract-matrix:contract.invalid failed UiNode validate"
-        ));
-        assert!(rendered.contains("contract-invalid-table"));
-        assert!(rendered.contains("Table"));
-        assert!(rendered.contains("table"));
-        assert!(!rendered.contains("plugin surface render: invalid UiNode body"));
-    }
-
-    #[test]
     fn navigation_open_requests_public_plugin_surface_render() {
         let mut app = TuiApp::new(None);
         app.observed_requests.clear();
@@ -16792,24 +12747,6 @@ mod tests {
         assert!(rendered.contains("target=web_app"));
         assert!(rendered.contains("target_entrypoint_id=web"));
         assert!(rendered.contains("open=unsupported in botster-tui"));
-    }
-
-    #[test]
-    fn iframe_plugin_surface_renders_precise_unsupported_diagnostic() {
-        let mut app = TuiApp::new(None);
-
-        app.apply_response(plugin_surface_response(iframe_plugin_surface()));
-
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 320, 160);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("plugin surface iframe unsupported"));
-        assert!(rendered.contains("package=botster.plugin-contract-matrix"));
-        assert!(rendered.contains("surface=contract.iframe"));
-        assert!(rendered.contains("title=Contract HTML"));
-        assert!(rendered.contains("src=/assets/botster.plugin-contract-matrix/contract.html"));
-        assert!(rendered.contains(r#"sandbox=["allow_scripts"]"#));
-        assert!(rendered.contains("open=copy URL or open it in a browser"));
-        assert!(!rendered.contains("failed UiNode deserialize"));
     }
 
     #[test]
@@ -17457,8 +13394,8 @@ mod tests {
             .diagnostics
             .push(DaemonDiagnostic::connected("status"));
 
-        app.record_transport_error(DaemonTransportError::Compatibility(error));
-        app.record_transport_error(DaemonTransportError::ClientDisconnected);
+        app.apply_link_failure(DaemonTransportError::Compatibility(error));
+        app.apply_link_failure(DaemonTransportError::ClientDisconnected);
         app.apply_response(response);
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
@@ -17538,7 +13475,7 @@ mod tests {
     fn not_running_path_is_not_reported_as_compatibility_mismatch() {
         let mut app = TuiApp::new(None);
 
-        app.record_transport_error(DaemonTransportError::NotRunning);
+        app.apply_link_failure(DaemonTransportError::NotRunning);
 
         let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
         let rendered = lines.join("\n");
@@ -17561,933 +13498,6 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("terminal stream unavailable"));
         assert!(rendered.contains("terminal stream unavailable"));
-    }
-
-    #[test]
-    fn terminal_input_rejects_stale_attached_subscription_generation() {
-        let mut app = TuiApp::new(None);
-        app.subscription_id = "sub-current".to_string();
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-stale".to_string());
-        app.observed_requests.clear();
-
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"x".to_vec(),
-        });
-
-        assert!(app.observed_requests.is_empty());
-        assert_eq!(
-            app.error.as_deref(),
-            Some("terminal stream unavailable: current subscription is not attached")
-        );
-    }
-
-    #[test]
-    fn attach_state_tracks_attached_session_separately_from_selection() {
-        let mut app = TuiApp::new(None);
-        app.sessions = session_rows([("session-alpha", "running"), ("session-beta", "running")]);
-        app.selected_session = Some("session-beta".to_string());
-        app.begin_attach_hydration("session-beta", "sub-test");
-
-        apply_incremental_snapshot_frames(&mut app, "session-beta", "sub-test", b"");
-        app.apply_response(attach_state_response("session-beta", "attached"));
-
-        let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-        let rendered = lines.join("\n");
-        assert_eq!(app.attached_session.as_deref(), Some("session-beta"));
-        assert!(rendered.contains("Attached: session-beta"));
-        assert!(rendered.contains("session-beta · attached"));
-        assert!(rendered.contains("Terminal · session-beta"));
-    }
-
-    #[test]
-    fn stale_subscription_events_cannot_own_or_mutate_current_terminal_state() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-current");
-
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-stale".to_string(),
-            state: "attached".to_string(),
-        }]));
-        assert!(app.attached_session.is_none());
-
-        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-current", b"");
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-current".to_string(),
-                state: "attached".to_string(),
-            },
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-stale".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"stale"),
-            },
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-current".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"current"),
-            },
-        ]));
-
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert_eq!(app.attached_subscription_id.as_deref(), Some("sub-current"));
-        // Projection is authority; stale subscription output must not apply.
-        assert!(app.ghostty_projection.is_some());
-        assert!(viewport_cache_contains(&app, "current"));
-        assert!(!viewport_cache_contains(&app, "stale"));
-
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-stale".to_string(),
-            state: "detached".to_string(),
-        }]));
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert!(viewport_cache_contains(&app, "current"));
-    }
-
-    #[test]
-    fn terminal_view_carries_output_bytes() {
-        let mut app = TuiApp::new(None);
-        app.terminal_output = "hello terminal".to_string();
-
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
-        assert!(lines.join("\n").contains("hello terminal"));
-    }
-
-    #[test]
-    fn terminal_output_renders_as_terminal_primitive_content() {
-        let mut app = TuiApp::new(None);
-        app.terminal_output = "primitive terminal bytes".to_string();
-
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
-
-        assert!(lines.join("\n").contains("primitive terminal bytes"));
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "tui-terminal")
-        );
-        assert!(
-            !hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "tui-terminal-output")
-        );
-    }
-
-    #[test]
-    fn opaque_history_events_never_render_as_terminal_text() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-test");
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(b"snapshot\n"),
-            },
-            DaemonEvent::Scrollback {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(b"scrollback\n"),
-            },
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"live\n"),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                state: "attached".to_string(),
-            },
-        ]));
-
-        // Invalid opaque bytes never become text and cannot bypass FINISH.
-        assert!(!viewport_cache_contains(&app, "snapshot"));
-        assert!(!viewport_cache_contains(&app, "scrollback"));
-        assert!(!viewport_cache_contains(&app, "live"));
-        assert!(app.attach_hydration.is_some());
-        assert!(app.attached_session.is_none());
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 120, 48);
-        let _rendered = lines.join("\n");
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "tui-terminal")
-        );
-    }
-
-    #[test]
-    fn shared_late_attach_history_waits_through_empty_drain_and_renders_once_in_order() {
-        let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
-        assert!(
-            scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION,
-            "shared fixture must satisfy the TUI's minimum conformance revision"
-        );
-        let attaching_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
-            })
-            .expect("shared fixture includes attaching state");
-        let snapshot_indices = scenario
-            .history_then_live
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| {
-                matches!(event, DaemonEvent::Snapshot { .. }).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let attached_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
-            })
-            .expect("shared fixture includes attached state");
-        let live_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
-            .expect("shared fixture includes live output");
-        assert!(
-            !scenario
-                .history_then_live
-                .iter()
-                .any(|event| matches!(event, DaemonEvent::Scrollback { .. }))
-        );
-        assert!(snapshot_indices.len() >= 3);
-        assert!(
-            snapshot_indices
-                .iter()
-                .all(|index| { attaching_index < *index && *index < attached_index })
-        );
-        assert_eq!(snapshot_indices[0], attaching_index + 1);
-        assert!(
-            snapshot_indices
-                .windows(2)
-                .all(|indices| indices[1] == indices[0] + 1)
-        );
-        assert_eq!(attached_index, snapshot_indices.last().unwrap() + 1);
-        assert_eq!(live_index, attached_index + 1);
-        assert!(attached_index < live_index);
-
-        let mut app = TuiApp::new(None);
-        app.subscription_id = scenario.subscription_id.clone();
-        app.begin_attach_hydration(&scenario.session_id, &scenario.subscription_id);
-        app.observed_requests.clear();
-
-        app.apply_response(events_response(Vec::new()));
-        assert!(app.attach_hydration.is_some());
-        assert!(app.observed_requests.is_empty());
-
-        app.apply_response(events_response(vec![
-            scenario.history_then_live[attaching_index].clone(),
-        ]));
-        assert!(app.attach_hydration.is_some());
-        assert!(app.attached_session.is_none());
-        assert!(app.observed_requests.is_empty());
-
-        for (frame_index, event_index) in snapshot_indices.iter().enumerate() {
-            app.apply_response(events_response(vec![
-                scenario.history_then_live[*event_index].clone(),
-            ]));
-            assert!(app.terminal_output.is_empty());
-            assert!(app.attach_hydration.is_some());
-            assert!(app.ghostty_projection.is_some());
-            if frame_index == 0 {
-                assert!(app.attach_hydration.as_ref().is_some_and(|hydration| {
-                    hydration.snapshot_ready && !hydration.snapshot_finished
-                }));
-            }
-        }
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|hydration| hydration.snapshot_finished)
-        );
-
-        app.apply_response(events_response(vec![
-            scenario.history_then_live[attached_index].clone(),
-        ]));
-        assert_eq!(
-            app.attached_session.as_deref(),
-            Some(scenario.session_id.as_str())
-        );
-        assert!(app.attach_hydration.is_none());
-        assert!(app.ghostty_projection.is_some());
-
-        app.apply_response(events_response(vec![
-            scenario.history_then_live[live_index].clone(),
-        ]));
-        let live = match &scenario.history_then_live[live_index] {
-            DaemonEvent::TerminalOutput { payload, .. } => String::from_utf8(
-                payload
-                    .decoded_bytes()
-                    .expect("shared fixture live payload decodes"),
-            )
-            .expect("shared fixture live payload is utf-8 text"),
-            other => panic!("expected shared live event, got {other:?}"),
-        };
-        assert!(viewport_cache_contains(&app, live.trim()));
-        let history_hits_before = app
-            .ghostty_viewport_cache
-            .as_ref()
-            .map(|viewport| {
-                viewport
-                    .cells
-                    .iter()
-                    .map(|cell| cell.grapheme.as_str())
-                    .collect::<String>()
-                    .matches(scenario.read_screen_text.trim())
-                    .count()
-            })
-            .unwrap_or(0);
-        assert_eq!(history_hits_before, 1);
-        app.apply_optional_readback_response(
-            read_screen_response(&scenario.session_id, &scenario.read_screen_text),
-            "read_screen_diagnostic",
-        );
-        // ReadScreen is diagnostic only; it must not rewrite or duplicate GHOSTSNP text.
-        let history_hits_after = app
-            .ghostty_viewport_cache
-            .as_ref()
-            .map(|viewport| {
-                viewport
-                    .cells
-                    .iter()
-                    .map(|cell| cell.grapheme.as_str())
-                    .collect::<String>()
-                    .matches(scenario.read_screen_text.trim())
-                    .count()
-            })
-            .unwrap_or(0);
-        assert_eq!(
-            history_hits_after, history_hits_before,
-            "ReadScreen must not become projection authority"
-        );
-        assert!(viewport_cache_contains(&app, live.trim()));
-        assert!(app.observed_requests.is_empty());
-    }
-
-    #[test]
-    fn shared_no_history_attached_owns_input_while_bounded_hydration_continues() {
-        let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
-        let attaching_index = scenario
-            .no_history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
-            })
-            .expect("idle fixture includes attaching state");
-        let attached_index = scenario
-            .no_history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
-            })
-            .expect("idle fixture includes attached state");
-        let live_index = scenario
-            .no_history_then_live
-            .iter()
-            .position(|event| matches!(event, DaemonEvent::TerminalOutput { .. }))
-            .expect("idle fixture includes live output");
-        let snapshot_indices = scenario
-            .no_history_then_live
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| {
-                matches!(event, DaemonEvent::Snapshot { .. }).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !scenario
-                .no_history_then_live
-                .iter()
-                .any(|event| matches!(event, DaemonEvent::Scrollback { .. }))
-        );
-        assert_eq!(snapshot_indices.len(), 2);
-        assert!(
-            snapshot_indices
-                .iter()
-                .all(|index| { attaching_index < *index && *index < attached_index })
-        );
-        assert_eq!(snapshot_indices[0], attaching_index + 1);
-        assert_eq!(snapshot_indices[1], snapshot_indices[0] + 1);
-        assert_eq!(attached_index, snapshot_indices[1] + 1);
-        assert_eq!(live_index, attached_index + 1);
-        assert!(attached_index < live_index);
-
-        let mut app = TuiApp::new(None);
-        app.subscription_id = scenario.no_history_subscription_id.clone();
-        app.begin_attach_hydration(
-            &scenario.no_history_session_id,
-            &scenario.no_history_subscription_id,
-        );
-        app.observed_requests.clear();
-
-        app.apply_response(events_response(vec![
-            scenario.no_history_then_live[attaching_index].clone(),
-            scenario.no_history_then_live[snapshot_indices[0]].clone(),
-        ]));
-        assert!(
-            app.attach_hydration.as_ref().is_some_and(|hydration| {
-                hydration.snapshot_ready && !hydration.snapshot_finished
-            })
-        );
-        assert!(app.attached_session.is_none());
-
-        app.apply_response(events_response(vec![
-            scenario.no_history_then_live[snapshot_indices[1]].clone(),
-        ]));
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|hydration| hydration.snapshot_finished)
-        );
-        assert!(app.attached_session.is_none());
-
-        app.apply_response(events_response(vec![
-            scenario.no_history_then_live[attached_index].clone(),
-        ]));
-
-        assert_eq!(
-            app.attached_session.as_deref(),
-            Some(scenario.no_history_session_id.as_str())
-        );
-        // Blank GHOSTSNP Snapshot still opens the live path.
-        assert!(app.attach_hydration.is_none());
-        assert!(app.ghostty_projection.is_some());
-        assert!(
-            !viewport_cache_contains(&app, "history-before-live"),
-            "idle GHOSTSNP must not carry the history golden"
-        );
-
-        app.apply_response(events_response(vec![
-            scenario.no_history_then_live[live_index].clone(),
-        ]));
-        let live = match &scenario.no_history_then_live[live_index] {
-            DaemonEvent::TerminalOutput { payload, .. } => String::from_utf8(
-                payload
-                    .decoded_bytes()
-                    .expect("shared fixture live payload decodes"),
-            )
-            .expect("shared fixture live payload is utf-8 text"),
-            other => panic!("expected shared live event, got {other:?}"),
-        };
-        assert!(viewport_cache_contains(&app, live.trim()));
-        assert!(app.observed_requests.is_empty());
-
-        let exit = scenario
-            .no_history_then_live
-            .iter()
-            .find(|event| matches!(event, DaemonEvent::ProcessExit { .. }))
-            .expect("idle fixture includes process exit")
-            .clone();
-        app.apply_response(events_response(vec![exit]));
-        assert!(app.attached_session.is_none());
-    }
-
-    #[test]
-    fn shared_history_incomplete_keeps_ready_then_opens_the_live_path() {
-        let scenario = botster_hub_test_support::late_attach_history_conformance_scenario();
-        let events = scenario.history_incomplete_then_live;
-        let (session_id, subscription_id) = match &events[0] {
-            DaemonEvent::AttachState {
-                session_id,
-                subscription_id,
-                state,
-            } if state == "attaching" => (session_id.clone(), subscription_id.clone()),
-            event => panic!("expected attaching state, got {event:?}"),
-        };
-        assert!(matches!(&events[1], DaemonEvent::Snapshot { .. }));
-        assert!(matches!(
-            &events[2],
-            DaemonEvent::AttachState { state, .. }
-                if state == ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE
-        ));
-        assert!(matches!(
-            &events[3],
-            DaemonEvent::AttachState { state, .. } if state == "attached"
-        ));
-        assert!(matches!(&events[4], DaemonEvent::TerminalOutput { .. }));
-
-        let mut app = TuiApp::new(None);
-        app.subscription_id = subscription_id.clone();
-        app.begin_attach_hydration(&session_id, &subscription_id);
-        app.observed_requests.clear();
-
-        app.apply_response(events_response(events[..2].to_vec()));
-        assert!(viewport_cache_contains(
-            &app,
-            scenario.read_screen_text.trim()
-        ));
-        assert!(
-            app.ghostty_projection
-                .as_ref()
-                .is_some_and(GhosttyClientProjection::snapshot_history_pending)
-        );
-
-        app.apply_response(events_response(vec![events[2].clone()]));
-        assert!(viewport_cache_contains(
-            &app,
-            scenario.read_screen_text.trim()
-        ));
-        assert!(
-            app.ghostty_projection
-                .as_ref()
-                .is_some_and(|projection| !projection.snapshot_history_pending())
-        );
-        assert!(app.attached_session.is_none());
-
-        app.apply_response(events_response(vec![events[3].clone()]));
-        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
-        app.apply_response(events_response(vec![events[4].clone()]));
-        assert!(viewport_cache_contains(&app, "live-after-attach"));
-        assert!(viewport_cache_contains(
-            &app,
-            scenario.read_screen_text.trim()
-        ));
-        assert!(app.observed_requests.is_empty());
-    }
-
-    #[test]
-    fn opaque_empty_snapshot_does_not_finish_visible_history_hydration() {
-        let mut app = TuiApp::new(None);
-        app.subscription_id = "sub-opaque".to_string();
-        app.begin_attach_hydration("session-opaque", "sub-opaque");
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::AttachState {
-                session_id: "session-opaque".to_string(),
-                subscription_id: "sub-opaque".to_string(),
-                state: "attaching".to_string(),
-            },
-            DaemonEvent::Snapshot {
-                session_id: "session-opaque".to_string(),
-                subscription_id: "sub-opaque".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&[0; 128]),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-opaque".to_string(),
-                subscription_id: "sub-opaque".to_string(),
-                state: "attached".to_string(),
-            },
-        ]));
-
-        // Invalid opaque Snapshot bytes cannot bypass READY or FINISH.
-        assert!(app.terminal_output.is_empty());
-        assert!(app.attach_hydration.is_some());
-        assert!(app.attached_session.is_none());
-        assert!(app.ghostty_projection.is_none());
-    }
-
-    #[test]
-    fn empty_response_never_bypasses_the_finish_barrier() {
-        let mut app = TuiApp::new(None);
-        app.subscription_id = "sub-captured".to_string();
-        app.begin_attach_hydration("session-captured", "sub-captured");
-        app.observed_requests.clear();
-
-        app.apply_response(attach_state_response("session-captured", "attached"));
-        app.apply_response(events_response(Vec::new()));
-        assert!(app.attach_hydration.is_some());
-        assert!(app.attached_session.is_none());
-        assert!(app.ghostty_projection.is_none());
-    }
-
-    #[test]
-    fn detach_cancels_an_incremental_attach_with_its_subscription() {
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = TerminalScreenSize::new(6, 48);
-        app.begin_attach_hydration("session-cancel", "sub-cancel");
-        let ready = producer_incremental_ghostsnp(app.terminal_viewport_size, b"READY_CANCEL")
-            .into_iter()
-            .next()
-            .expect("READY frame");
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-cancel".to_string(),
-            subscription_id: "sub-cancel".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
-        }]));
-        assert!(
-            app.ghostty_projection
-                .as_ref()
-                .is_some_and(GhosttyClientProjection::snapshot_history_pending)
-        );
-        app.observed_requests.clear();
-
-        app.detach_attached();
-
-        assert!(app.attach_hydration.is_none());
-        assert!(app.ghostty_projection.is_none());
-        assert!(app.observed_requests.contains(&ObservedRequest::Detach {
-            session_id: "session-cancel".to_string(),
-            subscription_id: "sub-cancel".to_string(),
-        }));
-        app.handle_dispatch(InputDispatch::TerminalResize {
-            node_id: "tui-terminal".to_string(),
-            rows: 10,
-            cols: 50,
-        });
-        assert_eq!(app.terminal_viewport_size, TerminalScreenSize::new(10, 50));
-        assert!(app.error.is_none());
-    }
-
-    #[test]
-    fn attach_failed_before_ready_ends_hydration_without_opening_live() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-failed", "sub-failed");
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::AttachState {
-                session_id: "session-failed".to_string(),
-                subscription_id: "sub-failed".to_string(),
-                state: "attaching".to_string(),
-            },
-            DaemonEvent::AttachState {
-                session_id: "session-failed".to_string(),
-                subscription_id: "sub-failed".to_string(),
-                state: ATTACH_STATE_ATTACH_FAILED.to_string(),
-            },
-        ]));
-
-        assert!(app.attach_hydration.is_none());
-        assert!(app.attached_session.is_none());
-        assert!(app.ghostty_projection.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("attach failed before READY (closed)"))
-        );
-
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-failed".to_string(),
-            subscription_id: "sub-failed".to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(b"must-not-open"),
-        }]));
-        assert!(app.applied_live_payloads.is_empty());
-    }
-
-    #[test]
-    fn late_screen_response_cannot_replace_restored_history() {
-        let mut app = TuiApp::new(None);
-        app.terminal_output_session_id = Some("session-alpha".to_string());
-        app.ensure_ghostty_projection("session-alpha");
-        {
-            let projection = app.ghostty_projection.as_mut().unwrap();
-            projection.apply_terminal_output(b"ordered history");
-        }
-        app.refresh_ghostty_viewport_cache();
-        assert!(viewport_cache_contains(&app, "ordered history"));
-
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "stale screen"),
-            "read_screen_diagnostic",
-        );
-
-        assert!(viewport_cache_contains(&app, "ordered history"));
-        assert!(!viewport_cache_contains(&app, "stale screen"));
-        assert!(!app.terminal_content().contains("stale screen"));
-    }
-
-    #[test]
-    fn read_screen_precedes_buffered_live_output_without_duplication() {
-        // Product path: Snapshot/live projection is authority; ReadScreen is diagnostic.
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-alpha");
-
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(b"authoritative-live"),
-        }]));
-        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-alpha", b"");
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            state: "attached".to_string(),
-        }]));
-        assert!(viewport_cache_contains(&app, "authoritative-live"));
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "restored-first\n"),
-            "read_screen_diagnostic",
-        );
-        assert!(!viewport_cache_contains(&app, "restored-first"));
-        assert_eq!(
-            app.ghostty_viewport_cache.as_ref().map(|v| v
-                .cells
-                .iter()
-                .map(|c| c.grapheme.as_str())
-                .collect::<String>()
-                .matches("authoritative-live")
-                .count()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn read_screen_overlap_is_not_duplicated_when_live_output_is_flushed() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-alpha");
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(b"marker\r\n"),
-        }]));
-        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-alpha", b"");
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            state: "attached".to_string(),
-        }]));
-        assert!(viewport_cache_contains(&app, "marker"));
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "prompt marker"),
-            "read_screen_diagnostic",
-        );
-        // Diagnostic ReadScreen must not inject a second marker into projection.
-        let text = app
-            .ghostty_viewport_cache
-            .as_ref()
-            .map(|v| {
-                v.cells
-                    .iter()
-                    .map(|c| c.grapheme.as_str())
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
-        assert_eq!(text.matches("marker").count(), 1);
-    }
-
-    #[test]
-    fn snapshot_readback_is_metadata_only_and_renders_status() {
-        let mut app = TuiApp::new(None);
-        app.terminal_output_session_id = Some("session-alpha".to_string());
-
-        app.apply_optional_readback_response(
-            capture_snapshot_response("session-alpha", 24, 80, Some("ghostty-page"), 4096),
-            "capture_snapshot",
-        );
-
-        assert!(app.terminal_output.is_empty());
-        let rendered = renderer::render_to_lines(&app.surface(), 120, 48)
-            .0
-            .join("\n");
-        assert!(rendered.contains("rows=24 cols=80"));
-        assert!(rendered.contains("format=ghostty-page"));
-        assert!(rendered.contains("payload_bytes=4096"));
-    }
-
-    #[test]
-    fn optional_readback_operator_error_is_non_fatal() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.terminal_output = "preserved".to_string();
-
-        app.apply_optional_readback_response(
-            operator_error_response("session exited during capture"),
-            "capture_snapshot",
-        );
-
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert_eq!(app.terminal_output, "preserved");
-        assert!(app.error.is_none());
-        assert!(
-            app.action_feedback
-                .as_deref()
-                .unwrap()
-                .contains("capture_snapshot unavailable")
-        );
-
-        app.apply_optional_readback_response(
-            operator_error_response("session exited during screen read"),
-            "read_screen",
-        );
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert_eq!(app.terminal_output, "preserved");
-        assert!(app.error.is_none());
-        assert!(
-            app.action_feedback
-                .as_deref()
-                .unwrap()
-                .contains("read_screen unavailable")
-        );
-    }
-
-    #[test]
-    fn every_attach_cycle_clears_owned_terminal_and_readback_state() {
-        let mut app = TuiApp::new(None);
-        app.terminal_output_session_id = Some("session-alpha".to_string());
-        app.terminal_output = "alpha history".to_string();
-        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
-            session_id: "session-alpha".to_string(),
-            rows: 24,
-            cols: 80,
-            payload_format: None,
-            payload_bytes: 1,
-        });
-
-        app.begin_attach_hydration("session-alpha", "sub-alpha");
-        assert!(app.terminal_output.is_empty());
-        assert!(app.snapshot_metadata.is_none());
-        assert_eq!(
-            app.terminal_output_session_id.as_deref(),
-            Some("session-alpha")
-        );
-
-        app.terminal_output = "replayed alpha history".to_string();
-
-        app.begin_attach_hydration("session-beta", "sub-alpha");
-        assert!(app.terminal_output.is_empty());
-        assert!(app.snapshot_metadata.is_none());
-        assert_eq!(
-            app.terminal_output_session_id.as_deref(),
-            Some("session-beta")
-        );
-    }
-
-    #[test]
-    fn process_exit_applies_same_response_bytes_and_suppresses_readbacks() {
-        let mut app = TuiApp::new(None);
-        app.subscription_id = "sub-alpha".to_string();
-        app.begin_attach_hydration("session-alpha", "sub-alpha");
-        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
-            session_id: "session-alpha".to_string(),
-            rows: 24,
-            cols: 80,
-            payload_format: None,
-            payload_bytes: 1,
-        });
-        app.observed_requests.clear();
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-alpha".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"final bytes"),
-            },
-            DaemonEvent::ProcessExit {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-alpha".to_string(),
-                code: Some(0),
-            },
-        ]));
-
-        assert!(
-            app.terminal_output.is_empty(),
-            "hydration-end must not dump live PTY bytes into diagnostic text"
-        );
-        assert!(app.applied_live_payloads.is_empty());
-        assert!(app.attach_hydration.is_none());
-        assert!(app.snapshot_metadata.is_none());
-        assert!(app.observed_requests.is_empty());
-    }
-
-    #[test]
-    fn process_exit_preserves_restored_screen_and_clears_snapshot_metadata() {
-        let mut app = TuiApp::new(None);
-        app.subscription_id = "sub-alpha".to_string();
-        app.begin_attach_hydration("session-alpha", "sub-alpha");
-        app.terminal_output = "last visible screen".to_string();
-        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
-            session_id: "session-alpha".to_string(),
-            rows: 24,
-            cols: 80,
-            payload_format: None,
-            payload_bytes: 1,
-        });
-
-        app.apply_response(events_response(vec![DaemonEvent::ProcessExit {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            code: Some(0),
-        }]));
-
-        assert_eq!(app.terminal_output, "last visible screen");
-        assert!(app.snapshot_metadata.is_none());
-        assert!(
-            render_app_to_lines(&app, 120, 48, &RenderState::default())
-                .0
-                .join("\n")
-                .contains("last visible screen")
-        );
-    }
-
-    #[test]
-    fn detach_preserves_restored_screen_and_clears_snapshot_metadata() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(attach_state_response("session-alpha", "attached"));
-        app.terminal_output_session_id = Some("session-alpha".to_string());
-        app.terminal_output = "last visible screen".to_string();
-        app.snapshot_metadata = Some(DaemonCaptureSnapshot {
-            session_id: "session-alpha".to_string(),
-            rows: 24,
-            cols: 80,
-            payload_format: None,
-            payload_bytes: 1,
-        });
-
-        app.apply_response(attach_state_response("session-alpha", "detached"));
-
-        assert_eq!(app.terminal_output, "last visible screen");
-        assert!(app.snapshot_metadata.is_none());
-    }
-
-    #[test]
-    fn opaque_history_events_do_not_mutate_existing_terminal_output() {
-        let mut app = TuiApp::new(None);
-        app.terminal_output = "existing output\n".to_string();
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&[0; 128]),
-            },
-            DaemonEvent::Scrollback {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&[255; 256]),
-            },
-        ]));
-
-        assert_eq!(app.terminal_output, "existing output\n");
-        assert!(app.error.is_none());
-    }
-
-    #[test]
-    fn stale_opaque_history_cannot_replace_current_terminal_output() {
-        let mut app = TuiApp::new(None);
-        app.ensure_ghostty_projection("session-alpha");
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-current".to_string());
-        app.subscription_id = "sub-current".to_string();
-        {
-            let projection = app.ghostty_projection.as_mut().unwrap();
-            projection.apply_terminal_output(b"current output");
-        }
-        app.refresh_ghostty_viewport_cache();
-        assert!(viewport_cache_contains(&app, "current output"));
-
-        // Stale subscription Snapshot must not replace current projection.
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-stale".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(b"stale opaque state"),
-        }]));
-
-        assert!(viewport_cache_contains(&app, "current output"));
-        assert!(!viewport_cache_contains(&app, "stale opaque state"));
     }
 
     #[test]
@@ -18584,286 +13594,6 @@ mod tests {
         assert_eq!(app.selected_session.as_deref(), Some("session-alpha"));
     }
 
-    #[test]
-    fn focused_terminal_mouse_pair_does_not_attach_and_preserves_key_forwarding() {
-        let mut app = TuiApp::new(None);
-        app.sessions = vec![SessionRow::running("session-alpha")];
-        app.selected_session = Some("session-alpha".to_string());
-        app.observed_requests.clear();
-        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-        let terminal = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "tui-terminal")
-            .expect("terminal should be focusable");
-        let (column, row) = (
-            terminal.rect.x.saturating_add(1),
-            terminal.rect.y.saturating_add(1),
-        );
-        let mut router = InputRouter::new(renderer::action_request_context());
-
-        let down_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &hit_map,
-        );
-        assert!(matches!(
-            &down_dispatch,
-            InputDispatch::Action(request)
-                if request.action_id
-                    == UiActionId("botster.terminal.focus".to_string())
-        ));
-        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
-        app.handle_dispatch(down_dispatch);
-
-        let up_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &hit_map,
-        );
-        assert_eq!(up_dispatch, InputDispatch::Ignored);
-        app.handle_dispatch(up_dispatch);
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
-                .count(),
-            0
-        );
-
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-
-        let dispatch = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
-            &hit_map,
-        );
-        assert_eq!(
-            dispatch,
-            InputDispatch::TerminalForward {
-                node_id: "tui-terminal".to_string(),
-                bytes: b"x".to_vec(),
-            }
-        );
-
-        app.handle_dispatch(dispatch);
-        assert!(
-            app.observed_terminal_inputs
-                .contains(&TerminalInputCommand::Input {
-                    data: b"x".to_vec(),
-                })
-        );
-    }
-
-    #[test]
-    fn mouse_mode_terminal_release_forwards_sgr_once_without_duplicate_focus_action() {
-        let mut app = TuiApp::new(None);
-        app.sessions = vec![SessionRow::running("session-alpha")];
-        app.selected_session = Some("session-alpha".to_string());
-        app.observed_requests.clear();
-        let terminal = node(
-            UiNodeKind::TerminalView,
-            "mouse-mode-terminal",
-            json!({ "session_id": "session-alpha" }),
-        );
-        terminal
-            .validate()
-            .expect("mouse-mode routing fixture should remain schema-valid");
-        let (_lines, mut hit_map) = renderer::render_to_lines(&terminal, 40, 10);
-        hit_map.set_terminal_mouse_mode("mouse-mode-terminal", 9);
-        let region = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "mouse-mode-terminal")
-            .expect("mouse-mode terminal should be hit-testable");
-        let (column, row) = (
-            region.rect.x.saturating_add(1),
-            region.rect.y.saturating_add(1),
-        );
-        let mut router = InputRouter::new(renderer::action_request_context());
-
-        let down_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &hit_map,
-        );
-        assert!(matches!(
-            &down_dispatch,
-            InputDispatch::Action(request)
-                if request.action_id
-                    == UiActionId("botster.terminal.focus".to_string())
-        ));
-        app.handle_dispatch(down_dispatch);
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
-                .count(),
-            0
-        );
-
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 9, 1, 2),
-            "read_mode_flags",
-        );
-
-        let up_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &hit_map,
-        );
-        let sgr_release = b"\x1b[<0;1;1m";
-        assert_eq!(
-            up_dispatch,
-            InputDispatch::TerminalForward {
-                node_id: "mouse-mode-terminal".to_string(),
-                bytes: sgr_release.to_vec(),
-            }
-        );
-        app.handle_dispatch(up_dispatch);
-
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
-                .count(),
-            0
-        );
-        // Mouse reports use ModeGatedInput with ModeFlags freshness, not plain SendInput.
-        assert!(app.observed_terminal_inputs.iter().any(|request| {
-            matches!(
-                request,
-                TerminalInputCommand::ModeGatedInput {
-                    data,
-                    mode_generation: 1,
-                    mode_revision: 2,
-                } if data.as_slice() == sgr_release
-            )
-        }));
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|request| matches!(request, TerminalInputCommand::Input { .. }))
-        );
-    }
-
-    #[test]
-    fn authoritative_mouse_mode_is_attachment_scoped_and_reapplied_after_render() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-alpha".to_string());
-        app.subscription_id = "sub-alpha".to_string();
-
-        app.apply_optional_readback_response(
-            mode_flags_response("session-alpha", 9),
-            "read_mode_flags",
-        );
-        assert_eq!(app.current_terminal_mouse_mode(), 9);
-
-        for _ in 0..2 {
-            let (_lines, mut hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-            let terminal = hit_map
-                .regions()
-                .iter()
-                .find(|region| region.node_id == "tui-terminal")
-                .expect("production terminal should be hit-testable");
-            assert!(!terminal.terminal_mouse_mode);
-
-            app.apply_terminal_mouse_mode(&mut hit_map);
-            let terminal = hit_map
-                .regions()
-                .iter()
-                .find(|region| region.node_id == "tui-terminal")
-                .expect("production terminal should still be hit-testable");
-            assert!(terminal.terminal_mouse_mode);
-        }
-
-        app.apply_optional_readback_response(
-            mode_flags_response("session-alpha", 0),
-            "read_mode_flags",
-        );
-        assert_eq!(app.current_terminal_mouse_mode(), 0);
-
-        app.apply_optional_readback_response(
-            mode_flags_response("session-alpha", 9),
-            "read_mode_flags",
-        );
-
-        app.apply_optional_readback_response(
-            mode_flags_response("session-stale", 9),
-            "read_mode_flags",
-        );
-        assert_eq!(app.current_terminal_mouse_mode(), 0);
-    }
-
-    #[test]
-    fn terminal_output_refresh_is_bounded_and_malformed_readback_is_safe_off() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-alpha".to_string());
-        app.subscription_id = "sub-alpha".to_string();
-        app.apply_optional_readback_response(
-            mode_flags_response("session-alpha", 9),
-            "read_mode_flags",
-        );
-        app.last_terminal_mouse_mode_probe = Some(Instant::now());
-
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-alpha".to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(b"output"),
-        }]));
-        assert!(app.terminal_mouse_mode_refresh_due);
-        app.refresh_terminal_mouse_mode_if_due();
-        assert!(app.terminal_mouse_mode_refresh_due);
-
-        app.last_terminal_mouse_mode_probe =
-            Some(Instant::now() - TERMINAL_MOUSE_MODE_REFRESH_INTERVAL);
-        app.refresh_terminal_mouse_mode_if_due();
-        assert!(!app.terminal_mouse_mode_refresh_due);
-
-        app.apply_optional_readback_response(
-            base_response(DaemonResponseKind::ReadModeFlags),
-            "read_mode_flags",
-        );
-        assert_eq!(app.current_terminal_mouse_mode(), 0);
-    }
-
-    #[test]
-    fn sgr_encoding_bit_alone_does_not_enable_terminal_mouse_tracking() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-alpha".to_string());
-        app.subscription_id = "sub-alpha".to_string();
-        app.apply_optional_readback_response(
-            mode_flags_response("session-alpha", 8),
-            "read_mode_flags",
-        );
-
-        let (_lines, mut hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-        app.apply_terminal_mouse_mode(&mut hit_map);
-        let terminal = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "tui-terminal")
-            .expect("production terminal should be hit-testable");
-        assert!(!terminal.terminal_mouse_mode);
-    }
-
     fn producer_ghostsnp(size: TerminalScreenSize, bytes: &[u8]) -> Vec<u8> {
         use botster_terminal_ghostty::{GhosttyAdapterConfig, GhosttyTerminal};
         let mut producer = GhosttyTerminal::with_config(
@@ -18896,21 +13626,6 @@ mod tests {
             })
             .expect("export incremental GHOSTSNP frames");
         frames
-    }
-
-    fn apply_incremental_snapshot_frames(
-        app: &mut TuiApp,
-        session_id: &str,
-        subscription_id: &str,
-        bytes: &[u8],
-    ) {
-        for frame in producer_incremental_ghostsnp(app.terminal_viewport_size, bytes) {
-            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-                session_id: session_id.to_string(),
-                subscription_id: subscription_id.to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
-            }]));
-        }
     }
 
     fn viewport_cache_contains(app: &TuiApp, needle: &str) -> bool {
@@ -18980,297 +13695,6 @@ mod tests {
         (lines.join("\n"), hit_map, cells)
     }
 
-    fn wait_for_mode_flags(
-        app: &mut TuiApp,
-        session_id: &str,
-        predicate: impl Fn(&TerminalModeShadow) -> bool,
-    ) -> TerminalModeShadow {
-        app.probe_terminal_mouse_mode(session_id);
-        let deadline = Instant::now() + Duration::from_secs(6);
-        loop {
-            app.poll_hub();
-            if let Some(shadow) = app.current_mode_shadow().cloned()
-                && predicate(&shadow)
-            {
-                return shadow;
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "timed out waiting for ModeFlags predicate; current={:?} error={:?}",
-                    app.current_mode_shadow(),
-                    app.error
-                );
-            }
-            thread::sleep(Duration::from_millis(50));
-            app.probe_terminal_mouse_mode(session_id);
-        }
-    }
-
-    fn prove_live_paste(
-        app: &mut TuiApp,
-        session_id: &str,
-        capture_path: &Path,
-        text: &str,
-        bracketed: bool,
-        label: &str,
-    ) {
-        let _ = std::fs::remove_file(capture_path);
-        let mut expected = Vec::new();
-        if bracketed {
-            expected.extend_from_slice(b"\x1b[200~");
-        }
-        expected.extend_from_slice(text.as_bytes());
-        if bracketed {
-            expected.extend_from_slice(b"\x1b[201~");
-        }
-        app.forward_terminal_input(
-            session_id.to_string(),
-            format!(
-                "paste-capture {} {} {}\n",
-                expected.len(),
-                if bracketed { "bracketed" } else { "plain" },
-                label
-            )
-            .into_bytes(),
-        );
-        let ready_marker = format!("paste-ready-{label}");
-        let ready_deadline = Instant::now() + Duration::from_secs(6);
-        while Instant::now() < ready_deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            if viewport_cache_contains(app, &ready_marker) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            viewport_cache_contains(app, &ready_marker),
-            "live paste capture must become ready for {label}"
-        );
-        wait_for_mode_flags(app, session_id, |shadow| {
-            shadow.bracketed_paste == bracketed
-        });
-        assert!(app.handle_focused_terminal_paste(text, Some("tui-terminal")));
-
-        let marker = format!("paste-done-{label}");
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            if viewport_cache_contains(app, &marker)
-                && std::fs::metadata(capture_path)
-                    .is_ok_and(|metadata| metadata.len() == expected.len() as u64)
-                && app.terminal_input_in_flight.is_empty()
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let captured = std::fs::read(capture_path).expect("read live paste capture");
-        assert_eq!(
-            captured, expected,
-            "live paste bytes must match for {label}"
-        );
-        assert!(
-            viewport_cache_contains(app, &marker),
-            "live paste marker must paint for {label}"
-        );
-        assert!(
-            app.terminal_input_in_flight.is_empty(),
-            "live paste result must clear the in-flight entry for {label}"
-        );
-        println!(
-            "ghostty-live-paste: label={label} raw_bytes={} delivered_bytes={} bracketed={bracketed}",
-            text.len(),
-            captured.len()
-        );
-    }
-
-    #[test]
-    fn incremental_attach_paints_ready_before_finish_and_retains_history() {
-        use botster_terminal_ghostty::GhosttySnapshotFrameKind;
-
-        let size = TerminalScreenSize::new(6, 48);
-        let mut source = b"HISTORY_MARKER\r\n".to_vec();
-        for line in 0..12_000 {
-            source.extend_from_slice(format!("history line {line:05}\r\n").as_bytes());
-        }
-        source.extend_from_slice(b"READY_MARKER");
-        let frames = producer_incremental_ghostsnp(size, &source);
-        assert_eq!(
-            frames.first().map(|frame| frame.kind),
-            Some(GhosttySnapshotFrameKind::Ready)
-        );
-        assert!(
-            frames
-                .iter()
-                .any(|frame| frame.kind == GhosttySnapshotFrameKind::History),
-            "the production encoder must emit at least one history PAGE"
-        );
-        assert_eq!(
-            frames.last().map(|frame| frame.kind),
-            Some(GhosttySnapshotFrameKind::Finish)
-        );
-
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        app.observed_requests.clear();
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            state: "attaching".to_string(),
-        }]));
-
-        let ready = frames.first().expect("READY frame");
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
-        }]));
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|hydration| hydration.snapshot_ready && !hydration.snapshot_finished)
-        );
-        assert!(app.attached_session.is_none());
-        let (ready_paint, _, _) = render_app_painted(&app, 140, 42);
-        assert!(
-            ready_paint.contains("READY_MARKER"),
-            "READY must paint before FINISH: {ready_paint}"
-        );
-
-        for frame in frames.iter().skip(1) {
-            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
-            }]));
-        }
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|hydration| hydration.snapshot_finished)
-        );
-        assert!(app.attached_session.is_none());
-        assert!(app.observed_requests.is_empty());
-
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            state: "attached".to_string(),
-        }]));
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert!(app.attach_hydration.is_none());
-
-        app.scroll_projection(ScrollOp::Top);
-        let (history_paint, _, _) = render_app_painted(&app, 140, 42);
-        assert!(
-            history_paint.contains("HISTORY_MARKER"),
-            "incremental PAGE delivery must retain painted history: {history_paint}"
-        );
-    }
-
-    fn snapshot_phase_for_frame(
-        kind: botster_terminal_ghostty::GhosttySnapshotFrameKind,
-    ) -> SnapshotPhase {
-        match kind {
-            botster_terminal_ghostty::GhosttySnapshotFrameKind::Ready => SnapshotPhase::Ready,
-            botster_terminal_ghostty::GhosttySnapshotFrameKind::History => SnapshotPhase::History,
-            botster_terminal_ghostty::GhosttySnapshotFrameKind::Finish => SnapshotPhase::Finish,
-        }
-    }
-
-    fn mux_snapshot_envelope(
-        session_id: &str,
-        subscription_id: &str,
-        bytes: &[u8],
-        phase: SnapshotPhase,
-    ) -> DaemonUnixTerminalEnvelope {
-        let event = TerminalEvent::Snapshot(Snapshot::from_bytes(
-            session_id,
-            subscription_id,
-            bytes,
-            phase,
-        ));
-        let frame = event.to_frame().expect("encode snapshot frame");
-        DaemonUnixTerminalEnvelope::from_frame_bytes(
-            session_id,
-            subscription_id,
-            &frame.to_bytes().expect("snapshot frame bytes"),
-        )
-    }
-
-    fn mux_output_envelope(
-        session_id: &str,
-        subscription_id: &str,
-        bytes: &[u8],
-    ) -> DaemonUnixTerminalEnvelope {
-        let event = TerminalEvent::TerminalOutput(TerminalOutput::from_bytes(
-            session_id,
-            subscription_id,
-            bytes,
-        ));
-        let frame = event.to_frame().expect("encode output frame");
-        DaemonUnixTerminalEnvelope::from_frame_bytes(
-            session_id,
-            subscription_id,
-            &frame.to_bytes().expect("output frame bytes"),
-        )
-    }
-
-    fn mux_attach_state_envelope(
-        session_id: &str,
-        subscription_id: &str,
-        state: AttachStateKind,
-    ) -> DaemonUnixTerminalEnvelope {
-        let event = TerminalEvent::AttachState(AttachState {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-            state,
-        });
-        let frame = event.to_frame().expect("encode attach state frame");
-        DaemonUnixTerminalEnvelope::from_frame_bytes(
-            session_id,
-            subscription_id,
-            &frame.to_bytes().expect("attach state frame bytes"),
-        )
-    }
-
-    fn mux_process_exit_envelope(
-        session_id: &str,
-        subscription_id: &str,
-        code: Option<i32>,
-    ) -> DaemonUnixTerminalEnvelope {
-        let event = TerminalEvent::ProcessExit(ProcessExit {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-            code,
-        });
-        let frame = event.to_frame().expect("encode process exit frame");
-        DaemonUnixTerminalEnvelope::from_frame_bytes(
-            session_id,
-            subscription_id,
-            &frame.to_bytes().expect("process exit frame bytes"),
-        )
-    }
-
-    fn apply_mux_snapshot_frames(
-        app: &mut TuiApp,
-        session_id: &str,
-        subscription_id: &str,
-        bytes: &[u8],
-    ) {
-        for frame in producer_incremental_ghostsnp(app.terminal_viewport_size, bytes) {
-            app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-                session_id,
-                subscription_id,
-                &frame.bytes,
-                snapshot_phase_for_frame(frame.kind),
-            ));
-        }
-    }
-
     #[test]
     fn missing_terminal_snapshot_delivery_on_hello_ack_fails_before_attach() {
         let mut compatibility = TerminalCompatibility::current();
@@ -19319,318 +13743,10 @@ mod tests {
             .expect_err("omitted terminal_compatibility must fail before Attach");
     }
 
-    #[test]
-    fn mux_incremental_attach_paints_ready_before_finish() {
-        let size = TerminalScreenSize::new(6, 48);
-        let mut source = b"HISTORY_MARKER\r\n".to_vec();
-        for line in 0..12_000 {
-            source.extend_from_slice(format!("history line {line:05}\r\n").as_bytes());
-        }
-        source.extend_from_slice(b"READY_MARKER");
-        let frames = producer_incremental_ghostsnp(size, &source);
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-mux");
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-alpha",
-            "sub-mux",
-            AttachStateKind::Attaching,
-        ));
-        let ready = frames.first().expect("READY");
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-mux",
-            &ready.bytes,
-            SnapshotPhase::Ready,
-        ));
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|hydration| hydration.snapshot_ready && !hydration.snapshot_finished)
-        );
-        let (ready_paint, _, _) = render_app_painted(&app, 140, 42);
-        assert!(ready_paint.contains("READY_MARKER"), "{ready_paint}");
-        for frame in frames.iter().skip(1) {
-            app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-                "session-alpha",
-                "sub-mux",
-                &frame.bytes,
-                snapshot_phase_for_frame(frame.kind),
-            ));
-        }
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-alpha",
-            "sub-mux",
-            AttachStateKind::Attached,
-        ));
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        app.scroll_projection(ScrollOp::Top);
-        let (history_paint, _, _) = render_app_painted(&app, 140, 42);
-        assert!(history_paint.contains("HISTORY_MARKER"), "{history_paint}");
-    }
-
-    #[test]
-    fn mux_phase_gap_fresh_attaches_without_replaying_leftover_frames() {
-        let size = TerminalScreenSize::new(6, 48);
-        let frames = producer_incremental_ghostsnp(size, b"READY_ONE");
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-a");
-        let first_sub = app.subscription_id.clone();
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-a",
-            &frames[0].bytes,
-            SnapshotPhase::Ready,
-        ));
-        assert!(viewport_cache_contains(&app, "READY_ONE"));
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-a",
-            &frames[0].bytes,
-            SnapshotPhase::Ready,
-        ));
-        assert!(
-            app.attach_recovery_used,
-            "phase gap must consume the one recovery"
-        );
-        let replacement = app.subscription_id.clone();
-        assert_ne!(replacement, first_sub);
-        assert!(app.retired_subscription_ids.contains(&first_sub));
-        assert!(app.ghostty_projection.is_none());
-        assert!(!viewport_cache_contains(&app, "READY_ONE"));
-        app.apply_unix_terminal_envelope(mux_output_envelope(
-            "session-alpha",
-            &first_sub,
-            b"must-not-replay",
-        ));
-        assert!(app.applied_live_payloads.is_empty());
-        assert!(!viewport_cache_contains(&app, "must-not-replay"));
-    }
-
-    #[test]
-    fn ghostty_sequence_error_after_ready_starts_fresh_attach_without_replay() {
-        let size = TerminalScreenSize::new(6, 48);
-        let frames = producer_incremental_ghostsnp(size, b"READY_ONE");
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-a");
-        let first_sub = app.subscription_id.clone();
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-a",
-            &frames[0].bytes,
-            SnapshotPhase::Ready,
-        ));
-        assert!(viewport_cache_contains(&app, "READY_ONE"));
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-a",
-            b"not-a-ghostsnp-page",
-            SnapshotPhase::History,
-        ));
-        assert!(
-            app.attach_recovery_used,
-            "client-detected decode error must start one recovery"
-        );
-        let replacement = app.subscription_id.clone();
-        assert_ne!(replacement, first_sub);
-        assert!(app.retired_subscription_ids.contains(&first_sub));
-        assert!(app.attached_session.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("recovering"))
-        );
-        app.apply_unix_terminal_envelope(mux_output_envelope(
-            "session-alpha",
-            &first_sub,
-            b"must-not-replay",
-        ));
-        assert!(app.applied_live_payloads.is_empty());
-        assert!(!viewport_cache_contains(&app, "must-not-replay"));
-    }
-
-    #[test]
-    fn unexpected_ghostty_progress_starts_fresh_attach() {
-        let size = TerminalScreenSize::new(6, 48);
-        let frames = producer_incremental_ghostsnp(size, b"READY_ONE");
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-a");
-        let first_sub = app.subscription_id.clone();
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-a",
-            &frames[0].bytes,
-            SnapshotPhase::Ready,
-        ));
-        app.apply_unix_terminal_envelope(mux_snapshot_envelope(
-            "session-alpha",
-            "sub-a",
-            &frames[0].bytes,
-            SnapshotPhase::History,
-        ));
-        assert!(app.attach_recovery_used);
-        assert_ne!(app.subscription_id, first_sub);
-        assert!(app.retired_subscription_ids.contains(&first_sub));
-        assert!(app.attached_session.is_none());
-    }
-
-    #[test]
-    fn mux_decoder_keeps_partial_lines_and_emits_concatenated_values() {
-        let envelope = mux_output_envelope("session-a", "sub-a", b"hello");
-        let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
-        let mut buffer = bytes[..7].to_vec();
-        let first = decode_complete_mux_frames(&mut buffer).expect("partial line stays");
-        assert!(first.is_empty());
-        assert_eq!(buffer, bytes[..7]);
-        buffer.extend_from_slice(&bytes[7..]);
-        buffer.push(b'\n');
-        let complete = decode_complete_mux_frames(&mut buffer).expect("complete line");
-        assert_eq!(complete.len(), 1);
-        assert!(buffer.is_empty());
-
-        let second = mux_attach_state_envelope("session-a", "sub-a", AttachStateKind::Attached);
-        let mut concatenated = serde_json::to_vec(&envelope).expect("first");
-        concatenated.extend(serde_json::to_vec(&second).expect("second"));
-        concatenated.push(b'\n');
-        let frames = decode_complete_mux_frames(&mut concatenated).expect("two values");
-        assert_eq!(frames.len(), 2);
-        assert!(matches!(frames[0], DaemonUnixMuxFrame::Terminal(_)));
-        assert!(matches!(frames[1], DaemonUnixMuxFrame::Terminal(_)));
-        assert!(concatenated.is_empty());
-
-        let mut two_lines = serde_json::to_vec(&envelope).expect("line one");
-        two_lines.push(b'\n');
-        two_lines.extend(serde_json::to_vec(&second).expect("line two"));
-        two_lines.push(b'\n');
-        let split_lines = decode_complete_mux_frames(&mut two_lines).expect("two lines");
-        assert_eq!(split_lines.len(), 2);
-        assert!(two_lines.is_empty());
-    }
-
-    #[test]
-    fn mux_poll_returns_complete_frames_while_the_stream_stays_readable() {
-        use std::io::Write;
-        use std::os::unix::net::UnixStream;
-
-        let (reader, mut writer) = UnixStream::pair().expect("socket pair");
-        let envelope = mux_output_envelope("session-a", "sub-a", b"hello");
-        let mut line = serde_json::to_vec(&envelope).expect("encode");
-        line.push(b'\n');
-        let writer_line = line.clone();
-        fn write_line(writer: &mut UnixStream, line: &[u8]) -> io::Result<()> {
-            let mut offset = 0;
-            while offset < line.len() {
-                match writer.write(&line[offset..]) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "mux flood writer made no progress",
-                        ));
-                    }
-                    Ok(count) => offset += count,
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        }
-        write_line(&mut writer, &writer_line).expect("prime one frame");
-        let writer_thread = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                if write_line(&mut writer, &writer_line).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let mut connection = HubConnection::from_stream(reader);
-        let started = Instant::now();
-        let frames = connection
-            .poll_mux_frames()
-            .expect("poll must return on a live readable stream");
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "poll must not wait for the producer to go idle; elapsed={:?}",
-            started.elapsed()
-        );
-        assert!(
-            !frames.is_empty(),
-            "first poll must emit complete frames before the flood ends"
-        );
-        drop(connection);
-        let _ = writer_thread.join();
-    }
-
     #[derive(Clone, Copy)]
     enum DetachStubMode {
         WithholdResponse,
         StopReadingAfterAttach,
-    }
-
-    fn spawn_detach_bound_stub(mode: DetachStubMode) -> (DaemonEndpoint, PathBuf) {
-        let (root, listener) = bind_unix_stub("detach-stub");
-        let socket = root.join("hub.sock");
-        thread::spawn(move || {
-            let (mut stream, _) = match listener.accept() {
-                Ok(accepted) => accepted,
-                Err(_) => return,
-            };
-            let _hello: botster_hub_client::DaemonHello =
-                match botster_hub_client::read_frame(&mut stream) {
-                    Ok(hello) => hello,
-                    Err(_) => return,
-                };
-            let ack = DaemonHelloAck {
-                protocol: PROTOCOL.to_string(),
-                compatibility: DaemonCompatibility::current(),
-                terminal_compatibility: Some(TerminalCompatibility::current()),
-                diagnostics: Vec::new(),
-            };
-            if write_frame(&mut stream, &ack).is_err() {
-                return;
-            }
-            loop {
-                let request: DaemonRequest = match botster_hub_client::read_frame(&mut stream) {
-                    Ok(request) => request,
-                    Err(_) => return,
-                };
-                match request {
-                    DaemonRequest::Attach { .. } => {
-                        if write_frame(&mut stream, &base_response(DaemonResponseKind::Shutdown))
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if matches!(mode, DetachStubMode::StopReadingAfterAttach) {
-                            thread::sleep(Duration::from_secs(8));
-                            return;
-                        }
-                    }
-                    DaemonRequest::Detach { .. } => {
-                        if matches!(mode, DetachStubMode::WithholdResponse) {
-                            thread::sleep(Duration::from_secs(8));
-                            return;
-                        }
-                        if write_frame(&mut stream, &base_response(DaemonResponseKind::Shutdown))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    _ => {
-                        if write_frame(&mut stream, &base_response(DaemonResponseKind::Shutdown))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        (DaemonEndpoint::new(socket), root)
     }
 
     #[derive(Debug)]
@@ -19658,310 +13774,6 @@ mod tests {
         }
     }
 
-    fn spawn_recovery_hub_stub() -> RecoveryHubStub {
-        let (root, listener) = bind_unix_stub("recovery-stub");
-        let socket = root.join("hub.sock");
-        let (events_tx, events_rx) = mpsc::channel();
-        let running = Arc::new(AtomicBool::new(true));
-        let listener_running = running.clone();
-        listener
-            .set_nonblocking(true)
-            .expect("set recovery listener nonblocking");
-        let listener_thread = thread::spawn(move || {
-            while listener_running.load(Ordering::Acquire) {
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(_) => return,
-                };
-                if stream.set_nonblocking(false).is_err() {
-                    return;
-                }
-                let events_tx = events_tx.clone();
-                thread::spawn(move || {
-                    let Ok(reader_stream) = stream.try_clone() else {
-                        return;
-                    };
-                    let mut reader = std::io::BufReader::new(reader_stream);
-                    let mut incomplete = String::new();
-                    let _hello: botster_hub_client::DaemonHello =
-                        match botster_hub_client::read_frame_from_reader(
-                            &mut reader,
-                            &mut incomplete,
-                        ) {
-                            Ok(hello) => hello,
-                            Err(_) => return,
-                        };
-                    let _ = events_tx.send(RecoveryStubEvent::Hello);
-                    let ack = DaemonHelloAck {
-                        protocol: PROTOCOL.to_string(),
-                        compatibility: DaemonCompatibility::current(),
-                        terminal_compatibility: Some(TerminalCompatibility::current()),
-                        diagnostics: Vec::new(),
-                    };
-                    if write_frame(&mut stream, &ack).is_err() {
-                        return;
-                    }
-                    loop {
-                        let value: Value = match botster_hub_client::read_frame_from_reader(
-                            &mut reader,
-                            &mut incomplete,
-                        ) {
-                            Ok(value) => value,
-                            Err(_) => return,
-                        };
-                        if value.get("plane").and_then(Value::as_str)
-                            == Some(botster_hub_client::UNIX_TERMINAL_PLANE)
-                        {
-                            if let Ok(envelope) =
-                                serde_json::from_value::<DaemonUnixTerminalEnvelope>(value)
-                            {
-                                let _ = events_tx.send(RecoveryStubEvent::TerminalInput(
-                                    envelope.subscription_id,
-                                ));
-                            }
-                            continue;
-                        }
-                        let Ok(request) = serde_json::from_value::<DaemonRequest>(value) else {
-                            return;
-                        };
-                        let (label, identity) = match &request {
-                            DaemonRequest::SubscribeEntities {
-                                entity_type,
-                                subscription_id,
-                            } => (
-                                "subscribe_entities",
-                                Some(format!("{entity_type}:{subscription_id}")),
-                            ),
-                            DaemonRequest::SubscribeEvents {
-                                subscription_id, ..
-                            } => ("subscribe_events", Some(subscription_id.clone())),
-                            DaemonRequest::Attach {
-                                subscription_id, ..
-                            } => ("attach", Some(subscription_id.clone())),
-                            DaemonRequest::ReadModeFlags { .. } => ("read_mode_flags", None),
-                            DaemonRequest::PluginSurfaceRender { .. } => ("plugin_surface", None),
-                            DaemonRequest::Status => ("status", None),
-                            _ => ("control", None),
-                        };
-                        let _ = events_tx.send(RecoveryStubEvent::Request(label, identity));
-                        match request {
-                            DaemonRequest::SubscribeEntities {
-                                entity_type,
-                                subscription_id,
-                            } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::EntitySubscribed),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                                let items = if entity_type == "session" {
-                                    vec![session_entity_value(session_entity(
-                                        "session-alpha",
-                                        Some("running"),
-                                    ))]
-                                } else {
-                                    Vec::new()
-                                };
-                                let frame = DaemonEntityFrame::Snapshot {
-                                    subscription_id,
-                                    entity_type,
-                                    snapshot_seq: 1,
-                                    items,
-                                    resync_reason: None,
-                                };
-                                if write_frame(&mut stream, &frame).is_err() {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::UnsubscribeEntities { .. } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::EntityUnsubscribed),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::Status => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::Status),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::ListApps => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::Apps),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::ListPackageNavigation => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::PackageNavigation),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::ListPackages => {
-                                let mut response = base_response(DaemonResponseKind::Packages);
-                                response.packages = vec![matrix_package(5_000)];
-                                if write_frame(&mut stream, &response).is_err() {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::ListSpawnTargets => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::SpawnTargets),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::SubscribeEvents { .. } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::EventSubscribed),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::UnsubscribeEvents { .. } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::EventUnsubscribed),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::PluginSurfaceRender { .. } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &plugin_surface_response(entity_options_picker_surface()),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::Attach {
-                                session_id,
-                                subscription_id,
-                            } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::Shutdown),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                                for frame in producer_incremental_ghostsnp(
-                                    TerminalScreenSize::new(24, 80),
-                                    b"RECOVERY_READY",
-                                ) {
-                                    if write_frame(
-                                        &mut stream,
-                                        &mux_snapshot_envelope(
-                                            &session_id,
-                                            &subscription_id,
-                                            &frame.bytes,
-                                            snapshot_phase_for_frame(frame.kind),
-                                        ),
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                if write_frame(
-                                    &mut stream,
-                                    &mux_attach_state_envelope(
-                                        &session_id,
-                                        &subscription_id,
-                                        AttachStateKind::Attached,
-                                    ),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::ReadModeFlags { session_id } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &mode_flags_response_full(&session_id, false, 0, 4, 8),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::ReadScreen { session_id } => {
-                                if write_frame(&mut stream, &read_screen_response(&session_id, ""))
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            DaemonRequest::CaptureSnapshot { .. }
-                            | DaemonRequest::Detach { .. } => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::Shutdown),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            _ => {
-                                if write_frame(
-                                    &mut stream,
-                                    &base_response(DaemonResponseKind::Shutdown),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        RecoveryHubStub {
-            root,
-            endpoint: DaemonEndpoint::new(socket),
-            events: events_rx,
-            running,
-            listener_thread: Some(listener_thread),
-        }
-    }
-
     fn assert_no_shutdown_session(app: &TuiApp) {
         assert!(
             !app.observed_requests
@@ -19970,914 +13782,6 @@ mod tests {
             "shared teardown must never send ShutdownSession: {:?}",
             app.observed_requests
         );
-    }
-
-    #[test]
-    fn bounded_detach_returns_when_hub_withholds_the_response() {
-        let _stub_test = lock_unix_stub_test();
-        let (endpoint, root) = spawn_detach_bound_stub(DetachStubMode::WithholdResponse);
-        let client = HubConnection::connect(&endpoint).expect("hello");
-        let mut connected = client;
-        connected
-            .request(&DaemonRequest::Attach {
-                session_id: "shared-session".to_string(),
-                subscription_id: "sub-a".to_string(),
-            })
-            .expect("attach");
-        let mut app = TuiApp::new(None);
-        app.client = Some(connected);
-        app.begin_attach_hydration("shared-session", "sub-a");
-        app.attached_session = Some("shared-session".to_string());
-        app.attached_subscription_id = Some("sub-a".to_string());
-        app.observed_requests.clear();
-        let started = Instant::now();
-        app.force_reconnect();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "withheld Detach response must return in under 3s; elapsed={:?}",
-            started.elapsed()
-        );
-        assert_no_shutdown_session(&app);
-        assert!(app.client.is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bounded_detach_returns_when_peer_stops_reading() {
-        let _stub_test = lock_unix_stub_test();
-        let (endpoint, root) = spawn_detach_bound_stub(DetachStubMode::StopReadingAfterAttach);
-        let client = HubConnection::connect(&endpoint).expect("hello");
-        let mut connected = client;
-        connected
-            .request(&DaemonRequest::Attach {
-                session_id: "shared-session".to_string(),
-                subscription_id: "sub-a".to_string(),
-            })
-            .expect("attach");
-        connected.fill_send_buffer_until_blocked();
-        let mut app = TuiApp::new(None);
-        app.client = Some(connected);
-        app.begin_attach_hydration("shared-session", "sub-a");
-        app.attached_session = Some("shared-session".to_string());
-        app.attached_subscription_id = Some("sub-a".to_string());
-        app.observed_requests.clear();
-        let started = Instant::now();
-        app.force_reconnect();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "saturated Detach write must return in under 3s; elapsed={:?}",
-            started.elapsed()
-        );
-        assert_no_shutdown_session(&app);
-        assert!(app.client.is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn mux_terminal_subscription_closed_recovers_once_then_fails_closed() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-a");
-        let first = app.subscription_id.clone();
-        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
-            session_id: "session-alpha".to_string(),
-            subscription_id: first.clone(),
-            generation: 9,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
-        });
-        assert_eq!(
-            app.terminal_close_evidence,
-            Some((9, "core_adapter_closed".to_string()))
-        );
-        let replacement = app.subscription_id.clone();
-        assert_ne!(replacement, first);
-        assert!(app.attach_recovery_used);
-        assert!(app.attach_hydration.is_some());
-        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
-            session_id: "session-alpha".to_string(),
-            subscription_id: replacement,
-            generation: 10,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
-        });
-        assert!(app.attach_hydration.is_none());
-        assert!(app.attached_session.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("failed closed after recovery"))
-        );
-    }
-
-    #[test]
-    fn late_close_for_retired_subscription_does_not_abort_replacement() {
-        let size = TerminalScreenSize::new(6, 48);
-        let frames = producer_incremental_ghostsnp(size, b"REPLACEMENT");
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-a");
-        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-a".to_string(),
-            generation: 3,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
-        });
-        let replacement = app.subscription_id.clone();
-        apply_mux_snapshot_frames(&mut app, "session-alpha", &replacement, b"REPLACEMENT");
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-alpha",
-            &replacement,
-            AttachStateKind::Attached,
-        ));
-        assert_eq!(
-            app.attached_subscription_id.as_deref(),
-            Some(replacement.as_str())
-        );
-        let decoder_before = app.ghostty_projection.is_some();
-        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-a".to_string(),
-            generation: 3,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
-        });
-        assert_eq!(
-            app.attached_subscription_id.as_deref(),
-            Some(replacement.as_str())
-        );
-        assert_eq!(app.ghostty_projection.is_some(), decoder_before);
-        assert!(viewport_cache_contains(&app, "REPLACEMENT") || frames.is_empty());
-        assert_eq!(app.subscription_id, replacement);
-    }
-
-    #[test]
-    fn mux_process_exit_closes_only_that_pair() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-a", "sub-a");
-        apply_mux_snapshot_frames(&mut app, "session-a", "sub-a", b"A");
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-a",
-            "sub-a",
-            AttachStateKind::Attached,
-        ));
-        app.apply_unix_terminal_envelope(mux_process_exit_envelope("session-b", "sub-b", Some(1)));
-        assert_eq!(app.attached_session.as_deref(), Some("session-a"));
-        app.apply_unix_terminal_envelope(mux_process_exit_envelope("session-a", "sub-a", Some(0)));
-        assert!(app.attached_session.is_none());
-        assert!(app.retired_subscription_ids.contains("sub-a"));
-    }
-
-    #[test]
-    fn sequential_sibling_attach_survives_closed_predecessor() {
-        let size = TerminalScreenSize::new(6, 48);
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-a", "sub-a");
-        apply_mux_snapshot_frames(&mut app, "session-a", "sub-a", b"AAA");
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-a",
-            "sub-a",
-            AttachStateKind::Attached,
-        ));
-        app.apply_unix_terminal_envelope(mux_process_exit_envelope("session-a", "sub-a", Some(0)));
-        app.reset_attach_campaign();
-        app.begin_attach_hydration("session-b", "sub-b");
-        apply_mux_snapshot_frames(&mut app, "session-b", "sub-b", b"BBB");
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-b",
-            "sub-b",
-            AttachStateKind::Attached,
-        ));
-        app.apply_mux_event(DaemonEvent::TerminalSubscriptionClosed {
-            session_id: "session-a".to_string(),
-            subscription_id: "sub-a".to_string(),
-            generation: 1,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
-        });
-        assert_eq!(app.attached_session.as_deref(), Some("session-b"));
-        assert!(viewport_cache_contains(&app, "BBB"));
-    }
-
-    #[test]
-    fn attach_queues_input_and_only_the_latest_resize_until_both_barriers() {
-        let size = TerminalScreenSize::new(6, 48);
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        app.observed_requests.clear();
-
-        let frames = producer_incremental_ghostsnp(size, b"");
-        assert_eq!(
-            frames.iter().map(|frame| frame.kind).collect::<Vec<_>>(),
-            vec![
-                botster_terminal_ghostty::GhosttySnapshotFrameKind::Ready,
-                botster_terminal_ghostty::GhosttySnapshotFrameKind::Finish,
-            ]
-        );
-        let ready = frames.first().expect("READY frame");
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
-        }]));
-
-        app.handle_dispatch(InputDispatch::TerminalResize {
-            node_id: "tui-terminal".to_string(),
-            rows: 10,
-            cols: 50,
-        });
-        app.handle_dispatch(InputDispatch::TerminalResize {
-            node_id: "tui-terminal".to_string(),
-            rows: 12,
-            cols: 60,
-        });
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"queued-input\n".to_vec(),
-        });
-        assert_eq!(app.terminal_viewport_size, size);
-        assert!(app.observed_requests.is_empty());
-
-        for frame in frames.iter().skip(1) {
-            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
-            }]));
-        }
-        assert_eq!(app.terminal_viewport_size, size);
-        assert!(app.observed_requests.is_empty());
-        app.apply_response(attach_state_response("session-alpha", "attached"));
-
-        assert_eq!(
-            app.observed_terminal_inputs
-                .iter()
-                .filter(|request| matches!(request, TerminalInputCommand::Resize { .. }))
-                .count(),
-            1
-        );
-        assert!(
-            app.observed_terminal_inputs
-                .contains(&TerminalInputCommand::Resize { rows: 12, cols: 60 })
-        );
-        assert!(app.observed_terminal_inputs.iter().any(|request| matches!(
-            request,
-            TerminalInputCommand::Input { data } if data == b"queued-input\n"
-        )));
-    }
-
-    #[test]
-    fn incremental_history_failure_keeps_ready_terminal_and_then_attaches() {
-        let size = TerminalScreenSize::new(6, 48);
-        let frames = producer_incremental_ghostsnp(size, b"READY_SURVIVES");
-        let ready = frames.first().expect("READY frame");
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-
-        app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ready.bytes),
-        }]));
-        assert!(viewport_cache_contains(&app, "READY_SURVIVES"));
-        assert!(
-            app.ghostty_projection
-                .as_ref()
-                .is_some_and(GhosttyClientProjection::snapshot_history_pending)
-        );
-        assert!(app.attached_session.is_none());
-
-        app.apply_response(events_response(vec![DaemonEvent::AttachState {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            state: ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE.to_string(),
-        }]));
-        assert!(viewport_cache_contains(&app, "READY_SURVIVES"));
-        assert!(
-            app.ghostty_projection
-                .as_ref()
-                .is_some_and(|projection| !projection.snapshot_history_pending())
-        );
-        assert!(app.attached_session.is_none());
-
-        app.apply_response(events_response(vec![
-            DaemonEvent::AttachState {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                state: "attached".to_string(),
-            },
-            DaemonEvent::TerminalOutput {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                payload: DaemonLiveOutputPayload::from_bytes(b"\r\nLIVE_AFTER_BARRIER"),
-            },
-        ]));
-
-        assert_eq!(app.attached_session.as_deref(), Some("session-alpha"));
-        assert!(app.attach_hydration.is_none());
-        assert!(viewport_cache_contains(&app, "READY_SURVIVES"));
-        assert!(viewport_cache_contains(&app, "LIVE_AFTER_BARRIER"));
-        let (painted, _, _) = render_app_painted(&app, 140, 42);
-        assert!(painted.contains("LIVE_AFTER_BARRIER"));
-    }
-
-    #[test]
-    fn ghostty_install_snapshot_before_live_applies_output() {
-        let size = TerminalScreenSize::new(8, 40);
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(b"pre-install-live"),
-        }]));
-        assert!(app.applied_live_payloads.is_empty());
-        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-test", b"seed-install");
-        assert!(app.applied_live_payloads.is_empty());
-        assert!(app.attach_hydration.is_some());
-        app.apply_response(attach_state_response("session-alpha", "attached"));
-        // FINISH and attached open the live path after incremental install.
-        assert!(app.attach_hydration.is_none());
-        assert!(
-            app.ghostty_projection.is_some(),
-            "projection must exist after install"
-        );
-        assert!(viewport_cache_contains(&app, "seed-install"));
-        assert!(viewport_cache_contains(&app, "pre-install-live"));
-        assert_eq!(
-            app.applied_live_payloads,
-            vec![b"pre-install-live".to_vec()]
-        );
-        // ReadScreen is diagnostic only and must not become terminal content.
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "diagnostic-only"),
-            "read_screen_diagnostic",
-        );
-        assert!(!viewport_cache_contains(&app, "diagnostic-only"));
-        assert!(!app.terminal_content().contains("diagnostic-only"));
-    }
-
-    fn live_output_event(session_id: &str, subscription_id: &str, bytes: &[u8]) -> DaemonEvent {
-        DaemonEvent::TerminalOutput {
-            session_id: session_id.to_string(),
-            subscription_id: subscription_id.to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(bytes),
-        }
-    }
-
-    fn attach_with_ghostsnp_seed(seed: &[u8]) -> TuiApp {
-        let size = TerminalScreenSize::new(8, 40);
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        apply_incremental_snapshot_frames(&mut app, "session-alpha", "sub-test", seed);
-        app.apply_response(attach_state_response("session-alpha", "attached"));
-        assert!(app.attach_hydration.is_none());
-        assert!(app.ghostty_projection.is_some());
-        app.applied_live_payloads.clear();
-        app
-    }
-
-    #[test]
-    fn apply_response_preserves_split_utf8_live_bytes() {
-        let mut app = attach_with_ghostsnp_seed(b"byte-seed");
-        app.apply_response(events_response(vec![live_output_event(
-            "session-alpha",
-            "sub-test",
-            &[0xE2],
-        )]));
-        assert_eq!(app.applied_live_payloads, vec![vec![0xE2]]);
-        assert!(
-            !viewport_cache_contains(&app, "\u{FFFD}"),
-            "first split frame must not UTF-8-repair to U+FFFD"
-        );
-        assert!(
-            app.applied_live_payloads.iter().all(|payload| !payload
-                .windows(3)
-                .any(|window| window == [0xEF, 0xBF, 0xBD])),
-            "applied bytes must not contain the UTF-8 replacement sequence"
-        );
-
-        app.apply_response(events_response(vec![live_output_event(
-            "session-alpha",
-            "sub-test",
-            &[0x82, 0xAC],
-        )]));
-        assert_eq!(
-            app.applied_live_payloads.concat(),
-            vec![0xE2, 0x82, 0xAC],
-            "concatenated applied payloads must be the euro UTF-8 sequence"
-        );
-        assert!(
-            viewport_cache_contains(&app, "\u{20AC}"),
-            "euro must appear in the projection after both fragments"
-        );
-        let (painted, _, _) = render_app_painted(&app, 120, 24);
-        assert!(
-            painted.contains('\u{20AC}'),
-            "painted frame must show euro after both fragments; painted={painted}"
-        );
-    }
-
-    #[test]
-    fn apply_response_preserves_invalid_nul_and_escape_live_bytes() {
-        let mut app = attach_with_ghostsnp_seed(b"byte-seed");
-        app.apply_response(events_response(vec![live_output_event(
-            "session-alpha",
-            "sub-test",
-            &[0x00, 0x1b, 0xff, 0xc0],
-        )]));
-        assert_eq!(
-            app.applied_live_payloads,
-            vec![vec![0x00, 0x1b, 0xff, 0xc0]]
-        );
-        assert!(
-            !viewport_cache_contains(&app, "\u{FFFD}"),
-            "invalid 0xff must not become U+FFFD in the projection"
-        );
-        assert!(
-            app.applied_live_payloads.iter().all(|payload| !payload
-                .windows(3)
-                .any(|window| window == [0xEF, 0xBF, 0xBD])),
-            "0xff must reach apply_terminal_output unchanged"
-        );
-
-        app.apply_response(events_response(vec![live_output_event(
-            "session-alpha",
-            "sub-test",
-            b"\x1b[0mNUL-LATER",
-        )]));
-        assert!(
-            viewport_cache_contains(&app, "NUL-LATER"),
-            "NUL prefix must not drop later live bytes"
-        );
-        let (painted, _, _) = render_app_painted(&app, 120, 24);
-        assert!(
-            painted.contains("NUL-LATER"),
-            "later marker after NUL/ESC/invalid must paint; painted={painted}"
-        );
-    }
-
-    #[test]
-    fn apply_response_rejects_retired_terminal_output_data_field() {
-        let event = live_output_event("session-alpha", "sub-test", b"live-after-attach\r\n");
-        let mut value = serde_json::to_value(&event).expect("serialize current live envelope");
-        assert!(value.get("data").is_none());
-        value["data"] = serde_json::json!("live-after-attach\r\n");
-        let error = serde_json::from_value::<DaemonEvent>(value)
-            .expect_err("retired data key must fail even when the current envelope is valid");
-        assert!(
-            error
-                .to_string()
-                .contains("legacy terminal_output data field is rejected"),
-            "expected retired-field rejection, got {error}"
-        );
-    }
-
-    #[test]
-    fn apply_response_fail_closes_on_live_output_decode_error() {
-        let mut app = attach_with_ghostsnp_seed(b"byte-seed");
-        let mut payload = DaemonLiveOutputPayload::from_bytes(b"ok");
-        payload.bytes = 99;
-        app.apply_response(events_response(vec![DaemonEvent::TerminalOutput {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            payload,
-        }]));
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("terminal output decode failed (closed)")),
-            "decode failure must fail closed; error={:?}",
-            app.error
-        );
-        assert!(
-            app.applied_live_payloads.is_empty(),
-            "decode failure must not apply repaired bytes"
-        );
-    }
-
-    #[test]
-    fn ghostty_scrollback_event_never_calls_install_ghostsnp() {
-        let size = TerminalScreenSize::new(6, 30);
-        let ghostsnp = producer_ghostsnp(size, b"must-not-install-from-scrollback");
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        app.apply_response(events_response(vec![DaemonEvent::Scrollback {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "sub-test".to_string(),
-            history: DaemonOpaqueHistoryPayload::from_bytes(&ghostsnp),
-        }]));
-        assert!(app.ghostty_projection.is_none());
-        assert!(
-            app.attach_hydration
-                .as_ref()
-                .is_some_and(|h| !h.snapshot_ready)
-        );
-        assert!(!viewport_cache_contains(
-            &app,
-            "must-not-install-from-scrollback"
-        ));
-    }
-
-    #[test]
-    fn ghostty_paint_real_frame_shows_styled_cells_cursor_and_palette() {
-        let size = TerminalScreenSize::new(6, 40);
-        let mut app = workspace_fixture();
-        app.terminal_viewport_size = size;
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.ensure_ghostty_projection("session-alpha");
-        {
-            let projection = app.ghostty_projection.as_mut().expect("projection");
-            // Bold green "Hi", cursor at column 3, OSC palette set.
-            projection.apply_terminal_output(
-                b"\x1b]4;1;rgb:ff/00/00\x07\x1b[1;38;2;0;128;0mHi\x1b[0m\x1b[1;3H",
-            );
-        }
-        app.refresh_ghostty_viewport_cache();
-        let viewport = app
-            .ghostty_viewport_cache
-            .as_ref()
-            .expect("viewport cache after apply");
-        let h = viewport
-            .cells
-            .iter()
-            .find(|c| c.grapheme == "H")
-            .expect("H cell");
-        assert!(h.bold);
-        assert_eq!(h.fg.r, 0);
-        assert_eq!(h.fg.g, 0x80);
-        assert_eq!(h.fg.b, 0);
-        assert!(viewport.cursor.in_viewport);
-        assert_eq!(viewport.cursor.x, 2);
-
-        let (lines, hit_map) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        let rendered = lines.join("\n");
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView),
-            "kit must register tui-terminal TerminalView region"
-        );
-        assert!(
-            rendered.contains('H') && rendered.contains('i'),
-            "real frame must paint projection graphemes: {rendered}"
-        );
-
-        // Workspace-error sibling: region still exists but paint must not crash
-        // when an error row shrinks the terminal rect relative to the pane.
-        app.error = Some("workspace sibling error".to_string());
-        let (_lines, hit_map_err) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        let terminal = hit_map_err
-            .regions()
-            .iter()
-            .find(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView);
-        assert!(
-            terminal.is_some(),
-            "error sibling must keep tui-terminal region for paint targeting"
-        );
-
-        // Detached / no-region negative: clear projection paint when not attached.
-        app.attached_session = None;
-        app.clear_ghostty_projection();
-        let (_lines, hit_map_clear) = render_app_to_lines(&app, 140, 42, &RenderState::default());
-        assert!(
-            crate::projection_paint::tui_terminal_region(&hit_map_clear).is_some()
-                || app.ghostty_viewport_cache.is_none()
-        );
-        assert!(app.ghostty_viewport_cache.is_none());
-    }
-
-    #[test]
-    fn ghostty_scroll_op_moves_viewport_to_pre_attach_history_marker() {
-        let size = TerminalScreenSize::new(5, 40);
-        use botster_terminal_ghostty::{GhosttyAdapterConfig, GhosttyTerminal};
-        let mut producer = GhosttyTerminal::with_config(
-            size,
-            GhosttyAdapterConfig::with_max_scrollback_bytes(512 * 1024),
-        )
-        .expect("producer");
-        producer.write_output_bytes(b"TOP_MARKER\r\n");
-        for i in 0..20 {
-            producer.write_output_bytes(format!("mid line {i}\r\n").as_bytes());
-        }
-        producer.write_output_bytes(b"JUST_ABOVE_VIEWPORT\r\n");
-        for i in 0..4 {
-            producer.write_output_bytes(format!("live edge {i}\r\n").as_bytes());
-        }
-        producer.write_output_bytes(b"BOTTOM_LIVE");
-        let mut frames = Vec::new();
-        producer
-            .export_snapshot_frames(|frame| {
-                frames.push(frame);
-                true
-            })
-            .expect("export incremental frames");
-
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        for frame in frames {
-            app.apply_response(events_response(vec![DaemonEvent::Snapshot {
-                session_id: "session-alpha".to_string(),
-                subscription_id: "sub-test".to_string(),
-                history: DaemonOpaqueHistoryPayload::from_bytes(&frame.bytes),
-            }]));
-        }
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", ""),
-            "read_screen",
-        );
-        assert!(
-            !viewport_cache_contains(&app, "TOP_MARKER"),
-            "top history must start outside the default viewport"
-        );
-        app.scroll_projection(ScrollOp::Top);
-        assert!(
-            viewport_cache_contains(&app, "TOP_MARKER"),
-            "ScrollOp::Top must reveal pre-attach history marker"
-        );
-    }
-
-    #[test]
-    fn mode_gated_kitty_and_mouse_use_freshness_with_single_reprobe() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-alpha".to_string());
-        app.subscription_id = "sub-alpha".to_string();
-        app.observed_requests.clear();
-
-        // Freshness tokens from ReadModeFlags.
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", true, 9, 3, 7),
-            "read_mode_flags",
-        );
-        assert!(app.current_mode_shadow().is_some_and(|s| s.kitty_enabled));
-        assert!(app.mode_gated_input_required(b"typed\n"));
-        let sgr = b"\x1b[<0;1;1M".to_vec();
-        assert!(app.mode_gated_input_required(&sgr));
-
-        // Kitty-enabled: plain text records ModeGatedInput with generation/revision.
-        // (No live Hub client: request fails closed after observation.)
-        app.forward_terminal_input("session-alpha".to_string(), b"typed\n".to_vec());
-        assert!(
-            app.observed_terminal_inputs
-                .contains(&TerminalInputCommand::ModeGatedInput {
-                    data: b"typed\n".to_vec(),
-                    mode_generation: 3,
-                    mode_revision: 7,
-                })
-        );
-
-        // Restore attachment-scoped modes after the failed request path.
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some("sub-alpha".to_string());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 9, 3, 7),
-            "read_mode_flags",
-        );
-        app.observed_requests.clear();
-        // Mouse mode without Kitty: only SGR mouse reports require ModeGatedInput.
-        assert!(!app.mode_gated_input_required(b"plain"));
-        assert!(app.mode_gated_input_required(&sgr));
-        app.forward_terminal_input("session-alpha".to_string(), sgr.clone());
-        assert!(app.observed_terminal_inputs.iter().any(|request| {
-            matches!(
-                request,
-                TerminalInputCommand::ModeGatedInput {
-                    data,
-                    mode_generation: 3,
-                    mode_revision: 7,
-                } if data == &sgr
-            )
-        }));
-    }
-
-    #[test]
-    fn read_screen_is_non_authoritative_when_projection_installed() {
-        let size = TerminalScreenSize::new(6, 40);
-        let mut app = TuiApp::new(None);
-        app.terminal_viewport_size = size;
-        app.begin_attach_hydration("session-alpha", "sub-test");
-        apply_incremental_snapshot_frames(
-            &mut app,
-            "session-alpha",
-            "sub-test",
-            b"projection-authority",
-        );
-        app.apply_response(attach_state_response("session-alpha", "attached"));
-        assert!(app.attach_hydration.is_none());
-        assert!(viewport_cache_contains(&app, "projection-authority"));
-        app.apply_optional_readback_response(
-            read_screen_response("session-alpha", "read-screen-text-only"),
-            "read_screen_diagnostic",
-        );
-        assert!(viewport_cache_contains(&app, "projection-authority"));
-        assert!(!viewport_cache_contains(&app, "read-screen-text-only"));
-        assert!(!app.terminal_content().contains("read-screen-text-only"));
-    }
-
-    #[test]
-    fn kitty_encoding_uses_real_key_path_and_mode_gated_input() {
-        let mut app = TuiApp::new(None);
-        app.sessions = vec![SessionRow::running("session-alpha")];
-        app.selected_session = Some("session-alpha".to_string());
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", true, 0, 5, 9),
-            "read_mode_flags",
-        );
-        app.observed_requests.clear();
-
-        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-        let mut router = InputRouter::new(renderer::action_request_context());
-        // Focus the terminal region so the production key path can encode Kitty.
-        let terminal = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "tui-terminal")
-            .expect("terminal region");
-        let focus = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                terminal.rect.x.saturating_add(1),
-                terminal.rect.y.saturating_add(1),
-            ),
-            &hit_map,
-        );
-        app.handle_dispatch(focus);
-        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
-
-        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-        assert!(app.handle_focused_terminal_key(key, router.focused_node_id()));
-        let expected = renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
-            .expect("kitty encodes char a");
-        assert!(
-            app.observed_terminal_inputs
-                .contains(&TerminalInputCommand::ModeGatedInput {
-                    data: expected,
-                    mode_generation: 5,
-                    mode_revision: 9,
-                })
-        );
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::Input { .. }))
-        );
-    }
-
-    #[test]
-    fn classic_encoding_remains_when_kitty_disabled() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 0, 1, 1),
-            "read_mode_flags",
-        );
-        app.observed_terminal_inputs.clear();
-        // Without kitty, focused key path still consumes and classic-encodes.
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert!(
-            app.observed_terminal_inputs
-                .contains(&TerminalInputCommand::Input {
-                    data: b"x".to_vec(),
-                })
-        );
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::ModeGatedInput { .. }))
-        );
-    }
-
-    #[test]
-    fn unknown_mode_flags_fail_closed_for_focused_terminal_keys() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        // No ModeFlags shadow: must not fall through to classic SendInput.
-        app.observed_requests.clear();
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::Input { .. })),
-            "unknown ModeFlags must not plain-SendInput classic key bytes"
-        );
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|e| e.contains("mode flags not ready"))
-        );
-    }
-
-    #[test]
-    fn kitty_key_path_covers_modifiers_repeat_and_release() {
-        let mut app = TuiApp::new(None);
-        let restore = |app: &mut TuiApp| {
-            app.attached_session = Some("session-alpha".to_string());
-            app.attached_subscription_id = Some(app.subscription_id.clone());
-            app.apply_optional_readback_response(
-                mode_flags_response_full("session-alpha", true, 0, 2, 4),
-                "read_mode_flags",
-            );
-        };
-        restore(&mut app);
-
-        // Modifier chord.
-        app.observed_requests.clear();
-        let mod_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.handle_focused_terminal_key(mod_key, Some("tui-terminal")));
-        let expected_mod =
-            renderer::terminal_key_bytes_with(mod_key, renderer::TerminalKeyEncoding::Kitty)
-                .expect("kitty encodes ctrl-c");
-        assert!(app.observed_terminal_inputs.iter().any(|r| {
-            matches!(
-                r,
-                TerminalInputCommand::ModeGatedInput { data, mode_generation: 2, mode_revision: 4 }
-                    if data.as_slice() == expected_mod.as_slice()
-            )
-        }));
-
-        // Repeat (Kitty encodes event type; always consume, never classic SendInput).
-        // Restore attachment: ModeGated without a live client transport-errors and clears.
-        restore(&mut app);
-        app.observed_requests.clear();
-        let mut repeat = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
-        repeat.kind = KeyEventKind::Repeat;
-        assert!(app.handle_focused_terminal_key(repeat, Some("tui-terminal")));
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::Input { .. }))
-        );
-        assert!(
-            app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::ModeGatedInput { .. }))
-        );
-
-        // Release is consumed (Kitty may encode release; either way no classic SendInput).
-        restore(&mut app);
-        app.observed_requests.clear();
-        let mut release = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
-        release.kind = KeyEventKind::Release;
-        assert!(app.handle_focused_terminal_key(release, Some("tui-terminal")));
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::Input { .. }))
-        );
-    }
-
-    #[test]
-    fn input_result_refreshes_the_live_mode_shadow() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", true, 0, 1, 1),
-            "read_mode_flags",
-        );
-        app.terminal_input_in_flight
-            .push_back(InFlightTerminalInput {
-                kind: TerminalInputKind::ModeGatedInput,
-                data: b"input".to_vec(),
-                operation_id: None,
-                retried: false,
-            });
-        app.terminal_input_in_flight_bytes = 5;
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::ModeGatedInput,
-            operation_id: None,
-            admitted: true,
-            bytes_written: 5,
-            mode_generation: 1,
-            mode_revision: 2,
-            mode_flags: TerminalModeFlags {
-                kitty_enabled: true,
-                cursor_visible: true,
-                bracketed_paste: false,
-                mouse_mode: 0,
-                alt_screen: false,
-                focus_reporting: false,
-                application_cursor: false,
-            },
-            rejection: None,
-        });
-        assert_eq!(app.current_mode_shadow().map(|s| s.mode_revision), Some(2));
     }
 
     fn empty_mode_flags() -> TerminalModeFlags {
@@ -20892,287 +13796,6 @@ mod tests {
         }
     }
 
-    fn connected_terminal_app(kitty_enabled: bool) -> TuiApp {
-        use std::os::unix::net::UnixStream;
-
-        let mut app = TuiApp::new(None);
-        let (client, mut responder) = UnixStream::pair().expect("terminal responder pair");
-        app.client = Some(HubConnection::from_stream(client));
-        thread::spawn(move || {
-            let Ok(reader_stream) = responder.try_clone() else {
-                return;
-            };
-            let mut reader = std::io::BufReader::new(reader_stream);
-            let mut incomplete = String::new();
-            loop {
-                let value: Value = match botster_hub_client::read_frame_from_reader(
-                    &mut reader,
-                    &mut incomplete,
-                ) {
-                    Ok(value) => value,
-                    Err(_) => return,
-                };
-                if value.get("plane").and_then(Value::as_str)
-                    == Some(botster_hub_client::UNIX_TERMINAL_PLANE)
-                {
-                    continue;
-                }
-                let Ok(request) = serde_json::from_value::<DaemonRequest>(value) else {
-                    return;
-                };
-                let response = match request {
-                    DaemonRequest::ReadModeFlags { session_id } => {
-                        mode_flags_response_full(&session_id, false, 0, 4, 8)
-                    }
-                    _ => base_response(DaemonResponseKind::Shutdown),
-                };
-                if write_frame(&mut responder, &response).is_err() {
-                    return;
-                }
-            }
-        });
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", kitty_enabled, 0, 1, 1),
-            "read_mode_flags",
-        );
-        app.observed_requests.clear();
-        app.observed_terminal_inputs.clear();
-        app
-    }
-
-    #[test]
-    fn plain_key_and_resize_results_preserve_live_mode_safety() {
-        let mut mouse_app = TuiApp::new(None);
-        let _mouse_peer = install_dummy_hub_client(&mut mouse_app);
-        mouse_app.attached_session = Some("session-alpha".to_string());
-        mouse_app.attached_subscription_id = Some(mouse_app.subscription_id.clone());
-        mouse_app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 9, 4, 8),
-            "read_mode_flags",
-        );
-        assert!(mouse_app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        mouse_app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: mouse_app.subscription_id.clone(),
-            kind: TerminalInputKind::Input,
-            operation_id: None,
-            admitted: true,
-            bytes_written: 1,
-            mode_generation: 0,
-            mode_revision: 0,
-            mode_flags: empty_mode_flags(),
-            rejection: None,
-        });
-        assert_eq!(mouse_app.current_terminal_mouse_mode(), 9);
-        mouse_app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"\x1b[<0;1;1M".to_vec(),
-        });
-        assert!(matches!(
-            mouse_app.observed_terminal_inputs.last(),
-            Some(TerminalInputCommand::ModeGatedInput {
-                mode_generation: 4,
-                mode_revision: 8,
-                ..
-            })
-        ));
-
-        let mut kitty_app = TuiApp::new(None);
-        let _kitty_peer = install_dummy_hub_client(&mut kitty_app);
-        kitty_app.attached_session = Some("session-alpha".to_string());
-        kitty_app.attached_subscription_id = Some(kitty_app.subscription_id.clone());
-        kitty_app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", true, 0, 5, 9),
-            "read_mode_flags",
-        );
-        kitty_app.handle_dispatch(InputDispatch::TerminalResize {
-            node_id: "tui-terminal".to_string(),
-            rows: 31,
-            cols: 97,
-        });
-        kitty_app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: kitty_app.subscription_id.clone(),
-            kind: TerminalInputKind::Resize,
-            operation_id: None,
-            admitted: true,
-            bytes_written: 0,
-            mode_generation: 0,
-            mode_revision: 0,
-            mode_flags: empty_mode_flags(),
-            rejection: None,
-        });
-        assert!(kitty_app.current_mode_shadow().is_some_and(|shadow| {
-            shadow.kitty_enabled && shadow.mode_generation == 5 && shadow.mode_revision == 9
-        }));
-        assert!(kitty_app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert!(matches!(
-            kitty_app.observed_terminal_inputs.last(),
-            Some(TerminalInputCommand::ModeGatedInput {
-                mode_generation: 5,
-                mode_revision: 9,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn stale_mode_retries_are_correlated_and_bounded() {
-        let mut app = connected_terminal_app(true);
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        let first_data = app.terminal_input_in_flight[0].data.clone();
-        let second_data = app.terminal_input_in_flight[1].data.clone();
-        assert_eq!(app.terminal_input_in_flight.len(), 2);
-
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::ModeGatedInput,
-            operation_id: None,
-            admitted: false,
-            bytes_written: 0,
-            mode_generation: 7,
-            mode_revision: 12,
-            mode_flags: TerminalModeFlags {
-                kitty_enabled: true,
-                cursor_visible: true,
-                ..empty_mode_flags()
-            },
-            rejection: Some(TerminalInputRejection::StaleMode),
-        });
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::ReadModeFlags(_)))
-                .count(),
-            1,
-            "one stale result must cause one real ReadModeFlags request"
-        );
-        assert!(matches!(
-            app.observed_terminal_inputs.last(),
-            Some(TerminalInputCommand::ModeGatedInput {
-                data,
-                mode_generation: 4,
-                mode_revision: 8,
-            }) if data == &first_data
-        ));
-        assert_eq!(app.terminal_input_in_flight.len(), 2);
-        assert!(app.terminal_input_in_flight[0].retried);
-        assert_eq!(app.terminal_input_in_flight[0].data, first_data);
-        assert_eq!(app.terminal_input_in_flight[1].data, second_data);
-
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::ModeGatedInput,
-            admitted: true,
-            bytes_written: first_data.len(),
-            mode_generation: 4,
-            mode_revision: 8,
-            mode_flags: empty_mode_flags(),
-            operation_id: None,
-            rejection: None,
-        });
-        assert_eq!(app.terminal_input_in_flight.len(), 1);
-        assert_eq!(app.terminal_input_in_flight[0].data, second_data);
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::ModeGatedInput,
-            admitted: true,
-            bytes_written: second_data.len(),
-            mode_generation: 4,
-            mode_revision: 8,
-            mode_flags: empty_mode_flags(),
-            operation_id: None,
-            rejection: None,
-        });
-        assert!(app.terminal_input_in_flight.is_empty());
-        assert_eq!(app.terminal_input_in_flight_bytes, 0);
-    }
-
-    #[test]
-    fn mode_gated_key_stops_after_a_second_stale_mode_result() {
-        let mut app = connected_terminal_app(true);
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        let input_bytes = app.terminal_input_in_flight_bytes;
-        assert!(input_bytes > 0);
-
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::ModeGatedInput,
-            operation_id: None,
-            admitted: false,
-            bytes_written: 0,
-            mode_generation: 7,
-            mode_revision: 12,
-            mode_flags: TerminalModeFlags {
-                kitty_enabled: true,
-                cursor_visible: true,
-                ..empty_mode_flags()
-            },
-            rejection: Some(TerminalInputRejection::StaleMode),
-        });
-        assert_eq!(app.terminal_input_in_flight.len(), 1);
-        assert!(app.terminal_input_in_flight[0].retried);
-        assert_eq!(app.terminal_input_in_flight_bytes, input_bytes);
-        let writes_after_retry = app.observed_terminal_inputs.len();
-        let probes_after_retry = app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::ReadModeFlags(_)))
-            .count();
-        assert_eq!(probes_after_retry, 1);
-
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::ModeGatedInput,
-            operation_id: None,
-            admitted: false,
-            bytes_written: 0,
-            mode_generation: 4,
-            mode_revision: 9,
-            mode_flags: TerminalModeFlags {
-                kitty_enabled: true,
-                cursor_visible: true,
-                ..empty_mode_flags()
-            },
-            rejection: Some(TerminalInputRejection::StaleMode),
-        });
-        assert_eq!(
-            app.observed_terminal_inputs.len(),
-            writes_after_retry,
-            "a second stale result must not write another retry"
-        );
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::ReadModeFlags(_)))
-                .count(),
-            probes_after_retry,
-            "a second stale result must not re-probe mode flags"
-        );
-        assert_eq!(
-            app.error.as_deref(),
-            Some("terminal input rejected: stale mode")
-        );
-        assert!(app.terminal_input_in_flight.is_empty());
-        assert_eq!(app.terminal_input_in_flight_bytes, 0);
-    }
-
     #[test]
     fn terminal_subscription_ids_advance_the_per_app_sequence() {
         let mut app = TuiApp::new(None);
@@ -21185,619 +13808,6 @@ mod tests {
         assert!(first.ends_with("-1"));
         assert!(second.ends_with("-2"));
         assert_eq!(app.next_terminal_subscription_sequence, 3);
-    }
-
-    #[test]
-    fn stale_paste_gets_one_new_operation_id_and_partial_write_never_retries() {
-        let mut app = connected_terminal_app(false);
-        app.next_paste_operation_id = 7;
-        assert!(app.handle_focused_terminal_paste("paste", Some("tui-terminal")));
-        let first_id = app.terminal_input_in_flight[0]
-            .operation_id
-            .expect("first paste operation id");
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Paste,
-            operation_id: Some(first_id),
-            admitted: false,
-            bytes_written: 0,
-            mode_generation: 3,
-            mode_revision: 6,
-            mode_flags: empty_mode_flags(),
-            rejection: Some(TerminalInputRejection::StaleMode),
-        });
-        let retry_id = app.terminal_input_in_flight[0]
-            .operation_id
-            .expect("retry paste operation id");
-        assert_ne!(retry_id, first_id);
-        assert!(matches!(
-            app.observed_terminal_inputs.iter().rev().find(|command| matches!(
-                command,
-                TerminalInputCommand::PasteBegin { .. }
-            )),
-            Some(TerminalInputCommand::PasteBegin {
-                operation_id,
-                mode_generation: 4,
-                mode_revision: 8,
-                ..
-            }) if *operation_id == retry_id
-        ));
-        let commands_after_retry = app.observed_terminal_inputs.len();
-
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Paste,
-            operation_id: Some(retry_id),
-            admitted: false,
-            bytes_written: 0,
-            mode_generation: 4,
-            mode_revision: 9,
-            mode_flags: empty_mode_flags(),
-            rejection: Some(TerminalInputRejection::StaleMode),
-        });
-        assert_eq!(app.observed_terminal_inputs.len(), commands_after_retry);
-        assert!(app.terminal_input_in_flight.is_empty());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("stale"))
-        );
-
-        assert!(app.handle_focused_terminal_paste("partial", Some("tui-terminal")));
-        let partial_id = app.terminal_input_in_flight[0]
-            .operation_id
-            .expect("partial paste operation id");
-        let commands_before_partial_result = app.observed_terminal_inputs.len();
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Paste,
-            operation_id: Some(partial_id),
-            admitted: false,
-            bytes_written: 3,
-            mode_generation: 4,
-            mode_revision: 9,
-            mode_flags: empty_mode_flags(),
-            rejection: Some(TerminalInputRejection::PartialWrite),
-        });
-        assert_eq!(
-            app.observed_terminal_inputs.len(),
-            commands_before_partial_result,
-            "PartialWrite must not retry"
-        );
-        let closed_subscription = app.subscription_id.clone();
-        app.apply_mux_frames(vec![DaemonUnixMuxFrame::Event(
-            DaemonEvent::TerminalSubscriptionClosed {
-                session_id: "session-alpha".to_string(),
-                subscription_id: closed_subscription.clone(),
-                generation: 12,
-                reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
-            },
-        )]);
-        assert!(app.retired_subscription_ids.contains(&closed_subscription));
-        assert_ne!(app.subscription_id, closed_subscription);
-        assert!(app.attached_session.is_none());
-    }
-
-    #[test]
-    fn entry_and_byte_pressure_recover_after_results_and_real_input() {
-        let mut app = connected_terminal_app(false);
-        for _ in 0..TERMINAL_INPUT_INFLIGHT_CAPACITY {
-            assert!(app.handle_focused_terminal_key(
-                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-                Some("tui-terminal"),
-            ));
-        }
-        assert_eq!(
-            app.terminal_input_in_flight.len(),
-            TERMINAL_INPUT_INFLIGHT_CAPACITY
-        );
-        let commands_at_entry_limit = app.observed_terminal_inputs.len();
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert_eq!(app.observed_terminal_inputs.len(), commands_at_entry_limit);
-        assert!(app.client.is_some());
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Input,
-            operation_id: None,
-            admitted: true,
-            bytes_written: 1,
-            mode_generation: 0,
-            mode_revision: 0,
-            mode_flags: empty_mode_flags(),
-            rejection: None,
-        });
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert_eq!(
-            app.observed_terminal_inputs.len(),
-            commands_at_entry_limit + 1
-        );
-        assert_eq!(
-            app.terminal_input_in_flight.len(),
-            TERMINAL_INPUT_INFLIGHT_CAPACITY
-        );
-
-        let mut app = connected_terminal_app(false);
-        for _ in 0..4 {
-            app.handle_dispatch(InputDispatch::TerminalForward {
-                node_id: "tui-terminal".to_string(),
-                bytes: vec![b'x'; MAX_INPUT_DATA_BYTES],
-            });
-        }
-        assert_eq!(app.terminal_input_in_flight_bytes, 4 * MAX_INPUT_DATA_BYTES);
-        let commands_at_byte_limit = app.observed_terminal_inputs.len();
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"extra".to_vec(),
-        });
-        assert_eq!(app.observed_terminal_inputs.len(), commands_at_byte_limit);
-        assert!(app.client.is_some());
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Input,
-            operation_id: None,
-            admitted: true,
-            bytes_written: MAX_INPUT_DATA_BYTES,
-            mode_generation: 0,
-            mode_revision: 0,
-            mode_flags: empty_mode_flags(),
-            rejection: None,
-        });
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"extra".to_vec(),
-        });
-        assert_eq!(
-            app.observed_terminal_inputs.len(),
-            commands_at_byte_limit + 1
-        );
-        assert_eq!(
-            app.terminal_input_in_flight_bytes,
-            3 * MAX_INPUT_DATA_BYTES + 5
-        );
-    }
-
-    #[test]
-    fn paste_event_routes_raw_bytes_through_the_core_transaction_helper() {
-        let mut app = TuiApp::new(None);
-        app.sessions = vec![SessionRow::running("session-alpha")];
-        app.selected_session = Some("session-alpha".to_string());
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 0, 7, 11),
-            "read_mode_flags",
-        );
-        let (_lines, hit_map) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-        let terminal = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "tui-terminal")
-            .expect("terminal region");
-        let mut router = InputRouter::new(renderer::action_request_context());
-        let focus = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                terminal.rect.x.saturating_add(1),
-                terminal.rect.y.saturating_add(1),
-            ),
-            &hit_map,
-        );
-        app.handle_dispatch(focus);
-        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
-        app.observed_terminal_inputs.clear();
-
-        assert!(route_input_event(
-            &mut app,
-            &mut router,
-            &hit_map,
-            Event::Paste("héllo".to_string()),
-        ));
-
-        let operation_id = match app.observed_terminal_inputs.first() {
-            Some(TerminalInputCommand::PasteBegin {
-                operation_id,
-                mode_generation: 7,
-                mode_revision: 11,
-                total_len: 6,
-            }) => *operation_id,
-            other => panic!("expected paste begin, got {other:?}"),
-        };
-        let mut content = Vec::new();
-        for (expected_index, command) in app.observed_terminal_inputs
-            [1..app.observed_terminal_inputs.len() - 1]
-            .iter()
-            .enumerate()
-        {
-            match command {
-                TerminalInputCommand::PasteChunk {
-                    operation_id: found,
-                    index,
-                    data,
-                } => {
-                    assert_eq!(*found, operation_id);
-                    assert_eq!(*index as usize, expected_index);
-                    content.extend_from_slice(data);
-                }
-                other => panic!("expected paste chunk, got {other:?}"),
-            }
-        }
-        assert_eq!(content, "héllo".as_bytes());
-        assert!(!content.windows(6).any(|bytes| bytes == b"\x1b[200~"));
-        assert!(!content.windows(6).any(|bytes| bytes == b"\x1b[201~"));
-        assert_eq!(
-            app.observed_terminal_inputs.last(),
-            Some(&TerminalInputCommand::PasteCommit { operation_id })
-        );
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|command| matches!(command, TerminalInputCommand::Input { .. }))
-        );
-    }
-
-    #[test]
-    fn terminal_forward_preserves_non_utf8_bytes() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        let bytes = vec![0, 0xff, 0x80, b'x'];
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: bytes.clone(),
-        });
-        assert_eq!(
-            app.observed_terminal_inputs,
-            vec![TerminalInputCommand::Input { data: bytes }]
-        );
-    }
-
-    #[test]
-    fn unix_duplex_writer_wraps_the_exact_core_frame_and_restores_timeout() {
-        let (writer, mut reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-        let mut connection = HubConnection::from_stream(writer);
-        let frame = encode_terminal_input(&TerminalInputCommand::Resize { rows: 31, cols: 97 })
-            .expect("encode resize");
-        connection
-            .write_terminal_frame(
-                "session-alpha",
-                "sub-alpha",
-                frame.as_bytes(),
-                TERMINAL_INPUT_WRITE_BOUND,
-            )
-            .expect("write duplex frame");
-        assert_eq!(connection.stream.write_timeout().expect("timeout"), None);
-
-        let mut bytes = [0_u8; 1024];
-        let read = reader.read(&mut bytes).expect("read envelope");
-        let line = std::str::from_utf8(&bytes[..read]).expect("UTF-8 envelope");
-        let envelope: DaemonUnixTerminalEnvelope =
-            serde_json::from_str(line.trim()).expect("decode envelope");
-        assert_eq!(envelope.session_id, "session-alpha");
-        assert_eq!(envelope.subscription_id, "sub-alpha");
-        let decoded = TerminalInputFrame::from_bytes(&envelope.payload_bytes().expect("payload"))
-            .expect("input frame");
-        assert_eq!(
-            decode_terminal_input(&decoded).expect("decode command"),
-            TerminalInputCommand::Resize { rows: 31, cols: 97 }
-        );
-    }
-
-    #[test]
-    fn input_queue_fails_soft_before_the_core_capacity() {
-        let mut app = TuiApp::new(None);
-        for _ in 0..TERMINAL_INPUT_INFLIGHT_CAPACITY {
-            assert!(app.reserve_terminal_input(InFlightTerminalInput {
-                kind: TerminalInputKind::Resize,
-                data: Vec::new(),
-                operation_id: None,
-                retried: false,
-            }));
-        }
-        assert!(!app.reserve_terminal_input(InFlightTerminalInput {
-            kind: TerminalInputKind::Input,
-            data: vec![1],
-            operation_id: None,
-            retried: false,
-        }));
-        assert_eq!(
-            app.terminal_input_in_flight.len(),
-            TERMINAL_INPUT_INFLIGHT_CAPACITY
-        );
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("back pressure"))
-        );
-    }
-
-    #[test]
-    fn paste_operation_ids_exhaust_without_wrapping_or_blocking_keys() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 0, 3, 4),
-            "read_mode_flags",
-        );
-        app.next_paste_operation_id = u32::MAX - 1;
-        assert!(app.handle_focused_terminal_paste("first", Some("tui-terminal")));
-        assert!(matches!(
-            app.observed_terminal_inputs.first(),
-            Some(TerminalInputCommand::PasteBegin { operation_id, .. })
-                if *operation_id == u32::MAX - 1
-        ));
-        assert_eq!(app.next_paste_operation_id, u32::MAX);
-
-        let written = app.observed_terminal_inputs.len();
-        assert!(app.handle_focused_terminal_paste("second", Some("tui-terminal")));
-        assert_eq!(app.observed_terminal_inputs.len(), written);
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("operation ids exhausted"))
-        );
-        assert_eq!(app.next_paste_operation_id, u32::MAX);
-
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.apply_optional_readback_response(
-            mode_flags_response_full("session-alpha", false, 0, 3, 4),
-            "read_mode_flags",
-        );
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-        assert!(matches!(
-            app.observed_terminal_inputs.last(),
-            Some(TerminalInputCommand::Input { data }) if data == b"k"
-        ));
-    }
-
-    #[test]
-    fn paste_hydration_keeps_one_raw_operation_and_refuses_oversize() {
-        let mut app = TuiApp::new(None);
-        app.begin_attach_hydration("session-alpha", "sub-alpha");
-        assert!(app.handle_focused_terminal_paste("raw", Some("tui-terminal")));
-        let operation_id = app.next_paste_operation_id - 1;
-        assert_eq!(
-            app.attach_hydration
-                .as_ref()
-                .expect("hydration")
-                .pending_input,
-            vec![PendingTerminalInput::Paste {
-                operation_id,
-                data: b"raw".to_vec(),
-            }]
-        );
-        assert!(app.handle_focused_terminal_paste("later", Some("tui-terminal")));
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("another paste"))
-        );
-
-        let pending = app
-            .attach_hydration
-            .as_ref()
-            .expect("hydration")
-            .pending_input
-            .len();
-        let oversized = "x".repeat(MAX_PASTE_BYTES + 1);
-        assert!(app.handle_focused_terminal_paste(&oversized, Some("tui-terminal")));
-        assert_eq!(
-            app.attach_hydration
-                .as_ref()
-                .expect("hydration")
-                .pending_input
-                .len(),
-            pending
-        );
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains(&MAX_PASTE_BYTES.to_string()))
-        );
-    }
-
-    #[test]
-    fn mismatched_input_result_clears_correlation_and_mode_freshness() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.terminal_mode_shadow = Some(TerminalModeShadow {
-            session_id: "session-alpha".to_string(),
-            subscription_id: app.subscription_id.clone(),
-            kitty_enabled: false,
-            bracketed_paste: false,
-            mouse_mode: 0,
-            mode_generation: 1,
-            mode_revision: 1,
-        });
-        app.terminal_input_in_flight
-            .push_back(InFlightTerminalInput {
-                kind: TerminalInputKind::Input,
-                data: b"x".to_vec(),
-                operation_id: None,
-                retried: false,
-            });
-        app.terminal_input_in_flight_bytes = 1;
-        app.apply_terminal_input_result(TerminalInputResult {
-            subscription_id: app.subscription_id.clone(),
-            kind: TerminalInputKind::Resize,
-            operation_id: None,
-            admitted: true,
-            bytes_written: 0,
-            mode_generation: 1,
-            mode_revision: 2,
-            mode_flags: TerminalModeFlags {
-                kitty_enabled: false,
-                cursor_visible: true,
-                bracketed_paste: false,
-                mouse_mode: 0,
-                alt_screen: false,
-                focus_reporting: false,
-                application_cursor: false,
-            },
-            rejection: None,
-        });
-        assert!(app.terminal_input_in_flight.is_empty());
-        assert_eq!(app.terminal_input_in_flight_bytes, 0);
-        assert!(app.terminal_mode_shadow.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("did not match"))
-        );
-    }
-
-    #[test]
-    fn mouse_report_without_mode_flags_fails_closed() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.attached_subscription_id = Some(app.subscription_id.clone());
-        app.observed_requests.clear();
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"\x1b[<0;1;1M".to_vec(),
-        });
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::Input { .. })),
-            "mouse reports must not plain-SendInput without ModeFlags freshness"
-        );
-        assert!(app.error.is_some());
-    }
-
-    #[test]
-    fn terminal_scroll_shortcuts_require_terminal_focus() {
-        let mut app = TuiApp::new(None);
-        app.attached_session = Some("session-alpha".to_string());
-        app.ensure_ghostty_projection("session-alpha");
-        {
-            let projection = app.ghostty_projection.as_mut().unwrap();
-            projection.apply_terminal_output(b"line1\r\nline2\r\nline3\r\n");
-        }
-        app.refresh_ghostty_viewport_cache();
-        // Focused navigator must not steal PageUp into terminal scroll.
-        assert!(!app.handle_tui_owned_key(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            Some("tui-session-list"),
-        ));
-        assert!(app.handle_tui_owned_key(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-    }
-
-    #[test]
-    fn authoritative_snapshot_preserves_selected_session_when_still_listed() {
-        let mut app = TuiApp::new(None);
-        app.session_entities
-            .begin_generation("generation-1".to_string());
-        app.selected_session = Some("session-beta".to_string());
-
-        assert!(
-            app.session_entities
-                .apply(snapshot_frame(
-                    "generation-1",
-                    0,
-                    vec![
-                        session_entity("session-alpha", Some("running")),
-                        session_entity("session-beta", Some("running")),
-                    ],
-                ))
-                .expect("snapshot applies")
-        );
-        app.rebuild_session_rows();
-
-        assert_eq!(
-            app.sessions,
-            session_rows([("session-alpha", "running"), ("session-beta", "running"),])
-        );
-        assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
-    }
-
-    #[test]
-    fn authoritative_snapshot_resets_stale_selection_without_attaching() {
-        let mut app = TuiApp::new(None);
-        app.session_entities
-            .begin_generation("generation-1".to_string());
-        app.selected_session = Some("session-beta".to_string());
-
-        app.session_entities
-            .apply(snapshot_frame(
-                "generation-1",
-                0,
-                vec![
-                    session_entity("session-delta", Some("running")),
-                    session_entity("session-gamma", Some("running")),
-                ],
-            ))
-            .expect("snapshot applies");
-        app.rebuild_session_rows();
-
-        assert_eq!(
-            app.sessions,
-            session_rows([("session-delta", "running"), ("session-gamma", "running"),])
-        );
-        assert_eq!(app.selected_session.as_deref(), Some("session-delta"));
-        assert_eq!(app.attached_session, None);
-    }
-
-    #[test]
-    fn entity_patch_preserves_and_renders_lifecycle_and_failure_state() {
-        let mut app = TuiApp::new(None);
-        app.session_entities
-            .begin_generation("generation-1".to_string());
-        app.session_entities
-            .apply(snapshot_frame(
-                "generation-1",
-                0,
-                vec![session_entity("session-alpha", Some("running"))],
-            ))
-            .expect("snapshot applies");
-        app.session_entities
-            .apply(DaemonEntityFrame::Patch {
-                subscription_id: "generation-1".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                id: "session-alpha".to_string(),
-                patch: json!({
-                    "lifecycle": "failed",
-                    "failure_reason": "worker exited",
-                    "updated_at": 2
-                }),
-            })
-            .expect("patch applies");
-        app.rebuild_session_rows();
-
-        assert_eq!(
-            app.sessions,
-            vec![SessionRow {
-                session_id: "session-alpha".to_string(),
-                lifecycle: "failed".to_string(),
-                failure_reason: Some("worker exited".to_string()),
-                pending: false,
-                session_type_id: None,
-                session_type_source: None,
-                role: None,
-                traits: Vec::new(),
-                interaction: None,
-                session_type_lifecycle: None,
-            }]
-        );
-        let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("session-alpha · failed"));
-        assert!(rendered.contains("worker exited"));
     }
 
     #[test]
@@ -21934,28 +13944,6 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_does_not_auto_attach_known_non_running_session() {
-        let mut app = TuiApp::new(None);
-        app.sessions = vec![SessionRow {
-            session_id: "session-beta".to_string(),
-            lifecycle: "exited".to_string(),
-            failure_reason: None,
-            pending: false,
-            session_type_id: None,
-            session_type_source: None,
-            role: None,
-            traits: Vec::new(),
-            interaction: None,
-            session_type_lifecycle: None,
-        }];
-        app.selected_session = Some("session-beta".to_string());
-        app.observed_requests.clear();
-
-        assert!(app.observed_requests.is_empty());
-        assert_eq!(app.attached_session, None);
-    }
-
-    #[test]
     fn refresh_read_models_does_not_list_sessions() {
         let mut app = TuiApp::new(None);
         app.observed_requests.clear();
@@ -22048,2446 +14036,6 @@ mod tests {
         assert_ne!(request.action_id.0, "botster_workspaces.open");
     }
 
-    #[test]
-    fn reconnect_does_not_auto_attach_selected_running_session() {
-        let mut app = TuiApp::new(None);
-        app.observed_requests.clear();
-        app.sessions = vec![SessionRow::running("session-alpha")];
-        app.selected_session = Some("session-alpha".to_string());
-        assert!(app.observed_requests.is_empty());
-        assert_eq!(app.attached_session, None);
-    }
-
-    #[test]
-    fn tui_hub_boundary_uses_public_client_without_private_protocol_plumbing() {
-        let source = source_without_line_comments();
-
-        assert!(source.contains("use botster_hub_client"));
-        for required in [
-            "connect_and_hello_with_terminal_requirement",
-            "parse_unix_mux_value",
-            "subscribe_session_entities",
-            "SubscribeEvents",
-            "FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS",
-            "DaemonEntityFrame",
-            "DaemonEndpoint",
-            "DaemonRequest",
-            "DaemonResponse",
-        ] {
-            assert!(
-                source.contains(required),
-                "botster-tui should keep using public botster-hub-client {required}"
-            );
-        }
-
-        let forbidden_patterns = [
-            concat!("FRA", "ME_"),
-            concat!("SESSION", "_FRAME"),
-            concat!("Daemon", "Frame"),
-            concat!("Session", "Frame"),
-            concat!("Hub", "Frame"),
-            concat!("session", "_protocol"),
-            concat!("read", "_line"),
-            concat!("write", "_all"),
-        ];
-        for pattern in forbidden_patterns {
-            assert!(
-                !source.contains(pattern),
-                "botster-tui source must not reintroduce private hub protocol plumbing: {pattern}"
-            );
-        }
-        assert_eq!(
-            source.matches(concat!("List", "Sessions")).count(),
-            2,
-            "the legacy list request may appear only in the acceptance audit and its positive control"
-        );
-    }
-
-    /// Hermetic production-path proof for the Available sessions claim seam:
-    /// keyboard-select exact session_uuid, submit botster_workspaces.add_session,
-    /// membership entity join, then option exclusion without surface refresh.
-    #[test]
-    fn workspaces_claim_keyboard_select_submit_membership_and_exclusion() {
-        let session_uuid = "00000000-0000-4000-8000-000000000099";
-        let workspace_id = "workspace-claim-fixture";
-        let body = ui_node(json!({
-            "type": "form",
-            "id": "botster-workspaces-add-form-fixture",
-            "props": {
-                "action": {
-                    "id": "botster_workspaces.add_session",
-                    "payload": { "workspace_id": workspace_id }
-                },
-                "submit_label": "Add session"
-            },
-            "children": [{
-                "type": "select",
-                "id": "botster-workspaces-add-session-id",
-                "props": {
-                    "name": "session_id",
-                    "label": "Available sessions",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/session",
-                        "value_field": "session_uuid",
-                        "display_fields": ["session_uuid", "lifecycle_class"],
-                        "order": ["session_uuid"],
-                        "exclude": {
-                            "source": "/botster-workspaces.membership",
-                            "value_field": "session_uuid"
-                        }
-                    }
-                }
-            }]
-        }));
-
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.entity_options_local_pumps = true;
-        app.acceptance_audit = Some(AcceptanceRequestAudit::default());
-        app.connection_error = None;
-        app.observed_requests.clear();
-        app.apply_response(plugin_surface_response(canonical_surface(
-            WORKSPACES_PACKAGE,
-            WORKSPACES_SURFACE,
-            body.clone(),
-        )));
-        app.error = None;
-        app.connection_error = None;
-        app.drop_entity_options_subscriptions();
-
-        // Process-wide /session row used by Available sessions projection.
-        app.session_entities.has_snapshot = true;
-        app.session_entities.snapshot_seq = Some(1);
-        app.session_entities.subscription_id = Some("sess-claim-1".to_string());
-        app.session_entities.entity_order = vec![session_uuid.to_string()];
-        app.session_entities.entities.insert(
-            session_uuid.to_string(),
-            session_entity(session_uuid, Some("running")),
-        );
-
-        // Membership exclude family starts empty (unclaimed).
-        app.start_entity_options_subscription(WORKSPACES_MEMBERSHIP_FAMILY)
-            .expect("membership pump starts");
-        let membership_sub = app
-            .entity_options
-            .family(WORKSPACES_MEMBERSHIP_FAMILY)
-            .and_then(|family| family.subscription_id.clone())
-            .expect("membership generation");
-        let injector = app
-            .entity_options_frame_injectors
-            .get(WORKSPACES_MEMBERSHIP_FAMILY)
-            .expect("membership injector")
-            .clone();
-        injector
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Snapshot {
-                    subscription_id: membership_sub.clone(),
-                    entity_type: WORKSPACES_MEMBERSHIP_FAMILY.to_string(),
-                    snapshot_seq: 1,
-                    items: vec![],
-                    resync_reason: None,
-                },
-            ))
-            .expect("empty membership snapshot");
-        assert!(!app.drain_entity_options_subscriptions());
-
-        // Sanity: process-wide session projection must feed Available sessions.
-        let projection_store = app.entity_options_projection_store();
-        assert!(
-            projection_store
-                .get("session")
-                .is_some_and(|records| records.contains_key(session_uuid)),
-            "session process-wide store must include the seeded row: {:?}",
-            projection_store
-                .get("session")
-                .map(|r| r.keys().collect::<Vec<_>>())
-        );
-
-        let mut router = InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE));
-        let (lines, hit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let rendered = lines.join("\n");
-        let focusable = hit_map
-            .focusable_regions()
-            .map(|region| region.node_id.clone())
-            .collect::<Vec<_>>();
-        let select_field = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == WORKSPACES_ADD_SESSION_NODE)
-            .and_then(|region| region.field.as_ref());
-        let select_field = select_field.unwrap_or_else(|| {
-            panic!(
-                "Available sessions field must materialize; focusable={focusable:?}; rendered={rendered}"
-            )
-        });
-        assert!(
-            select_field
-                .options
-                .iter()
-                .any(|value| value == &json!(session_uuid)),
-            "exact session must appear before claim: {rendered}"
-        );
-
-        // Production keyboard path: Tab focus, open select, choose exact uuid.
-        focus_hit_map_node_by_tab(&mut router, &hit_map, WORKSPACES_ADD_SESSION_NODE);
-        let (_, open_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &open_map,
-        );
-        // Only one option — commit it.
-        let (_, commit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &commit_map,
-        );
-        assert_eq!(
-            router.draft_value(WORKSPACES_ADD_SESSION_FIELD),
-            Some(&json!(session_uuid)),
-            "keyboard must select exact session_uuid"
-        );
-        app.set_drafts(router.draft_values());
-
-        // Keyboard form submit through production hit map / InputRouter only —
-        // never construct UiActionRequest.values by hand.
-        let (_, submit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let submit_node = submit_map
-            .regions()
-            .iter()
-            .find(|region| {
-                region
-                    .action
-                    .as_ref()
-                    .is_some_and(|action| action.id.0 == WORKSPACES_ADD_SESSION_ACTION)
-            })
-            .map(|region| region.node_id.clone())
-            .expect("realized add_session form action must appear in hit map");
-        focus_hit_map_node_by_tab(&mut router, &submit_map, &submit_node);
-        let (_, enter_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let dispatch = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &enter_map,
-        );
-        let InputDispatch::Action(request) = dispatch else {
-            panic!("keyboard form submit must dispatch Action, got {dispatch:?}");
-        };
-        assert_eq!(request.action_id.0, WORKSPACES_ADD_SESSION_ACTION);
-        assert_eq!(
-            request
-                .values
-                .as_ref()
-                .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
-                .and_then(Value::as_str),
-            Some(session_uuid),
-            "submit request.values.session_id must equal exact keyboard selection: {:?}",
-            request.values
-        );
-        // Prove the oracle is request.values-only: a draft match without values fails.
-        let mut values_missing = request.clone();
-        values_missing.values = None;
-        assert_ne!(
-            values_missing
-                .values
-                .as_ref()
-                .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
-                .and_then(Value::as_str),
-            Some(session_uuid),
-            "stripped values must not satisfy the exact-uuid oracle"
-        );
-        app.handle_dispatch(InputDispatch::Action(request.clone()));
-        assert!(
-            app.observed_requests.iter().any(|observed| matches!(
-                observed,
-                ObservedRequest::PluginSurfaceAction {
-                    package_name,
-                    request: observed_request
-                } if package_name == WORKSPACES_PACKAGE
-                    && observed_request.action_id.0 == WORKSPACES_ADD_SESSION_ACTION
-                    && observed_request
-                        .values
-                        .as_ref()
-                        .and_then(|values| values.0.get(WORKSPACES_ADD_SESSION_FIELD))
-                        .and_then(Value::as_str)
-                        == Some(session_uuid)
-            )),
-            "claim submit must travel PluginSurfaceAction with exact uuid: {:?}",
-            app.observed_requests
-        );
-        assert_eq!(
-            app.acceptance_audit
-                .as_ref()
-                .map(|audit| audit.list_sessions)
-                .unwrap_or(1),
-            0,
-            "claim path must not issue session-list reads"
-        );
-
-        // Offline transport clears the surface; restore form + membership generation
-        // so the join oracle can apply entity frames without a surface re-render RPC.
-        app.apply_response(plugin_surface_response(canonical_surface(
-            WORKSPACES_PACKAGE,
-            WORKSPACES_SURFACE,
-            body.clone(),
-        )));
-        app.error = None;
-        app.connection_error = None;
-        app.drop_entity_options_subscriptions();
-        app.session_entities.has_snapshot = true;
-        app.session_entities.snapshot_seq = Some(1);
-        app.session_entities.subscription_id = Some("sess-claim-1".to_string());
-        app.session_entities.entity_order = vec![session_uuid.to_string()];
-        app.session_entities.entities.insert(
-            session_uuid.to_string(),
-            session_entity(session_uuid, Some("running")),
-        );
-        app.start_entity_options_subscription(WORKSPACES_MEMBERSHIP_FAMILY)
-            .expect("membership pump restarts");
-        let membership_sub = app
-            .entity_options
-            .family(WORKSPACES_MEMBERSHIP_FAMILY)
-            .and_then(|family| family.subscription_id.clone())
-            .expect("membership generation after restore");
-        let injector = app
-            .entity_options_frame_injectors
-            .get(WORKSPACES_MEMBERSHIP_FAMILY)
-            .expect("membership injector after restore")
-            .clone();
-        injector
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Snapshot {
-                    subscription_id: membership_sub.clone(),
-                    entity_type: WORKSPACES_MEMBERSHIP_FAMILY.to_string(),
-                    snapshot_seq: 1,
-                    items: vec![],
-                    resync_reason: None,
-                },
-            ))
-            .expect("restored empty membership snapshot");
-        assert!(!app.drain_entity_options_subscriptions());
-
-        // Membership join via entity frame (not action result alone).
-        injector
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Upsert {
-                    subscription_id: membership_sub.clone(),
-                    entity_type: WORKSPACES_MEMBERSHIP_FAMILY.to_string(),
-                    snapshot_seq: 2,
-                    id: session_uuid.to_string(),
-                    entity: json!({
-                        "id": session_uuid,
-                        "session_uuid": session_uuid,
-                        "workspace_id": workspace_id
-                    }),
-                },
-            ))
-            .expect("membership upsert");
-        assert!(!app.drain_entity_options_subscriptions());
-        assert!(
-            membership_entity_contains(&app, workspace_id, session_uuid),
-            "membership entity row must record exact W+S"
-        );
-
-        // Option exclusion without surface refresh.
-        let surface_renders_before = app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-            .count();
-        app.reconcile_entity_option_drafts();
-        let (after_lines, after_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let after = after_lines.join("\n");
-        let after_field = after_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == WORKSPACES_ADD_SESSION_NODE)
-            .and_then(|region| region.field.as_ref())
-            .expect("select remains for exclusion observation");
-        assert!(
-            !after_field
-                .options
-                .iter()
-                .any(|value| value == &json!(session_uuid)),
-            "claimed session must leave Available sessions options: {after}"
-        );
-        let surface_renders_after = app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-            .count();
-        assert_eq!(
-            surface_renders_before, surface_renders_after,
-            "exclusion must not issue PluginSurfaceRender sync"
-        );
-    }
-
-    #[test]
-    fn entity_options_select_materializes_keyboard_submit_and_invalidates_without_surface_refresh()
-    {
-        let body = ui_node(json!({
-            "type": "form",
-            "id": "entity-options-form",
-            "props": {
-                "action": { "id": "entity-options.submit" },
-                "submit_label": "Submit selection"
-            },
-            "children": [{
-                "type": "select",
-                "id": "entity-options-select",
-                "props": {
-                    "name": "option",
-                    "label": "Option",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/entity-options-reactive.item",
-                        "value_field": "value",
-                        "display_fields": ["label", "lifecycle_class", "session_type", "spawn_point"],
-                        "order": ["label", "value"],
-                        "where": { "lifecycle_class": "current" }
-                    }
-                }
-            }]
-        }));
-
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.observed_requests.clear();
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            body.clone(),
-        )));
-        // Offline unit path has no hub endpoint for SubscribeEntities; seed frames below.
-        app.error = None;
-        app.drop_entity_options_subscriptions();
-
-        // Seed options store as production frame apply would (without surface re-render RPC).
-        app.entity_options
-            .begin_generation("entity-options-reactive.item", "opts-gen-1".to_string());
-        assert!(
-            app.entity_options
-                .apply_daemon_frame(DaemonEntityFrame::Snapshot {
-                    subscription_id: "opts-gen-1".to_string(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 1,
-                    items: vec![
-                        json!({
-                            "id": "opt-alpha",
-                            "label": "Alpha",
-                            "lifecycle_class": "current",
-                            "session_type": "agent",
-                            "spawn_point": "local",
-                            "value": "opt-alpha"
-                        }),
-                        json!({
-                            "id": "opt-bravo",
-                            "label": "Bravo",
-                            "lifecycle_class": "current",
-                            "session_type": "agent",
-                            "spawn_point": "local",
-                            "value": "opt-bravo"
-                        }),
-                    ],
-                    resync_reason: None,
-                })
-                .expect("options snapshot applies")
-        );
-
-        let surface_renders_before = app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-            .count();
-
-        let mut router = InputRouter::new(renderer::action_request_context_for(
-            "entity-options-reactive.picker",
-        ));
-        let (lines, hit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let rendered = lines.join("\n");
-        let select_field = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "entity-options-select")
-            .and_then(|region| region.field.as_ref())
-            .expect("select field must appear in production hit map");
-        assert_eq!(
-            select_field.options,
-            vec![json!("opt-alpha"), json!("opt-bravo")],
-            "materialized options must reach the hit-map field: {rendered}"
-        );
-
-        // Keyboard: focus select, open, choose Bravo, submit form.
-        focus_hit_map_node_by_tab(&mut router, &hit_map, "entity-options-select");
-        let (_, open_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &open_map,
-        );
-        let (_, down_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            &down_map,
-        );
-        let (_, commit_map) = render_app_to_lines(&app, 120, 40, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &commit_map,
-        );
-        assert_eq!(
-            router.draft_value("option"),
-            Some(&json!("opt-bravo")),
-            "keyboard selection must set exact option value"
-        );
-        app.set_drafts(router.draft_values());
-
-        // Submit through production action route with form values.
-        let mut submit = plugin_request(
-            "req-entity-options-submit",
-            "entity-options-reactive.picker",
-            "entity-options.submit",
-            "entity-options-form",
-        );
-        submit.values = Some(UiFormValues(
-            json!({ "option": "opt-bravo" })
-                .as_object()
-                .expect("values object")
-                .clone(),
-        ));
-        app.handle_dispatch(InputDispatch::Action(submit.clone()));
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: "entity-options-reactive".to_string(),
-                    request: submit,
-                }),
-            "submit must travel PluginSurfaceAction with exact value: {:?}",
-            app.observed_requests
-        );
-        // Offline transport error clears the active surface; restore for the
-        // entity-frame invalidation path (no surface re-render RPC).
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            body.clone(),
-        )));
-        app.error = None;
-        app.drop_entity_options_subscriptions();
-        app.entity_options
-            .begin_generation("entity-options-reactive.item", "opts-gen-1".to_string());
-        assert!(
-            app.entity_options
-                .apply_daemon_frame(DaemonEntityFrame::Snapshot {
-                    subscription_id: "opts-gen-1".to_string(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 1,
-                    items: vec![
-                        json!({
-                            "id": "opt-alpha",
-                            "label": "Alpha",
-                            "lifecycle_class": "current",
-                            "session_type": "agent",
-                            "spawn_point": "local",
-                            "value": "opt-alpha"
-                        }),
-                        json!({
-                            "id": "opt-bravo",
-                            "label": "Bravo",
-                            "lifecycle_class": "current",
-                            "session_type": "agent",
-                            "spawn_point": "local",
-                            "value": "opt-bravo"
-                        }),
-                    ],
-                    resync_reason: None,
-                })
-                .expect("restored snapshot applies")
-        );
-        app.drafts.insert("option".to_string(), json!("opt-bravo"));
-
-        // Remove Bravo via production frame path — no PluginSurfaceRender.
-        assert!(
-            app.entity_options
-                .apply_daemon_frame(DaemonEntityFrame::Remove {
-                    subscription_id: "opts-gen-1".to_string(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 2,
-                    id: "opt-bravo".to_string(),
-                })
-                .expect("remove applies")
-        );
-        app.reconcile_entity_option_drafts();
-        assert!(!app.drafts.contains_key("option"));
-        assert!(app.entity_options_invalid_fields.contains("option"));
-
-        let (invalid_lines, invalid_map) =
-            render_app_to_lines(&app, 120, 40, &router.render_state());
-        let invalid_rendered = invalid_lines.join("\n");
-        let invalid_field = invalid_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "entity-options-select")
-            .and_then(|region| region.field.as_ref())
-            .expect("select remains after invalidation");
-        assert_eq!(
-            invalid_field.options,
-            vec![json!("opt-alpha")],
-            "removed option must leave the hit-map options: {invalid_rendered}"
-        );
-        assert!(
-            app.entity_options_invalid_fields.contains("option")
-                || invalid_rendered.contains("Selected value is no longer available"),
-            "invalid selection must surface a clear state change: {invalid_rendered}"
-        );
-
-        let surface_renders_after = app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-            .count();
-        assert_eq!(
-            surface_renders_before, surface_renders_after,
-            "entity option updates must not issue PluginSurfaceRender"
-        );
-
-        // Constrained width still materializes a usable compact select field.
-        let (narrow_lines, narrow_map) = render_app_to_lines(&app, 40, 20, &router.render_state());
-        let narrow = narrow_lines.join("\n");
-        assert!(
-            narrow_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "entity-options-select")
-                || narrow.contains("Option"),
-            "{narrow}"
-        );
-
-        // Generation: stale frames ignored after begin_generation.
-        app.entity_options
-            .begin_generation("entity-options-reactive.item", "opts-gen-2".to_string());
-        assert!(
-            !app.entity_options
-                .apply_daemon_frame(DaemonEntityFrame::Upsert {
-                    subscription_id: "opts-gen-1".to_string(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 99,
-                    id: "opt-stale".to_string(),
-                    entity: json!({
-                        "id": "opt-stale",
-                        "label": "Stale",
-                        "lifecycle_class": "current",
-                        "value": "opt-stale"
-                    }),
-                })
-                .expect("stale gen rejected")
-        );
-    }
-
-    #[test]
-    fn plugin_action_result_replacement_resyncs_entity_option_families() {
-        let initial = ui_node(json!({
-            "type": "form",
-            "id": "entity-options-form",
-            "props": {
-                "action": { "id": "entity-options.submit" },
-                "submit_label": "Submit"
-            },
-            "children": [{
-                "type": "select",
-                "id": "entity-options-select",
-                "props": {
-                    "name": "option",
-                    "label": "Option",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/entity-options-reactive.item",
-                        "value_field": "value",
-                        "display_fields": ["label"],
-                        "order": ["value"]
-                    }
-                }
-            }]
-        }));
-        let replacement = ui_node(json!({
-            "type": "form",
-            "id": "entity-options-form",
-            "props": {
-                "action": { "id": "entity-options.submit" },
-                "submit_label": "Submit"
-            },
-            "children": [{
-                "type": "select",
-                "id": "entity-options-select",
-                "props": {
-                    "name": "option",
-                    "label": "Option",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/entity-options-reactive.other",
-                        "value_field": "value",
-                        "display_fields": ["label"],
-                        "order": ["value"]
-                    }
-                }
-            }]
-        }));
-
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            initial,
-        )));
-        app.error = None;
-        // Offline: seed the initial family generation so retain/drop can observe it.
-        app.entity_options
-            .begin_generation("entity-options-reactive.item", "opts-item".to_string());
-        assert!(
-            app.entity_options
-                .family("entity-options-reactive.item")
-                .is_some()
-        );
-
-        let request = plugin_request(
-            "req-replace-surface",
-            "entity-options-reactive.picker",
-            "entity-options.submit",
-            "entity-options-form",
-        );
-        app.pending_plugin_request = Some(request.clone());
-        app.apply_plugin_action_result(UiActionResult {
-            request_id: request.request_id.clone(),
-            surface_id: request.surface_id.clone(),
-            action_id: request.action_id.clone(),
-            node_id: request.node_id.clone(),
-            state: botster_ui_contract::UiActionResultState::Accepted,
-            field_errors: BTreeMap::new(),
-            form_errors: Vec::new(),
-            warnings: Vec::new(),
-            normalized_values: None,
-            presentation: None,
-            replacement: Some(Box::new(replacement)),
-            payload: None,
-            error: None,
-        });
-
-        assert!(
-            app.plugin_surface
-                .as_ref()
-                .is_some_and(|surface| demanded_entity_option_families(&surface.body)
-                    .contains("entity-options-reactive.other")),
-            "replacement body must demand the new family"
-        );
-        assert!(
-            app.entity_options
-                .family("entity-options-reactive.item")
-                .is_none(),
-            "prior options family generation must be dropped after body replacement"
-        );
-        // Offline path cannot open pumps, but demand sync must not leave the old family active.
-        assert!(
-            !app.entity_options_subscriptions
-                .contains_key("entity-options-reactive.item")
-        );
-    }
-
-    #[test]
-    fn plugin_action_result_applies_static_success_replacement_and_drops_options_families() {
-        // Owner-authored success trees may drop every options_source producer.
-        let initial = ui_node(json!({
-            "type": "select",
-            "id": "entity-options-select",
-            "props": {
-                "name": "option",
-                "label": "Option",
-                "options_source": {
-                    "$kind": "entity_options",
-                    "source": "/entity-options-reactive.item",
-                    "value_field": "value",
-                    "display_fields": ["label"],
-                    "order": ["value"]
-                }
-            }
-        }));
-        let success = ui_node(json!({
-            "type": "text",
-            "id": "entity-options-success",
-            "props": { "text": "Selection accepted" }
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            initial,
-        )));
-        app.error = None;
-        app.entity_options
-            .begin_generation("entity-options-reactive.item", "opts-item".to_string());
-        let request = plugin_request(
-            "req-success-replacement",
-            "entity-options-reactive.picker",
-            "entity-options.submit",
-            "entity-options-select",
-        );
-        app.pending_plugin_request = Some(request.clone());
-        app.apply_plugin_action_result(UiActionResult {
-            request_id: request.request_id.clone(),
-            surface_id: request.surface_id.clone(),
-            action_id: request.action_id.clone(),
-            node_id: request.node_id.clone(),
-            state: botster_ui_contract::UiActionResultState::Accepted,
-            field_errors: BTreeMap::new(),
-            form_errors: Vec::new(),
-            warnings: Vec::new(),
-            normalized_values: None,
-            presentation: None,
-            replacement: Some(Box::new(success.clone())),
-            payload: None,
-            error: None,
-        });
-        assert_eq!(
-            app.plugin_surface.as_ref().map(|surface| &surface.body),
-            Some(&success),
-            "accepted owner replacement must replace the active surface body"
-        );
-        assert!(
-            !app.plugin_surface
-                .as_ref()
-                .is_some_and(|surface| surface_has_options_source(&surface.body)),
-            "success replacement may drop options_source producers"
-        );
-        assert!(
-            app.entity_options
-                .family("entity-options-reactive.item")
-                .is_none(),
-            "resync must drop options families no longer demanded by the replacement"
-        );
-    }
-
-    #[test]
-    fn entity_options_drain_gap_recovery_replaces_pump_and_requires_new_snapshot() {
-        let body = ui_node(json!({
-            "type": "form",
-            "id": "entity-options-form",
-            "props": {
-                "action": { "id": "entity-options.submit" },
-                "submit_label": "Submit"
-            },
-            "children": [{
-                "type": "select",
-                "id": "entity-options-select",
-                "props": {
-                    "name": "option",
-                    "label": "Option",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/entity-options-reactive.item",
-                        "value_field": "value",
-                        "display_fields": ["label"],
-                        "order": ["value"]
-                    }
-                }
-            }]
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.entity_options_local_pumps = true;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            body,
-        )));
-        app.error = None;
-        app.drop_entity_options_subscriptions();
-        app.start_entity_options_subscription("entity-options-reactive.item")
-            .expect("local pump starts");
-        let old_sub = app
-            .entity_options
-            .family("entity-options-reactive.item")
-            .and_then(|family| family.subscription_id.clone())
-            .expect("generation subscription id");
-        let injector = app
-            .entity_options_frame_injectors
-            .get("entity-options-reactive.item")
-            .expect("local injector")
-            .clone();
-        injector
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Snapshot {
-                    subscription_id: old_sub.clone(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 1,
-                    items: vec![json!({
-                        "id": "opt-alpha",
-                        "label": "Alpha",
-                        "value": "opt-alpha"
-                    })],
-                    resync_reason: None,
-                },
-            ))
-            .expect("inject snapshot");
-        assert!(!app.drain_entity_options_subscriptions());
-        assert!(
-            app.entity_options
-                .family("entity-options-reactive.item")
-                .is_some_and(|family| family.has_snapshot)
-        );
-
-        // Sequence hole on the active generation must resubscribe with a new id.
-        injector
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Upsert {
-                    subscription_id: old_sub.clone(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 3,
-                    id: "opt-gap".to_string(),
-                    entity: json!({
-                        "id": "opt-gap",
-                        "label": "Gap",
-                        "value": "opt-gap"
-                    }),
-                },
-            ))
-            .expect("inject gap");
-        assert!(!app.drain_entity_options_subscriptions());
-        let new_sub = app
-            .entity_options
-            .family("entity-options-reactive.item")
-            .and_then(|family| family.subscription_id.clone())
-            .expect("recovered generation");
-        assert_ne!(
-            old_sub, new_sub,
-            "gap recovery must begin a new subscription id"
-        );
-        assert!(
-            app.entity_options
-                .family("entity-options-reactive.item")
-                .is_some_and(|family| !family.has_snapshot),
-            "recovery generation must wait for an authoritative snapshot"
-        );
-        assert!(
-            app.entity_options_subscriptions
-                .contains_key("entity-options-reactive.item"),
-            "recovered family must keep a live pump"
-        );
-
-        let recovery_injector = app
-            .entity_options_frame_injectors
-            .get("entity-options-reactive.item")
-            .expect("recovery injector")
-            .clone();
-        recovery_injector
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Snapshot {
-                    subscription_id: new_sub.clone(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 1,
-                    items: vec![json!({
-                        "id": "opt-recovered",
-                        "label": "Recovered",
-                        "value": "opt-recovered"
-                    })],
-                    resync_reason: None,
-                },
-            ))
-            .expect("inject recovery snapshot");
-        assert!(!app.drain_entity_options_subscriptions());
-        assert!(
-            app.entity_options
-                .family("entity-options-reactive.item")
-                .is_some_and(|family| {
-                    family.has_snapshot && family.records.contains_key("opt-recovered")
-                }),
-            "authoritative recovery snapshot must populate the new generation"
-        );
-    }
-
-    #[test]
-    fn entity_options_drain_gap_recovery_start_failure_forces_reconnect_signal() {
-        let body = ui_node(json!({
-            "type": "select",
-            "id": "entity-options-select",
-            "props": {
-                "name": "option",
-                "label": "Option",
-                "options_source": {
-                    "$kind": "entity_options",
-                    "source": "/entity-options-reactive.item",
-                    "value_field": "value",
-                    "display_fields": ["label"],
-                    "order": ["value"]
-                }
-            }
-        }));
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.entity_options_local_pumps = false;
-        app.apply_response(plugin_surface_response(canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            body,
-        )));
-        app.error = None;
-        app.drop_entity_options_subscriptions();
-        let (sender, receiver) = mpsc::channel();
-        let (cancel_sender, _cancel_receiver) = mpsc::channel();
-        let (_stopped_sender, stopped_receiver) = mpsc::channel();
-        app.entity_options
-            .begin_generation("entity-options-reactive.item", "gap-old".to_string());
-        app.entity_options_subscriptions.insert(
-            "entity-options-reactive.item".to_string(),
-            SessionSubscriptionPump {
-                messages: receiver,
-                cancel: Some(cancel_sender),
-                stopped: stopped_receiver,
-                stop_attempted: false,
-                stopped_confirmed: false,
-            },
-        );
-        assert!(
-            app.entity_options
-                .apply_daemon_frame(DaemonEntityFrame::Snapshot {
-                    subscription_id: "gap-old".to_string(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 1,
-                    items: vec![json!({
-                        "id": "opt-alpha",
-                        "label": "Alpha",
-                        "value": "opt-alpha"
-                    })],
-                    resync_reason: None,
-                })
-                .expect("seed snapshot")
-        );
-        sender
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Upsert {
-                    subscription_id: "gap-old".to_string(),
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    snapshot_seq: 3,
-                    id: "opt-gap".to_string(),
-                    entity: json!({
-                        "id": "opt-gap",
-                        "label": "Gap",
-                        "value": "opt-gap"
-                    }),
-                },
-            ))
-            .expect("inject gap");
-        let force_reconnect = app.drain_entity_options_subscriptions();
-        assert!(
-            force_reconnect,
-            "failed recovery without an endpoint must signal reconnect"
-        );
-        assert!(
-            !app.entity_options_subscriptions
-                .contains_key("entity-options-reactive.item"),
-            "failed recovery must not leave a half-open pump"
-        );
-        assert!(
-            app.error
-                .as_ref()
-                .is_some_and(|error| error.contains("recovery failed")
-                    || error.contains("heal failed")
-                    || error.contains("subscription failed")),
-            "failed recovery must record an error: {:?}",
-            app.error
-        );
-    }
-
-    #[test]
-    fn entity_options_live_hub_proof_when_binaries_are_available() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-
-        let root = PathBuf::from(format!("/tmp/bt-eo{}", short_suffix() % 1_000_000));
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
-            .root(&root)
-            .name("botster-tui-entity-options-live")
-            .start()
-            .expect("isolated hub starts");
-
-        let package_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/entity-options-reactive")
-            .canonicalize()
-            .expect("fixture package path");
-        let package_manifest = serde_json::json!({
-            "name": "entity-options-reactive",
-            "version": "1.0.0",
-            "kind": "plugin",
-            "botster": ">=0.1.0",
-            "source": { "type": "path", "path": package_path },
-            "description": "Owner package surface for TUI reactive entity-backed select options live proof.",
-            "capabilities": [{ "surface": "surfaces" }],
-            "entrypoints": [{
-                "runtime": "lua",
-                "path": "plugin.lua",
-                "bootstrap": false
-            }],
-            "surfaces": [{
-                "id": "entity-options-reactive.picker",
-                "kind": "app",
-                "title": "Entity Options Picker",
-                "description": "Reactive entity-backed select options live proof surface.",
-                "icon": "list",
-                "order": 10,
-                "category": "contract",
-                "supports": ["render", "action"]
-            }]
-        });
-        let staged = root.join("entity-options-reactive-package");
-        std::fs::create_dir_all(&staged).expect("stage package dir");
-        std::fs::write(
-            staged.join("botster-package.json"),
-            serde_json::to_string_pretty(&package_manifest).unwrap(),
-        )
-        .expect("write staged manifest");
-        std::fs::copy(package_path.join("plugin.lua"), staged.join("plugin.lua"))
-            .expect("copy plugin.lua");
-        let data_dir = hub.data_dir().to_string_lossy().to_string();
-        let staged_str = staged.to_string_lossy().to_string();
-        let install = std::process::Command::new(&hub_bin)
-            .args([
-                "packages",
-                "install",
-                "--data-dir",
-                data_dir.as_str(),
-                "--path",
-                staged_str.as_str(),
-            ])
-            .output()
-            .expect("install entity-options-reactive package");
-        assert!(
-            install.status.success(),
-            "package install failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&install.stdout),
-            String::from_utf8_lossy(&install.stderr)
-        );
-        let enable = std::process::Command::new(&hub_bin)
-            .args([
-                "packages",
-                "enable",
-                "--data-dir",
-                data_dir.as_str(),
-                "entity-options-reactive",
-            ])
-            .output()
-            .expect("enable entity-options-reactive package");
-        assert!(
-            enable.status.success(),
-            "package enable failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&enable.stdout),
-            String::from_utf8_lossy(&enable.stderr)
-        );
-
-        let endpoint = hub.endpoint();
-        let mut app = TuiApp::new_with_runtime_context(Some(endpoint.clone()), None, true);
-        app.try_connect();
-        assert!(app.client.is_some(), "live hub client connected");
-
-        // Spawn an authoritative session so /session options_source has a live row.
-        let session_id = format!("eo-live-{}", short_suffix());
-        app.request_and_apply(DaemonRequest::Spawn {
-            session_id: session_id.clone(),
-            command: DEFAULT_COMMAND.to_string(),
-        });
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            app.poll_hub();
-            if session_entity_expectation_satisfied(
-                &app.session_entities,
-                &session_id,
-                SessionEntityExpectation::Lifecycle("current"),
-            ) {
-                break;
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "timed out waiting for live session entity {session_id}; error={:?}",
-                    app.error
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        app.observed_requests.clear();
-        app.request_and_apply(DaemonRequest::PluginSurfaceRender {
-            package_name: "entity-options-reactive".to_string(),
-            surface_id: "entity-options-reactive.picker".to_string(),
-            payload: json!({}),
-        });
-        assert!(
-            app.plugin_surface.is_some(),
-            "plugin surface render must activate picker: error={:?}",
-            app.error
-        );
-        let surface_renders = app
-            .observed_requests
-            .iter()
-            .filter(|request| {
-                matches!(
-                    request,
-                    ObservedRequest::PluginSurfaceRender {
-                        package_name,
-                        surface_id
-                    } if package_name == "entity-options-reactive"
-                        && surface_id == "entity-options-reactive.picker"
-                )
-            })
-            .count();
-        assert_eq!(
-            surface_renders, 1,
-            "exactly one surface render for baseline"
-        );
-
-        // Process-wide session family must feed options without a second subscription.
-        assert!(
-            !app.entity_options_subscriptions.contains_key("session"),
-            "session options must reuse process-wide subscription"
-        );
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            app.poll_hub();
-            let store = app.entity_options_projection_store();
-            let ready = store
-                .get("session")
-                .is_some_and(|records| records.contains_key(&session_id));
-            if ready {
-                break;
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "timed out waiting for session option projection; store={:?} error={:?}",
-                    store.keys().collect::<Vec<_>>(),
-                    app.error
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        let mut router = InputRouter::new(renderer::action_request_context_for(
-            "entity-options-reactive.picker",
-        ));
-        let (lines, hit_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
-        let rendered = lines.join("\n");
-        let select_field = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "entity-options-select")
-            .and_then(|region| region.field.as_ref())
-            .expect("live select field must appear in production hit map");
-        assert!(
-            select_field
-                .options
-                .iter()
-                .any(|value| value.as_str() == Some(session_id.as_str())),
-            "live options must include spawned session {session_id}: {:?} render={rendered}",
-            select_field.options
-        );
-
-        // Keyboard: focus select, open listbox, commit first option (spawned session).
-        focus_hit_map_node_by_tab(&mut router, &hit_map, "entity-options-select");
-        let (_, open_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &open_map,
-        );
-        let target = Value::String(session_id.clone());
-        let target_index = select_field
-            .options
-            .iter()
-            .position(|value| value == &target)
-            .expect("spawned session option index");
-        for _ in 0..target_index {
-            let (_, map) = render_app_to_lines(&app, 140, 50, &router.render_state());
-            let _ = router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                &map,
-            );
-        }
-        let (_, commit_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
-        let _ = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &commit_map,
-        );
-        assert_eq!(
-            router.draft_value("option").and_then(Value::as_str),
-            Some(session_id.as_str()),
-            "keyboard selection must set exact session value through InputRouter"
-        );
-        app.set_drafts(router.draft_values());
-
-        // Keyboard form submit through production hit map / InputRouter only.
-        let (_, submit_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
-        // Prefer the form submit control when present; otherwise submit from the select field.
-        let submit_node = submit_map
-            .regions()
-            .iter()
-            .find(|region| {
-                region
-                    .action
-                    .as_ref()
-                    .is_some_and(|action| action.id.0 == "entity-options.submit")
-            })
-            .map(|region| region.node_id.clone())
-            .unwrap_or_else(|| "entity-options-form".to_string());
-        if submit_map
-            .focusable_regions()
-            .any(|region| region.node_id == submit_node)
-        {
-            focus_hit_map_node_by_tab(&mut router, &submit_map, &submit_node);
-        }
-        let (_, enter_map) = render_app_to_lines(&app, 140, 50, &router.render_state());
-        let dispatch = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &enter_map,
-        );
-        let InputDispatch::Action(request) = dispatch else {
-            panic!("keyboard form submit must dispatch Action, got {dispatch:?}");
-        };
-        assert_eq!(request.action_id.0, "entity-options.submit");
-        assert_eq!(
-            request
-                .values
-                .as_ref()
-                .and_then(|values| values.0.get("option"))
-                .and_then(Value::as_str),
-            Some(session_id.as_str()),
-            "submit values must carry exact keyboard selection: {:?}",
-            request.values
-        );
-        app.handle_dispatch(InputDispatch::Action(request.clone()));
-        assert!(
-            app.observed_requests.iter().any(|observed| matches!(
-                observed,
-                ObservedRequest::PluginSurfaceAction {
-                    package_name,
-                    request: observed_request
-                } if package_name == "entity-options-reactive"
-                    && observed_request.action_id.0 == "entity-options.submit"
-                    && observed_request
-                        .values
-                        .as_ref()
-                        .and_then(|values| values.0.get("option"))
-                        .and_then(Value::as_str)
-                        == Some(session_id.as_str())
-            )),
-            "live submit must travel PluginSurfaceAction with exact value: {:?}",
-            app.observed_requests
-        );
-        // Production path must keep the Hub-delivered surface after submit (no
-        // test-authored body rewrite). Owner-authored replacements that drop
-        // every options_source producer are applied when present (see
-        // plugin_action_result_applies_static_success_replacement…); this live
-        // fixture does not return such a replacement, so options_source stays.
-        assert!(
-            app.plugin_surface
-                .as_ref()
-                .is_some_and(|surface| surface_has_options_source(&surface.body)),
-            "Hub-delivered surface must retain options_source after keyboard submit; body={:?}",
-            app.plugin_surface.as_ref().map(|surface| &surface.body)
-        );
-        let (_, baseline_map) = renderer::render_to_lines(&app.surface(), 140, 50);
-        assert!(
-            baseline_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "entity-options-select"),
-            "Hub-delivered surface must materialize the select before ordered change"
-        );
-
-        // Post-baseline ordered change on the active session subscription: shutdown
-        // transitions lifecycle_class away from "current" so the where-filtered option
-        // drops via entity frames without PluginSurfaceRender.
-        app.request_and_apply(DaemonRequest::ShutdownSession {
-            session_id: session_id.clone(),
-        });
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            app.poll_hub();
-            let store = app.entity_options_projection_store();
-            let still_current = store.get("session").is_some_and(|records| {
-                records.values().any(|fields| {
-                    fields.get("session_uuid").and_then(Value::as_str) == Some(session_id.as_str())
-                        && fields.get("lifecycle_class").and_then(Value::as_str) == Some("current")
-                })
-            });
-            if !still_current {
-                break;
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "timed out waiting for ordered session lifecycle patch to drop option {session_id}; store={:?} error={:?}",
-                    store
-                        .get("session")
-                        .map(|records| records.keys().cloned().collect::<Vec<_>>()),
-                    app.error
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            app.plugin_surface.is_some(),
-            "plugin surface must remain active through ordered entity updates; error={:?}",
-            app.error
-        );
-        // Prove production surface still materializes the select without the exited option.
-        let surface = app.surface();
-        let surface_json =
-            serde_json::to_string(&surface).unwrap_or_else(|error| error.to_string());
-        let (after_lines, after_map) = renderer::render_to_lines(&surface, 140, 50);
-        let after_rendered = after_lines
-            .iter()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let after_field = after_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "entity-options-select")
-            .and_then(|region| region.field.as_ref())
-            .unwrap_or_else(|| {
-                panic!(
-                    "select remains after ordered lifecycle change; regions={:?}; rendered={after_rendered}; tree={surface_json}; error={:?}",
-                    after_map
-                        .regions()
-                        .iter()
-                        .map(|region| region.node_id.as_str())
-                        .collect::<Vec<_>>(),
-                    app.error
-                )
-            });
-        assert!(
-            !after_field
-                .options
-                .iter()
-                .any(|value| value.as_str() == Some(session_id.as_str())),
-            "exited session must leave hit-map options: {:?}",
-            after_field.options
-        );
-        let surface_renders_after = app
-            .observed_requests
-            .iter()
-            .filter(|request| {
-                matches!(
-                    request,
-                    ObservedRequest::PluginSurfaceRender {
-                        package_name,
-                        surface_id
-                    } if package_name == "entity-options-reactive"
-                        && surface_id == "entity-options-reactive.picker"
-                )
-            })
-            .count();
-        assert_eq!(
-            surface_renders_after, 1,
-            "pure entity updates must not re-render the plugin surface"
-        );
-        println!(
-            "entity-options-live-proof: selected={session_id} surface_renders={surface_renders_after}"
-        );
-    }
-
-    #[test]
-    fn headless_live_runtime_ghostty_install_scrollback_palette_and_mode_gated_input() {
-        // Exact-bin live gate. BOTSTER_TUI_REQUIRE_HUB_TEST=1 hard-fails missing bins.
-        // Build matching binaries from Hub 1a0df65 and Core bf6e7d9. Export
-        // BOTSTER_HUB_BIN / BOTSTER_SESSION_WORKER_BIN and
-        // optional BOTSTER_*_BIN_REV for provenance logging — do not commit /tmp paths.
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-        let hub_path = PathBuf::from(&hub_bin);
-        let worker_path = PathBuf::from(&session_worker_bin);
-        assert!(hub_path.is_file(), "BOTSTER_HUB_BIN must exist");
-        assert!(
-            worker_path.is_file(),
-            "BOTSTER_SESSION_WORKER_BIN must exist"
-        );
-        let hub_rev = std::env::var("BOTSTER_HUB_BIN_REV")
-            .unwrap_or_else(|_| "1a0df65230a476cfea362fdc5131e035d303a928".to_string());
-        let worker_rev = std::env::var("BOTSTER_SESSION_WORKER_BIN_REV")
-            .unwrap_or_else(|_| "bf6e7d996bca2786ad4142c870a13c57a490e241".to_string());
-        let ghostty_rev = botster_terminal_ghostty::GHOSTTY_SOURCE_COMMIT;
-        let fixture_provenance = botster_hub_test_support::late_attach_ghostsnp_provenance();
-        assert_eq!(
-            fixture_provenance.core_pin, worker_rev,
-            "Hub fixture Core pin must match the live session worker"
-        );
-        assert_eq!(
-            fixture_provenance.ghostty_pin, ghostty_rev,
-            "Hub fixture Ghostty pin must match the TUI Ghostty library"
-        );
-        let hub_real = std::fs::canonicalize(&hub_path).expect("canonicalize hub bin");
-        let worker_real = std::fs::canonicalize(&worker_path).expect("canonicalize worker bin");
-        assert_ne!(
-            hub_real, worker_real,
-            "Hub and Core worker binaries must have distinct realpaths"
-        );
-        println!(
-            "ghostty-live-provenance: hub_rev={hub_rev} worker_rev={worker_rev} ghostty_rev={ghostty_rev} hub_bin={} worker_bin={}",
-            hub_real.display(),
-            worker_real.display()
-        );
-
-        let root = PathBuf::from(format!("/tmp/bt-ghostty-{}", short_suffix() % 1_000_000));
-        let flood_id = format!("btui-flood-{}", short_suffix());
-        let hub = start_ghostty_pressure_hub(&hub_path, &worker_path, &root, &flood_id);
-
-        // --- History attach: GHOSTSNP, scrollback, palette, styles, modes, live, reconnect ---
-        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
-        app.workspace_test_mode = true;
-        // Full OSC form matches Core projection tests; STYLED is bold truecolor green.
-        let session_id = format!("btui-ghostty-{}", short_suffix());
-        let paste_capture_path = PathBuf::from(format!("/tmp/{session_id}-paste.bin"));
-        let command = format!(
-            concat!(
-                // Kernel echo would insert the command token between split UTF-8
-                // fragments. Disable it so barrier writes are exact payloads.
-                "stty -echo; ",
-                "printf 'HISTORY_HEAD\\n'; ",
-                "i=0; while [ $i -lt 12000 ]; do printf 'mid-%s\\n' \"$i\"; i=$((i+1)); done; ",
-                "printf 'HISTORY_TAIL\\n'; ",
-                "printf 'BOTTOM_LIVE\\n'; ",
-                "printf '\\033]4;1;rgb:ffff/0000/0000\\033\\\\'; ",
-                "printf '\\033]10;rgb:0000/ffff/0000\\033\\\\'; ",
-                "printf '\\033[1;38;2;0;128;0mSTYLED\\033[0m\\n'; ",
-                "printf 'palette-ready\\n'; ",
-                "while IFS= read -r line; do ",
-                "  if [ \"$line\" = enable-modes ]; then ",
-                "    printf '\\033[?1000h\\033[?1006h\\033[=1;1u'; ",
-                "    printf 'modes-enabled\\n'; ",
-                "  elif [ \"$line\" = emit-split-e2 ]; then ",
-                "    printf '\\342'; ",
-                "  elif [ \"$line\" = emit-split-rest ]; then ",
-                "    printf '\\202\\254'; ",
-                "  elif [ \"$line\" = emit-invalid-bytes ]; then ",
-                "    printf '\\000\\033\\377\\300'; ",
-                "  elif [ \"$line\" = emit-later-marker ]; then ",
-                "    printf '\\033[0mBYTEFAITH'; ",
-                "  elif set -- $line && [ \"$1\" = paste-capture ]; then ",
-                "    paste_bytes=$2; paste_mode=$3; paste_label=$4; ",
-                "    if [ \"$paste_mode\" = bracketed ]; then printf '\\033[?2004h'; else printf '\\033[?2004l'; fi; ",
-                "    printf 'paste-ready-%s\\n' \"$paste_label\"; ",
-                "    stty raw -echo; ",
-                "    dd bs=1 count=\"$paste_bytes\" of='{paste_capture}' 2>/dev/null; ",
-                "    stty -raw -echo; ",
-                "    printf '\\033[?2004l'; ",
-                "    printf 'paste-done-%s\\n' \"$paste_label\"; ",
-                "  else ",
-                "    printf 'echo:%s\\n' \"$line\"; ",
-                "  fi; ",
-                "done"
-            ),
-            paste_capture = paste_capture_path.display()
-        );
-        app.pending_sessions
-            .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
-        app.selected_session = Some(session_id.clone());
-        app.rebuild_session_rows();
-        match app.request(DaemonRequest::Spawn {
-            session_id: session_id.clone(),
-            command,
-        }) {
-            Ok(response) => app.apply_response(response),
-            Err(error) => panic!("spawn failed: {error}"),
-        }
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("spawned session becomes authoritative");
-        thread::sleep(Duration::from_secs(2));
-        app.attach_selected_or_first();
-        wait_for_attached_projection(&mut app, &session_id);
-        assert!(
-            app.ghostty_projection.is_some(),
-            "production attach must install GHOSTSNP; error={:?} close={:?}",
-            app.error,
-            app.terminal_close_evidence
-        );
-        assert_eq!(
-            app.attached_session.as_deref(),
-            Some(session_id.as_str()),
-            "history attach must reach Attached; error={:?} close={:?} recovery={}",
-            app.error,
-            app.terminal_close_evidence,
-            app.attach_recovery_used
-        );
-
-        // 12,000 history lines sit above the live screen. ScrollOp::Top must
-        // reveal retained PAGE history; the live screen keeps BOTTOM_LIVE.
-        app.refresh_ghostty_viewport_cache();
-        assert!(
-            viewport_cache_contains(&app, "BOTTOM_LIVE")
-                || viewport_cache_contains(&app, "HISTORY_TAIL")
-                || viewport_cache_contains(&app, "mid-"),
-            "READY/live screen must show the 12k history stream"
-        );
-        assert!(
-            !viewport_cache_contains(&app, "HISTORY_HEAD"),
-            "HISTORY_HEAD must start outside the default live viewport"
-        );
-        app.scroll_projection(ScrollOp::Top);
-        let has_head = viewport_cache_contains(&app, "HISTORY_HEAD");
-        let has_early_mid =
-            (0..200).any(|line| viewport_cache_contains(&app, &format!("mid-{line}")));
-        assert!(
-            has_head || has_early_mid,
-            "ScrollOp::Top must reveal retained PAGE history from the 12k stream"
-        );
-        let (painted_top, hit_map_top, _) = render_app_painted(&app, 140, 42);
-        assert!(
-            painted_top.contains("HISTORY_HEAD") || painted_top.contains("mid-"),
-            "Ratatui frame must paint retained history; frame={painted_top}"
-        );
-        assert!(
-            hit_map_top.regions().iter().any(|r| {
-                r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView
-            })
-        );
-
-        // Exact palette index 1 red + special foreground green.
-        let profile = app
-            .ghostty_projection
-            .as_mut()
-            .expect("projection")
-            .color_profile()
-            .expect("color_profile");
-        let palette1 = profile
-            .colors
-            .get(&1)
-            .unwrap_or_else(|| panic!("palette index 1 missing: {profile:?}"));
-        assert_eq!(
-            (palette1.r, palette1.g, palette1.b),
-            (255, 0, 0),
-            "OSC 4;1 must resolve pure red"
-        );
-        let special_fg = profile
-            .colors
-            .get(&botster_terminal_ghostty::COLOR_INDEX_FOREGROUND)
-            .unwrap_or_else(|| panic!("special foreground missing: {profile:?}"));
-        assert_eq!(
-            (special_fg.r, special_fg.g, special_fg.b),
-            (0, 255, 0),
-            "OSC 10 must resolve pure green"
-        );
-
-        // Styled cell required in projection and painted frame attributes.
-        app.scroll_projection(ScrollOp::Bottom);
-        app.refresh_ghostty_viewport_cache();
-        assert!(
-            viewport_cache_contains(&app, "STYLED"),
-            "READY/live screen must include the STYLED run"
-        );
-        let viewport = app
-            .ghostty_viewport_cache
-            .as_ref()
-            .expect("viewport after scroll bottom");
-        let styled = viewport
-            .cells
-            .iter()
-            .find(|c| c.grapheme == "S" && (c.bold || (c.fg.r, c.fg.g, c.fg.b) == (0, 128, 0)));
-        if app.error.is_none() {
-            let styled = styled.unwrap_or_else(|| panic!("STYLED head cell missing in projection"));
-            assert!(styled.bold, "STYLED S must be bold: {styled:?}");
-            assert_eq!(
-                (styled.fg.r, styled.fg.g, styled.fg.b),
-                (0, 128, 0),
-                "STYLED S must be truecolor green: {styled:?}"
-            );
-        }
-        let (painted_styled, hit_map_styled, painted_cells) = render_app_painted(&app, 140, 42);
-        assert!(
-            painted_styled.contains("STYLED"),
-            "painted frame must contain STYLED run: {painted_styled}"
-        );
-        let terminal_rect = hit_map_styled
-            .regions()
-            .iter()
-            .rev()
-            .find(|r| r.node_id == "tui-terminal" && r.role == renderer::HitRole::TerminalView)
-            .map(|r| r.rect)
-            .expect("tui-terminal region for styled paint");
-        if app.error.is_none() {
-            let painted_s = painted_cells
-                .iter()
-                .find(|c| {
-                    c.symbol == 'S'
-                        && c.fg == Some((0, 128, 0))
-                        && c.x >= terminal_rect.x
-                        && c.x < terminal_rect.x.saturating_add(terminal_rect.width)
-                        && c.y >= terminal_rect.y
-                        && c.y < terminal_rect.y.saturating_add(terminal_rect.height)
-                })
-                .cloned()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "painted truecolor-green S missing in terminal region; candidates={:?}",
-                        painted_cells
-                            .iter()
-                            .filter(|c| c.symbol == 'S')
-                            .take(12)
-                            .collect::<Vec<_>>()
-                    )
-                });
-            assert!(
-                painted_s.bold,
-                "painted STYLED head must be bold: {painted_s:?}"
-            );
-        }
-
-        // Enable Kitty + mouse tracking in-session; fail if either branch does not run.
-        app.forward_terminal_input(session_id.clone(), b"enable-modes\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            if viewport_cache_contains(&app, "modes-enabled") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let shadow = wait_for_mode_flags(&mut app, &session_id, |s| {
-            s.kitty_enabled && s.mouse_mode != 0
-        });
-        println!(
-            "ghostty-live-modes: kitty_enabled={} mouse_mode={} gen={} rev={}",
-            shadow.kitty_enabled, shadow.mouse_mode, shadow.mode_generation, shadow.mode_revision
-        );
-        assert!(
-            shadow.kitty_enabled,
-            "controlled session must enable Kitty keyboard"
-        );
-        assert!(
-            shadow.mouse_mode != 0,
-            "controlled session must enable mouse tracking; mouse_mode={}",
-            shadow.mouse_mode
-        );
-
-        prove_live_paste(
-            &mut app,
-            &session_id,
-            &paste_capture_path,
-            "small-paste\n",
-            true,
-            "small",
-        );
-        let mut large_paste = "p".repeat(MAX_PASTE_CHUNK_DATA_BYTES + 37);
-        large_paste.push('\n');
-        prove_live_paste(
-            &mut app,
-            &session_id,
-            &paste_capture_path,
-            &large_paste,
-            true,
-            "large",
-        );
-        prove_live_paste(
-            &mut app,
-            &session_id,
-            &paste_capture_path,
-            "plain-paste\n",
-            false,
-            "plain",
-        );
-        let post_paste_shadow = wait_for_mode_flags(&mut app, &session_id, |shadow| {
-            shadow.kitty_enabled && !shadow.bracketed_paste
-        });
-
-        // Resize production path: local viewport update plus a Core duplex frame.
-        // Client-owned dimensions alone are not enough — require Hub success, then
-        // prove session-worker applied 30x100 via reconnect Snapshot dimensions.
-        app.error = None;
-        app.handle_dispatch(InputDispatch::TerminalResize {
-            node_id: "tui-terminal".to_string(),
-            rows: 30,
-            cols: 100,
-        });
-        assert_eq!(app.terminal_viewport_size.rows, 30);
-        assert_eq!(app.terminal_viewport_size.cols, 100);
-        assert!(
-            app.error.is_none(),
-            "TerminalResize must complete without a transport error; error={:?}",
-            app.error
-        );
-        let post_resize_dims = app
-            .ghostty_projection
-            .as_ref()
-            .expect("projection still present after resize")
-            .dimensions();
-        assert_eq!(post_resize_dims.rows, 30);
-        assert_eq!(post_resize_dims.cols, 100);
-
-        // Required Kitty branch: real focused KeyEvent → duplex ModeGatedInput.
-        app.observed_terminal_inputs.clear();
-        let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
-        assert!(app.handle_focused_terminal_key(key, Some("tui-terminal")));
-        let expected = renderer::terminal_key_bytes_with(key, renderer::TerminalKeyEncoding::Kitty)
-            .expect("kitty encodes z");
-        assert!(
-            app.observed_terminal_inputs.iter().any(|r| matches!(
-                r,
-                TerminalInputCommand::ModeGatedInput {
-                    data,
-                    mode_generation,
-                    mode_revision,
-                } if data.as_slice() == expected.as_slice()
-                    && *mode_generation == post_paste_shadow.mode_generation
-                    && *mode_revision == post_paste_shadow.mode_revision
-            )),
-            "Kitty branch must ModeGatedInput CSI-u with freshness tokens: {:?}",
-            app.observed_requests
-        );
-        assert!(
-            !app.observed_terminal_inputs
-                .iter()
-                .any(|r| matches!(r, TerminalInputCommand::Input { .. })),
-            "Kitty branch must not send plain input"
-        );
-
-        // Required mouse branch: SGR → ModeGatedInput.
-        app.observed_terminal_inputs.clear();
-        let sgr = "\x1b[<0;1;1M".to_string();
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: sgr.as_bytes().to_vec(),
-        });
-        assert!(
-            app.observed_terminal_inputs.iter().any(|r| matches!(
-                r,
-                TerminalInputCommand::ModeGatedInput { data, .. } if data == sgr.as_bytes()
-            )),
-            "mouse branch must ModeGatedInput SGR: {:?}",
-            app.observed_requests
-        );
-
-        // Later live output required in painted Ratatui frame (not cache alone).
-        app.forward_terminal_input(session_id.clone(), b"live-marker\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut painted_live = String::new();
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            let (frame, _, _) = render_app_painted(&app, 140, 42);
-            painted_live = frame;
-            if painted_live.contains("live-marker") || painted_live.contains("echo:live-marker") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            painted_live.contains("live-marker") || painted_live.contains("echo:live-marker"),
-            "later live output must appear in painted Ratatui frame; painted={painted_live}"
-        );
-
-        // Deterministic split-UTF-8 barrier: write [0xE2], observe that exact
-        // applied payload, then release [0x82, 0xAC] and prove euro without U+FFFD.
-        app.applied_live_payloads.clear();
-        app.forward_terminal_input(session_id.clone(), b"emit-split-e2\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut saw_e2 = false;
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app
-                .applied_live_payloads
-                .iter()
-                .any(|payload| payload.as_slice() == [0xE2])
-            {
-                saw_e2 = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            saw_e2,
-            "producer barrier must apply exact first UTF-8 fragment [0xE2]; applied={:?}",
-            app.applied_live_payloads
-        );
-        assert!(
-            app.applied_live_payloads.iter().all(|payload| !payload
-                .windows(3)
-                .any(|window| window == [0xEF, 0xBF, 0xBD])),
-            "first fragment must not UTF-8-repair; applied={:?}",
-            app.applied_live_payloads
-        );
-        app.refresh_ghostty_viewport_cache();
-        assert!(
-            !viewport_cache_contains(&app, "\u{FFFD}"),
-            "split-first-frame must not paint U+FFFD"
-        );
-
-        app.forward_terminal_input(session_id.clone(), b"emit-split-rest\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut painted_euro = String::new();
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            let (frame, _, _) = render_app_painted(&app, 140, 42);
-            painted_euro = frame;
-            if viewport_cache_contains(&app, "\u{20AC}") || painted_euro.contains('\u{20AC}') {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            app.applied_live_payloads
-                .concat()
-                .windows(3)
-                .any(|window| window == [0xE2, 0x82, 0xAC])
-                || (app
-                    .applied_live_payloads
-                    .iter()
-                    .any(|payload| payload.as_slice() == [0xE2])
-                    && app
-                        .applied_live_payloads
-                        .iter()
-                        .any(|payload| payload.as_slice() == [0x82, 0xAC])),
-            "concatenated applied bytes must include the euro sequence; applied={:?}",
-            app.applied_live_payloads
-        );
-        assert!(
-            viewport_cache_contains(&app, "\u{20AC}") || painted_euro.contains('\u{20AC}'),
-            "euro must appear after both fragments; painted={painted_euro}"
-        );
-        assert!(
-            !viewport_cache_contains(&app, "\u{FFFD}"),
-            "completed euro must not leave U+FFFD in the projection"
-        );
-
-        app.applied_live_payloads.clear();
-        app.forward_terminal_input(session_id.clone(), b"emit-invalid-bytes\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut saw_invalid_sequence = false;
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app
-                .applied_live_payloads
-                .concat()
-                .windows(4)
-                .any(|window| window == [0x00, 0x1b, 0xff, 0xc0])
-            {
-                saw_invalid_sequence = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let applied = app.applied_live_payloads.concat();
-        assert!(
-            saw_invalid_sequence,
-            "live path must apply [0x00, 0x1b, 0xff, 0xc0] in order; applied={:?}",
-            app.applied_live_payloads
-        );
-        assert!(
-            applied.contains(&0x00),
-            "NUL must reach apply_terminal_output; applied={applied:?}"
-        );
-        assert!(
-            applied.contains(&0x1b),
-            "ESC must reach apply_terminal_output; applied={applied:?}"
-        );
-        assert!(
-            applied.contains(&0xff),
-            "invalid 0xff must reach apply_terminal_output unrepaired; applied={applied:?}"
-        );
-        assert!(
-            applied.contains(&0xc0),
-            "invalid 0xc0 must reach apply_terminal_output unrepaired; applied={applied:?}"
-        );
-        assert!(
-            !applied
-                .windows(3)
-                .any(|window| window == [0xEF, 0xBF, 0xBD]),
-            "live invalid bytes must not be UTF-8-repaired to U+FFFD; applied={applied:?}"
-        );
-
-        app.forward_terminal_input(session_id.clone(), b"emit-later-marker\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut painted_marker = String::new();
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            let (frame, _, _) = render_app_painted(&app, 140, 42);
-            painted_marker = frame;
-            if viewport_cache_contains(&app, "BYTEFAITH") || painted_marker.contains("BYTEFAITH") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            viewport_cache_contains(&app, "BYTEFAITH") || painted_marker.contains("BYTEFAITH"),
-            "later ASCII marker after invalid/NUL/ESC prefix must paint; painted={painted_marker}"
-        );
-
-        // Reconnect must restore pre-attach history marker after reinstall.
-        let reconnect_sub = format!("reconnect-{}", short_suffix());
-        app.begin_attach_hydration(&session_id, &reconnect_sub);
-        assert!(app.ghostty_projection.is_none());
-        app.request_and_apply(DaemonRequest::Attach {
-            session_id: session_id.clone(),
-            subscription_id: reconnect_sub.clone(),
-        });
-        wait_for_attached_projection(&mut app, &session_id);
-        assert!(
-            app.ghostty_projection.is_some(),
-            "reconnect attach must reinstall projection; error={:?} close={:?}",
-            app.error,
-            app.terminal_close_evidence
-        );
-        assert_eq!(
-            app.attached_session.as_deref(),
-            Some(session_id.as_str()),
-            "reconnect attach must reach Attached; error={:?} close={:?} recovery={}",
-            app.error,
-            app.terminal_close_evidence,
-            app.attach_recovery_used
-        );
-        // Downstream oracle: GHOSTSNP Snapshot dimensions come from the session
-        // worker after Resize, not from the client-side TerminalResize handler.
-        let reconnect_dims = app
-            .ghostty_projection
-            .as_ref()
-            .expect("projection after reconnect Snapshot")
-            .dimensions();
-        assert_eq!(
-            reconnect_dims.rows, 30,
-            "reconnect Snapshot projection rows must be worker-applied 30; dims={reconnect_dims:?}"
-        );
-        assert_eq!(
-            reconnect_dims.cols, 100,
-            "reconnect Snapshot projection cols must be worker-applied 100; dims={reconnect_dims:?}"
-        );
-        assert_eq!(
-            app.terminal_viewport_size.rows, 30,
-            "terminal viewport rows must track Snapshot install (30)"
-        );
-        assert_eq!(
-            app.terminal_viewport_size.cols, 100,
-            "terminal viewport cols must track Snapshot install (100)"
-        );
-        app.refresh_ghostty_viewport_cache();
-        let reconnect_viewport = app
-            .ghostty_viewport_cache
-            .as_ref()
-            .expect("viewport cache after reconnect Snapshot");
-        assert_eq!(reconnect_viewport.rows, 30);
-        assert_eq!(reconnect_viewport.cols, 100);
-        app.scroll_projection(ScrollOp::Top);
-        assert!(
-            viewport_cache_contains(&app, "HISTORY_HEAD")
-                || viewport_cache_contains(&app, "HISTORY_TAIL")
-                || (0..200).any(|line| viewport_cache_contains(&app, &format!("mid-{line}"))),
-            "reconnect must restore retained PAGE history"
-        );
-        let (painted_reconnect, _, _) = render_app_painted(&app, 140, 42);
-        assert!(
-            painted_reconnect.contains("HISTORY_HEAD")
-                || painted_reconnect.contains("HISTORY_TAIL")
-                || painted_reconnect.contains("mid-"),
-            "reconnect painted frame must show history"
-        );
-        app.scroll_projection(ScrollOp::Bottom);
-
-        app.forward_terminal_input(session_id.clone(), b"reconnect-live\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut painted_reconnect_live = String::new();
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            let (frame, _, _) = render_app_painted(&app, 140, 42);
-            painted_reconnect_live = frame;
-            if painted_reconnect_live.contains("reconnect-live")
-                || painted_reconnect_live.contains("echo:reconnect-live")
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            painted_reconnect_live.contains("reconnect-live")
-                || painted_reconnect_live.contains("echo:reconnect-live"),
-            "later live marker after reconnect must paint; painted={painted_reconnect_live}"
-        );
-
-        // --- Truly silent no-history session: no pre-attach print, no Snapshot install ---
-        let no_hist_id = format!("btui-silent-{}", short_suffix());
-        app.pending_sessions
-            .insert(no_hist_id.clone(), SessionRow::pending(no_hist_id.clone()));
-        app.selected_session = Some(no_hist_id.clone());
-        app.rebuild_session_rows();
-        match app.request(DaemonRequest::Spawn {
-            session_id: no_hist_id.clone(),
-            // No printf before the read loop — empty initial screen, no Snapshot body.
-            command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
-        }) {
-            Ok(response) => app.apply_response(response),
-            Err(error) => panic!("silent spawn failed: {error}"),
-        }
-        wait_for_authoritative_session(&mut app, &no_hist_id).expect("silent session ready");
-        app.selected_session = Some(no_hist_id.clone());
-        // Attach immediately — no pre-attach producer output / no history Snapshot.
-        app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app.attached_session.as_deref() == Some(no_hist_id.as_str())
-                && app.ghostty_projection.is_some()
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert_eq!(app.attached_session.as_deref(), Some(no_hist_id.as_str()));
-        assert!(
-            app.ghostty_projection.is_some(),
-            "silent attach must open blank projection without Snapshot"
-        );
-        // Blank projection: no history markers from the other session.
-        app.refresh_ghostty_viewport_cache();
-        assert!(
-            !viewport_cache_contains(&app, "TOP_MARKER"),
-            "silent session must not inherit history Snapshot content"
-        );
-        assert!(
-            !viewport_cache_contains(&app, "ready"),
-            "silent session must not print a pre-attach readiness banner"
-        );
-        app.forward_terminal_input(no_hist_id.clone(), b"after-empty\n".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut painted_empty = String::new();
-        while Instant::now() < deadline {
-            app.poll_hub();
-            app.refresh_ghostty_viewport_cache();
-            let (frame, _, _) = render_app_painted(&app, 140, 42);
-            painted_empty = frame;
-            if painted_empty.contains("after-empty") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            painted_empty.contains("after-empty"),
-            "silent session live output must paint immediately; painted={painted_empty}"
-        );
-
-        app.request_and_apply(DaemonRequest::ShutdownSession {
-            session_id: no_hist_id.clone(),
-        });
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            let exited_row = app.sessions.iter().any(|session| {
-                session.session_id == no_hist_id
-                    && (session.lifecycle == "exited" || session.lifecycle == "failed")
-            });
-            if app.status.contains("process exited")
-                || app.attached_session.as_deref() != Some(no_hist_id.as_str())
-                || exited_row
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let exited_row = app.sessions.iter().any(|session| {
-            session.session_id == no_hist_id
-                && (session.lifecycle == "exited" || session.lifecycle == "failed")
-        });
-        assert!(
-            app.status.contains("process exited")
-                || app.attached_session.as_deref() != Some(no_hist_id.as_str())
-                || exited_row,
-            "shutdown must surface ProcessExit or exited session row; status={} attached={:?} sessions={:?}",
-            app.status,
-            app.attached_session,
-            app.sessions
-                .iter()
-                .map(|session| format!("{}:{}", session.session_id, session.lifecycle))
-                .collect::<Vec<_>>()
-        );
-
-        let sibling_id = prove_ghostty_core_close(&hub, &mut app, &root, &flood_id);
-
-        println!(
-            "ghostty-live-complete: hub_rev={hub_rev} worker_rev={worker_rev} ghostty_rev={ghostty_rev} history={session_id} silent={no_hist_id} flood={flood_id} sibling={sibling_id} kitty={} mouse={}",
-            shadow.kitty_enabled, shadow.mouse_mode
-        );
-    }
-
-    fn start_ghostty_pressure_hub(
-        hub_bin: &Path,
-        worker_bin: &Path,
-        root: &Path,
-        flood_id: &str,
-    ) -> botster_hub_test_support::IsolatedHub {
-        let observation = root.join("pressure");
-        std::fs::create_dir_all(&observation).expect("create pressure observation directory");
-        botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(hub_bin)
-            .session_worker_bin(worker_bin)
-            .root(root)
-            .name("botster-tui-ghostty-live")
-            .env("BOTSTER_ENV", "test")
-            .env("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK", "0")
-            .env(
-                "BOTSTER_HUB_TEST_CLEAR_ADAPTER_WOULD_BLOCK_AFTER_REJECTION",
-                "0",
-            )
-            .env(
-                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_SESSION",
-                flood_id,
-            )
-            .env("BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_DELAY_MS", "500")
-            .env(
-                "BOTSTER_HUB_TEST_FORCE_ADAPTER_WOULD_BLOCK_OBSERVATION",
-                observation.to_string_lossy(),
-            )
-            .start()
-            .expect("isolated hub starts")
-    }
-
-    #[test]
-    fn ghostty_live_core_close_uses_session_scoped_pressure() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-        let root = PathBuf::from(format!("/tmp/bt-pressure-{}", short_suffix() % 1_000_000));
-        let flood_id = format!("btui-flood-{}", short_suffix());
-        let hub = start_ghostty_pressure_hub(
-            Path::new(&hub_bin),
-            Path::new(&worker_bin),
-            &root,
-            &flood_id,
-        );
-        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
-        app.workspace_test_mode = true;
-        prove_ghostty_core_close(&hub, &mut app, &root, &flood_id);
-    }
-
-    fn prove_ghostty_core_close(
-        hub: &botster_hub_test_support::IsolatedHub,
-        app: &mut TuiApp,
-        root: &Path,
-        flood_id: &str,
-    ) -> String {
-        let flood_id = flood_id.to_string();
-        let release = root.join("flood.release");
-        let pressure = root.join("pressure/would_block");
-        assert!(!release.exists(), "producer release must start absent");
-        assert!(
-            !pressure.exists(),
-            "other sessions must not activate pressure"
-        );
-        let sibling_id = format!("btui-sib-{}", short_suffix());
-        app.reset_attach_campaign();
-        app.pending_sessions
-            .insert(flood_id.clone(), SessionRow::pending(flood_id.clone()));
-        app.selected_session = Some(flood_id.clone());
-        app.rebuild_session_rows();
-        match app.request(DaemonRequest::Spawn {
-            session_id: flood_id.clone(),
-            command: format!(
-                "while [ ! -f '{}' ]; do sleep 0.02; done; exec yes write-budget-stall",
-                release.display()
-            ),
-        }) {
-            Ok(response) => app.apply_response(response),
-            Err(error) => panic!("flood spawn failed: {error}"),
-        }
-        match app.request(DaemonRequest::Spawn {
-            session_id: sibling_id.clone(),
-            command: "i=0; while true; do printf 'SIB-%s\\n' \"$i\"; i=$((i+1)); sleep 0.2; done"
-                .to_string(),
-        }) {
-            Ok(response) => app.apply_response(response),
-            Err(error) => panic!("sibling spawn failed: {error}"),
-        }
-        wait_for_authoritative_session(app, &flood_id).expect("flood session ready");
-        wait_for_authoritative_session(app, &sibling_id).expect("sibling session ready");
-        app.selected_session = Some(flood_id.clone());
-        app.attach_selected_or_first();
-        wait_for_attached_projection(app, &flood_id);
-        assert_eq!(
-            app.attached_session.as_deref(),
-            Some(flood_id.as_str()),
-            "flood must reach Attached before producer release"
-        );
-        assert!(app.terminal_close_evidence.is_none());
-        let flood_sub = app
-            .attached_subscription_id
-            .clone()
-            .expect("flood has a live subscription");
-
-        let mut sibling = HubConnection::connect(hub.endpoint()).expect("sibling connection");
-        let sibling_sub = format!("sib-sub-{}", short_suffix());
-        sibling
-            .request(&DaemonRequest::Attach {
-                session_id: sibling_id.clone(),
-                subscription_id: sibling_sub.clone(),
-            })
-            .expect("sibling attach");
-
-        // Observe host Status before the producer can fill the adapter.
-        match app.request(DaemonRequest::Status) {
-            Ok(response) => {
-                assert_ne!(
-                    response.kind,
-                    botster_hub_client::DaemonResponseKind::OperatorError,
-                    "host Status must stay readable before core_adapter_closed: {:?}",
-                    response.error
-                );
-                app.apply_response(response);
-            }
-            Err(error) => panic!("pre-close Status failed: {error}"),
-        }
-        assert!(app.terminal_close_evidence.is_none());
-        assert_eq!(
-            app.attached_subscription_id.as_deref(),
-            Some(flood_sub.as_str())
-        );
-        let mut sibling_terminal_frames = 0_usize;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !pressure.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            pressure.exists(),
-            "exact-session pressure hook must activate"
-        );
-        std::fs::write(&release, b"release").expect("release flood after Attached and Status");
-        println!(
-            "ghostty-live-pressure: session={flood_id} subscription={flood_sub} attached=true pre_close_status=true hook=would_block"
-        );
-        while Instant::now() < deadline {
-            app.poll_hub();
-            let frames = sibling
-                .poll_mux_frames()
-                .expect("sibling mux stays readable during flood");
-            sibling_terminal_frames += frames
-                .iter()
-                .filter(|frame| matches!(frame, DaemonUnixMuxFrame::Terminal(_)))
-                .count();
-            if app.terminal_close_evidence.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let close_reason = app
-            .terminal_close_evidence
-            .as_ref()
-            .map(|(_, reason)| reason.clone());
-        assert_eq!(
-            close_reason.as_deref(),
-            Some(TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER),
-            "exact core_adapter_closed required; evidence={:?}",
-            app.terminal_close_evidence
-        );
-        assert_ne!(
-            close_reason.as_deref(),
-            Some("host_adapter_closed"),
-            "host_adapter_closed is not the Core write-budget oracle"
-        );
-        assert!(
-            app.attach_recovery_used,
-            "adapter close must start the one recovery attach"
-        );
-        assert!(app.retired_subscription_ids.contains(&flood_sub));
-
-        match app.request(DaemonRequest::Status) {
-            Ok(response) => {
-                assert_ne!(
-                    response.kind,
-                    botster_hub_client::DaemonResponseKind::OperatorError,
-                    "host Status must stay readable after core_adapter_closed: {:?}",
-                    response.error
-                );
-                app.apply_response(response);
-            }
-            Err(error) => panic!("post-close Status failed: {error}"),
-        }
-
-        let sibling_after = Instant::now() + Duration::from_secs(8);
-        let sibling_before_close = sibling_terminal_frames;
-        while Instant::now() < sibling_after {
-            let frames = sibling
-                .poll_mux_frames()
-                .expect("sibling mux stays readable after core close");
-            sibling_terminal_frames += frames
-                .iter()
-                .filter(|frame| matches!(frame, DaemonUnixMuxFrame::Terminal(_)))
-                .count();
-            if sibling_terminal_frames > sibling_before_close {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            sibling_terminal_frames > sibling_before_close,
-            "sibling must keep receiving terminal frames after core_adapter_closed; before={sibling_before_close} after={sibling_terminal_frames}"
-        );
-        println!(
-            "ghostty-live-sibling: terminal_frames={sibling_terminal_frames} after_close={}",
-            sibling_terminal_frames - sibling_before_close
-        );
-        println!(
-            "ghostty-live-write-budget: reason={} generation={:?} retired={flood_sub}",
-            close_reason.as_deref().unwrap_or("missing"),
-            app.terminal_close_evidence
-                .as_ref()
-                .map(|(generation, _)| *generation)
-        );
-
-        sibling_id
-    }
-
-    fn require_shared_ghostty_injectors() -> Option<(DaemonEndpoint, String)> {
-        let connection_raw = match std::env::var_os("BOTSTER_HUB_CONNECTION") {
-            Some(value) => value,
-            None => {
-                skip_or_panic("BOTSTER_HUB_CONNECTION");
-                return None;
-            }
-        };
-        let session_raw = match std::env::var_os("BOTSTER_SHARED_SESSION_ID") {
-            Some(value) => value,
-            None => {
-                skip_or_panic("BOTSTER_SHARED_SESSION_ID");
-                return None;
-            }
-        };
-        let (connection, error) = parse_hub_connection(Some(connection_raw));
-        let connection = connection.unwrap_or_else(|| {
-            panic!(
-                "{}",
-                error.unwrap_or_else(|| "BOTSTER_HUB_CONNECTION is required".to_string())
-            )
-        });
-        let session_id =
-            parse_shared_session_id(Some(session_raw)).unwrap_or_else(|error| panic!("{error}"));
-        let endpoint = match connection.transport {
-            RunnableEntrypointHubConnectionTransport::UnixSocket { path } => {
-                DaemonEndpoint::new(path)
-            }
-        };
-        Some((endpoint, session_id))
-    }
-
     fn occupancy_has_pair(
         occupancy: &[botster_hub_client::DaemonAttachOccupancy],
         session_id: &str,
@@ -24496,540 +14044,6 @@ mod tests {
         occupancy
             .iter()
             .any(|row| row.session_id == session_id && row.subscription_id == subscription_id)
-    }
-
-    fn sibling_frames_contain(frames: &[DaemonUnixMuxFrame], needle: &str) -> bool {
-        frames.iter().any(|frame| {
-            let DaemonUnixMuxFrame::Terminal(envelope) = frame else {
-                return false;
-            };
-            let Ok(bytes) = envelope.payload_bytes() else {
-                return false;
-            };
-            let Ok(term) = TerminalFrame::from_bytes(&bytes) else {
-                return false;
-            };
-            let Ok(event) = TerminalEvent::from_frame(&term) else {
-                return false;
-            };
-            match event {
-                TerminalEvent::TerminalOutput(output) => {
-                    output.decoded_bytes().ok().is_some_and(|payload| {
-                        payload
-                            .windows(needle.len())
-                            .any(|window| window == needle.as_bytes())
-                    })
-                }
-                _ => false,
-            }
-        })
-    }
-
-    fn wait_for_shared_marker(app: &mut TuiApp, needle: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if app.applied_live_payloads.iter().any(|payload| {
-                payload
-                    .windows(needle.len())
-                    .any(|window| window == needle.as_bytes())
-            }) || viewport_cache_contains(app, needle)
-                || viewport_cache_contains(app, &format!("echo:{needle}"))
-            {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        false
-    }
-
-    #[test]
-    fn ghostty_shared_attaches_to_caller_owned_hub_session() {
-        let Some((endpoint, session_id)) = require_shared_ghostty_injectors() else {
-            return;
-        };
-        assert!(
-            std::env::var_os("BOTSTER_HUB_BIN").is_none(),
-            "ghostty-shared must not inherit BOTSTER_HUB_BIN"
-        );
-        assert!(
-            std::env::var_os("BOTSTER_SESSION_WORKER_BIN").is_none(),
-            "ghostty-shared must not inherit BOTSTER_SESSION_WORKER_BIN"
-        );
-
-        let mut sibling = HubConnection::connect_with_host_requirement(
-            &endpoint,
-            &tui_attach_occupancy_requirement(),
-        )
-        .expect("sibling hello");
-        let sibling_sub = format!("sib-sub-{}", short_suffix());
-        sibling
-            .request(&DaemonRequest::Attach {
-                session_id: session_id.clone(),
-                subscription_id: sibling_sub.clone(),
-            })
-            .expect("sibling attach");
-
-        let mut app = TuiApp::new_for_attach_occupancy(Some(endpoint.clone()));
-        app.workspace_test_mode = true;
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("exact shared session becomes attachable");
-        app.selected_session = Some(session_id.clone());
-        app.observed_requests.clear();
-        app.attach_selected_or_first();
-        wait_for_attached_projection(&mut app, &session_id);
-        let ready = app
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| hydration.snapshot_ready)
-            || app.ghostty_projection.is_some();
-        let finished = app
-            .attach_hydration
-            .as_ref()
-            .is_some_and(|hydration| hydration.snapshot_finished)
-            || app.attached_session.as_deref() == Some(session_id.as_str());
-        assert!(ready, "shared attach must observe READY");
-        assert!(
-            finished,
-            "shared attach must observe FINISH or snapshot_history_incomplete then attached"
-        );
-        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
-        assert!(app.ghostty_projection.is_some(), "one Ghostty decoder");
-        let tui_sub = app
-            .attached_subscription_id
-            .clone()
-            .expect("attached subscription");
-
-        app.scroll_projection(ScrollOp::Top);
-        app.refresh_ghostty_viewport_cache();
-        assert!(
-            viewport_cache_contains(&app, "NORTH_STAR_HISTORY"),
-            "late attach must show NORTH_STAR_HISTORY"
-        );
-
-        let suffix = short_suffix();
-        let marker = format!("NORTH_STAR_TUI_{suffix}");
-        app.applied_live_payloads.clear();
-        app.forward_terminal_input(session_id.clone(), format!("{marker}\n").into_bytes());
-        assert!(
-            wait_for_shared_marker(&mut app, &marker),
-            "exact TUI marker bytes must appear; applied={:?}",
-            app.applied_live_payloads
-        );
-        assert!(
-            app.applied_live_payloads.iter().all(|payload| !payload
-                .windows(3)
-                .any(|window| window == [0xEF, 0xBF, 0xBD])),
-            "shared input must not UTF-8-repair; applied={:?}",
-            app.applied_live_payloads
-        );
-
-        app.error = None;
-        app.handle_dispatch(InputDispatch::TerminalResize {
-            node_id: "tui-terminal".to_string(),
-            rows: 30,
-            cols: 100,
-        });
-        assert_eq!(app.terminal_viewport_size.rows, 30);
-        assert_eq!(app.terminal_viewport_size.cols, 100);
-        assert!(app.error.is_none(), "resize must succeed: {:?}", app.error);
-        assert!(
-            app.observed_terminal_inputs.iter().any(|request| matches!(
-                request,
-                TerminalInputCommand::Resize {
-                    rows: 30,
-                    cols: 100
-                }
-            )),
-            "production TerminalResize must send a duplex Resize frame"
-        );
-
-        app.observed_requests.clear();
-        app.detach_attached();
-        assert!(
-            app.observed_requests
-                .iter()
-                .any(|request| matches!(request, ObservedRequest::Detach { .. })),
-            "cancel must send Detach: {:?}",
-            app.observed_requests
-        );
-        assert_no_shutdown_session(&app);
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("session stays running after cancel");
-        app.selected_session = Some(session_id.clone());
-        app.attach_selected_or_first();
-        wait_for_attached_projection(&mut app, &session_id);
-        let cancel_sub = app
-            .attached_subscription_id
-            .clone()
-            .expect("reattach after cancel");
-        assert_ne!(
-            cancel_sub, tui_sub,
-            "cancel reattach mints a new subscription"
-        );
-
-        let dead_sub = cancel_sub.clone();
-        if let Some(client) = app.client.as_mut() {
-            client.hard_close();
-        }
-        let cut_deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < cut_deadline {
-            app.poll_hub();
-            if app.client.is_none() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            app.client.is_none(),
-            "poll_hub must drive ClientDisconnected after the TUI socket is cut"
-        );
-        assert_no_shutdown_session(&app);
-
-        let occupancy_deadline = Instant::now() + Duration::from_secs(5);
-        let mut occupancy_status = None;
-        while Instant::now() < occupancy_deadline {
-            let status = sibling
-                .request(&DaemonRequest::Status)
-                .expect("sibling Status after TUI EOF");
-            let body = status.status.expect("Status body");
-            if body
-                .compatibility
-                .features
-                .iter()
-                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY)
-                && !occupancy_has_pair(&body.live_attach_occupancy, &session_id, &dead_sub)
-                && occupancy_has_pair(&body.live_attach_occupancy, &session_id, &sibling_sub)
-            {
-                occupancy_status = Some(body);
-                break;
-            }
-            occupancy_status = Some(body);
-            thread::sleep(Duration::from_millis(50));
-        }
-        let status = occupancy_status.expect("sibling Status");
-        assert!(
-            status
-                .compatibility
-                .features
-                .iter()
-                .any(|feature| feature == FEATURE_ATTACH_OCCUPANCY),
-            "empty occupancy without attach_occupancy is not absence proof: {:?}",
-            status.compatibility.features
-        );
-        assert!(
-            !occupancy_has_pair(&status.live_attach_occupancy, &session_id, &dead_sub),
-            "dead TUI pair must be absent: {:?}",
-            status.live_attach_occupancy
-        );
-        assert!(
-            occupancy_has_pair(&status.live_attach_occupancy, &session_id, &sibling_sub),
-            "sibling pair must remain: {:?}",
-            status.live_attach_occupancy
-        );
-
-        let sibling_marker = format!("SIB_{suffix}");
-        let sibling_frame = encode_terminal_input(&TerminalInputCommand::Input {
-            data: format!("{sibling_marker}\n").into_bytes(),
-        })
-        .expect("encode sibling input");
-        sibling
-            .write_terminal_frame(
-                &session_id,
-                &sibling_sub,
-                sibling_frame.as_bytes(),
-                TERMINAL_INPUT_WRITE_BOUND,
-            )
-            .expect("sibling duplex input after cut");
-        let echo_deadline = Instant::now() + Duration::from_secs(8);
-        let mut sibling_echoed = false;
-        while Instant::now() < echo_deadline {
-            let frames = sibling.poll_mux_frames().expect("sibling mux after cut");
-            if sibling_frames_contain(&frames, &sibling_marker)
-                || sibling_frames_contain(&frames, &format!("echo:{sibling_marker}"))
-            {
-                sibling_echoed = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(sibling_echoed, "sibling must echo after TUI socket cut");
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("exact session still running after TUI cut");
-        assert_no_shutdown_session(&app);
-
-        app.try_connect();
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("session still attachable after reconnect");
-        app.selected_session = Some(session_id.clone());
-        app.attach_selected_or_first();
-        wait_for_attached_projection(&mut app, &session_id);
-        let replacement = app
-            .attached_subscription_id
-            .clone()
-            .expect("replacement attach");
-        assert_ne!(
-            replacement, dead_sub,
-            "reconnect attach mints a new subscription id"
-        );
-        app.scroll_projection(ScrollOp::Top);
-        app.refresh_ghostty_viewport_cache();
-        assert!(
-            viewport_cache_contains(&app, "NORTH_STAR_HISTORY"),
-            "reconnect must still show NORTH_STAR_HISTORY"
-        );
-        let live_marker = format!("NORTH_STAR_LIVE_{suffix}");
-        app.forward_terminal_input(session_id.clone(), format!("{live_marker}\n").into_bytes());
-        assert!(
-            wait_for_shared_marker(&mut app, &live_marker),
-            "reconnect must show a later live marker"
-        );
-        assert_no_shutdown_session(&app);
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("run 1 leaves the host session running");
-        println!("ghostty-shared-complete");
-    }
-
-    #[test]
-    fn ghostty_shared_exit_observes_caller_ended_session() {
-        let Some((endpoint, session_id)) = require_shared_ghostty_injectors() else {
-            return;
-        };
-        assert!(
-            std::env::var_os("BOTSTER_HUB_BIN").is_none(),
-            "ghostty-shared-exit must not inherit BOTSTER_HUB_BIN"
-        );
-
-        let mut app = TuiApp::new(Some(endpoint));
-        app.workspace_test_mode = true;
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("exact shared session becomes attachable");
-        app.selected_session = Some(session_id.clone());
-        app.observed_requests.clear();
-        app.attach_selected_or_first();
-        wait_for_attached_projection(&mut app, &session_id);
-        assert_eq!(app.attached_session.as_deref(), Some(session_id.as_str()));
-        println!("ghostty-shared-exit-attached");
-
-        let deadline = Instant::now() + Duration::from_secs(180);
-        let mut observed_exit = false;
-        while Instant::now() < deadline {
-            app.poll_hub();
-            let entity_ended = app.sessions.iter().any(|session| {
-                session.session_id == session_id
-                    && (session.lifecycle == "exited" || session.lifecycle == "failed")
-            });
-            if app.status.contains("process exited") || entity_ended {
-                observed_exit = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            observed_exit,
-            "ghostty-shared-exit must observe ProcessExited or exact entity exited/failed; status={} sessions={:?}",
-            app.status,
-            app.sessions
-                .iter()
-                .map(|session| format!("{}:{}", session.session_id, session.lifecycle))
-                .collect::<Vec<_>>()
-        );
-        assert_no_shutdown_session(&app);
-        println!("ghostty-shared-exit-complete");
-    }
-
-    #[test]
-    fn headless_live_runtime_runs_against_isolated_hub_when_binaries_are_available() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-
-        let root = PathBuf::from(format!("/tmp/bt{}", short_suffix() % 1_000_000));
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
-            .root(&root)
-            .name("botster-tui-headless-live-runtime")
-            .start()
-            .expect("isolated hub starts");
-
-        let lifecycle_report =
-            botster_hub_test_support::run_session_lifecycle_subscription_conformance(&hub)
-                .expect("session lifecycle subscription conformance passes");
-        assert!(lifecycle_report.initial_snapshot_authoritative);
-        assert!(lifecycle_report.spawn_upsert_observed);
-        assert!(lifecycle_report.lifecycle_patch_observed);
-        assert!(lifecycle_report.natural_exit_patch_observed);
-        assert!(lifecycle_report.remove_observed);
-        assert!(lifecycle_report.sequences_strictly_increasing);
-        assert!(lifecycle_report.disconnect_cleanup_released_subscription);
-        assert!(lifecycle_report.fresh_subscription_snapshot_authoritative);
-        println!(
-            "session-lifecycle-conformance: revision={} report={lifecycle_report:?}",
-            botster_hub_test_support::session_lifecycle_subscription_conformance_scenario()
-                .conformance_fixture_revision
-        );
-
-        run_headless_live_runtime(AppArgs {
-            smoke: false,
-            hub_connection: Some(RunnableEntrypointHubConnection {
-                transport: RunnableEntrypointHubConnectionTransport::UnixSocket {
-                    path: hub.endpoint().socket_path.to_string_lossy().into_owned(),
-                },
-            }),
-            connection_error: None,
-            hub_data_dir: Some(hub.data_dir().to_path_buf()),
-            headless_live_runtime: true,
-        })
-        .expect("headless live-runtime surface completes a real Hub round trip");
-
-        assert_live_attach_history_readback(&hub);
-
-        let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let data_dir = hub.data_dir().to_string_lossy().to_string();
-        let package_root = package_root.to_string_lossy().to_string();
-        let package_install_output = std::process::Command::new(&hub_bin)
-            .args([
-                "packages",
-                "install",
-                "--data-dir",
-                data_dir.as_str(),
-                "--path",
-                package_root.as_str(),
-            ])
-            .output()
-            .expect("run packages install for botster-tui checkout");
-        assert!(
-            package_install_output.status.success(),
-            "packages install failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&package_install_output.stdout),
-            String::from_utf8_lossy(&package_install_output.stderr)
-        );
-        println!("package-install: ok");
-
-        let contract_matrix_fixture = std::env::var_os("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
-            .map(PathBuf::from)
-            .expect(
-                "BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required for live plugin-surface proof",
-            );
-        let plugin_report = botster_hub_test_support::run_plugin_contract_matrix_conformance(
-            &hub,
-            contract_matrix_fixture,
-        )
-        .expect("plugin contract matrix conformance passes");
-        assert_plugin_contract_matrix_renders_through_tui(&hub, &plugin_report);
-
-        let package_enable_output = std::process::Command::new(&hub_bin)
-            .args([
-                "packages",
-                "enable",
-                "--data-dir",
-                data_dir.as_str(),
-                "botster-tui",
-            ])
-            .output()
-            .expect("run packages enable for botster-tui checkout");
-        assert!(
-            package_enable_output.status.success(),
-            "packages enable failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&package_enable_output.stdout),
-            String::from_utf8_lossy(&package_enable_output.stderr)
-        );
-        println!("package-enable: ok");
-        let app_open_output = std::process::Command::new(&hub_bin)
-            .args([
-                "apps",
-                "open",
-                "--data-dir",
-                data_dir.as_str(),
-                "botster-tui",
-            ])
-            .env("BOTSTER_TUI_HEADLESS_LIVE_RUNTIME", "1")
-            .output()
-            .expect("run apps open for botster-tui package");
-        assert!(
-            app_open_output.status.success(),
-            "apps open failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&app_open_output.stdout),
-            String::from_utf8_lossy(&app_open_output.stderr)
-        );
-        let app_open_stdout = String::from_utf8_lossy(&app_open_output.stdout);
-        assert!(
-            app_open_stdout.contains("terminal-output: echo:botster-tui-headless"),
-            "apps open stdout={} stderr={}",
-            app_open_stdout,
-            String::from_utf8_lossy(&app_open_output.stderr)
-        );
-        assert!(
-            app_open_stdout.contains("package-storage-context: configured"),
-            "apps open stdout={} stderr={}",
-            app_open_stdout,
-            String::from_utf8_lossy(&app_open_output.stderr)
-        );
-        println!("package-open: typed Hub connection accepted");
-        let mut requirement = tui_compatibility_requirement();
-        requirement
-            .required_features
-            .push("botster-tui-future-feature".to_string());
-        let error = connect_and_hello_with_terminal_requirement(
-            hub.endpoint(),
-            &requirement,
-            Some(&tui_terminal_compatibility_requirement()),
-        )
-        .expect_err("live hub should reject unsatisfied TUI compatibility requirement");
-        let mut app = TuiApp::new(None);
-        app.record_transport_error(error);
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("compatibility mismatch"));
-        assert!(rendered.contains("unsupported_feature"));
-        assert!(rendered.contains("botster-tui-future-feature"));
-
-        let unavailable_connection = serde_json::to_string(&RunnableEntrypointHubConnection {
-            transport: RunnableEntrypointHubConnectionTransport::UnixSocket {
-                path: root.join("missing-hub.sock").to_string_lossy().into_owned(),
-            },
-        })
-        .expect("serialize unavailable Hub descriptor");
-        let unavailable_args = AppArgs::parse_with_environment(
-            Vec::<String>::new(),
-            Some(unavailable_connection.into()),
-            None,
-            false,
-        );
-        let unavailable_app = TuiApp::new_with_connection(
-            unavailable_args.daemon_endpoint(),
-            unavailable_args.connection_error,
-        );
-        let surface = unavailable_app.surface();
-        let connection_error = unavailable_app
-            .connection_error
-            .as_deref()
-            .expect("unavailable live Hub must report a connection error");
-        let connection_alert = find_ui_node_by_id(&surface, "workspace-connection-alert")
-            .expect("never-connected live app must include the workspace connection alert");
-        assert!(
-            connection_alert.props["text"]
-                .as_str()
-                .is_some_and(|text| text.contains(connection_error)),
-            "workspace connection alert must include the complete connection error: {:?}",
-            connection_alert.props
-        );
-        assert!(
-            find_ui_node_by_id(&surface, "tui-terminal-output").is_some(),
-            "never-connected live app must keep the terminal panel visible"
-        );
-        let (lines, _) = renderer::render_to_lines(&surface, 120, 48);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("Hub unavailable"));
-        assert!(rendered.contains("Connection unavailable:"));
-
-        hub.shutdown().expect("isolated hub shuts down cleanly");
     }
 
     /// Hermetic: contract-matrix mode must fail closed when its fixture env is
@@ -25144,673 +14158,6 @@ mod tests {
     }
 
     #[test]
-    fn installed_workspaces_spawn_driver_runs_through_apps_open() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-        let workspaces_path = PathBuf::from(
-            std::env::var("BOTSTER_WORKSPACES_PACKAGE_PATH")
-                .expect("BOTSTER_WORKSPACES_PACKAGE_PATH is required"),
-        );
-        validate_workspaces_package(&workspaces_path).expect("validate Workspaces package");
-
-        let root = PathBuf::from(format!("/tmp/btid{}", short_suffix() % 1_000_000));
-        std::fs::create_dir_all(&root).expect("create installed-driver fixture root");
-        let repository = root.join("repository");
-        std::fs::create_dir_all(repository.join(".botster"))
-            .expect("create repo session-types directory");
-        std::fs::create_dir_all(repository.join("bin")).expect("create repo bin directory");
-        std::fs::write(
-            repository.join("bin/acceptance-session.sh"),
-            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
-        )
-        .expect("write repo session type command");
-        // Protocol-6 PackageSessionType requires label/role/interaction/lifecycle in addition
-        // to id/command. Incomplete repo-local files make CreateSpawnTarget fail with
-        // ClientDisconnected on Hub 8a60bd58 instead of a structured operator error
-        // (hub-side stderr may also say "unexpected daemon response").
-        std::fs::write(
-            repository.join(".botster/session-types.json"),
-            r#"{"session_types":[{"id":"acceptance","label":"Acceptance","role":"botster.acceptance","interaction":"interactive","lifecycle":"task","command":"bin/acceptance-session.sh","working_directory":{"policy":"package_root"}}]}"#,
-        )
-        .expect("write repo session type");
-        run_fixture_command(&repository, "chmod", &["+x", "bin/acceptance-session.sh"]);
-        run_fixture_command(&repository, "git", &["init", "-b", "main"]);
-        run_fixture_command(
-            &repository,
-            "git",
-            &["config", "user.email", "acceptance@botster.dev"],
-        );
-        run_fixture_command(
-            &repository,
-            "git",
-            &["config", "user.name", "Botster Acceptance"],
-        );
-        run_fixture_command(&repository, "git", &["add", "."]);
-        run_fixture_command(&repository, "git", &["commit", "-m", "acceptance fixture"]);
-        run_fixture_command(&repository, "git", &["branch", "feature/existing-worktree"]);
-        run_fixture_command(&repository, "git", &["branch", "feature/existing-branch"]);
-
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
-            .root(root.join("hub"))
-            .name("botster-tui-installed-workspaces-driver")
-            .start()
-            .expect("isolated Hub starts for installed driver");
-        let mut client =
-            HubConnection::connect(hub.endpoint()).expect("connect fixture Hub client");
-        let target_id = "tgt_tui_acceptance";
-        let target = client
-            .request(&DaemonRequest::CreateSpawnTarget {
-                target_id: Some(target_id.to_string()),
-                label: Some("TUI acceptance".to_string()),
-                root: repository.clone(),
-                enabled: true,
-                kind: Some("git".to_string()),
-                base_ref: Some("main".to_string()),
-                metadata: BTreeMap::new(),
-            })
-            .expect("create explicit Git spawn target");
-        assert!(target.error.is_none(), "spawn target response: {target:?}");
-
-        for package_path in [
-            workspaces_path,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
-        ] {
-            let installed = client
-                .request(&DaemonRequest::InstallPackageLocalPath { path: package_path })
-                .expect("install package through public Hub request");
-            assert!(installed.error.is_none(), "install response: {installed:?}");
-        }
-        for package_name in [WORKSPACES_PACKAGE, "botster-tui"] {
-            let enabled = client
-                .request(&DaemonRequest::EnablePackage {
-                    package_name: package_name.to_string(),
-                })
-                .expect("enable installed package");
-            assert!(enabled.error.is_none(), "enable response: {enabled:?}");
-            let reloaded = client
-                .request(&DaemonRequest::ReloadPackage {
-                    package_name: package_name.to_string(),
-                })
-                .expect("reload enabled package");
-            assert!(reloaded.error.is_none(), "reload response: {reloaded:?}");
-        }
-        let created = client
-            .request(&DaemonRequest::PluginMcpCallTool {
-                name: "botster_workspaces.create".to_string(),
-                arguments: json!({ "name": "Installed driver workspace" }),
-            })
-            .expect("create Workspaces fixture through plugin MCP");
-        assert_eq!(created.plugin_tool_result["ok"], true, "{created:?}");
-        let workspace_id = created.plugin_tool_result["workspace"]["id"]
-            .as_str()
-            .expect("workspace id")
-            .to_string();
-
-        let managed_root = hub.data_dir().join("managed-worktrees").join(target_id);
-        std::fs::create_dir_all(&managed_root).expect("create managed fixture root");
-        let managed_root = managed_root
-            .canonicalize()
-            .expect("canonicalize managed fixture root");
-        let existing_worktree = managed_root.join(hex_path_component("feature/existing-worktree"));
-        run_fixture_command(
-            &repository,
-            "git",
-            &[
-                "worktree",
-                "add",
-                existing_worktree.to_str().expect("fixture path is UTF-8"),
-                "feature/existing-worktree",
-            ],
-        );
-        let branches = [
-            (
-                "existing-worktree",
-                "feature/existing-worktree",
-                existing_worktree,
-            ),
-            (
-                "existing-branch",
-                "feature/existing-branch",
-                managed_root.join(hex_path_component("feature/existing-branch")),
-            ),
-            (
-                "missing-branch",
-                "feature/missing-branch",
-                managed_root.join(hex_path_component("feature/missing-branch")),
-            ),
-        ];
-        let cases = branches
-            .iter()
-            .map(|(case_id, branch, path)| {
-                json!({
-                    "case_id": case_id,
-                    "target_id": target_id,
-                    "branch": branch,
-                    "resolution": case_id.replace('-', "_"),
-                    "expected": {
-                        "target_id": target_id,
-                        "branch": branch,
-                        "worktree_path": path.canonicalize().unwrap_or_else(|_| path.clone())
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let scenario_path = root.join("scenario.json");
-        let evidence_path = root.join("evidence.jsonl");
-        std::fs::write(
-            &scenario_path,
-            serde_json::to_vec_pretty(&json!({
-                "schema": crate::acceptance::SCHEMA,
-                "workspace_id": workspace_id,
-                "cases": cases
-            }))
-            .expect("serialize installed-driver scenario"),
-        )
-        .expect("write installed-driver scenario");
-        let scenario_document: Value = serde_json::from_slice(
-            &std::fs::read(&scenario_path).expect("read installed-driver scenario"),
-        )
-        .expect("decode installed-driver scenario");
-        crate::acceptance::validate_contract_document(&scenario_document)
-            .expect("installed-driver scenario matches published schema");
-
-        let output = std::process::Command::new(&hub_bin)
-            .args([
-                "apps",
-                "open",
-                "--data-dir",
-                hub.data_dir().to_str().expect("Hub data path is UTF-8"),
-                "botster-tui",
-            ])
-            .env(crate::acceptance::SCENARIO_ENV, &scenario_path)
-            .env(crate::acceptance::EVIDENCE_ENV, &evidence_path)
-            .output()
-            .expect("launch installed TUI package through apps open");
-        assert!(
-            output.status.success(),
-            "installed driver failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let evidence = std::fs::read_to_string(&evidence_path).expect("read driver evidence");
-        let records = evidence
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("evidence line is JSON"))
-            .collect::<Vec<_>>();
-        for record in &records {
-            crate::acceptance::validate_contract_document(record)
-                .expect("driver-produced evidence matches published schema");
-        }
-        let fixture_records = include_str!("../fixtures/workspaces-spawn-driver-v1.evidence.jsonl")
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<Value>(line).expect("fixture evidence line is JSON")
-            });
-        for fixture in fixture_records {
-            let fixture_payload_keys = fixture["payload"]
-                .as_object()
-                .expect("fixture payload is an object")
-                .keys()
-                .collect::<std::collections::BTreeSet<_>>();
-            assert!(
-                records.iter().any(|record| {
-                    record["kind"] == fixture["kind"]
-                        && record.get("case_id").is_some() == fixture.get("case_id").is_some()
-                        && record["payload"].as_object().is_some_and(|payload| {
-                            payload.keys().collect::<std::collections::BTreeSet<_>>()
-                                == fixture_payload_keys
-                        })
-                }),
-                "canonical fixture record is not shaped like producer output: {fixture}"
-            );
-        }
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record["kind"] == "complete")
-                .count(),
-            1
-        );
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record["kind"] == "case_complete")
-                .count(),
-            3
-        );
-        for (case_id, _, _) in &branches {
-            for kind in ["focused_control", "dispatched_action"] {
-                let matching = records
-                    .iter()
-                    .filter(|record| {
-                        record["kind"] == kind
-                            && record["case_id"] == *case_id
-                            && record["payload"]["action_id"] == "botster_workspaces.open_spawn"
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    matching.len(),
-                    1,
-                    "case {case_id} must record one {kind} for the semantic Spawn opener"
-                );
-                assert!(matching[0]["payload"]["node_id"].is_string());
-                if kind == "dispatched_action" {
-                    assert_eq!(
-                        matching[0]["payload"]["payload"]["selected_workspace"],
-                        workspace_id
-                    );
-                }
-            }
-            assert!(
-                records.iter().all(|record| {
-                    record["case_id"] != *case_id
-                        || record["kind"] != "dispatched_action"
-                        || record["payload"]["action_id"] != "botster_workspaces.open"
-                }),
-                "case {case_id} must not dispatch the deprecated generic action as Spawn"
-            );
-        }
-        assert!(
-            records
-                .iter()
-                .all(|record| record["schema"] == crate::acceptance::SCHEMA)
-        );
-        let mut failure_scenario = scenario_document;
-        failure_scenario["workspace_id"] = json!("workspace-not-rendered");
-        let failure_scenario_path = root.join("failure-scenario.json");
-        let failure_evidence_path = root.join("failure-evidence.jsonl");
-        std::fs::write(
-            &failure_scenario_path,
-            serde_json::to_vec_pretty(&failure_scenario)
-                .expect("serialize bounded-failure scenario"),
-        )
-        .expect("write bounded-failure scenario");
-        let failure_output = std::process::Command::new(&hub_bin)
-            .args([
-                "apps",
-                "open",
-                "--data-dir",
-                hub.data_dir().to_str().expect("Hub data path is UTF-8"),
-                "botster-tui",
-            ])
-            .env(crate::acceptance::SCENARIO_ENV, &failure_scenario_path)
-            .env(crate::acceptance::EVIDENCE_ENV, &failure_evidence_path)
-            .output()
-            .expect("launch installed TUI bounded-failure case");
-        assert!(!failure_output.status.success());
-        let failure_records = std::fs::read_to_string(&failure_evidence_path)
-            .expect("read bounded-failure evidence")
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("failure line is JSON"))
-            .collect::<Vec<_>>();
-        let failure = failure_records.last().expect("terminal failure record");
-        crate::acceptance::validate_contract_document(failure)
-            .expect("driver-produced failure matches published schema");
-        assert_eq!(failure["kind"], "failure");
-        assert_eq!(failure["payload"]["phase"], "initial_surface_open");
-        assert!(failure["payload"]["subscription_id"].is_string());
-        assert!(failure["payload"]["snapshot_seq"].is_number());
-        assert!(failure["payload"]["surface_render_count"].is_number());
-        assert!(
-            failure["payload"]["focusable_ids"]
-                .as_array()
-                .is_some_and(|ids| !ids.is_empty())
-        );
-        println!("installed-workspaces-driver: complete cases=3");
-        hub.shutdown().expect("installed-driver Hub shuts down");
-    }
-
-    /// Shared-Hub production claim seam: caller-owned Hub injectors, pin ledger,
-    /// keyboard Available sessions claim, membership join, option exclusion.
-    #[test]
-    fn installed_workspaces_claim_driver_runs_through_apps_open() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-        let workspaces_path = PathBuf::from(
-            std::env::var("BOTSTER_WORKSPACES_PACKAGE_PATH")
-                .expect("BOTSTER_WORKSPACES_PACKAGE_PATH is required"),
-        );
-        let Some(hub_source) = std::env::var_os("BOTSTER_HUB_SOURCE_PATH") else {
-            skip_or_panic("BOTSTER_HUB_SOURCE_PATH");
-            return;
-        };
-        let hub_source_path = PathBuf::from(hub_source);
-        validate_workspaces_package(&workspaces_path).expect("validate Workspaces package");
-        assert!(
-            crate::acceptance::workspaces_package_has_available_sessions_form(&workspaces_path)
-                .expect("scan Available sessions form"),
-            "live claim requires Workspaces Available sessions entity_options form"
-        );
-        // Fail closed on pin floors before starting the Hub.
-        let pin_probe = crate::acceptance::ClaimScenario {
-            schema: crate::acceptance::CLAIM_SCHEMA.to_string(),
-            workspace_id: "probe".to_string(),
-            session_uuid: "00000000-0000-4000-8000-0000000000aa".to_string(),
-            hub_source_path: Some(hub_source_path.display().to_string()),
-            workspaces_package_path: Some(workspaces_path.display().to_string()),
-            hub_rev: None,
-            workspaces_rev: None,
-            tui_rev: None,
-            session_worker_rev: None,
-        };
-        let pin_ledger =
-            crate::acceptance::verify_claim_pins(&pin_probe).expect("claim pin ledger fail-closed");
-        // Evidence copy path is owned by the wrapper (outside the tracked tree during the run).
-        let evidence_out =
-            std::env::var_os(crate::acceptance::CLAIM_EVIDENCE_OUT_ENV).map(PathBuf::from);
-        if let Some(path) = evidence_out.as_ref() {
-            assert!(
-                path.is_absolute(),
-                "{} must be an absolute path",
-                crate::acceptance::CLAIM_EVIDENCE_OUT_ENV
-            );
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create claim evidence out parent");
-            }
-        }
-
-        // Keep the Hub data path short: unix socket paths must fit SUN_LEN.
-        let root = PathBuf::from(format!("/tmp/btc{}", short_suffix() % 100_000));
-        std::fs::create_dir_all(&root).expect("create claim-driver fixture root");
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(&session_worker_bin)
-            .root(root.join("h"))
-            .name("btc")
-            .start()
-            .expect("isolated Hub starts for claim driver");
-        let mut client =
-            HubConnection::connect(hub.endpoint()).expect("connect fixture Hub client");
-
-        for package_path in [
-            workspaces_path.clone(),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
-        ] {
-            let installed = client
-                .request(&DaemonRequest::InstallPackageLocalPath { path: package_path })
-                .expect("install package through public Hub request");
-            assert!(installed.error.is_none(), "install response: {installed:?}");
-        }
-        for package_name in [WORKSPACES_PACKAGE, "botster-tui"] {
-            let enabled = client
-                .request(&DaemonRequest::EnablePackage {
-                    package_name: package_name.to_string(),
-                })
-                .expect("enable installed package");
-            assert!(enabled.error.is_none(), "enable response: {enabled:?}");
-            let reloaded = client
-                .request(&DaemonRequest::ReloadPackage {
-                    package_name: package_name.to_string(),
-                })
-                .expect("reload enabled package");
-            assert!(reloaded.error.is_none(), "reload response: {reloaded:?}");
-        }
-
-        let created = client
-            .request(&DaemonRequest::PluginMcpCallTool {
-                name: "botster_workspaces.create".to_string(),
-                arguments: json!({ "name": "Claim driver workspace" }),
-            })
-            .expect("create workspace through plugin MCP");
-        assert_eq!(created.plugin_tool_result["ok"], true, "{created:?}");
-        let workspace_id = created.plugin_tool_result["workspace"]["id"]
-            .as_str()
-            .expect("workspace id")
-            .to_string();
-
-        // Seed an unclaimed running Hub session outside membership (not package MCP claim).
-        let session_uuid = format!("00000000-0000-4000-8000-{:012x}", short_suffix() % 0xffff);
-        client
-            .request(&DaemonRequest::Spawn {
-                session_id: session_uuid.clone(),
-                command: "while IFS= read -r line; do :; done".to_string(),
-            })
-            .expect("spawn unclaimed running session");
-
-        let scenario_path = root.join("claim-scenario.json");
-        let evidence_path = root.join("claim-evidence.jsonl");
-        std::fs::write(
-            &scenario_path,
-            serde_json::to_vec_pretty(&json!({
-                "schema": crate::acceptance::CLAIM_SCHEMA,
-                "workspace_id": workspace_id,
-                "session_uuid": session_uuid,
-                "hub_source_path": hub_source_path,
-                "workspaces_package_path": workspaces_path,
-            }))
-            .expect("serialize claim scenario"),
-        )
-        .expect("write claim scenario");
-        let scenario_document: Value =
-            serde_json::from_slice(&std::fs::read(&scenario_path).expect("read claim scenario"))
-                .expect("decode claim scenario");
-        crate::acceptance::validate_claim_contract_document(&scenario_document)
-            .expect("claim scenario matches published schema");
-
-        let output = std::process::Command::new(&hub_bin)
-            .args([
-                "apps",
-                "open",
-                "--data-dir",
-                hub.data_dir().to_str().expect("Hub data path is UTF-8"),
-                "botster-tui",
-            ])
-            .env(crate::acceptance::SCENARIO_ENV, &scenario_path)
-            .env(crate::acceptance::EVIDENCE_ENV, &evidence_path)
-            .env(
-                crate::acceptance::WORKSPACES_PACKAGE_PATH_ENV,
-                &workspaces_path,
-            )
-            .env(crate::acceptance::HUB_SOURCE_PATH_ENV, &hub_source_path)
-            // Propagate the same binaries + fresh build target the pin ledger binds.
-            .env(crate::acceptance::HUB_BIN_ENV, &hub_bin)
-            .env(
-                crate::acceptance::SESSION_WORKER_BIN_ENV,
-                &session_worker_bin,
-            )
-            .env(
-                crate::acceptance::HUB_BUILD_TARGET_DIR_ENV,
-                std::env::var_os(crate::acceptance::HUB_BUILD_TARGET_DIR_ENV).unwrap_or_default(),
-            )
-            .env(
-                crate::acceptance::CLAIM_BUILD_RECEIPT_ENV,
-                std::env::var_os(crate::acceptance::CLAIM_BUILD_RECEIPT_ENV).unwrap_or_default(),
-            )
-            .output()
-            .expect("launch claim driver through apps open");
-        assert!(
-            output.status.success(),
-            "installed claim driver failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let evidence = std::fs::read_to_string(&evidence_path).expect("read claim evidence");
-        let records = evidence
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("evidence line is JSON"))
-            .collect::<Vec<_>>();
-        for record in &records {
-            crate::acceptance::validate_claim_contract_document(record)
-                .expect("claim evidence matches published schema");
-        }
-        assert!(
-            records
-                .iter()
-                .all(|record| { record["schema"] == crate::acceptance::CLAIM_SCHEMA })
-        );
-        // Optional wrapper-owned copy: fail closed when requested and write fails.
-        if let Some(out_path) = evidence_out.as_ref() {
-            std::fs::write(out_path, &evidence).unwrap_or_else(|error| {
-                panic!(
-                    "failed to write claim evidence to {}: {error}",
-                    out_path.display()
-                )
-            });
-            let copied = std::fs::read_to_string(out_path).expect("re-read claim evidence out");
-            assert_eq!(
-                copied, evidence,
-                "claim evidence out path must match driver evidence bytes"
-            );
-        }
-        for kind in [
-            "pin_ledger",
-            "ready",
-            "baseline",
-            "option_present",
-            "dispatched_action",
-            "membership_join",
-            "option_excluded",
-            "complete",
-        ] {
-            assert!(
-                records.iter().any(|record| record["kind"] == kind),
-                "claim evidence missing stage {kind}: {evidence}"
-            );
-        }
-        let baseline = records
-            .iter()
-            .find(|record| record["kind"] == "baseline")
-            .expect("baseline");
-        assert_eq!(baseline["payload"]["session_uuid"], session_uuid);
-        assert_eq!(baseline["payload"]["lifecycle_class"], "current");
-        let join = records
-            .iter()
-            .find(|record| record["kind"] == "membership_join")
-            .expect("membership_join");
-        assert_eq!(join["payload"]["session_uuid"], session_uuid);
-        assert_eq!(join["payload"]["workspace_id"], workspace_id);
-        let submit = records
-            .iter()
-            .find(|record| {
-                record["kind"] == "dispatched_action"
-                    && record["payload"]["action_id"] == WORKSPACES_ADD_SESSION_ACTION
-            })
-            .expect("add_session dispatch");
-        assert_eq!(
-            submit["payload"]["values"]["session_id"], session_uuid,
-            "request.values must carry exact uuid"
-        );
-        let summary = records
-            .iter()
-            .find(|record| record["kind"] == "request_summary")
-            .expect("request_summary");
-        assert_eq!(summary["payload"]["list_sessions_count"], 0);
-        let pin = records
-            .iter()
-            .find(|record| record["kind"] == "pin_ledger")
-            .expect("pin_ledger");
-        assert_eq!(pin["payload"]["hub_ancestry_ok"], true);
-        assert_eq!(pin["payload"]["workspaces_ancestry_ok"], true);
-        assert_eq!(pin["payload"]["tui_ancestry_ok"], true);
-        assert_eq!(
-            pin["payload"]["workspaces_available_sessions_form_ok"],
-            true
-        );
-        assert_eq!(pin["payload"]["sources_clean"], true);
-        assert_eq!(pin["payload"]["hub_bin_under_build_target"], true);
-        assert_eq!(
-            pin["payload"]["session_worker_bin_under_build_target"],
-            true
-        );
-        assert_eq!(pin["payload"]["hub_rev"], pin_ledger.hub_rev);
-        assert_eq!(pin["payload"]["tui_rev"], pin_ledger.tui_rev);
-        assert_eq!(pin["payload"]["core_rev"], pin_ledger.core_rev);
-        // Committed evidence uses path-neutral labels only (no machine-local paths).
-        assert_eq!(
-            pin["payload"]["hub_source_path"],
-            crate::acceptance::LABEL_HUB_SOURCE
-        );
-        assert_eq!(
-            pin["payload"]["tui_source_path"],
-            crate::acceptance::LABEL_TUI_SOURCE
-        );
-        assert_eq!(
-            pin["payload"]["workspaces_package_path"],
-            crate::acceptance::LABEL_WORKSPACES_PACKAGE
-        );
-        assert_eq!(
-            pin["payload"]["hub_build_target_dir"],
-            crate::acceptance::LABEL_HUB_BUILD_TARGET
-        );
-        assert_eq!(
-            pin["payload"]["hub_bin_path"],
-            format!(
-                "{}/release/botster-hub",
-                crate::acceptance::LABEL_HUB_BUILD_TARGET
-            )
-        );
-        assert_eq!(
-            pin["payload"]["session_worker_bin_path"],
-            format!(
-                "{}/release/botster-session-worker",
-                crate::acceptance::LABEL_HUB_BUILD_TARGET
-            )
-        );
-        assert!(
-            pin["payload"]["hub_build_command"]
-                .as_str()
-                .is_some_and(|cmd| {
-                    cmd.contains("botster-hub")
-                        && cmd.contains("--locked")
-                        && cmd.contains(crate::acceptance::LABEL_HUB_SOURCE)
-                        && cmd.contains(crate::acceptance::LABEL_HUB_BUILD_TARGET)
-                        && !cmd.contains("/Users/")
-                        && !cmd.contains("/var/folders/")
-                        && !cmd.contains("/private/var/")
-                        && !cmd.contains("/tmp/")
-                }),
-            "pin ledger must record path-neutral locked Hub build command"
-        );
-        assert!(
-            pin["payload"]["session_worker_build_command"]
-                .as_str()
-                .is_some_and(|cmd| {
-                    cmd.contains("botster-session-worker")
-                        && cmd.contains("--locked")
-                        && cmd.contains(crate::acceptance::LABEL_HUB_BUILD_TARGET)
-                        && !cmd.contains("/Users/")
-                        && !cmd.contains("/var/folders/")
-                        && !cmd.contains("/private/var/")
-                        && !cmd.contains("/tmp/")
-                }),
-            "pin ledger must record path-neutral locked session-worker build command"
-        );
-        // Executed binary still bound to the fresh build target env (not a stale cache).
-        let executed_hub = PathBuf::from(&hub_bin)
-            .canonicalize()
-            .expect("canonicalize executed hub bin");
-        let build_target = PathBuf::from(
-            std::env::var(crate::acceptance::HUB_BUILD_TARGET_DIR_ENV)
-                .expect("fresh build target required"),
-        )
-        .canonicalize()
-        .expect("canonicalize build target");
-        assert!(
-            executed_hub.starts_with(&build_target),
-            "executed hub binary must live under the fresh build target, not a stale cache"
-        );
-        println!(
-            "installed-workspaces-claim-driver: complete workspace={workspace_id} session={session_uuid} tui_rev={} hub_rev={}",
-            pin_ledger.tui_rev, pin_ledger.hub_rev
-        );
-        hub.shutdown().expect("claim-driver Hub shuts down");
-    }
-
-    #[test]
     fn claim_session_baseline_requires_lifecycle_class_current() {
         let mut app = TuiApp::new(None);
         app.session_entities.has_snapshot = true;
@@ -25854,1798 +14201,6 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
-    }
-
-    /// Backs both the `plumbing` and `lifecycle` profiles against a real
-    /// `botster-workspaces` package path supplied by the live-hub wrapper.
-    #[test]
-    fn workspaces_live_acceptance_runs_against_real_package() {
-        let Ok(profile_value) = std::env::var("BOTSTER_TUI_WORKSPACES_PROFILE") else {
-            if std::env::var_os("BOTSTER_TUI_REQUIRE_HUB_TEST").is_some() {
-                panic!("BOTSTER_TUI_WORKSPACES_PROFILE is required");
-            }
-            eprintln!("skipping Workspaces live acceptance; no explicit profile selected");
-            return;
-        };
-        let profile = WorkspacesProfile::parse(&profile_value)
-            .expect("select an explicit Workspaces acceptance profile");
-        let mut ledger = WorkspacesLedger::new(profile);
-        let package_path = validate_workspaces_package(Path::new(
-            &std::env::var("BOTSTER_WORKSPACES_PACKAGE_PATH")
-                .expect("BOTSTER_WORKSPACES_PACKAGE_PATH is required"),
-        ))
-        .expect("validate the explicit real Workspaces package checkout");
-        ledger.record(WorkspacesStage::PackageValidated);
-
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-        let root = PathBuf::from(format!("/tmp/btw{}", short_suffix() % 1_000_000));
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(hub_bin)
-            .session_worker_bin(session_worker_bin)
-            .root(&root)
-            .name("botster-tui-workspaces-live-acceptance")
-            .start()
-            .expect("isolated hub starts for Workspaces acceptance");
-        let mut client = HubConnection::connect(hub.endpoint()).expect("connect to isolated hub");
-
-        let installed = client
-            .request(&DaemonRequest::InstallPackageLocalPath {
-                path: package_path.clone(),
-            })
-            .expect("install the explicit Workspaces package through the public Hub request");
-        assert_eq!(installed.kind, DaemonResponseKind::PackageDecision);
-        assert!(installed.error.is_none(), "install response: {installed:?}");
-        ledger.record(WorkspacesStage::PackageInstalled);
-
-        let enabled = client
-            .request(&DaemonRequest::EnablePackage {
-                package_name: WORKSPACES_PACKAGE_NAME.to_string(),
-            })
-            .expect("enable the installed Workspaces package through the public Hub request");
-        assert_eq!(enabled.kind, DaemonResponseKind::PackageDecision);
-        assert!(enabled.error.is_none(), "enable response: {enabled:?}");
-        let reloaded = client
-            .request(&DaemonRequest::ReloadPackage {
-                package_name: WORKSPACES_PACKAGE_NAME.to_string(),
-            })
-            .expect("reload the enabled Workspaces package through the public Hub request");
-        assert_eq!(reloaded.kind, DaemonResponseKind::PackageDecision);
-        assert!(reloaded.error.is_none(), "reload response: {reloaded:?}");
-        ledger.record(WorkspacesStage::PackageEnabledAndReloaded);
-
-        let created = client
-            .request(&DaemonRequest::PluginMcpCallTool {
-                name: "botster_workspaces.create".to_string(),
-                arguments: json!({ "name": "TUI acceptance workspace" }),
-            })
-            .expect("seed a workspace through the real plugin-worker MCP boundary");
-        assert_eq!(created.kind, DaemonResponseKind::PluginMcpToolResult);
-        assert_eq!(created.plugin_tool_result["ok"], true, "{created:?}");
-        let workspace_id = created.plugin_tool_result["workspace"]["id"]
-            .as_str()
-            .expect("Workspaces create returns the owner-generated workspace id")
-            .to_string();
-
-        let reference_count = match profile {
-            WorkspacesProfile::Plumbing => 1,
-            WorkspacesProfile::Lifecycle => 16,
-        };
-        let session_ids = (1..=reference_count)
-            .map(|index| format!("00000000-0000-4000-8000-{index:012x}"))
-            .collect::<Vec<_>>();
-        for session_id in &session_ids {
-            let added = client
-                .request(&DaemonRequest::PluginMcpCallTool {
-                    name: "botster_workspaces.add_session".to_string(),
-                    arguments: json!({
-                        "workspace_id": workspace_id,
-                        "session_id": session_id,
-                    }),
-                })
-                .expect("seed a deliberate session reference through the plugin MCP tool");
-            assert_eq!(added.kind, DaemonResponseKind::PluginMcpToolResult);
-            assert_eq!(added.plugin_tool_result["ok"], true, "{added:?}");
-        }
-
-        let packages = client
-            .request(&DaemonRequest::ListPackages)
-            .expect("list packages after Workspaces enablement");
-        let apps = client
-            .request(&DaemonRequest::ListApps)
-            .expect("list apps after Workspaces enablement");
-        let navigation = client
-            .request(&DaemonRequest::ListPackageNavigation)
-            .expect("list admitted Workspaces navigation");
-        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
-        app.workspace_test_mode = true;
-        app.system_details_visible = true;
-        app.apply_response(packages);
-        app.apply_response(apps);
-        app.apply_response(navigation);
-        let mut expected_historical_keyboard_node_id = None;
-        if profile == WorkspacesProfile::Lifecycle {
-            for session_id in &session_ids[..2] {
-                wait_for_session_entity_expectation(
-                    &mut app,
-                    session_id,
-                    SessionEntityExpectation::Absent,
-                    "controlled Workspaces session must be absent from the pre-spawn baseline",
-                );
-            }
-            for session_id in &session_ids[..2] {
-                client
-                    .request(&DaemonRequest::Spawn {
-                        session_id: session_id.clone(),
-                        command: "while IFS= read -r line; do :; done".to_string(),
-                    })
-                    .expect("spawn a controlled authoritative Hub session");
-            }
-            for session_id in &session_ids[..2] {
-                wait_for_session_entity_expectation(
-                    &mut app,
-                    session_id,
-                    SessionEntityExpectation::Lifecycle("current"),
-                    "controlled Workspaces session must become authoritative before surface open",
-                );
-            }
-        } else {
-            let snapshot_deadline = Instant::now() + Duration::from_secs(7);
-            while !app.session_entities.has_snapshot && Instant::now() < snapshot_deadline {
-                app.poll_hub();
-                thread::yield_now();
-            }
-            assert!(
-                app.session_entities.has_snapshot,
-                "Workspaces mode requires an authoritative session snapshot"
-            );
-        }
-        app.observed_requests.clear();
-
-        let navigation_index = app
-            .package_navigation
-            .iter()
-            .position(|entry| {
-                entry.package_name == WORKSPACES_PACKAGE_NAME
-                    && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE_ID)
-            })
-            .expect("Hub admits the real Workspaces navigation entry");
-        let (_navigation_lines, navigation_hits) =
-            renderer::render_to_lines(&app.surface(), 500, 240);
-        app.handle_dispatch(click_dispatch(
-            &navigation_hits,
-            &format!("tui-package-navigation-{navigation_index}-open"),
-        ));
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceRender {
-                    package_name: WORKSPACES_PACKAGE_NAME.to_string(),
-                    surface_id: WORKSPACES_SURFACE_ID.to_string(),
-                })
-        );
-        ledger.record(WorkspacesStage::NavigationOpened);
-
-        let owner_surface = app
-            .plugin_surface
-            .clone()
-            .expect("navigation applies the owner-authored Workspaces surface");
-        assert_eq!(owner_surface.package_name, WORKSPACES_PACKAGE_NAME);
-        assert_eq!(owner_surface.surface_id, WORKSPACES_SURFACE_ID);
-        let index_rendered = renderer::render_to_lines(&app.surface(), 500, 240)
-            .0
-            .join("\n");
-        assert!(
-            index_rendered.contains("TUI acceptance workspace"),
-            "{index_rendered}"
-        );
-        ledger.record(WorkspacesStage::OwnerIndexRendered);
-
-        let row_node = find_action_node(
-            &owner_surface.body,
-            "botster_workspaces.open",
-            "selected_workspace",
-            &workspace_id,
-        )
-        .expect("discover the owner-authored workspace row from delivered action metadata");
-        let row_node_id = row_node
-            .id
-            .as_ref()
-            .and_then(UiAuthoredNodeId::as_literal)
-            .expect("current Workspaces row identity is a producer-authored literal")
-            .clone();
-        let row_action = node_action(row_node);
-        let (_lines, row_hits) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            500,
-            240,
-            &RenderState::default(),
-            &app.plugin_presentation,
-        );
-        let row_dispatch =
-            click_dispatch_for_surface(&row_hits, &row_node_id.0, Some(WORKSPACES_SURFACE_ID));
-        let row_request = match &row_dispatch {
-            InputDispatch::Action(request) => request.clone(),
-            other => panic!("real workspace row must dispatch an action, got {other:?}"),
-        };
-        assert_eq!(row_request.action_id, row_action.id);
-        assert_eq!(row_request.node_id, Some(row_node_id));
-        assert_eq!(row_request.payload, row_action.payload);
-        app.handle_dispatch(row_dispatch);
-        assert_eq!(
-            app.plugin_action_result.as_ref().map(|result| result.state),
-            Some(botster_ui_contract::UiActionResultState::Accepted)
-        );
-        ledger.record(WorkspacesStage::OwnerRowSelected);
-        ledger.record(WorkspacesStage::MouseDispatch);
-        ledger.record(WorkspacesStage::LiteralActionIdentityObserved);
-        ledger.record(WorkspacesStage::AcceptedOwnerAction);
-
-        let detail_rendered = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            500,
-            240,
-            &RenderState::default(),
-            &app.plugin_presentation,
-        )
-        .0
-        .join("\n");
-        assert!(
-            detail_rendered.contains(&session_ids[0]),
-            "{detail_rendered}"
-        );
-        ledger.record(WorkspacesStage::OwnerDetailRendered);
-
-        if profile == WorkspacesProfile::Lifecycle {
-            let bindings = collect_session_bindings(&owner_surface.body);
-            for session_id in &session_ids {
-                let reference_bindings = bindings
-                    .iter()
-                    .filter(|binding| binding.session_uuid() == Some(session_id))
-                    .count();
-                assert!(
-                    reference_bindings <= 4,
-                    "retained reference {session_id} exceeds the approved four-bindings-per-reference ceiling with {reference_bindings} bindings"
-                );
-            }
-            for session_id in &session_ids {
-                let current = session_binding(&bindings, session_id, Some("current"));
-                let ended = session_binding(&bindings, session_id, Some("ended"));
-                let indeterminate = session_binding(&bindings, session_id, Some("indeterminate"));
-                let absence = session_binding(&bindings, session_id, None);
-                assert!(current.empty_template.is_none());
-                assert!(ended.empty_template.is_none());
-                assert!(indeterminate.empty_template.is_none());
-                assert!(absence.empty_template.is_some());
-            }
-            ledger.record(WorkspacesStage::SixteenReferenceScale);
-
-            let current_root = materialized_plugin_root(&app);
-            collect_realized_node_ids(&current_root)
-                .expect("current Workspaces render has unique realized identity");
-            for session_id in &session_ids[..2] {
-                assert_binding_realization(
-                    &current_root,
-                    session_binding(&bindings, session_id, Some("current")),
-                    true,
-                    false,
-                );
-                assert_binding_realization(
-                    &current_root,
-                    session_binding(&bindings, session_id, Some("ended")),
-                    false,
-                    false,
-                );
-                assert_binding_realization(
-                    &current_root,
-                    session_binding(&bindings, session_id, Some("indeterminate")),
-                    false,
-                    false,
-                );
-                assert_binding_realization(
-                    &current_root,
-                    session_binding(&bindings, session_id, None),
-                    true,
-                    false,
-                );
-            }
-            for session_id in &session_ids[2..] {
-                for lifecycle_class in ["current", "ended", "indeterminate"] {
-                    assert_binding_realization(
-                        &current_root,
-                        session_binding(&bindings, session_id, Some(lifecycle_class)),
-                        false,
-                        false,
-                    );
-                }
-                assert_binding_realization(
-                    &current_root,
-                    session_binding(&bindings, session_id, None),
-                    false,
-                    true,
-                );
-            }
-            assert_realized_roots_follow_reference_order(
-                &current_root,
-                session_ids[..2].iter().map(|session_id| {
-                    session_binding(&bindings, session_id, Some("current"))
-                        .item_root_id()
-                        .expect("literal current root")
-                        .to_string()
-                }),
-            );
-            assert_realized_roots_follow_reference_order(
-                &current_root,
-                session_ids[2..].iter().map(|session_id| {
-                    session_binding(&bindings, session_id, None)
-                        .empty_root_id()
-                        .expect("literal absent root")
-                        .to_string()
-                }),
-            );
-            ledger.record(WorkspacesStage::CurrentRendered);
-            ledger.record(WorkspacesStage::AbsentRendered);
-            ledger.record(WorkspacesStage::CanonicalItemRootIdentityObserved);
-
-            let absence_binding = session_binding(&bindings, &session_ids[0], None);
-            let absence_item_id = absence_binding
-                .item_root_id()
-                .expect("absence binding item template has literal producer identity");
-            let absence_item = find_ui_node_by_id(&current_root, absence_item_id)
-                .expect("present reference realizes absence-detection item template");
-            let (absence_lines, absence_hits) = renderer::render_to_lines(absence_item, 80, 8);
-            assert!(
-                absence_lines.join("\n").trim().is_empty(),
-                "presence detector item template must be visually inert"
-            );
-            assert!(
-                absence_hits
-                    .regions()
-                    .iter()
-                    .all(|region| region.node_id != absence_item_id),
-                "presence detector item template must not publish a hit region"
-            );
-            ledger.record(WorkspacesStage::AbsenceTemplateInert);
-
-            let descriptor_before_transition = owner_surface.body.clone();
-            let render_requests_before_transition = app
-                .observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-                .count();
-            client
-                .request(&DaemonRequest::ShutdownSession {
-                    session_id: session_ids[1].clone(),
-                })
-                .expect("end the controlled referenced session through Hub authority");
-            wait_for_session_entity_expectation(
-                &mut app,
-                &session_ids[1],
-                SessionEntityExpectation::Lifecycle("ended"),
-                "controlled Workspaces session must become authoritative ended state",
-            );
-            assert_eq!(
-                app.session_entities.entities[&session_ids[1]].lifecycle_class,
-                "ended"
-            );
-            assert_eq!(
-                app.plugin_surface
-                    .as_ref()
-                    .expect("surface remains active")
-                    .body,
-                descriptor_before_transition,
-                "entity lifecycle transition must not replace the owner-authored surface tree"
-            );
-            assert_eq!(
-                app.observed_requests
-                    .iter()
-                    .filter(|request| matches!(
-                        request,
-                        ObservedRequest::PluginSurfaceRender { .. }
-                    ))
-                    .count(),
-                render_requests_before_transition,
-                "entity lifecycle transition must not request a fresh surface"
-            );
-            let ended_root = materialized_plugin_root(&app);
-            collect_realized_node_ids(&ended_root)
-                .expect("ended Workspaces render has unique realized identity");
-            assert_binding_realization(
-                &ended_root,
-                session_binding(&bindings, &session_ids[1], Some("current")),
-                false,
-                false,
-            );
-            assert_binding_realization(
-                &ended_root,
-                session_binding(&bindings, &session_ids[1], Some("ended")),
-                true,
-                false,
-            );
-            assert_binding_realization(
-                &ended_root,
-                session_binding(&bindings, &session_ids[1], None),
-                true,
-                false,
-            );
-            ledger.record(WorkspacesStage::EndedRendered);
-            ledger.record(WorkspacesStage::TransitionWithoutListOrSurfaceRefresh);
-
-            client
-                .request(&DaemonRequest::ShutdownSession {
-                    session_id: session_ids[0].clone(),
-                })
-                .expect("end the controlled session before removing Hub history");
-            wait_for_session_entity_expectation(
-                &mut app,
-                &session_ids[0],
-                SessionEntityExpectation::Lifecycle("ended"),
-                "controlled Workspaces session must end before history removal",
-            );
-            client
-                .request(&DaemonRequest::RemoveSession {
-                    session_id: session_ids[0].clone(),
-                })
-                .expect("remove one controlled Hub session while retaining workspace history");
-            wait_for_session_entity_expectation(
-                &mut app,
-                &session_ids[0],
-                SessionEntityExpectation::Absent,
-                "controlled Workspaces session must be authoritatively removed",
-            );
-            assert!(!app.session_entities.entities.contains_key(&session_ids[0]));
-            let absent_root = materialized_plugin_root(&app);
-            collect_realized_node_ids(&absent_root)
-                .expect("absent Workspaces render has unique realized identity");
-            for lifecycle_class in ["current", "ended", "indeterminate"] {
-                assert_binding_realization(
-                    &absent_root,
-                    session_binding(&bindings, &session_ids[0], Some(lifecycle_class)),
-                    false,
-                    false,
-                );
-            }
-            assert_binding_realization(
-                &absent_root,
-                session_binding(&bindings, &session_ids[0], None),
-                false,
-                true,
-            );
-
-            let old_generation = app
-                .session_entities
-                .subscription_id
-                .clone()
-                .expect("pre-reconnect session generation exists");
-            app.force_reconnect();
-            let reconnect_deadline = Instant::now() + Duration::from_secs(7);
-            while (!app.session_entities.has_snapshot
-                || app.session_entities.subscription_id.as_deref() == Some(old_generation.as_str()))
-                && Instant::now() < reconnect_deadline
-            {
-                app.poll_hub();
-                thread::yield_now();
-            }
-            assert_ne!(
-                app.session_entities.subscription_id.as_deref(),
-                Some(old_generation.as_str())
-            );
-            assert!(app.session_entities.has_snapshot);
-            ledger.record(WorkspacesStage::FreshReconnectSubscription);
-            ledger.record(WorkspacesStage::FreshReconnectSnapshot);
-            wait_for_session_entity_expectation(
-                &mut app,
-                &session_ids[1],
-                SessionEntityExpectation::Lifecycle("ended"),
-                "reconnect must rehydrate the exact controlled session in its authoritative ended state",
-            );
-
-            let stale_seq = app.session_entities.snapshot_seq.unwrap_or_default() + 1;
-            assert!(
-                !app.session_entities
-                    .apply(DaemonEntityFrame::Patch {
-                        subscription_id: old_generation,
-                        entity_type: "session".to_string(),
-                        snapshot_seq: stale_seq,
-                        id: session_ids[1].clone(),
-                        patch: json!({ "lifecycle_class": "current" }),
-                    })
-                    .expect("stale prior-generation patch is rejected")
-            );
-            ledger.record(WorkspacesStage::StaleGenerationRejected);
-
-            let navigation_deadline = Instant::now() + Duration::from_secs(7);
-            while !app.package_navigation.iter().any(|entry| {
-                entry.package_name == WORKSPACES_PACKAGE_NAME
-                    && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE_ID)
-            }) && Instant::now() < navigation_deadline
-            {
-                app.poll_hub();
-                thread::yield_now();
-            }
-            app.system_details_visible = true;
-            let navigation_index = app
-                .package_navigation
-                .iter()
-                .position(|entry| {
-                    entry.package_name == WORKSPACES_PACKAGE_NAME
-                        && entry.target.surface_id.as_deref() == Some(WORKSPACES_SURFACE_ID)
-                })
-                .expect("reconnect refreshes admitted Workspaces navigation");
-            let (_lines, reconnect_navigation_hits) =
-                renderer::render_to_lines(&app.surface(), 500, 240);
-            app.handle_dispatch(click_dispatch(
-                &reconnect_navigation_hits,
-                &format!("tui-package-navigation-{navigation_index}-open"),
-            ));
-            let reopened_surface = app
-                .plugin_surface
-                .clone()
-                .expect("reconnect explicitly pulls the Workspaces surface");
-            let reopened_row = find_action_node(
-                &reopened_surface.body,
-                "botster_workspaces.open",
-                "selected_workspace",
-                &workspace_id,
-            )
-            .expect("reopened surface retains the workspace row");
-            let reopened_row_id = reopened_row
-                .id
-                .as_ref()
-                .and_then(UiAuthoredNodeId::as_literal)
-                .expect("reopened workspace row has literal identity")
-                .0
-                .clone();
-            let (_lines, reopened_hits) = renderer::render_to_lines_with_presentation_state(
-                &app.surface(),
-                500,
-                240,
-                &RenderState::default(),
-                &app.plugin_presentation,
-            );
-            app.handle_dispatch(click_dispatch_for_surface(
-                &reopened_hits,
-                &reopened_row_id,
-                Some(WORKSPACES_SURFACE_ID),
-            ));
-            ledger.record(WorkspacesStage::SurfaceReopened);
-
-            let rehydrated_root = materialized_plugin_root(&app);
-            collect_realized_node_ids(&rehydrated_root)
-                .expect("rehydrated Workspaces render has unique realized identity");
-            assert_binding_realization(
-                &rehydrated_root,
-                session_binding(&bindings, &session_ids[1], Some("ended")),
-                true,
-                false,
-            );
-            assert_binding_realization(
-                &rehydrated_root,
-                session_binding(&bindings, &session_ids[0], None),
-                false,
-                true,
-            );
-            let historical_keyboard_binding = session_binding(&bindings, &session_ids[2], None);
-            assert_binding_realization(&rehydrated_root, historical_keyboard_binding, false, true);
-            expected_historical_keyboard_node_id = Some(UiNodeId(
-                historical_keyboard_binding
-                    .empty_root_id()
-                    .expect("historical keyboard binding has a literal empty root")
-                    .to_string(),
-            ));
-            ledger.record(WorkspacesStage::HistoricalReferencesRehydrated);
-        }
-
-        let active_surface = app
-            .plugin_surface
-            .clone()
-            .expect("Workspaces retains its owner surface after row selection");
-        let mut router =
-            InputRouter::new(renderer::action_request_context_for(WORKSPACES_SURFACE_ID));
-        let (_lines, keyboard_hits) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            500,
-            240,
-            &router.render_state(),
-            &app.plugin_presentation,
-        );
-        let (keyboard_node_id, keyboard_action, keyboard_expectation) = match profile {
-            WorkspacesProfile::Plumbing => {
-                let keyboard_node = find_action_node(
-                    &active_surface.body,
-                    "botster_workspaces.open",
-                    "dialog",
-                    &format!("rename:{workspace_id}"),
-                )
-                .expect("discover an owner-authored detail action from the delivered tree");
-                (
-                    keyboard_node
-                        .id
-                        .as_ref()
-                        .and_then(UiAuthoredNodeId::as_literal)
-                        .expect("owner-authored keyboard action has literal identity")
-                        .clone(),
-                    node_action(keyboard_node),
-                    None,
-                )
-            }
-            WorkspacesProfile::Lifecycle => {
-                let (node_id, action) = unique_hit_action(
-                    &keyboard_hits,
-                    "botster_workspaces.remove_session",
-                    "session_id",
-                    &session_ids[2],
-                )
-                .expect("discover one exact membership action in the production hit map");
-                assert_eq!(
-                    Some(&node_id),
-                    expected_historical_keyboard_node_id.as_ref(),
-                    "lifecycle keyboard action belongs to the realized absent reference root"
-                );
-                (node_id, action, Some(&session_ids[2]))
-            }
-        };
-        router.reconcile(&keyboard_hits);
-        let keyboard_region = keyboard_hits
-            .regions()
-            .iter()
-            .find(|region| region.node_id == keyboard_node_id.0)
-            .unwrap_or_else(|| {
-                panic!(
-                    "owner-authored keyboard action {} is in the production hit map; regions={:?}",
-                    keyboard_node_id.0,
-                    keyboard_hits
-                        .regions()
-                        .iter()
-                        .map(|region| region.node_id.as_str())
-                        .collect::<Vec<_>>()
-                )
-            });
-        let focus_dispatch = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                keyboard_region.rect.x,
-                keyboard_region.rect.y,
-            ),
-            &keyboard_hits,
-        );
-        assert!(matches!(focus_dispatch, InputDispatch::Focus { .. }));
-        assert_eq!(router.focused_node_id(), Some(keyboard_node_id.0.as_str()));
-        let keyboard_dispatch = router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &keyboard_hits,
-        );
-        let keyboard_request = match &keyboard_dispatch {
-            InputDispatch::Action(request) => request.clone(),
-            other => panic!("focused owner action must dispatch, got {other:?}"),
-        };
-        assert_eq!(keyboard_request.action_id, keyboard_action.id);
-        assert_eq!(keyboard_request.node_id, Some(keyboard_node_id));
-        assert_eq!(keyboard_request.payload, keyboard_action.payload);
-        app.handle_dispatch(keyboard_dispatch);
-        assert_eq!(
-            app.plugin_action_result.as_ref().map(|result| result.state),
-            Some(botster_ui_contract::UiActionResultState::Accepted)
-        );
-        if let Some(removed_membership_id) = keyboard_expectation {
-            let (_lines, after_remove_hits) = renderer::render_to_lines_with_presentation_state(
-                &app.surface(),
-                500,
-                240,
-                &RenderState::default(),
-                &app.plugin_presentation,
-            );
-            unique_hit_action(
-                &after_remove_hits,
-                "botster_workspaces.remove_session",
-                "session_id",
-                &session_ids[0],
-            )
-            .expect(
-                "retained historical references still publish their exact removal action after an unrelated removal",
-            );
-            let removed = unique_hit_action(
-                &after_remove_hits,
-                "botster_workspaces.remove_session",
-                "session_id",
-                removed_membership_id,
-            )
-            .expect_err("accepted removal eliminates the exact membership action");
-            assert!(removed.contains("found 0"), "{removed}");
-        }
-        ledger.record(WorkspacesStage::KeyboardDispatch);
-
-        hub.shutdown()
-            .expect("Workspaces acceptance isolated hub shuts down cleanly");
-        ledger.record(WorkspacesStage::CleanShutdown);
-        ledger
-            .assert_complete()
-            .expect("selected Workspaces ledger completes");
-    }
-
-    fn assert_live_attach_history_readback(hub: &botster_hub_test_support::IsolatedHub) {
-        let mut daemon =
-            HubConnection::connect(hub.endpoint()).expect("connect direct daemon client");
-        let prior_session_id = format!("tui-history-{}", short_suffix());
-        let prior_marker = format!("history-before-tui-{}", short_suffix());
-        let later_marker = format!("live-after-tui-{}", short_suffix());
-        daemon
-            .request(&DaemonRequest::Spawn {
-                session_id: prior_session_id.clone(),
-                command: format!(
-                    "printf '{prior_marker}\\n'; printf '\\033[?1000h\\033[?1006h'; while IFS= read -r line; do case \"$line\" in enable-mouse) printf '\\033[?1000h\\033[?1006h' ;; disable-mouse) printf '\\033[?1000l\\033[?1006l' ;; esac; done"
-                ),
-            })
-            .expect("spawn history-producing session before TUI attach");
-        thread::yield_now();
-
-        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
-        app.workspace_test_mode = true;
-        wait_for_authoritative_session(&mut app, &prior_session_id)
-            .expect("external session appears through entity subscription");
-        app.selected_session = Some(prior_session_id.clone());
-        app.observed_requests.clear();
-        app.attach_selected_or_first();
-        let first_subscription_id = app.subscription_id.clone();
-        wait_for_app_output(&mut app, &prior_marker).expect("late TUI attach renders prior output");
-        let hydration_deadline = Instant::now() + Duration::from_secs(7);
-        while app.attach_hydration.is_some() && Instant::now() < hydration_deadline {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert_eq!(
-            app.terminal_output.matches(&prior_marker).count(),
-            1,
-            "initial restoration duplicated prior output: {:?}",
-            app.terminal_output
-        );
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::CaptureSnapshot(prior_session_id.clone()))
-        );
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ReadScreen(prior_session_id.clone()))
-        );
-
-        let attached_deadline = Instant::now() + Duration::from_secs(7);
-        while app.attached_session.as_deref() != Some(prior_session_id.as_str())
-            && Instant::now() < attached_deadline
-        {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert_eq!(
-            app.attached_session.as_deref(),
-            Some(prior_session_id.as_str()),
-            "TUI must observe Attached before forwarding terminal input"
-        );
-        let mode_on_deadline = Instant::now() + Duration::from_secs(3);
-        while app.current_terminal_mouse_mode() != 9 && Instant::now() < mode_on_deadline {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert_eq!(
-            app.current_terminal_mouse_mode(),
-            9,
-            "real Ghostty mode flags must reach the attachment shadow"
-        );
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ReadModeFlags(prior_session_id.clone())),
-            "the production attachment path must issue targeted mode readback"
-        );
-
-        let (_lines, mut mouse_hit_map) = renderer::render_to_lines(&app.surface(), 200, 80);
-        app.apply_terminal_mouse_mode(&mut mouse_hit_map);
-        let terminal = mouse_hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == "tui-terminal")
-            .expect("production terminal should be hit-testable");
-        assert!(terminal.terminal_mouse_mode);
-        let (column, row) = (
-            terminal.rect.x.saturating_add(1),
-            terminal.rect.y.saturating_add(1),
-        );
-        let mut router = InputRouter::new(renderer::action_request_context());
-        let focus = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &mouse_hit_map,
-        );
-        assert!(matches!(focus, InputDispatch::Action(_)));
-        let sgr_release = router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                column,
-                row,
-            ),
-            &mouse_hit_map,
-        );
-        assert!(matches!(
-            &sgr_release,
-            InputDispatch::TerminalForward { bytes, .. } if bytes == b"\x1b[<0;1;1m"
-        ));
-        app.handle_dispatch(sgr_release);
-        assert!(app.observed_terminal_inputs.iter().any(|request| {
-            matches!(request, TerminalInputCommand::Input { data }
-                if data == b"\x1b[<0;1;1m")
-        }));
-
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"\ndisable-mouse\n".to_vec(),
-        });
-        thread::yield_now();
-        let mode_off_deadline = Instant::now() + Duration::from_secs(3);
-        while app.current_terminal_mouse_mode() != 0 && Instant::now() < mode_off_deadline {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert_eq!(
-            app.current_terminal_mouse_mode(),
-            0,
-            "real DECRST output must restore outer mouse routing"
-        );
-
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"enable-mouse\n".to_vec(),
-        });
-        thread::yield_now();
-        let mode_reenabled_deadline = Instant::now() + Duration::from_secs(3);
-        while app.current_terminal_mouse_mode() != 9 && Instant::now() < mode_reenabled_deadline {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert_eq!(app.current_terminal_mouse_mode(), 9);
-
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: format!("{later_marker}\n").into_bytes(),
-        });
-        assert!(
-            app.observed_terminal_inputs
-                .contains(&TerminalInputCommand::Input {
-                    data: format!("{later_marker}\n").into_bytes(),
-                })
-        );
-        wait_for_app_output(&mut app, &later_marker).expect("TUI renders later live output");
-        assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
-        let rendered = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
-        assert!(
-            rendered.find(&prior_marker).unwrap() < rendered.find(&later_marker).unwrap(),
-            "restored history must render before later live output: {rendered}"
-        );
-
-        let prior_entity_generation = app
-            .session_entities
-            .subscription_id
-            .clone()
-            .expect("initial entity generation exists");
-        let attach_count_before_reconnect = app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
-            .count();
-        app.force_reconnect();
-        assert_ne!(
-            app.error.as_deref(),
-            Some("session subscription cleanup timed out")
-        );
-        subscribe_session_entities(hub.endpoint(), prior_entity_generation.clone())
-            .expect("client reconnect releases the old hub subscription id")
-            .unsubscribe()
-            .expect("cleanup probe unsubscribes");
-        let reconnect_entity_generation = app.session_entities.subscription_id.clone();
-        assert_ne!(
-            reconnect_entity_generation.as_deref(),
-            Some(prior_entity_generation.as_str()),
-            "reconnect must establish a fresh entity subscription generation"
-        );
-        assert_eq!(app.attached_session, None, "reconnect must not auto-attach");
-        assert_eq!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::Attach { .. }))
-                .count(),
-            attach_count_before_reconnect,
-            "reconnect must not issue a terminal attach request"
-        );
-        wait_for_authoritative_session(&mut app, &prior_session_id)
-            .expect("fresh generation snapshot restores the session row");
-        app.selected_session = Some(prior_session_id.clone());
-        app.attach_selected_or_first();
-        let reconnect_subscription_id = app.subscription_id.clone();
-        assert_ne!(reconnect_subscription_id, first_subscription_id);
-        let reconnect_deadline = Instant::now() + Duration::from_secs(7);
-        while app.attach_hydration.is_some() && Instant::now() < reconnect_deadline {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert!(
-            app.attach_hydration.is_none(),
-            "same-session reconnect hydration must finish"
-        );
-        let restored_mode_deadline = Instant::now() + Duration::from_secs(3);
-        while app.current_terminal_mouse_mode() != 9 && Instant::now() < restored_mode_deadline {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        assert_eq!(
-            app.current_terminal_mouse_mode(),
-            9,
-            "reattach must restore current authoritative mouse mode"
-        );
-        wait_for_app_output(&mut app, &prior_marker)
-            .expect("same-session reconnect restores prior output");
-        wait_for_app_output(&mut app, &later_marker)
-            .expect("same-session reconnect restores later output");
-        assert_eq!(app.terminal_output.matches(&prior_marker).count(), 1);
-        assert_eq!(app.terminal_output.matches(&later_marker).count(), 1);
-        let reconnected = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
-        assert!(
-            reconnected.find(&prior_marker).unwrap() < reconnected.find(&later_marker).unwrap(),
-            "same-session reconnect must render one ordered replay: {reconnected}"
-        );
-        daemon
-            .request(&DaemonRequest::ShutdownSession {
-                session_id: prior_session_id.clone(),
-            })
-            .expect("shut down history-producing session");
-        let exit_deadline = Instant::now() + Duration::from_secs(7);
-        while app
-            .sessions
-            .iter()
-            .any(|session| session.session_id == prior_session_id && session.lifecycle != "exited")
-            && Instant::now() < exit_deadline
-        {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        let exited = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
-        assert!(
-            exited.contains(&format!("{prior_session_id} · exited")),
-            "natural exit patch must render through the app surface: {exited}"
-        );
-        daemon
-            .request(&DaemonRequest::RemoveSession {
-                session_id: prior_session_id.clone(),
-            })
-            .expect("remove history-producing session");
-        let remove_deadline = Instant::now() + Duration::from_secs(7);
-        while app
-            .sessions
-            .iter()
-            .any(|session| session.session_id == prior_session_id)
-            && Instant::now() < remove_deadline
-        {
-            app.poll_hub();
-            thread::yield_now();
-        }
-        let removed = renderer::render_to_lines(&app.surface(), 200, 80)
-            .0
-            .join("\n");
-        assert!(
-            !removed.contains(&format!("{prior_session_id} ·")),
-            "remove delta must delete the rendered session row: {removed}"
-        );
-
-        let empty_session_id = format!("tui-empty-{}", short_suffix());
-        daemon
-            .request(&DaemonRequest::Spawn {
-                session_id: empty_session_id.clone(),
-                command: "while IFS= read -r line; do :; done".to_string(),
-            })
-            .expect("spawn empty session");
-        thread::yield_now();
-
-        let mut empty_app = TuiApp::new(Some(hub.endpoint().clone()));
-        wait_for_authoritative_session(&mut empty_app, &empty_session_id)
-            .expect("empty external session appears through entity subscription");
-        empty_app.selected_session = Some(empty_session_id.clone());
-        empty_app.observed_requests.clear();
-        empty_app.attach_selected_or_first();
-        let deadline = Instant::now() + Duration::from_secs(7);
-        while empty_app.attach_hydration.is_some() && Instant::now() < deadline {
-            empty_app.poll_hub();
-            thread::yield_now();
-        }
-        assert!(empty_app.attach_hydration.is_none());
-        assert_eq!(
-            empty_app
-                .observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::ReadScreen(id) if id == &empty_session_id))
-                .count(),
-            1
-        );
-        assert_eq!(
-            empty_app
-                .observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::CaptureSnapshot(id) if id == &empty_session_id))
-                .count(),
-            1
-        );
-        let rendered = renderer::render_to_lines(&empty_app.surface(), 200, 80)
-            .0
-            .join("\n");
-        assert!(rendered.contains("terminal snapshot: session="));
-        daemon
-            .request(&DaemonRequest::ShutdownSession {
-                session_id: empty_session_id,
-            })
-            .expect("shut down empty session");
-    }
-
-    fn assert_plugin_contract_matrix_renders_through_tui(
-        hub: &botster_hub_test_support::IsolatedHub,
-        report: &botster_hub_test_support::PluginContractMatrixConformanceReport,
-    ) {
-        assert_eq!(
-            report.failure_classes.client_rendering,
-            report.client_render_check.class
-        );
-        assert_eq!(
-            report.app_surface_node_id,
-            report.client_render_check.app_surface_node_id
-        );
-        assert_eq!(
-            report.empty_surface_child_id,
-            report.client_render_check.empty_surface_child_id
-        );
-        assert_eq!(
-            report.settings_surface_node_id,
-            report.client_render_check.settings_surface_node_id
-        );
-        assert_eq!(
-            report.valid_configuration_secret_state,
-            report.client_render_check.expected_redacted_secret_state
-        );
-
-        let mut client = HubConnection::connect(hub.endpoint()).expect("connect to live hub");
-        let live_session_uuid = format!("tui-binding-{}", short_suffix());
-        let missing_session_uuid = format!("tui-binding-missing-{}", short_suffix());
-        let mut binding_app = TuiApp::new(Some(hub.endpoint().clone()));
-        binding_app.workspace_test_mode = true;
-        wait_for_session_entity_expectation(
-            &mut binding_app,
-            &live_session_uuid,
-            SessionEntityExpectation::Absent,
-            "generated contract-matrix session must be absent from the pre-spawn baseline",
-        );
-        client
-            .request(&DaemonRequest::Spawn {
-                session_id: live_session_uuid.clone(),
-                command: "while IFS= read -r line; do :; done".to_string(),
-            })
-            .expect("spawn session after the TUI subscription baseline");
-        wait_for_session_entity_expectation(
-            &mut binding_app,
-            &live_session_uuid,
-            SessionEntityExpectation::Lifecycle("current"),
-            "live spawn must reach the TUI-owned entity store",
-        );
-        binding_app.observed_requests.clear();
-        binding_app.request_and_apply(DaemonRequest::PluginSurfaceRender {
-            package_name: report.package_name.clone(),
-            surface_id: report.session_surface_id.clone(),
-            payload: json!({
-                "session_uuids": [&live_session_uuid, &missing_session_uuid]
-            }),
-        });
-        assert!(
-            binding_app
-                .observed_requests
-                .contains(&ObservedRequest::PluginSurfaceRender {
-                    package_name: report.package_name.clone(),
-                    surface_id: report.session_surface_id.clone(),
-                })
-        );
-        let lifecycle_class = binding_app
-            .session_entities
-            .entities
-            .get(&live_session_uuid)
-            .expect("live row is held by the app-owned store")
-            .lifecycle_class
-            .clone();
-        let rendered = renderer::render_to_lines(&binding_app.surface(), 180, 60)
-            .0
-            .join("\n");
-        assert!(rendered.contains(&lifecycle_class), "{rendered}");
-        assert!(rendered.contains("Session unavailable"), "{rendered}");
-        for fallback in ["bind /", "bind @/", "bound list: waiting for entities"] {
-            assert!(!rendered.contains(fallback), "{rendered}");
-        }
-
-        let materialized = materialize_plugin_surface(
-            &binding_app
-                .plugin_surface
-                .as_ref()
-                .expect("live session surface")
-                .body,
-            &binding_app.session_entities,
-            &binding_app.entity_options_projection_store(),
-            &binding_app.drafts,
-            &binding_app.entity_options_invalid_fields,
-        )
-        .expect("live Hub surface materializes canonical controls");
-        let mut live_rows = Vec::new();
-        collect_session_action_rows(&materialized, &mut live_rows);
-        let live_row = live_rows
-            .iter()
-            .find(|row| row.node_id == live_session_uuid)
-            .expect("live session owns a materialized action row");
-        assert_eq!(
-            live_row
-                .controls
-                .iter()
-                .map(|control| control.key.as_str())
-                .collect::<Vec<_>>(),
-            ["spawn", "rename", "remove"]
-        );
-        for control in &live_row.controls {
-            assert_eq!(
-                control.node_id,
-                realize_bind_list_descendant_id(&live_session_uuid, &control.key)
-                    .expect("live canonical descendant identity")
-                    .0
-            );
-            assert_eq!(
-                control.action_payload,
-                json!({
-                    "operation": control.key,
-                    "session_uuid": live_session_uuid,
-                })
-            );
-        }
-
-        let rename = &live_row.controls[1];
-        let mut key_router = InputRouter::new(renderer::action_request_context_for(
-            &report.session_surface_id,
-        ));
-        let (_lines, key_hits) = renderer::render_to_lines_with_presentation_state(
-            &binding_app.surface(),
-            180,
-            60,
-            &key_router.render_state(),
-            &binding_app.plugin_presentation,
-        );
-        key_router.reconcile(&key_hits);
-        for _ in 0..=key_hits.regions().len() {
-            if key_router.focused_node_id() == Some(rename.node_id.as_str()) {
-                break;
-            }
-            key_router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &key_hits,
-            );
-        }
-        let rename_dispatch = key_router.dispatch_event(
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &key_hits,
-        );
-        let InputDispatch::Action(rename_request) = &rename_dispatch else {
-            panic!("live rename must dispatch through keyboard, got {rename_dispatch:?}");
-        };
-        assert_eq!(
-            rename_request.node_id,
-            Some(UiNodeId(rename.node_id.clone()))
-        );
-        assert_eq!(
-            rename_request.payload.as_ref(),
-            Some(&rename.action_payload)
-        );
-        binding_app.handle_dispatch(rename_dispatch);
-        let rename_result = binding_app
-            .plugin_action_result
-            .as_ref()
-            .expect("live Hub returns rename result");
-        assert_eq!(
-            rename_result.node_id,
-            Some(UiNodeId(rename.node_id.clone()))
-        );
-        assert_eq!(rename_result.payload.as_ref(), Some(&rename.action_payload));
-        assert_eq!(
-            serde_json::to_value(rename_result.state).unwrap(),
-            json!("accepted")
-        );
-
-        let remove = &live_row.controls[2];
-        let mut mouse_router = InputRouter::new(renderer::action_request_context_for(
-            &report.session_surface_id,
-        ));
-        let (_lines, mouse_hits) = renderer::render_to_lines_with_presentation_state(
-            &binding_app.surface(),
-            180,
-            60,
-            &mouse_router.render_state(),
-            &binding_app.plugin_presentation,
-        );
-        let remove_region = mouse_hits
-            .regions()
-            .iter()
-            .find(|region| region.node_id == remove.node_id)
-            .expect("live remove has a production hit region");
-        assert!(matches!(
-            mouse_router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
-                    remove_region.rect.x,
-                    remove_region.rect.y,
-                ),
-                &mouse_hits,
-            ),
-            InputDispatch::Focus { .. }
-        ));
-        let remove_dispatch = mouse_router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                remove_region.rect.x,
-                remove_region.rect.y,
-            ),
-            &mouse_hits,
-        );
-        let InputDispatch::Action(remove_request) = &remove_dispatch else {
-            panic!("live remove must dispatch through mouse, got {remove_dispatch:?}");
-        };
-        assert_eq!(
-            remove_request.node_id,
-            Some(UiNodeId(remove.node_id.clone()))
-        );
-        assert_eq!(
-            remove_request.payload.as_ref(),
-            Some(&remove.action_payload)
-        );
-        binding_app.handle_dispatch(remove_dispatch);
-        let remove_result = binding_app
-            .plugin_action_result
-            .as_ref()
-            .expect("live Hub returns remove result");
-        assert_eq!(
-            remove_result.node_id,
-            Some(UiNodeId(remove.node_id.clone()))
-        );
-        assert_eq!(remove_result.payload.as_ref(), Some(&remove.action_payload));
-        assert_eq!(
-            serde_json::to_value(remove_result.state).unwrap(),
-            json!("accepted")
-        );
-
-        let prior_generation = binding_app
-            .session_entities
-            .subscription_id
-            .clone()
-            .expect("initial binding generation");
-        let render_requests_before_reconnect = binding_app
-            .observed_requests
-            .iter()
-            .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-            .count();
-        binding_app.force_reconnect();
-        assert_ne!(
-            binding_app.session_entities.subscription_id.as_deref(),
-            Some(prior_generation.as_str())
-        );
-        assert_eq!(
-            binding_app
-                .observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::PluginSurfaceRender { .. }))
-                .count(),
-            render_requests_before_reconnect,
-            "reconnect must not refresh the plugin surface"
-        );
-        wait_for_session_entity_expectation(
-            &mut binding_app,
-            &live_session_uuid,
-            SessionEntityExpectation::Lifecycle("current"),
-            "fresh app-owned generation must restore the exact bound row",
-        );
-        binding_app.request_and_apply(DaemonRequest::PluginSurfaceRender {
-            package_name: report.package_name.clone(),
-            surface_id: report.session_surface_id.clone(),
-            payload: json!({
-                "session_uuids": [&live_session_uuid, &missing_session_uuid]
-            }),
-        });
-        let rebound = renderer::render_to_lines(&binding_app.surface(), 180, 60)
-            .0
-            .join("\n");
-        assert!(rebound.contains(&lifecycle_class), "{rebound}");
-
-        client
-            .request(&DaemonRequest::ShutdownSession {
-                session_id: live_session_uuid.clone(),
-            })
-            .expect("shutdown live bound session");
-        wait_for_session_entity_expectation(
-            &mut binding_app,
-            &live_session_uuid,
-            SessionEntityExpectation::Lifecycle("ended"),
-            "live bound session must become authoritative ended state",
-        );
-        let ended = renderer::render_to_lines(&binding_app.surface(), 180, 60)
-            .0
-            .join("\n");
-        assert!(ended.contains("ended"), "{ended}");
-        client
-            .request(&DaemonRequest::RemoveSession {
-                session_id: live_session_uuid.clone(),
-            })
-            .expect("remove live bound session");
-        wait_for_session_entity_expectation(
-            &mut binding_app,
-            &live_session_uuid,
-            SessionEntityExpectation::Absent,
-            "live bound session must be authoritatively removed",
-        );
-        let removed = renderer::render_to_lines(&binding_app.surface(), 180, 60)
-            .0
-            .join("\n");
-        assert!(removed.contains("Session unavailable"), "{removed}");
-
-        let list_packages = client
-            .request(&DaemonRequest::ListPackages)
-            .expect("list packages after contract matrix conformance");
-        let list_apps = client
-            .request(&DaemonRequest::ListApps)
-            .expect("list apps after contract matrix conformance");
-        let list_package_navigation = client
-            .request(&DaemonRequest::ListPackageNavigation)
-            .expect("list package navigation after contract matrix conformance");
-        let listed_packages = list_packages.packages.clone();
-        assert!(
-            listed_packages.len() > 1,
-            "live Show/Refresh proof requires multiple packages, got {}",
-            listed_packages.len()
-        );
-        let listed_fixture = listed_packages
-            .iter()
-            .find(|package| package.package_name == report.package_name)
-            .expect("listed packages include the installed contract matrix fixture")
-            .clone();
-        assert_eq!(
-            listed_fixture
-                .surfaces
-                .iter()
-                .map(|surface| surface.id.clone())
-                .collect::<Vec<_>>(),
-            report.surface_ids
-        );
-        assert!(report.list_surfaces_match_enabled);
-        assert!(report.show_routes_match_list);
-        let mut app = TuiApp::new(None);
-        app.workspace_test_mode = true;
-        app.system_details_visible = true;
-        app.apply_response(list_packages);
-        app.apply_response(list_apps);
-        app.apply_response(list_package_navigation);
-        app.client =
-            Some(HubConnection::connect(hub.endpoint()).expect("connect package app to live hub"));
-        app.observed_requests.clear();
-        let fixture_index = app
-            .packages
-            .iter()
-            .position(|package| package.package_name == report.package_name)
-            .expect("fixture package remains visible in TUI state");
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 500, 240);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains(&format!(
-            "id=contract.settings kind={} title=Contract Settings supports={}",
-            report.settings_surface_kind,
-            report.settings_surface_supports.join(",")
-        )));
-        assert!(rendered.contains("navigation entry: package=botster.plugin-contract-matrix"));
-        assert!(rendered.contains(&report.app_route_path));
-        assert!(rendered.contains("route_id=surface:contract.app"));
-        assert!(rendered.contains(&format!(
-            "target_surface_id={}",
-            report.app_route_surface_id
-        )));
-
-        app.handle_dispatch(click_dispatch(
-            &hit_map,
-            &format!("tui-package-{fixture_index}-show"),
-        ));
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ShowPackage(report.package_name.clone()))
-        );
-        assert_eq!(app.packages.len(), 1);
-        assert_eq!(app.packages[0].surfaces, listed_fixture.surfaces);
-        let (show_lines, show_hit_map) = renderer::render_to_lines(&app.surface(), 500, 240);
-        let show_rendered = show_lines.join("\n");
-        assert!(show_rendered.contains(&format!(
-            "id=contract.settings kind={} title=Contract Settings supports={}",
-            report.settings_surface_kind,
-            report.settings_surface_supports.join(",")
-        )));
-
-        app.handle_dispatch(click_dispatch(&show_hit_map, "tui-refresh"));
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ListPackages)
-        );
-        assert_eq!(app.packages, listed_packages);
-
-        let navigation_index = app
-            .package_navigation
-            .iter()
-            .position(|entry| {
-                entry.package_name == report.package_name
-                    && entry.target.surface_id.as_deref() == Some("contract.app")
-            })
-            .expect("Hub-projected contract app navigation remains visible after refresh");
-        let (_lines, navigation_hit_map) = renderer::render_to_lines(&app.surface(), 500, 240);
-        app.handle_dispatch(click_dispatch(
-            &navigation_hit_map,
-            &format!("tui-package-navigation-{navigation_index}-open"),
-        ));
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::PluginSurfaceRender {
-                    package_name: report.package_name.clone(),
-                    surface_id: "contract.app".to_string(),
-                })
-        );
-        let app_surface = app
-            .plugin_surface
-            .clone()
-            .expect("real navigation Open applies the delivered plugin surface");
-        let packages_before_missing_show = app.packages.clone();
-        let navigation_before_missing_show = app.package_navigation.clone();
-        let owner_before_missing_show = app.plugin_surface.clone();
-        app.request_and_apply(DaemonRequest::ShowPackage {
-            package_name: "missing-package".to_string(),
-        });
-        assert!(
-            app.observed_requests
-                .contains(&ObservedRequest::ShowPackage("missing-package".to_string()))
-        );
-        assert_eq!(app.packages, packages_before_missing_show);
-        assert_eq!(app.package_navigation, navigation_before_missing_show);
-        assert_eq!(app.plugin_surface, owner_before_missing_show);
-        assert!(app.error.as_deref().is_some_and(
-            |error| error.contains("package_policy_error") && error.contains("operation=show")
-        ));
-        let missing_show_rendered = renderer::render_to_lines(&app.surface(), 500, 240)
-            .0
-            .join("\n");
-        assert!(missing_show_rendered.contains("package_policy_error"));
-        assert!(missing_show_rendered.contains("operation=show"));
-        let app_rendered = assert_rendered_plugin_surface_contains(
-            &app_surface,
-            &report.client_render_check.app_surface_node_id,
-            "plugin_surface_render",
-        );
-        assert!(app_rendered.contains("Render path: validated"));
-        assert!(app_rendered.contains("Validated"));
-
-        let empty_surface =
-            request_plugin_surface(&mut client, &report.package_name, "contract.empty");
-        assert_rendered_plugin_surface_contains(
-            &empty_surface,
-            &report.client_render_check.empty_surface_child_id,
-            "No fixture rows are available.",
-        );
-
-        let settings_surface =
-            request_plugin_surface(&mut client, &report.package_name, "contract.settings");
-        let settings_rendered = assert_rendered_plugin_surface_contains(
-            &settings_surface,
-            &report.client_render_check.settings_surface_node_id,
-            "api_token_state=redacted",
-        );
-        // `read`, not `write`: the conformance scenario's own settings check runs
-        // against `mode=write`, but its later `contract_matrix_advance_package_entities`
-        // step re-sets `mode` to `read` to drive a package-entity generation bump.
-        // That third mutation is new at Hub 8a60bd58 (e8febabf had only the rejected
-        // `sideways` and the `write` mutation, both before the settings render), so
-        // the scenario's end state moved. This asserts the TUI renders whatever the
-        // Hub currently holds, which is the point of the check.
-        assert!(settings_rendered.contains("mode=read"));
-        assert!(
-            settings_rendered
-                .contains("endpoint=https://example.invalid/plugin-contract-matrix/acceptance")
-        );
-        assert!(!settings_rendered.contains("write_only"));
-        assert!(!settings_rendered.contains("contract-action-secret"));
-
-        let submit_node = find_ui_node_by_id(&app_surface.body, "contract-app-form")
-            .expect("delivered app surface includes its action-bearing form");
-        let submit_action = node_action(submit_node);
-        assert_eq!(submit_action.id.0, report.submit_action_id);
-        let submit_node_id = submit_node
-            .id
-            .as_ref()
-            .and_then(UiAuthoredNodeId::as_literal)
-            .expect("action-bearing form has an id")
-            .clone();
-        let success_request = UiActionRequest {
-            request_id: UiActionRequestId("contract-action-success".to_string()),
-            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
-            action_id: submit_action.id.clone(),
-            node_id: Some(submit_node_id.clone()),
-            kind: UiActionKind::Submit,
-            values: Some(UiFormValues(
-                json!({ "message": "hello" })
-                    .as_object()
-                    .expect("values object")
-                    .clone(),
-            )),
-            payload: submit_action.payload.clone(),
-        };
-        let mut action_app = TuiApp::new(None);
-        action_app.apply_response(plugin_surface_response(app_surface.clone()));
-        action_app.client =
-            Some(HubConnection::connect(hub.endpoint()).expect("connect action app to live hub"));
-        action_app.observed_requests.clear();
-        action_app.handle_dispatch(InputDispatch::Action(success_request.clone()));
-        assert!(
-            action_app
-                .observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: report.package_name.clone(),
-                    request: success_request.clone(),
-                })
-        );
-        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &action_app.surface(),
-            240,
-            120,
-            &RenderState::default(),
-            &action_app.plugin_presentation,
-        );
-        assert_eq!(
-            action_app
-                .plugin_surface
-                .as_ref()
-                .expect("owner retained")
-                .body
-                .id
-                .as_ref()
-                .and_then(UiAuthoredNodeId::as_literal)
-                .map(|id| id.0.as_str()),
-            Some(report.action_success_replacement_node_id.as_str())
-        );
-        assert!(
-            hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == report.action_success_replacement_node_id)
-        );
-        assert_eq!(
-            action_app
-                .plugin_action_result
-                .as_ref()
-                .map(|result| result.request_id.0.as_str()),
-            Some("contract-action-success")
-        );
-
-        let open_node = find_ui_node_by_id(&app_surface.body, &report.open_action_node_id)
-            .expect("delivered app surface includes the reported open control");
-        let open_action = node_action(open_node);
-        assert_eq!(open_action.id.0, report.open_action_id);
-        assert_eq!(
-            open_action.payload,
-            Some(report.open_action_payload.clone())
-        );
-        let mut open_app = TuiApp::new(None);
-        open_app.apply_response(plugin_surface_response(app_surface.clone()));
-        open_app.client =
-            Some(HubConnection::connect(hub.endpoint()).expect("connect open app to live hub"));
-        open_app.observed_requests.clear();
-        let (_lines, open_hit_map) = renderer::render_to_lines_with_presentation_state(
-            &open_app.surface(),
-            240,
-            120,
-            &RenderState::default(),
-            &open_app.plugin_presentation,
-        );
-        let open_dispatch = click_dispatch_for_surface(
-            &open_hit_map,
-            &report.open_action_node_id,
-            Some(&app_surface.surface_id),
-        );
-        let open_request = match &open_dispatch {
-            InputDispatch::Action(request) => request.clone(),
-            other => panic!("rendered plugin Open must dispatch an action, got {other:?}"),
-        };
-        assert_eq!(open_request.surface_id.0, app_surface.surface_id);
-        assert_eq!(open_request.action_id.0, report.open_action_id);
-        assert_eq!(
-            open_request.node_id,
-            open_node
-                .id
-                .as_ref()
-                .and_then(UiAuthoredNodeId::as_literal)
-                .cloned()
-        );
-        assert_eq!(open_request.kind, UiActionKind::Submit);
-        assert!(
-            open_request
-                .values
-                .as_ref()
-                .is_some_and(|values| values.0.is_empty())
-        );
-        assert_eq!(
-            open_request.payload,
-            Some(report.open_action_payload.clone())
-        );
-        open_app.handle_dispatch(open_dispatch);
-        assert!(
-            open_app
-                .observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: report.package_name.clone(),
-                    request: open_request.clone(),
-                })
-        );
-        assert_eq!(
-            open_app
-                .plugin_action_result
-                .as_ref()
-                .map(|result| &result.request_id),
-            Some(&open_request.request_id)
-        );
-        for (key, value) in &report.open_set_values {
-            assert_eq!(
-                open_app
-                    .plugin_presentation
-                    .get(&botster_ui_contract::UiPresentationKey(key.clone())),
-                Some(value)
-            );
-        }
-        assert!(report.dialog_visible_after_open);
-        assert!(report.selected_workspace_visible_after_open);
-        let dialog_node =
-            find_presentation_bound_node(&app_surface.body, &report.dialog_presence_key, None)
-                .expect("delivered tree binds its dialog to the reported presence key");
-        let selected_node = find_presentation_bound_node(
-            &app_surface.body,
-            &report.selected_workspace_equality_key,
-            Some(&Value::String(
-                report.selected_workspace_equality_value.clone(),
-            )),
-        )
-        .expect("delivered tree binds selected detail to the reported equality");
-        let dialog_title = dialog_node
-            .props
-            .get("title")
-            .and_then(Value::as_str)
-            .expect("bound dialog has visible title");
-        let selected_text = selected_node
-            .props
-            .get("text")
-            .and_then(Value::as_str)
-            .expect("bound selected detail has visible text");
-        let rendered = renderer::render_to_lines_with_presentation_state(
-            &open_app.surface(),
-            240,
-            120,
-            &RenderState::default(),
-            &open_app.plugin_presentation,
-        )
-        .0
-        .join("\n");
-        assert!(rendered.contains(dialog_title), "{rendered}");
-        assert!(rendered.contains(selected_text), "{rendered}");
-
-        let mut failure_payload = submit_action
-            .payload
-            .clone()
-            .expect("delivered submit action includes payload");
-        failure_payload
-            .as_object_mut()
-            .expect("delivered submit payload is an object")
-            .insert("fail".to_string(), Value::Bool(true));
-        let failure_request = UiActionRequest {
-            request_id: UiActionRequestId("contract-action-error".to_string()),
-            surface_id: UiSurfaceId(app_surface.surface_id.clone()),
-            action_id: submit_action.id,
-            node_id: Some(submit_node_id),
-            kind: UiActionKind::Submit,
-            values: None,
-            payload: Some(failure_payload),
-        };
-        let mut failure_app = TuiApp::new(None);
-        failure_app.apply_response(plugin_surface_response(app_surface));
-        failure_app.client =
-            Some(HubConnection::connect(hub.endpoint()).expect("connect failure app to live hub"));
-        failure_app.observed_requests.clear();
-        let original_root = failure_app
-            .plugin_surface
-            .as_ref()
-            .expect("active fixture")
-            .body
-            .clone();
-        failure_app.handle_dispatch(InputDispatch::Action(failure_request.clone()));
-        assert!(
-            failure_app
-                .observed_requests
-                .contains(&ObservedRequest::PluginSurfaceAction {
-                    package_name: report.package_name.clone(),
-                    request: failure_request,
-                })
-        );
-        assert_eq!(
-            failure_app
-                .plugin_action_result
-                .as_ref()
-                .map(|result| result.request_id.0.as_str()),
-            Some("contract-action-error")
-        );
-        assert_eq!(
-            failure_app
-                .plugin_surface
-                .as_ref()
-                .expect("owner retained")
-                .body,
-            original_root
-        );
-        assert!(failure_app.diagnostics.iter().any(|diagnostic| {
-            diagnostic.kind == DaemonDiagnosticKind::ActionFailure
-                && diagnostic.operation.as_deref() == Some("plugin_surface_action")
-        }));
-        let rendered = renderer::render_to_lines(&failure_app.surface(), 240, 120)
-            .0
-            .join("\n");
-        assert!(rendered.contains("state=Error"), "{rendered}");
-        assert!(
-            rendered.contains("diagnostic: action_failure"),
-            "{rendered}"
-        );
-
-        let blocked = client
-            .request(&DaemonRequest::PluginSurfaceRender {
-                package_name: report.package_name.clone(),
-                surface_id: "contract.blocked".to_string(),
-                payload: json!({}),
-            })
-            .expect("render blocked contract surface");
-        let mut blocked_app = TuiApp::new(None);
-        blocked_app.workspace_test_mode = true;
-        blocked_app.system_details_visible = true;
-        blocked_app.apply_response(blocked);
-        let (lines, _) = renderer::render_to_lines(&blocked_app.surface(), 240, 120);
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("plugin surface render failed"));
-        assert!(rendered.contains("plugin_invocation_failed"));
-    }
-
-    fn request_plugin_surface(
-        client: &mut HubConnection,
-        package_name: &str,
-        surface_id: &str,
-    ) -> DaemonPluginSurface {
-        let response = client
-            .request(&DaemonRequest::PluginSurfaceRender {
-                package_name: package_name.to_string(),
-                surface_id: surface_id.to_string(),
-                payload: json!({}),
-            })
-            .expect("render contract plugin surface");
-        assert_eq!(response.kind, DaemonResponseKind::PluginSurface);
-        response
-            .plugin_surface
-            .expect("plugin surface response includes body")
     }
 
     fn assert_rendered_plugin_surface_contains(
@@ -27743,20 +14298,6 @@ mod tests {
     /// now carry, so frame construction sites do not duplicate entity literals.
     fn session_entity_value(entity: DaemonSessionEntity) -> Value {
         serde_json::to_value(entity).expect("session entity serializes as a value")
-    }
-
-    fn snapshot_frame(
-        subscription_id: &str,
-        snapshot_seq: u64,
-        items: Vec<DaemonSessionEntity>,
-    ) -> DaemonEntityFrame {
-        DaemonEntityFrame::Snapshot {
-            subscription_id: subscription_id.to_string(),
-            entity_type: "session".to_string(),
-            snapshot_seq,
-            items: items.into_iter().map(session_entity_value).collect(),
-            resync_reason: None,
-        }
     }
 
     fn status_response(lifecycle_state: &str, schema_version: u16) -> DaemonResponse {
@@ -27892,483 +14433,6 @@ mod tests {
             values: None,
             payload: None,
         }
-    }
-
-    fn canonical_plugin_surface_fixture(mut surface: DaemonPluginSurface) -> DaemonPluginSurface {
-        surface.ui_tree_snapshot = Some(botster_hub_client::DaemonUiTreeSnapshot {
-            package_name: surface.package_name.clone(),
-            surface_id: surface.surface_id.clone(),
-            body: surface.body.clone(),
-        });
-        surface
-    }
-
-    fn presentation_plugin_surface() -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.presentation".to_string(),
-            body: ui_node(json!({
-                "type": "stack",
-                "id": "contract-presentation-root",
-                "props": { "direction": "vertical" },
-                "children": [
-                    {
-                        "type": "button",
-                        "id": "contract-open",
-                        "props": {
-                            "label": "Open contract form",
-                            "action": { "id": "contract.open" }
-                        }
-                    },
-                    {
-                        "$kind": "presentation_if",
-                        "predicate": {
-                            "kind": "equals",
-                            "key": "selected-workspace",
-                            "value": "workspace-alpha"
-                        },
-                        "node": {
-                            "type": "text",
-                            "id": "contract-selected-workspace",
-                            "props": {
-                                "text": "Selected workspace: workspace-alpha"
-                            }
-                        }
-                    },
-                    {
-                        "$kind": "presentation_if",
-                        "predicate": {
-                            "kind": "present",
-                            "key": "contract-dialog"
-                        },
-                        "node": {
-                            "type": "dialog",
-                            "id": "contract-dialog",
-                            "props": {
-                                "title": "Contract form",
-                                "presentation": "auto"
-                            },
-                            "slots": {
-                                "body": [
-                                    {
-                                        "type": "form",
-                                        "id": "contract-form",
-                                        "props": {
-                                            "submit_label": "Submit",
-                                            "action": {
-                                                "id": "contract.submit",
-                                                "payload": { "source": "dialog" }
-                                            }
-                                        },
-                                        "children": [
-                                            {
-                                                "type": "text_input",
-                                                "id": "contract-message",
-                                                "props": {
-                                                    "name": "message",
-                                                    "label": "Message",
-                                                    "value": ""
-                                                }
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        }
-                    }
-                ]
-            })),
-            ui_tree_snapshot: None,
-        })
-    }
-
-    fn field_error_kinds_plugin_surface() -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.field-errors".to_string(),
-            body: ui_node(json!({
-                "type": "dialog",
-                "id": "contract-field-error-dialog",
-                "props": {
-                    "title": "Field error contract",
-                    "presentation": "auto"
-                },
-                "slots": {
-                    "body": [
-                        {
-                            "type": "form",
-                            "id": "contract-field-error-form",
-                            "props": {
-                                "submit_label": "Submit",
-                                "action": { "id": "contract.submit" }
-                            },
-                            "children": [
-                                {
-                                    "type": "text_input",
-                                    "id": "contract-text-input",
-                                    "props": {
-                                        "name": "text_input",
-                                        "label": "Text input"
-                                    }
-                                },
-                                {
-                                    "type": "checkbox",
-                                    "id": "contract-checkbox",
-                                    "props": {
-                                        "name": "checkbox",
-                                        "label": "Checkbox"
-                                    }
-                                },
-                                {
-                                    "type": "form_field",
-                                    "id": "contract-form-field",
-                                    "props": {
-                                        "schema": {
-                                            "kind": "text",
-                                            "name": "form_field",
-                                            "label": "Form field"
-                                        }
-                                    }
-                                },
-                                {
-                                    "type": "textarea",
-                                    "id": "contract-textarea",
-                                    "props": {
-                                        "name": "textarea",
-                                        "label": "Textarea",
-                                        "value": "line one\nline two\nline three"
-                                    }
-                                },
-                                {
-                                    "type": "select",
-                                    "id": "contract-select",
-                                    "props": {
-                                        "name": "select",
-                                        "label": "Select",
-                                        "selected": "alpha"
-                                    },
-                                    "slots": {
-                                        "options": [
-                                            {
-                                                "type": "select_option",
-                                                "id": "contract-select-alpha",
-                                                "props": {
-                                                    "label": "Alpha",
-                                                    "value": "alpha"
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            })),
-            ui_tree_snapshot: None,
-        })
-    }
-
-    fn contract_app_plugin_surface() -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.app".to_string(),
-            body: ui_node(json!({
-                "type": "panel",
-                "id": "contract-app-panel",
-                "props": {
-                    "title": "Plugin Contract Matrix"
-                },
-                "children": [
-                    {
-                        "type": "text",
-                        "id": "contract-app-summary",
-                        "props": {
-                            "text": "UiNode payload delivered through plugin_surface_render."
-                        }
-                    },
-                    {
-                        "type": "button",
-                        "id": "contract-app-action",
-                        "props": {
-                            "label": "Run contract action",
-                            "action": {
-                                "id": "contract.action"
-                            }
-                        }
-                    }
-                ]
-            })),
-            ui_tree_snapshot: None,
-        })
-    }
-
-    fn composite_application_primitives_plugin_surface() -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.composite".to_string(),
-            body: ui_node(json!({
-                "type": "section",
-                "id": "contract-composite-section",
-                "props": {
-                    "title": "Project Pipeline Overview",
-                    "description": "Composite surface for upgraded application primitives"
-                },
-                "slots": {
-                    "toolbar": [
-                        {
-                            "type": "toolbar",
-                            "id": "contract-composite-toolbar",
-                            "props": {
-                                "label": "Pipeline tools"
-                            },
-                            "slots": {
-                                "actions": [
-                                    {
-                                        "type": "button",
-                                        "id": "contract-composite-refresh",
-                                        "props": {
-                                            "label": "Refresh",
-                                            "action": {
-                                                "id": "contract.refresh",
-                                                "payload": { "source": "toolbar" }
-                                            }
-                                        }
-                                    }
-                                ]
-                            }
-                        }
-                    ],
-                    "body": [
-                        {
-                            "type": "panel",
-                            "id": "contract-composite-panel",
-                            "props": {
-                                "title": "Review queue",
-                                "density": "compact",
-                                "variant": "subtle"
-                            },
-                            "slots": {
-                                "header": [
-                                    {
-                                        "type": "status_badge",
-                                        "id": "contract-composite-health",
-                                        "props": {
-                                            "label": "Healthy",
-                                            "status": "online",
-                                            "tone": "success"
-                                        }
-                                    }
-                                ],
-                                "body": [
-                                    {
-                                        "type": "metric_grid",
-                                        "id": "contract-composite-metrics",
-                                        "props": {
-                                            "density": "compact",
-                                            "variant": "plain"
-                                        },
-                                        "children": [
-                                            {
-                                                "type": "metric",
-                                                "id": "contract-composite-active-runs",
-                                                "props": {
-                                                    "label": "Active Runs",
-                                                    "value": "3",
-                                                    "caption": "currently assigned"
-                                                }
-                                            },
-                                            {
-                                                "type": "metric",
-                                                "id": "contract-composite-findings",
-                                                "props": {
-                                                    "label": "Open Findings",
-                                                    "value": "1",
-                                                    "trend": {
-                                                        "direction": "down",
-                                                        "label": "falling"
-                                                    }
-                                                }
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        "type": "table",
-                                        "id": "contract-composite-ticket-table",
-                                        "props": {
-                                            "columns": [
-                                                { "id": "ticket", "label": "Ticket" },
-                                                { "id": "state", "label": "State" }
-                                            ],
-                                            "rows": [
-                                                {
-                                                    "id": "contract-composite-ticket-a",
-                                                    "cells": {
-                                                        "ticket": "1783529012",
-                                                        "state": "review"
-                                                    },
-                                                    "action": {
-                                                        "id": "contract.ticket.open",
-                                                        "payload": { "ticket_id": "1783529012" }
-                                                    }
-                                                },
-                                                {
-                                                    "id": "contract-composite-ticket-b",
-                                                    "cells": {
-                                                        "ticket": "1783529013",
-                                                        "state": "implement"
-                                                    },
-                                                    "action": {
-                                                        "id": "contract.ticket.open",
-                                                        "payload": { "ticket_id": "1783529013" }
-                                                    }
-                                                }
-                                            ],
-                                            "selection": {
-                                                "mode": "single",
-                                                "selected": ["contract-composite-ticket-a"]
-                                            },
-                                            "empty_state": {
-                                                "type": "empty_state",
-                                                "id": "contract-composite-empty-table",
-                                                "props": {
-                                                    "title": "No tickets",
-                                                    "description": "Nothing needs attention"
-                                                }
-                                            }
-                                        }
-                                    },
-                                    {
-                                        "type": "list",
-                                        "id": "contract-composite-reviewers",
-                                        "props": {
-                                            "selection": {
-                                                "mode": "single",
-                                                "selected": ["contract-composite-reviewer-a"]
-                                            }
-                                        },
-                                        "children": [
-                                            {
-                                                "type": "list_item",
-                                                "id": "contract-composite-reviewer-a",
-                                                "props": {
-                                                    "value": "claude",
-                                                    "action": {
-                                                        "id": "contract.reviewer.focus"
-                                                    }
-                                                },
-                                                "slots": {
-                                                    "title": [
-                                                        {
-                                                            "type": "text",
-                                                            "id": "contract-composite-reviewer-title",
-                                                            "props": {
-                                                                "text": "Reviewer"
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        "type": "form",
-                                        "id": "contract-composite-form",
-                                        "props": {
-                                            "submit_label": "Submit",
-                                            "action": {
-                                                "id": "contract.form.submit"
-                                            }
-                                        },
-                                        "children": [
-                                            {
-                                                "type": "text_input",
-                                                "id": "contract-composite-notes",
-                                                "props": {
-                                                    "name": "notes",
-                                                    "label": "Notes",
-                                                    "value": "Ready for review"
-                                                }
-                                            },
-                                            {
-                                                "type": "button",
-                                                "id": "contract-composite-submit",
-                                                "props": {
-                                                    "label": "Submit",
-                                                    "action": {
-                                                        "id": "contract.form.submit"
-                                                    }
-                                                }
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        "type": "empty_state",
-                                        "id": "contract-composite-empty",
-                                        "props": {
-                                            "title": "No blocked tickets",
-                                            "description": "All current work can continue"
-                                        }
-                                    }
-                                ],
-                                "actions": [
-                                    {
-                                        "type": "button",
-                                        "id": "contract-composite-action-feedback",
-                                        "props": {
-                                            "label": "Acknowledge",
-                                            "action": {
-                                                "id": "contract.feedback.ack",
-                                                "payload": { "state": "accepted" }
-                                            }
-                                        }
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                }
-            })),
-            ui_tree_snapshot: None,
-        })
-    }
-
-    fn invalid_table_plugin_surface() -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.invalid".to_string(),
-            body: ui_node(json!({
-                "type": "table",
-                "id": "contract-invalid-table"
-            })),
-            ui_tree_snapshot: None,
-        })
-    }
-
-    fn iframe_plugin_surface() -> DaemonPluginSurface {
-        canonical_plugin_surface_fixture(DaemonPluginSurface {
-            package_name: "botster.plugin-contract-matrix".to_string(),
-            surface_id: "contract.iframe".to_string(),
-            body: ui_node(json!({
-                "type": "panel",
-                "id": "contract-iframe-panel",
-                "props": {
-                    "title": "Contract HTML Host"
-                },
-                "children": [
-                    {
-                        "type": "iframe",
-                        "id": "contract-html-frame",
-                        "props": {
-                            "title": "Contract HTML",
-                            "src": "/assets/botster.plugin-contract-matrix/contract.html",
-                            "sandbox": ["allow_scripts"]
-                        }
-                    }
-                ]
-            })),
-            ui_tree_snapshot: None,
-        })
     }
 
     fn plugin_contract_app_navigation() -> DaemonPackageNavigationEntry {
@@ -28769,14 +14833,6 @@ mod tests {
         response
     }
 
-    fn attach_state_response(session_id: &str, state: &str) -> DaemonResponse {
-        events_response(vec![DaemonEvent::AttachState {
-            session_id: session_id.to_string(),
-            subscription_id: "sub-test".to_string(),
-            state: state.to_string(),
-        }])
-    }
-
     fn events_response(events: Vec<DaemonEvent>) -> DaemonResponse {
         let mut response = base_response(DaemonResponseKind::Events);
         response.events = events;
@@ -28788,51 +14844,6 @@ mod tests {
         response.read_screen = Some(botster_hub_client::DaemonReadScreen {
             session_id: session_id.to_string(),
             text: text.to_string(),
-        });
-        response
-    }
-
-    fn mode_flags_response(session_id: &str, mouse_mode: u8) -> DaemonResponse {
-        mode_flags_response_full(session_id, false, mouse_mode, 1, 1)
-    }
-
-    fn mode_flags_response_full(
-        session_id: &str,
-        kitty_enabled: bool,
-        mouse_mode: u8,
-        mode_generation: u64,
-        mode_revision: u64,
-    ) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::ReadModeFlags);
-        response.mode_flags = Some(botster_hub_client::DaemonModeFlags::new(
-            session_id,
-            kitty_enabled,
-            true,
-            false,
-            mouse_mode,
-            false,
-            false,
-            false,
-            mode_generation,
-            mode_revision,
-        ));
-        response
-    }
-
-    fn capture_snapshot_response(
-        session_id: &str,
-        rows: u16,
-        cols: u16,
-        payload_format: Option<&str>,
-        payload_bytes: usize,
-    ) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::CaptureSnapshot);
-        response.capture_snapshot = Some(DaemonCaptureSnapshot {
-            session_id: session_id.to_string(),
-            rows,
-            cols,
-            payload_format: payload_format.map(str::to_string),
-            payload_bytes,
         });
         response
     }
@@ -28869,63 +14880,6 @@ mod tests {
             target_id: "repo-a".to_string(),
             available: true,
         }
-    }
-
-    #[test]
-    fn session_type_entity_reducer_snapshot_upsert_remove_and_rejects_patch() {
-        let mut state = SessionTypeEntityState::default();
-        state.begin_generation("st-gen".to_string());
-        let entity = sample_session_type("device/shell", "device", true);
-        assert!(
-            state
-                .apply(DaemonEntityFrame::Snapshot {
-                    subscription_id: "st-gen".to_string(),
-                    entity_type: "session_type".to_string(),
-                    snapshot_seq: 1,
-                    items: vec![serde_json::to_value(&entity).expect("serialize")],
-                    resync_reason: None,
-                })
-                .expect("snapshot applies")
-        );
-        assert!(state.entities.contains_key("device/shell"));
-
-        let mut updated = entity.clone();
-        updated.label = "updated".to_string();
-        assert!(
-            state
-                .apply(DaemonEntityFrame::Upsert {
-                    subscription_id: "st-gen".to_string(),
-                    entity_type: "session_type".to_string(),
-                    snapshot_seq: 2,
-                    id: "device/shell".to_string(),
-                    entity: serde_json::to_value(&updated).expect("serialize"),
-                })
-                .expect("upsert applies")
-        );
-        assert_eq!(state.entities["device/shell"].label, "updated");
-
-        let err = state
-            .apply(DaemonEntityFrame::Patch {
-                subscription_id: "st-gen".to_string(),
-                entity_type: "session_type".to_string(),
-                snapshot_seq: 3,
-                id: "device/shell".to_string(),
-                patch: json!({ "label": "nope" }),
-            })
-            .expect_err("patch must fail");
-        assert!(err.contains("patch is unsupported"));
-
-        assert!(
-            state
-                .apply(DaemonEntityFrame::Remove {
-                    subscription_id: "st-gen".to_string(),
-                    entity_type: "session_type".to_string(),
-                    snapshot_seq: 4,
-                    id: "device/shell".to_string(),
-                })
-                .expect("remove applies")
-        );
-        assert!(state.entities.is_empty());
     }
 
     #[test]
@@ -29404,8 +15358,8 @@ mod tests {
     fn pinned_session_plugin_binding_fixture_is_conformance_40() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 48,
-            "hub-test-support pin must publish fixture revision 48"
+            scenario.conformance_fixture_revision, 49,
+            "hub-test-support pin must publish fixture revision 49"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -29458,18 +15412,6 @@ mod tests {
             rendered.contains("does not provide session_type_entity_subscriptions"),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn feature_session_type_entity_subscriptions_is_not_a_required_handshake_feature() {
-        let requirement = tui_compatibility_requirement();
-        assert!(
-            !requirement
-                .required_features
-                .iter()
-                .any(|feature| feature == FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
-        );
-        assert_eq!(MINIMUM_CONFORMANCE_FIXTURE_REVISION, 48);
     }
 
     #[test]
@@ -29908,78 +15850,6 @@ mod tests {
     }
 
     #[test]
-    fn submit_session_type_form_success_path_does_not_refresh_subscribe() {
-        let source = source_without_line_comments();
-        let body = rust_fn_body(&source, "fn submit_session_type_form(");
-        let refresh_helper = format!("{}{}", "refresh_session_type_subscription", "_for_test");
-        let invalidate = format!("{}{}", "invalidate_session_type", "_generation");
-        assert!(
-            !body.contains(&refresh_helper),
-            "production form submit must not call the IsolatedHub subscribe refresh helper"
-        );
-        assert!(
-            !body.contains(&invalidate),
-            "production form submit must not invalidate the session_type subscription"
-        );
-    }
-
-    #[test]
-    fn refresh_session_type_subscription_for_test_stops_before_start() {
-        let mut app = TuiApp::new(None);
-        let (cancel_sender, cancel_receiver) = mpsc::channel();
-        let (stopped_sender, stopped_receiver) = mpsc::channel();
-        let (_frame_sender, frame_receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = cancel_receiver.recv();
-            let _ = stopped_sender.send(());
-        });
-        app.session_type_subscription = Some(SessionSubscriptionPump {
-            messages: frame_receiver,
-            cancel: Some(cancel_sender),
-            stopped: stopped_receiver,
-            stop_attempted: false,
-            stopped_confirmed: false,
-        });
-        app.session_type_entities
-            .begin_generation("old-session-type-sub".to_string());
-        app.session_type_entities.has_snapshot = true;
-
-        let error = app
-            .refresh_session_type_subscription_for_test()
-            .expect_err("start without a hub endpoint must fail after stop");
-        assert!(
-            error.contains("subscribe after stop failed"),
-            "helper must attempt start after stop: {error}"
-        );
-        assert!(
-            app.session_type_subscription.is_none(),
-            "failed start must not leave a pump"
-        );
-        assert_eq!(app.session_type_entities.subscription_id, None);
-        assert!(!app.session_type_entities.has_snapshot);
-
-        let source = source_without_line_comments();
-        let helper_body = rust_fn_body(&source, "fn refresh_session_type_subscription_for_test(");
-        let start_body = rust_fn_body(&source, "fn start_session_type_subscription(&mut self)");
-        let invalidate = format!("{}{}", "invalidate_session_type", "_generation");
-        let start_call = format!("{}{}", "start_session_type_subscription", "()");
-        let invalidate_at = helper_body
-            .find(&invalidate)
-            .expect("helper must stop through invalidate");
-        let start_at = helper_body
-            .find(&start_call)
-            .expect("helper must start a new subscribe");
-        assert!(
-            invalidate_at < start_at,
-            "helper contract is stop-before-start"
-        );
-        assert!(
-            !start_body.contains(&invalidate),
-            "a second start without stop is not the helper contract"
-        );
-    }
-
-    #[test]
     fn session_type_real_input_create_button_dispatches_through_input_router() {
         let mut app = TuiApp::new(None);
         app.system_details_visible = true;
@@ -30015,366 +15885,8 @@ mod tests {
         assert!(app.session_type_form.is_some());
     }
 
-    #[test]
-    fn session_types_live_profile_runs_against_isolated_hub_when_binaries_are_available() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-        let root = PathBuf::from(format!("/tmp/btst{}", short_suffix() % 1_000_000));
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
-            .root(&root)
-            .name("botster-tui-session-types-live")
-            .start()
-            .expect("isolated hub starts");
-
-        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
-        // Fail closed on provenance before product cases.
-        let compatibility = app
-            .compatibility
-            .clone()
-            .or_else(|| {
-                for _ in 0..40 {
-                    app.poll_hub();
-                    if app.compatibility.is_some() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                app.compatibility.clone()
-            })
-            .expect("live hub must publish compatibility");
-        assert!(
-            compatibility.conformance_fixture_revision >= 33,
-            "session-types live profile requires hub conformance >= 33, observed {}",
-            compatibility.conformance_fixture_revision
-        );
-        assert!(
-            compatibility.supports_feature(FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS),
-            "session-types live profile requires session_type_entity_subscriptions; features={:?}",
-            compatibility.features
-        );
-        assert_eq!(
-            compatibility.protocol_version,
-            botster_hub_client::PROTOCOL_VERSION
-        );
-
-        // Wait for session type subscription snapshot (may be empty).
-        for _ in 0..80 {
-            app.poll_hub();
-            if app.session_type_entities.has_snapshot {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            app.session_type_entities.has_snapshot,
-            "session_type entity snapshot required"
-        );
-
-        // Create interactive agent type with relative path + environment.
-        let create_id = format!("live-agent-{}", short_suffix() % 1_000_000);
-        let definition = DaemonSessionTypeDefinition {
-            id: create_id.clone(),
-            label: "Live Agent".to_string(),
-            description: Some("live proof".to_string()),
-            icon: None,
-            role: "botster.agent".to_string(),
-            interaction: "interactive".to_string(),
-            traits: vec!["proof.trait".to_string()],
-            lifecycle: "task".to_string(),
-            execution: DaemonSessionTypeExecution::ShellCommand,
-            command: "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
-            args: Vec::new(),
-            working_directory: DaemonSessionTypeWorkingDirectory::Relative {
-                path: "proof/nested".to_string(),
-            },
-            environment: BTreeMap::from([("LIVE_PROOF".to_string(), "1".to_string())]),
-            allowed_environment_overrides: Vec::new(),
-            context: Vec::new(),
-            target_id: None,
-        };
-        app.request_and_apply(DaemonRequest::CreateSessionType {
-            source: DaemonSessionTypeMutationSource::Device,
-            definition: definition.clone(),
-        });
-        if let Some(error) = &app.error {
-            panic!("create agent session type failed: {error}");
-        }
-        let agent_type_id = format!("device/{create_id}");
-        app.wait_for_session_type_after_subscribe_refresh(&agent_type_id, true);
-
-        // Accessory interactive + service types.
-        for (suffix, interaction, role) in [
-            ("acc", "interactive", "botster.accessory"),
-            ("svc", "service", "botster.accessory"),
-        ] {
-            let id = format!("live-{suffix}-{}", short_suffix() % 1_000_000);
-            let accessory_script = format!("{id}.sh");
-            let accessory_dir = hub.data_dir().join("session-types");
-            std::fs::create_dir_all(&accessory_dir).expect("device session-types dir");
-            let accessory_path = accessory_dir.join(&accessory_script);
-            std::fs::write(
-                &accessory_path,
-                "#!/bin/sh
-exit 0
-",
-            )
-            .expect("accessory script");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&accessory_path).unwrap().permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&accessory_path, permissions).unwrap();
-            }
-            app.request_and_apply(DaemonRequest::CreateSessionType {
-                source: DaemonSessionTypeMutationSource::Device,
-                definition: DaemonSessionTypeDefinition {
-                    id: id.clone(),
-                    label: format!("Live {suffix}"),
-                    description: None,
-                    icon: None,
-                    role: role.to_string(),
-                    interaction: interaction.to_string(),
-                    traits: vec!["unknown.namespaced.token".to_string()],
-                    lifecycle: "task".to_string(),
-                    execution: DaemonSessionTypeExecution::RelativeExecutable,
-                    command: accessory_script,
-                    args: Vec::new(),
-                    working_directory: DaemonSessionTypeWorkingDirectory::PackageRoot,
-                    environment: BTreeMap::new(),
-                    allowed_environment_overrides: Vec::new(),
-                    context: Vec::new(),
-                    target_id: None,
-                },
-            });
-            let effective = format!("device/{id}");
-            app.wait_for_session_type_after_subscribe_refresh(&effective, true);
-            let entity = app
-                .session_type_entities
-                .entities
-                .get(&effective)
-                .unwrap_or_else(|| panic!("missing {effective}"));
-            assert_eq!(entity.interaction, interaction);
-            assert_eq!(entity.role, role);
-            assert!(
-                entity
-                    .traits
-                    .iter()
-                    .any(|t| t == "unknown.namespaced.token")
-            );
-        }
-
-        // Lossless authoring round-trip: edit label only; path+env preserved.
-        app.open_session_type_edit(&agent_type_id);
-        let mut form = app
-            .session_type_form
-            .clone()
-            .expect("edit form after authoring read");
-        form.label = "Live Agent Edited".to_string();
-        app.session_type_form = Some(form);
-        app.submit_session_type_form();
-        if let Some(error) = &app.error {
-            panic!("update session type failed: {error}");
-        }
-        // Re-read authoring definition to prove path/env retained.
-        match app.request(DaemonRequest::ShowSessionTypeDefinition {
-            session_type_id: agent_type_id.clone(),
-        }) {
-            Ok(response) => {
-                let definition = response
-                    .session_type_definition
-                    .as_ref()
-                    .expect("authoring definition after update")
-                    .definition
-                    .clone();
-                assert_eq!(definition.label, "Live Agent Edited");
-                assert_eq!(
-                    definition.working_directory,
-                    DaemonSessionTypeWorkingDirectory::Relative {
-                        path: "proof/nested".to_string()
-                    }
-                );
-                assert_eq!(
-                    definition.environment.get("LIVE_PROOF").map(String::as_str),
-                    Some("1")
-                );
-                app.apply_response(response);
-            }
-            Err(error) => panic!("show definition after update failed: {error}"),
-        }
-
-        // Package read-only: if any package type exists, ensure editable=false.
-        for entity in app.session_type_entities.ordered() {
-            if entity.source == "package" {
-                assert!(!entity.editable);
-            }
-        }
-
-        // Product launch path: admit a real spawn point T, list-for-target through
-        // the toolbar flow, pick Global device type, spawn with target_id = T.
-        let launch_type_id = app
-            .ensure_headless_shell_session_type(hub.data_dir(), DEFAULT_COMMAND)
-            .expect("launch session type");
-        app.wait_for_session_type_after_subscribe_refresh(&launch_type_id, true);
-        let repo_root = root.join("spawn-point-repo");
-        std::fs::create_dir_all(repo_root.join(".botster")).expect("spawn point repo");
-        std::fs::write(repo_root.join("README.md"), "live spawn point\n").expect("seed repo file");
-        run_fixture_command(&repo_root, "git", &["init", "-b", "main"]);
-        run_fixture_command(
-            &repo_root,
-            "git",
-            &["config", "user.email", "live@botster.dev"],
-        );
-        run_fixture_command(&repo_root, "git", &["config", "user.name", "Botster Live"]);
-        run_fixture_command(&repo_root, "git", &["add", "."]);
-        run_fixture_command(&repo_root, "git", &["commit", "-m", "live spawn point"]);
-        let admitted_target_id = "live-spawn-point".to_string();
-        app.request_and_apply(DaemonRequest::CreateSpawnTarget {
-            target_id: Some(admitted_target_id.clone()),
-            label: Some("Live Spawn Point".to_string()),
-            root: repo_root.clone(),
-            enabled: true,
-            kind: Some("git".to_string()),
-            base_ref: Some("main".to_string()),
-            metadata: BTreeMap::new(),
-        });
-        if let Some(error) = &app.error {
-            panic!("create spawn target failed: {error}");
-        }
-        for _ in 0..80 {
-            app.poll_hub();
-            app.request_and_apply(DaemonRequest::ListSpawnTargets);
-            if app
-                .spawn_targets
-                .iter()
-                .any(|target| target.target_id == admitted_target_id && target.enabled)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            app.spawn_targets
-                .iter()
-                .any(|target| target.target_id == admitted_target_id && target.enabled),
-            "admitted spawn point T must be present: {:?}",
-            app.spawn_targets
-        );
-
-        app.error = None;
-        app.observed_requests.clear();
-        app.begin_target_first_spawn();
-        assert!(
-            app.target_first_spawn.is_some(),
-            "product spawn dialog open"
-        );
-        // Production keyboard path through InputRouter (Tab focus + Enter), not
-        // direct spawn_pick_* helpers — required consumer proof for admitted T.
-        let mut router = InputRouter::new(renderer::action_request_context());
-        let target_node_id = format!("tui-spawn-target-{admitted_target_id}");
-        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
-        focus_hit_map_node_by_tab(&mut router, &hit_map, &target_node_id);
-        activate_focused_action_with_enter(&mut app, &mut router, &hit_map);
-        if let Some(error) = &app.error {
-            panic!("list-for-target through keyboard product path failed: {error}");
-        }
-        let listed_ids = match &app.target_first_spawn.as_ref().unwrap().step {
-            TargetFirstSpawnStep::PickSessionType { session_types, .. } => session_types
-                .iter()
-                .map(|session_type| session_type.session_type_id.clone())
-                .collect::<Vec<_>>(),
-            other => panic!("expected PickSessionType after list-for-target, got {other:?}"),
-        };
-        assert!(
-            listed_ids.iter().any(|id| id == &launch_type_id),
-            "device Global {launch_type_id} must appear via list-for-target for T={admitted_target_id}; listed={listed_ids:?}"
-        );
-        let type_node_id = format!("tui-spawn-session-type-{launch_type_id}");
-        let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
-        focus_hit_map_node_by_tab(&mut router, &hit_map, &type_node_id);
-        activate_focused_action_with_enter(&mut app, &mut router, &hit_map);
-        if let Some(error) = &app.error {
-            panic!("product keyboard spawn pick failed: {error}");
-        }
-        assert!(
-            app.observed_requests.iter().any(|request| matches!(
-                request,
-                ObservedRequest::ListSessionTypesForTarget { target_id }
-                    if target_id == &admitted_target_id
-            )),
-            "live keyboard product path must observe ListSessionTypesForTarget: {:?}",
-            app.observed_requests
-        );
-        assert!(
-            app.observed_requests.iter().any(|request| matches!(
-                request,
-                ObservedRequest::SpawnSessionType {
-                    session_type_id,
-                    target_id: Some(target_id),
-                    ..
-                } if session_type_id == &launch_type_id && target_id == &admitted_target_id
-            )),
-            "keyboard spawn must carry target_id=T not device:local: {:?}",
-            app.observed_requests
-        );
-        let session_id = app.selected_session.clone().expect("spawn selects session");
-        wait_for_authoritative_session(&mut app, &session_id)
-            .expect("session becomes authoritative");
-        let session = app
-            .session_entities
-            .entities
-            .get(&session_id)
-            .expect("session entity");
-        assert_eq!(
-            session.session_type_id.as_deref(),
-            Some(launch_type_id.as_str())
-        );
-
-        // Delete device type and observe remove.
-        app.delete_session_type(&agent_type_id);
-        app.wait_for_session_type_after_subscribe_refresh(&agent_type_id, false);
-
-        // Reconnect projection: force reconnect and wait for exact id for remaining accessory.
-        let remaining: Vec<String> = app.session_type_entities.entity_order.to_vec();
-        assert!(!remaining.is_empty());
-        let expected = remaining[0].clone();
-        app.force_reconnect();
-        for _ in 0..100 {
-            app.poll_hub();
-            if app.session_type_entities.has_snapshot
-                && app.session_type_entities.entities.contains_key(&expected)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            app.session_type_entities.entities.contains_key(&expected),
-            "reconnect must restore exact session_type_id {expected}"
-        );
-
-        println!(
-            "session-types-live: complete conformance={} features_has_session_type=true cases=agent,accessory,service,authoring,launch,delete,reconnect",
-            compatibility.conformance_fixture_revision
-        );
-    }
-
-    fn install_dummy_hub_client(app: &mut TuiApp) -> std::os::unix::net::UnixStream {
-        use std::os::unix::net::UnixStream;
-        let (local, peer) = UnixStream::pair().expect("unix pair");
-        app.client = Some(HubConnection::from_stream(local));
-        peer
-    }
-
     const MATRIX_OWNER: &str = "botster.plugin-contract-matrix";
+
     const MATRIX_EVENT: &str = "contract.ready";
 
     fn matrix_descriptor(ttl_ms: u32) -> PackageNoticeReactionDescriptor {
@@ -30422,11 +15934,6 @@ exit 0
         );
     }
 
-    fn apply_json_mux(app: &mut TuiApp, line: &str) {
-        let frames = decode_mux_line(line.as_bytes()).expect("decode mux line");
-        app.apply_mux_frames(frames);
-    }
-
     fn package_event_line(
         subscription_id: &str,
         owner: &str,
@@ -30459,41 +15966,10 @@ exit 0
             .join("\n")
     }
 
-    fn entity_options_picker_surface() -> DaemonPluginSurface {
-        let body = ui_node(json!({
-            "type": "form",
-            "id": "entity-options-form",
-            "props": {
-                "action": { "id": "entity-options.submit" },
-                "submit_label": "Submit"
-            },
-            "children": [{
-                "type": "select",
-                "id": "entity-options-select",
-                "props": {
-                    "name": "option",
-                    "label": "Option",
-                    "options_source": {
-                        "$kind": "entity_options",
-                        "source": "/entity-options-reactive.item",
-                        "value_field": "value",
-                        "display_fields": ["label"],
-                        "order": ["value"]
-                    }
-                }
-            }]
-        }));
-        canonical_surface(
-            "entity-options-reactive",
-            "entity-options-reactive.picker",
-            body,
-        )
-    }
-
     #[test]
-    fn tui_requires_package_event_subscriptions_at_floor_48() {
+    fn tui_requires_package_event_subscriptions_at_floor_49() {
         let requirement = tui_compatibility_requirement();
-        assert_eq!(requirement.minimum_conformance_fixture_revision, 48);
+        assert_eq!(requirement.minimum_conformance_fixture_revision, 49);
         assert!(
             requirement
                 .required_features
@@ -30507,643 +15983,6 @@ exit 0
                 .iter()
                 .any(|feature| feature == FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS)
         );
-    }
-
-    #[test]
-    fn package_event_and_event_gap_reach_apply_through_decode_boundary() {
-        let mut app = workspace_fixture();
-        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "Need a human answer" }),
-            ),
-        );
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("Need a human answer")
-        );
-
-        apply_json_mux(
-            &mut app,
-            &event_gap_line("btui-events-1", MATRIX_OWNER, MATRIX_EVENT),
-        );
-        assert!(app.transient_notice.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("event gap"))
-        );
-    }
-
-    #[test]
-    fn mux_apply_drains_at_most_32_frames_and_retains_surplus_in_order() {
-        let mut app = workspace_fixture();
-        let _peer = install_dummy_hub_client(&mut app);
-        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
-        let client = app.client.as_mut().expect("client");
-        for index in 0..100 {
-            let line = package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": format!("notice-{index}") }),
-            );
-            let frames = decode_mux_line(line.as_bytes()).expect("decode");
-            for frame in frames {
-                client.enqueue_pending_mux_frame(frame);
-            }
-        }
-        assert_eq!(
-            app.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(100)
-        );
-        app.apply_pending_mux_frames();
-        assert_eq!(
-            app.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(68)
-        );
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("notice-31")
-        );
-        app.apply_pending_mux_frames();
-        assert_eq!(
-            app.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(36)
-        );
-        app.apply_pending_mux_frames();
-        assert_eq!(
-            app.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(4)
-        );
-        app.apply_pending_mux_frames();
-        assert_eq!(
-            app.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(0)
-        );
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("notice-99")
-        );
-    }
-
-    #[test]
-    fn resolve_notice_text_errors_suppress_the_visible_notice() {
-        let mut app = workspace_fixture();
-        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "ok" }),
-            ),
-        );
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "other": "missing" }),
-            ),
-        );
-        assert!(app.transient_notice.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("missing"))
-        );
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": 12 }),
-            ),
-        );
-        assert!(app.transient_notice.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("not a string"))
-        );
-        let oversized = "a".repeat(botster_ui_contract::NOTICE_TEXT_MAX_BYTES + 1);
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": oversized }),
-            ),
-        );
-        assert!(app.transient_notice.is_none());
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("maximum"))
-        );
-    }
-
-    #[test]
-    fn entity_options_admission_failure_is_backoff_bounded() {
-        let mut app = workspace_fixture();
-        let _peer = install_dummy_hub_client(&mut app);
-        app.entity_options_forced_subscribe_error = Some("entity subscription was not accepted");
-        app.apply_response(plugin_surface_response(entity_options_picker_surface()));
-        let first = app.entity_options_subscribe_attempts.clone();
-        assert_eq!(first.get("entity-options-reactive.item").copied(), Some(1));
-        assert!(app.transient_notice.is_none());
-        for _ in 0..20 {
-            app.poll_hub();
-        }
-        assert_eq!(app.entity_options_subscribe_attempts, first);
-        app.entity_options_forced_subscribe_error = None;
-        app.entity_options_local_pumps = true;
-        for state in app.entity_options_retry.values_mut() {
-            state.next_attempt_at = Instant::now();
-        }
-        app.heal_entity_options_subscriptions();
-        assert!(
-            app.entity_options_subscriptions
-                .contains_key("entity-options-reactive.item")
-        );
-        assert!(app.entity_options_retry.is_empty());
-
-        let question_id = app
-            .entity_options
-            .family("entity-options-reactive.item")
-            .and_then(|family| family.subscription_id.clone())
-            .expect("item generation");
-        app.entity_options_forced_subscribe_error = Some("entity subscription was not accepted");
-        app.entity_options_frame_injectors
-            .get("entity-options-reactive.item")
-            .expect("injector")
-            .send(SessionSubscriptionMessage::Frame(
-                DaemonEntityFrame::Error {
-                    subscription_id: question_id,
-                    entity_type: "entity-options-reactive.item".to_string(),
-                    code: "provider_failed".to_string(),
-                    message: "boom".to_string(),
-                },
-            ))
-            .expect("inject error");
-        let before = app
-            .entity_options_subscribe_attempts
-            .get("entity-options-reactive.item")
-            .copied()
-            .unwrap_or(0);
-        let _ = app.drain_entity_options_subscriptions();
-        let after = app
-            .entity_options_subscribe_attempts
-            .get("entity-options-reactive.item")
-            .copied()
-            .unwrap_or(0);
-        assert!(
-            after > before,
-            "in-stream error must consume an admission attempt"
-        );
-        assert!(
-            app.entity_options_retry
-                .contains_key("entity-options-reactive.item")
-        );
-    }
-
-    #[test]
-    fn transient_notice_latest_wins_and_ttl_follows_descriptor() {
-        let mut app = workspace_fixture();
-        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "first" }),
-            ),
-        );
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "second" }),
-            ),
-        );
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("second")
-        );
-        let notice = app.transient_notice.as_mut().expect("notice");
-        notice.deadline = Instant::now() + Duration::from_secs(5);
-        app.poll_hub();
-        assert!(rendered_workspace(&app).contains("second"));
-        let notice = app.transient_notice.as_mut().expect("notice");
-        notice.deadline = Instant::now();
-        app.poll_hub();
-        assert!(app.transient_notice.is_none());
-        assert!(!rendered_workspace(&app).contains("second"));
-        app.transient_notice = Some(TransientNotice {
-            text: "stale".to_string(),
-            deadline: Instant::now() - Duration::from_millis(1),
-        });
-        app.poll_hub();
-        assert!(app.transient_notice.is_none());
-        assert!(!rendered_workspace(&app).contains("stale"));
-    }
-
-    #[test]
-    fn event_subscribe_response_race_promotes_before_parked_apply() {
-        let mut app = workspace_fixture();
-        let _peer = install_dummy_hub_client(&mut app);
-        activate_notice(&mut app, "cand-1", 5_000, "session-alpha");
-        if let Some(entry) = app
-            .notice_subscriptions
-            .get_mut(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
-        {
-            entry.state = EventSubscriptionState::Candidate("cand-1".to_string());
-        }
-        let line = package_event_line(
-            "cand-1",
-            MATRIX_OWNER,
-            MATRIX_EVENT,
-            json!({ "notice": "parked" }),
-        );
-        let frames = decode_mux_line(line.as_bytes()).expect("decode");
-        for frame in frames {
-            app.client
-                .as_mut()
-                .expect("client")
-                .enqueue_pending_mux_frame(frame);
-        }
-        assert!(app.transient_notice.is_none());
-        if let Some(entry) = app
-            .notice_subscriptions
-            .get_mut(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
-        {
-            entry.state = EventSubscriptionState::Active("cand-1".to_string());
-        }
-        app.apply_pending_mux_frames();
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("parked")
-        );
-
-        let mut rejected = workspace_fixture();
-        let _peer = install_dummy_hub_client(&mut rejected);
-        activate_notice(&mut rejected, "cand-2", 5_000, "session-alpha");
-        if let Some(entry) = rejected
-            .notice_subscriptions
-            .get_mut(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
-        {
-            entry.state = EventSubscriptionState::Candidate("cand-2".to_string());
-        }
-        let line = package_event_line(
-            "cand-2",
-            MATRIX_OWNER,
-            MATRIX_EVENT,
-            json!({ "notice": "dropped" }),
-        );
-        let frames = decode_mux_line(line.as_bytes()).expect("decode");
-        for frame in frames {
-            rejected
-                .client
-                .as_mut()
-                .expect("client")
-                .enqueue_pending_mux_frame(frame);
-        }
-        rejected.reject_event_subscription_candidate(
-            "cand-2",
-            "event subscription was not accepted".to_string(),
-        );
-        assert_eq!(
-            rejected.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(0),
-            "reject must drop parked frames before apply"
-        );
-        rejected.apply_pending_mux_frames();
-        assert!(rejected.transient_notice.is_none());
-        assert_eq!(
-            rejected.client.as_ref().map(HubConnection::pending_mux_len),
-            Some(0)
-        );
-        let rejected_entry = rejected
-            .notice_subscriptions
-            .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()));
-        assert!(rejected_entry.is_some_and(|entry| entry.state == EventSubscriptionState::Idle));
-    }
-
-    #[test]
-    fn event_gap_clears_notice_without_durable_or_request_side_effects() {
-        let mut app = workspace_fixture();
-        activate_notice(&mut app, "btui-events-1", 5_000, "session-alpha");
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "live" }),
-            ),
-        );
-        app.observed_requests.clear();
-        apply_json_mux(
-            &mut app,
-            &event_gap_line("btui-events-1", MATRIX_OWNER, MATRIX_EVENT),
-        );
-        assert!(app.transient_notice.is_none());
-        assert!(app.observed_requests.is_empty());
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "btui-events-1",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "later" }),
-            ),
-        );
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("later")
-        );
-    }
-
-    #[test]
-    fn foreign_and_stale_event_ids_drop_silently() {
-        let mut app = workspace_fixture();
-        activate_notice(&mut app, "active", 5_000, "session-alpha");
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "cleared",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "stale" }),
-            ),
-        );
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "active",
-                "other-owner",
-                MATRIX_EVENT,
-                json!({ "notice": "foreign-owner" }),
-            ),
-        );
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "active",
-                MATRIX_OWNER,
-                "other.event",
-                json!({ "notice": "foreign-name" }),
-            ),
-        );
-        assert!(app.transient_notice.is_none());
-    }
-
-    #[test]
-    fn rejected_notice_subscription_retries_on_later_sync() {
-        let mut app = workspace_fixture();
-        app.notice_subscriptions_local = true;
-        let _peer = install_dummy_hub_client(&mut app);
-        app.packages = vec![matrix_package(5_000)];
-        let key = (MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string());
-        app.notice_subscriptions.insert(
-            key.clone(),
-            NoticeSubscriptionEntry {
-                descriptor: matrix_descriptor(5_000),
-                subject: "session-alpha".to_string(),
-                state: EventSubscriptionState::Candidate("cand-reject".to_string()),
-            },
-        );
-        app.notice_subscription_by_id
-            .insert("cand-reject".to_string(), key.clone());
-        app.reject_event_subscription_candidate(
-            "cand-reject",
-            "event subscription was not accepted".to_string(),
-        );
-        assert!(
-            app.notice_subscriptions
-                .get(&key)
-                .is_some_and(|entry| entry.state == EventSubscriptionState::Idle)
-        );
-        assert!(!app.notice_subscription_by_id.contains_key("cand-reject"));
-        app.observed_requests.clear();
-        app.sync_notice_subscriptions();
-        let retry_id = app
-            .notice_subscriptions
-            .get(&key)
-            .and_then(|entry| entry.state.active_id())
-            .map(ToOwned::to_owned)
-            .expect("rejected key must subscribe again");
-        assert_ne!(retry_id, "cand-reject");
-        assert!(
-            app.observed_requests.iter().any(|request| matches!(
-                request,
-                ObservedRequest::SubscribeEvents { subscription_id, .. }
-                    if subscription_id == &retry_id
-            )),
-            "{:?}",
-            app.observed_requests
-        );
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                "cand-reject",
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "stale-reject" }),
-            ),
-        );
-        assert!(app.transient_notice.is_none());
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                &retry_id,
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "retry-ok" }),
-            ),
-        );
-        assert_eq!(
-            app.transient_notice
-                .as_ref()
-                .map(|notice| notice.text.as_str()),
-            Some("retry-ok")
-        );
-    }
-
-    #[test]
-    fn entity_options_do_not_subscribe_without_a_plugin_surface() {
-        let mut app = workspace_fixture();
-        let _peer = install_dummy_hub_client(&mut app);
-        app.entity_options_local_pumps = true;
-        app.plugin_surface = None;
-        app.sync_entity_options_subscriptions();
-        assert!(app.entity_options_subscriptions.is_empty());
-    }
-
-    #[test]
-    fn notice_sync_subscribes_two_descriptors_and_clears_on_no_focus() {
-        let mut app = workspace_fixture();
-        app.notice_subscriptions_local = true;
-        let _peer = install_dummy_hub_client(&mut app);
-        app.packages = vec![
-            notice_package("owner-a", "alpha.ready", 5_000),
-            notice_package("owner-b", "beta.ready", 4_000),
-        ];
-        app.sync_notice_subscriptions();
-        assert_eq!(app.notice_subscriptions.len(), 2);
-        let ids: BTreeSet<_> = app.notice_subscription_by_id.keys().cloned().collect();
-        assert_eq!(ids.len(), 2);
-        assert!(
-            app.observed_requests
-                .iter()
-                .filter(|request| matches!(request, ObservedRequest::SubscribeEvents { .. }))
-                .count()
-                >= 2
-        );
-        app.set_selected_session(None);
-        assert!(app.notice_subscriptions.is_empty());
-        assert!(app.notice_subscription_by_id.is_empty());
-    }
-
-    #[test]
-    fn notice_sync_resubscribes_on_subject_change_and_keeps_id_for_ttl_only() {
-        let mut app = workspace_fixture();
-        app.notice_subscriptions_local = true;
-        let _peer = install_dummy_hub_client(&mut app);
-        app.packages = vec![matrix_package(5_000)];
-        app.sync_notice_subscriptions();
-        let key = (MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string());
-        let first_id = app
-            .notice_subscriptions
-            .get(&key)
-            .and_then(|entry| entry.state.active_id())
-            .unwrap()
-            .to_string();
-        app.observed_requests.clear();
-        app.set_selected_session(Some("session-beta".to_string()));
-        let second_id = app
-            .notice_subscriptions
-            .get(&key)
-            .and_then(|entry| entry.state.active_id())
-            .unwrap()
-            .to_string();
-        assert_ne!(first_id, second_id);
-        assert!(app.observed_requests.iter().any(|request| matches!(
-            request,
-            ObservedRequest::UnsubscribeEvents { subscription_id } if subscription_id == &first_id
-        )));
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                &first_id,
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "late-a" }),
-            ),
-        );
-        assert!(app.transient_notice.is_none());
-
-        app.observed_requests.clear();
-        app.packages = vec![matrix_package(10_000)];
-        app.sync_notice_subscriptions();
-        let third_id = app
-            .notice_subscriptions
-            .get(&key)
-            .and_then(|entry| entry.state.active_id())
-            .unwrap()
-            .to_string();
-        assert_eq!(third_id, second_id);
-        assert_eq!(
-            app.notice_subscriptions
-                .get(&key)
-                .map(|entry| entry.descriptor.ttl_ms),
-            Some(10_000)
-        );
-        assert!(
-            !app.observed_requests
-                .iter()
-                .any(|request| matches!(request, ObservedRequest::SubscribeEvents { .. }))
-        );
-    }
-
-    #[test]
-    fn notice_sync_unsubscribes_removed_descriptor_and_caps_at_64() {
-        let mut app = workspace_fixture();
-        app.notice_subscriptions_local = true;
-        let _peer = install_dummy_hub_client(&mut app);
-        app.packages = vec![
-            notice_package("owner-a", "keep.ready", 5_000),
-            notice_package("owner-b", "drop.ready", 5_000),
-        ];
-        app.sync_notice_subscriptions();
-        assert_eq!(app.notice_subscriptions.len(), 2);
-        app.packages = vec![notice_package("owner-a", "keep.ready", 5_000)];
-        app.sync_notice_subscriptions();
-        assert_eq!(app.notice_subscriptions.len(), 1);
-        assert!(
-            app.notice_subscriptions
-                .contains_key(&("owner-a".to_string(), "keep.ready".to_string()))
-        );
-
-        app.packages = (0..70)
-            .map(|index| notice_package("owner-cap", &format!("evt-{index:02}"), 1_000))
-            .collect();
-        app.sync_notice_subscriptions();
-        assert_eq!(app.notice_subscriptions.len(), 64);
-        assert_eq!(app.notice_overflow_dropped, 6);
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("dropped 6"))
-        );
-        assert!(
-            app.notice_subscriptions
-                .contains_key(&("owner-cap".to_string(), "evt-00".to_string()))
-        );
-        assert!(
-            !app.notice_subscriptions
-                .contains_key(&("owner-cap".to_string(), "evt-69".to_string()))
-        );
-    }
-
-    fn wait_for_condition(
-        app: &mut TuiApp,
-        timeout: Duration,
-        mut ready: impl FnMut(&TuiApp) -> bool,
-    ) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            app.poll_hub();
-            if ready(app) {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        false
     }
 
     fn overlay_contract_matrix_emit(root: &Path) -> PathBuf {
@@ -31188,231 +16027,12 @@ exit 0
         package_dir
     }
 
-    fn emit_contract_ready(
-        hub: &botster_hub_test_support::IsolatedHub,
-        subject: Option<&str>,
-        notice: &str,
-    ) -> DaemonResponse {
-        let mut arguments = serde_json::Map::new();
-        arguments.insert("notice".to_string(), json!(notice));
-        if let Some(subject) = subject {
-            arguments.insert("subject".to_string(), json!(subject));
-        }
-        botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::PluginMcpCallTool {
-                name: "contract.emit_ready".to_string(),
-                arguments: Value::Object(arguments),
-            },
-        )
-        .unwrap_or_else(|error| panic!("contract.emit_ready failed: {error}"))
-    }
-
     fn set_event_flush_stall(path: &Path, stalled: bool) {
         if stalled {
             std::fs::write(path, b"stall").expect("create event flush stall");
         } else {
             let _ = std::fs::remove_file(path);
         }
-    }
-
-    #[test]
-    fn package_events_live_runtime_runs_against_isolated_hub_when_binaries_are_available() {
-        let Some(hub_bin) = std::env::var_os("BOTSTER_HUB_BIN") else {
-            skip_or_panic("BOTSTER_HUB_BIN");
-            return;
-        };
-        let Some(session_worker_bin) = std::env::var_os("BOTSTER_SESSION_WORKER_BIN") else {
-            skip_or_panic("BOTSTER_SESSION_WORKER_BIN");
-            return;
-        };
-
-        let root = PathBuf::from(format!("/tmp/bt-pe{}", short_suffix() % 1_000_000));
-        let stall_path = root.join("event-flush.stall");
-        set_event_flush_stall(&stall_path, false);
-        let package_path = overlay_contract_matrix_emit(&root);
-        let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(&hub_bin)
-            .session_worker_bin(session_worker_bin)
-            .root(&root)
-            .name("botster-tui-package-events-live")
-            .env("BOTSTER_ENV", "test")
-            .env("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX", "2")
-            .env(
-                "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
-                stall_path.to_string_lossy().into_owned(),
-            )
-            .start()
-            .expect("isolated hub starts");
-
-        let enable = botster_hub_client::request(
-            hub.endpoint(),
-            DaemonRequest::EnablePackageLocalPath {
-                path: package_path.clone(),
-            },
-        )
-        .expect("enable plugin-contract-matrix");
-        assert_eq!(enable.kind, DaemonResponseKind::PackageDecision);
-
-        let mut app = TuiApp::new(Some(hub.endpoint().clone()));
-        app.workspace_test_mode = true;
-        app.request_and_apply(DaemonRequest::Spawn {
-            session_id: "sess-notice-live".to_string(),
-            command: DEFAULT_COMMAND.to_string(),
-        });
-        wait_for_authoritative_session(&mut app, "sess-notice-live")
-            .expect("spawned session becomes authoritative");
-        app.set_selected_session(Some("sess-notice-live".to_string()));
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.notice_subscriptions
-                    .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
-                    .is_some_and(|entry| {
-                        matches!(entry.state, EventSubscriptionState::Active(_))
-                            && entry.subject == "sess-notice-live"
-                    })
-            }),
-            "descriptor-driven subscribe must become active: requests={:?} error={:?}",
-            app.observed_requests,
-            app.error
-        );
-        assert!(
-            app.observed_requests.iter().any(|request| matches!(
-                request,
-                ObservedRequest::SubscribeEvents {
-                    owner,
-                    name,
-                    subjects,
-                    ..
-                } if owner == MATRIX_OWNER
-                    && name == MATRIX_EVENT
-                    && subjects.as_slice() == ["sess-notice-live"]
-            )),
-            "subscribe must use the session subject: {:?}",
-            app.observed_requests
-        );
-
-        let events_before = app
-            .client
-            .as_ref()
-            .map(|client| client.mux_event_frames)
-            .unwrap_or(0);
-        let emitted = emit_contract_ready(&hub, Some("sess-notice-live"), "live notice");
-        assert_eq!(emitted.plugin_tool_result["status"], "accepted");
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.transient_notice
-                    .as_ref()
-                    .is_some_and(|notice| notice.text.contains("live notice"))
-            }),
-            "matching session notice must render: notice={:?} error={:?}",
-            app.transient_notice,
-            app.error
-        );
-        assert!(
-            rendered_workspace(&app).contains("live notice"),
-            "transient notice must render"
-        );
-        assert!(
-            app.client
-                .as_ref()
-                .is_some_and(|client| client.mux_event_frames > events_before),
-            "matching notice must arrive on the event plane"
-        );
-
-        let events_after_match = app
-            .client
-            .as_ref()
-            .map(|client| client.mux_event_frames)
-            .unwrap_or(0);
-        let foreign = emit_contract_ready(&hub, Some("sess-other"), "foreign notice");
-        assert_eq!(foreign.plugin_tool_result["status"], "accepted");
-        thread::sleep(Duration::from_millis(250));
-        app.poll_hub();
-        assert!(
-            app.transient_notice
-                .as_ref()
-                .is_none_or(|notice| !notice.text.contains("foreign notice")),
-            "foreign subject must not replace the matching notice: {:?}",
-            app.transient_notice
-        );
-        assert_eq!(
-            app.client
-                .as_ref()
-                .map(|client| client.mux_event_frames)
-                .unwrap_or(0),
-            events_after_match,
-            "Hub must not deliver a foreign-subject frame"
-        );
-
-        set_event_flush_stall(&stall_path, true);
-        for index in 0..4 {
-            let _ = emit_contract_ready(&hub, Some("sess-notice-live"), &format!("gap {index}"));
-        }
-        set_event_flush_stall(&stall_path, false);
-        let gap_deadline = Instant::now() + Duration::from_secs(8);
-        let mut saw_event_gap = false;
-        while Instant::now() < gap_deadline && !saw_event_gap {
-            let frames = app
-                .client
-                .as_mut()
-                .expect("client")
-                .poll_mux_frames()
-                .expect("poll mux after shed");
-            if frames.is_empty() {
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            for frame in frames {
-                let is_gap = matches!(
-                    &frame,
-                    DaemonUnixMuxFrame::Event(DaemonEvent::EventGap { owner, name, .. })
-                        if owner == MATRIX_OWNER && name == MATRIX_EVENT
-                );
-                app.apply_mux_frames(vec![frame]);
-                if is_gap {
-                    saw_event_gap = true;
-                    assert!(app.transient_notice.is_none());
-                    assert!(
-                        app.error
-                            .as_deref()
-                            .is_some_and(|error| error.contains("event gap")),
-                        "gap diagnostic: {:?}",
-                        app.error
-                    );
-                }
-            }
-        }
-        assert!(
-            saw_event_gap,
-            "live EventGap must arrive after mailbox shed"
-        );
-
-        let before_reconnect_id = app
-            .notice_subscriptions
-            .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
-            .and_then(|entry| entry.state.active_id())
-            .map(ToOwned::to_owned)
-            .expect("active event subscription");
-        app.force_reconnect();
-        assert!(app.transient_notice.is_none());
-        app.set_selected_session(Some("sess-notice-live".to_string()));
-        assert!(
-            wait_for_condition(&mut app, Duration::from_secs(8), |app| {
-                app.notice_subscriptions
-                    .get(&(MATRIX_OWNER.to_string(), MATRIX_EVENT.to_string()))
-                    .and_then(|entry| entry.state.active_id())
-                    .is_some_and(|id| id != before_reconnect_id)
-            }),
-            "reconnect must mint a fresh SubscribeEvents id"
-        );
-        assert!(
-            app.transient_notice.is_none(),
-            "reconnect must not replay notices"
-        );
-
-        set_event_flush_stall(&stall_path, false);
-        println!("package-events-live: complete");
     }
 
     #[test]
@@ -31428,285 +16048,6 @@ exit 0
         assert!(app.notice_subscription_by_id.is_empty());
         assert!(app.transient_notice.is_none());
         assert!(!rendered_workspace(&app).contains("old"));
-    }
-
-    #[test]
-    fn saturated_terminal_write_sweeps_all_connection_owners_and_rejects_late_frames() {
-        let _stub_test = lock_unix_stub_test();
-        let stub = spawn_recovery_hub_stub();
-        let stub_root = stub.root.clone();
-        let mut app = TuiApp::new(Some(stub.endpoint.clone()));
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(3),
-            |app| {
-                app.sessions
-                    .iter()
-                    .any(|session| session.session_id == "session-alpha")
-                    && app.session_subscription.is_some()
-                    && app.session_type_subscription.is_some()
-            }
-        ));
-        app.set_selected_session(Some("session-alpha".to_string()));
-        app.request_and_apply(DaemonRequest::PluginSurfaceRender {
-            package_name: MATRIX_OWNER.to_string(),
-            surface_id: "entity-options-picker".to_string(),
-            payload: Value::Null,
-        });
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(3),
-            |app| {
-                !app.notice_subscriptions.is_empty() && !app.entity_options_subscriptions.is_empty()
-            }
-        ));
-        app.attach_selected_or_first();
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(3),
-            |app| {
-                app.attached_session.as_deref() == Some("session-alpha")
-                    && app.current_mode_shadow().is_some()
-            }
-        ));
-
-        let old_terminal_sub = app.subscription_id.clone();
-        let old_session_sub = app
-            .session_entities
-            .subscription_id
-            .clone()
-            .expect("old session subscription");
-        let old_type_sub = app
-            .session_type_entities
-            .subscription_id
-            .clone()
-            .expect("old session-type subscription");
-        let old_notice_sub = app
-            .notice_subscription_by_id
-            .keys()
-            .next()
-            .cloned()
-            .expect("old notice subscription");
-        let (old_options_family, old_options_sub) = app
-            .entity_options_subscriptions
-            .keys()
-            .next()
-            .and_then(|family| {
-                app.entity_options
-                    .family(family)
-                    .and_then(|state| state.subscription_id.clone())
-                    .map(|subscription_id| (family.clone(), subscription_id))
-            })
-            .expect("old entity-options subscription");
-        app.transient_notice = Some(TransientNotice {
-            text: "old notice".to_string(),
-            deadline: Instant::now() + Duration::from_secs(5),
-        });
-        app.plugin_surface = Some(presentation_plugin_surface());
-        app.pending_plugin_request = Some(plugin_request(
-            "old-request",
-            "entity-options-picker",
-            "contract.open",
-            "contract-open",
-        ));
-
-        let (blocked_local, _blocked_peer) =
-            std::os::unix::net::UnixStream::pair().expect("blocked Unix pair");
-        app.client = Some(HubConnection::from_stream(blocked_local));
-
-        assert!(
-            app.handle_focused_terminal_paste(&"x".repeat(MAX_PASTE_BYTES), Some("tui-terminal"),)
-        );
-        assert!(
-            app.client.is_none(),
-            "the saturated write must close the stream"
-        );
-        assert!(app.terminal_input_in_flight.is_empty());
-        assert_eq!(app.terminal_input_in_flight_bytes, 0);
-        assert!(app.attached_session.is_none());
-        assert!(app.attached_subscription_id.is_none());
-        assert!(app.attach_hydration.is_none());
-        assert!(app.terminal_mode_shadow.is_none());
-        assert!(app.ghostty_projection.is_none());
-        assert!(app.session_entities.subscription_id.is_none());
-        assert!(app.session_type_entities.subscription_id.is_none());
-        assert!(app.notice_subscriptions.is_empty());
-        assert!(app.notice_subscription_by_id.is_empty());
-        assert!(app.transient_notice.is_none());
-        assert!(app.plugin_surface.is_none());
-        assert!(app.pending_plugin_request.is_none());
-        assert!(app.entity_options_subscriptions.is_empty());
-        assert!(app.entity_options.family(&old_options_family).is_none());
-        assert!(app.session_subscription.is_none());
-        assert!(app.session_type_subscription.is_none());
-        assert!(app.retired_subscription_ids.contains(&old_terminal_sub));
-
-        let error_after_failure = app.error.clone();
-        app.apply_unix_terminal_envelope(mux_output_envelope(
-            "session-alpha",
-            &old_terminal_sub,
-            b"late terminal",
-        ));
-        app.apply_unix_terminal_envelope(mux_attach_state_envelope(
-            "session-alpha",
-            &old_terminal_sub,
-            AttachStateKind::Attached,
-        ));
-        let late_result = TerminalEvent::InputResult(TerminalInputResult {
-            subscription_id: old_terminal_sub.clone(),
-            kind: TerminalInputKind::Paste,
-            operation_id: Some(1),
-            admitted: true,
-            bytes_written: MAX_PASTE_BYTES,
-            mode_generation: 4,
-            mode_revision: 8,
-            mode_flags: empty_mode_flags(),
-            rejection: None,
-        })
-        .to_frame()
-        .expect("encode late input result");
-        let late_result_bytes = late_result.to_bytes().expect("input result frame bytes");
-        app.apply_unix_terminal_envelope(DaemonUnixTerminalEnvelope::from_frame_bytes(
-            "session-alpha",
-            &old_terminal_sub,
-            &late_result_bytes,
-        ));
-        apply_json_mux(
-            &mut app,
-            &package_event_line(
-                &old_notice_sub,
-                MATRIX_OWNER,
-                MATRIX_EVENT,
-                json!({ "notice": "late notice" }),
-            ),
-        );
-        assert!(app.ghostty_projection.is_none());
-        assert!(app.transient_notice.is_none());
-        assert!(app.terminal_mode_shadow.is_none());
-        assert_eq!(app.error, error_after_failure);
-
-        app.last_reconnect_attempt = None;
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(4),
-            |app| {
-                app.client.is_some()
-                    && app.session_entities.subscription_id.is_some()
-                    && app.session_type_entities.subscription_id.is_some()
-                    && app
-                        .notice_subscription_by_id
-                        .keys()
-                        .any(|id| id != &old_notice_sub)
-            }
-        ));
-        let new_session_sub = app
-            .session_entities
-            .subscription_id
-            .clone()
-            .expect("new session subscription");
-        let new_type_sub = app
-            .session_type_entities
-            .subscription_id
-            .clone()
-            .expect("new session-type subscription");
-        assert_ne!(new_session_sub, old_session_sub);
-        assert_ne!(new_type_sub, old_type_sub);
-        assert!(
-            app.request(DaemonRequest::Status).is_ok(),
-            "ordinary control request must succeed after reconnect"
-        );
-
-        app.request_and_apply(DaemonRequest::PluginSurfaceRender {
-            package_name: MATRIX_OWNER.to_string(),
-            surface_id: "entity-options-picker".to_string(),
-            payload: Value::Null,
-        });
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(3),
-            |app| {
-                app.entity_options_subscriptions.keys().any(|family| {
-                    family == &old_options_family
-                        && app
-                            .entity_options
-                            .family(family)
-                            .and_then(|state| state.subscription_id.as_deref())
-                            .is_some_and(|id| id != old_options_sub)
-                })
-            }
-        ));
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(3),
-            |app| {
-                app.sessions
-                    .iter()
-                    .any(|session| session.session_id == "session-alpha")
-            }
-        ));
-        app.set_selected_session(Some("session-alpha".to_string()));
-        app.attach_selected_or_first();
-        assert!(wait_for_condition(
-            &mut app,
-            Duration::from_secs(3),
-            |app| {
-                app.attached_session.as_deref() == Some("session-alpha")
-                    && app.current_mode_shadow().is_some()
-            }
-        ));
-        let new_terminal_sub = app.subscription_id.clone();
-        assert_ne!(new_terminal_sub, old_terminal_sub);
-        assert!(app.handle_focused_terminal_key(
-            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
-            Some("tui-terminal"),
-        ));
-
-        let event_deadline = Instant::now() + Duration::from_secs(1);
-        let mut observed = Vec::new();
-        while Instant::now() < event_deadline
-            && !observed.iter().any(|event| {
-                matches!(
-                    event,
-                    RecoveryStubEvent::TerminalInput(identity) if identity == &new_terminal_sub
-                )
-            })
-        {
-            if let Ok(event) = stub.events.recv_timeout(Duration::from_millis(20)) {
-                observed.push(event);
-            }
-        }
-        observed.extend(stub.events.try_iter());
-        assert!(
-            observed
-                .iter()
-                .filter(|event| matches!(event, RecoveryStubEvent::Hello))
-                .count()
-                >= 6
-        );
-        assert!(
-            observed
-                .iter()
-                .any(|event| matches!(event, RecoveryStubEvent::Request("status", _)))
-        );
-        assert!(observed.iter().any(|event| matches!(
-            event,
-            RecoveryStubEvent::Request("subscribe_entities", Some(identity))
-                if identity.ends_with(&new_session_sub)
-        )));
-        assert!(observed.iter().any(|event| matches!(
-            event,
-            RecoveryStubEvent::Request("attach", Some(identity)) if identity == &new_terminal_sub
-        )));
-        assert!(observed.iter().any(|event| matches!(
-            event,
-            RecoveryStubEvent::TerminalInput(identity) if identity == &new_terminal_sub
-        )));
-        drop(app);
-        drop(stub);
-        assert!(
-            !stub_root.exists(),
-            "recovery stub must remove its Unix socket directory"
-        );
     }
 
     fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
@@ -31752,5 +16093,370 @@ exit 0
             error: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    // ── Wake-driven contracts (v9 host control, scheme 2 terminal stream) ──
+
+    fn routed(
+        route: &str,
+        generation: u64,
+        frame: botster_terminal_protocol_client::TerminalFrame,
+    ) -> AppWake {
+        AppWake::Terminal(RoutedTerminalFrame {
+            route: RouteId::new(route).expect("route id"),
+            generation,
+            frame,
+        })
+    }
+
+    fn attach_state_frame(
+        state: AttachStateCode,
+    ) -> botster_terminal_protocol_client::TerminalFrame {
+        botster_terminal_protocol_client::encode_attach_state(state).expect("attach state frame")
+    }
+
+    fn modes_frame(mode_bits: u32) -> botster_terminal_protocol_client::TerminalFrame {
+        botster_terminal_protocol_client::encode_modes(ModesBody {
+            mode_bits,
+            rows: 24,
+            cols: 80,
+        })
+        .expect("modes frame")
+    }
+
+    #[test]
+    fn terminal_frames_adopt_generation_only_from_attach_state_and_drop_others() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        // MODES before any ATTACH_STATE adopts nothing and is dropped.
+        app.apply_wake(routed("route-1", 4, modes_frame(mode_bits::MOUSE_NORMAL)));
+        assert_eq!(app.route_generation, None);
+        assert!(app.terminal_modes.is_none());
+        app.apply_wake(routed(
+            "route-1",
+            4,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        assert_eq!(app.route_generation, Some(4));
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.attached_seen)
+        );
+        // A different generation on a non-adopting frame is dropped.
+        app.apply_wake(routed("route-1", 3, modes_frame(mode_bits::MOUSE_NORMAL)));
+        assert!(app.terminal_modes.is_none());
+        app.apply_wake(routed("route-1", 4, modes_frame(mode_bits::MOUSE_NORMAL)));
+        assert_eq!(
+            app.terminal_modes
+                .as_ref()
+                .map(|state| state.modes.mode_bits),
+            Some(mode_bits::MOUSE_NORMAL)
+        );
+        // Frames for a foreign route never touch the campaign.
+        app.apply_wake(routed(
+            "route-9",
+            4,
+            attach_state_frame(AttachStateCode::Detached),
+        ));
+        assert!(app.attach_hydration.is_some());
+    }
+
+    #[test]
+    fn route_resync_raises_generation_and_restarts_hydration() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed(
+            "route-1",
+            2,
+            botster_terminal_protocol_client::encode_route_resync().expect("resync frame"),
+        ));
+        assert_eq!(app.route_generation, Some(2));
+        let hydration = app
+            .attach_hydration
+            .as_ref()
+            .expect("hydration restarts at SNAPSHOT_READY");
+        assert!(hydration.attached_seen);
+        assert!(!hydration.snapshot_ready);
+        assert!(app.attached.is_none());
+        assert!(app.ghostty_projection.is_none());
+    }
+
+    #[test]
+    fn attach_completion_adopts_generation_from_terminal_attach() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        let mut response = base_response(DaemonResponseKind::TerminalAttached);
+        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach {
+            session_id: "session-alpha".to_string(),
+            subscription_id: "route-1".to_string(),
+            generation: 6,
+        });
+        app.apply_completion(
+            PendingReply::Attach {
+                session_id: "session-alpha".to_string(),
+                route: "route-1".to_string(),
+            },
+            response,
+        );
+        assert_eq!(app.route_generation, Some(6));
+        assert!(app.attach_hydration.is_some());
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn attach_completion_without_terminal_attach_closes_the_campaign() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        app.apply_completion(
+            PendingReply::Attach {
+                session_id: "session-alpha".to_string(),
+                route: "route-1".to_string(),
+            },
+            base_response(DaemonResponseKind::TerminalAttached),
+        );
+        assert!(app.attach_hydration.is_none());
+        assert!(app.retired_subscription_ids.contains("route-1"));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("omitted the terminal attachment"))
+        );
+    }
+
+    #[test]
+    fn attach_failed_before_ready_recovers_once_with_a_fresh_route() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Failed),
+        ));
+        assert!(app.retired_subscription_ids.contains("route-1"));
+        assert!(app.attach_recovery_used);
+        let replacement = app
+            .attach_hydration
+            .as_ref()
+            .map(|hydration| hydration.route.clone())
+            .expect("one fresh attach campaign");
+        assert_ne!(replacement, "route-1");
+        app.apply_wake(routed(
+            &replacement,
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed(
+            &replacement,
+            1,
+            attach_state_frame(AttachStateCode::Failed),
+        ));
+        assert!(app.attach_hydration.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed closed after recovery"))
+        );
+    }
+
+    #[test]
+    fn history_unavailable_before_ready_is_a_phase_gap_and_after_ready_keeps_the_route() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            botster_terminal_protocol_client::encode_history_unavailable(
+                HistoryUnavailableReason::CaptureFailed,
+            )
+            .expect("history unavailable frame"),
+        ));
+        assert!(app.retired_subscription_ids.contains("route-1"));
+        assert!(app.attach_recovery_used);
+        let replacement = app
+            .attach_hydration
+            .as_ref()
+            .map(|hydration| hydration.route.clone())
+            .expect("recovery campaign");
+        app.apply_wake(routed(
+            &replacement,
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        if let Some(hydration) = app.attach_hydration.as_mut() {
+            hydration.snapshot_ready = true;
+        }
+        app.apply_wake(routed(
+            &replacement,
+            1,
+            botster_terminal_protocol_client::encode_history_unavailable(
+                HistoryUnavailableReason::CaptureFailed,
+            )
+            .expect("history unavailable frame"),
+        ));
+        let hydration = app
+            .attach_hydration
+            .as_ref()
+            .expect("post-READY history unavailable keeps the campaign");
+        assert!(!hydration.snapshot_finished);
+        assert!(
+            app.action_feedback
+                .as_deref()
+                .is_some_and(|feedback| feedback.contains("history unavailable"))
+        );
+    }
+
+    #[test]
+    fn package_events_before_event_subscribed_are_parked_then_promoted() {
+        let mut app = workspace_fixture();
+        let descriptor = matrix_descriptor(5_000);
+        let key = (descriptor.owner.clone(), descriptor.name.clone());
+        app.subscribe_notice_entry(NoticeSubscriptionEntry {
+            descriptor: descriptor.clone(),
+            subject: "session-alpha".to_string(),
+            state: EventSubscriptionState::Idle,
+        });
+        let subscription_id = app.notice_subscriptions[&key]
+            .state
+            .candidate_id()
+            .expect("candidate")
+            .to_string();
+        app.handle_package_event(
+            subscription_id.clone(),
+            descriptor.owner.clone(),
+            descriptor.name.clone(),
+            json!({ "notice": "early" }),
+        );
+        assert!(app.transient_notice.is_none());
+        assert_eq!(app.notice_parked[&subscription_id].events.len(), 1);
+        app.complete_notice_subscription(
+            &key,
+            &subscription_id,
+            base_response(DaemonResponseKind::EventSubscribed),
+        );
+        assert_eq!(
+            app.transient_notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some("early")
+        );
+        assert!(app.notice_parked.is_empty());
+        assert_eq!(
+            app.notice_subscriptions[&key].state.active_id(),
+            Some(subscription_id.as_str())
+        );
+    }
+
+    #[test]
+    fn input_result_for_unknown_operation_reports_and_updates_modes() {
+        let mut app = workspace_fixture();
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.route_generation = Some(1);
+        app.terminal_modes = Some(TerminalModeState {
+            route: "route-1".to_string(),
+            modes: ModesBody::default(),
+        });
+        let result = InputResultBody {
+            operation_id: 9,
+            outcome: InputOutcome::RejectedLaneFull,
+            accepted_payload_bytes: None,
+            written_pty_bytes: None,
+            mode_bits: mode_bits::KITTY_KEYBOARD,
+            detail: "lane".to_string(),
+        };
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            botster_terminal_protocol_client::encode_input_result(&result).expect("result frame"),
+        ));
+        assert_eq!(app.current_mode_bits(), mode_bits::KITTY_KEYBOARD);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("input lane full"))
+        );
+    }
+
+    #[test]
+    fn request_failures_route_through_the_pending_reply() {
+        let mut app = workspace_fixture();
+        app.submit_apply(DaemonRequest::Status);
+        assert_eq!(app.pending_requests.len(), 1);
+        let wake = app
+            .try_next_wake()
+            .expect("completion queued without a link");
+        app.apply_wake(wake);
+        assert!(app.pending_requests.is_empty());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("request failed"))
+        );
+    }
+
+    #[test]
+    fn disconnect_wake_schedules_a_reconnect_and_resets_route_state() {
+        let mut app = workspace_fixture();
+        app.endpoint = Some(DaemonEndpoint::new("/tmp/botster-tui-test-none.sock"));
+        let generation = app.hub_io.generation();
+        app.connected_generation = Some(generation);
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.apply_wake(AppWake::Disconnected {
+            generation,
+            error: DaemonTransportError::ClientDisconnected,
+        });
+        assert!(app.attached.is_none());
+        assert!(app.connected_generation.is_none());
+        assert_eq!(app.reconnect_failures, 1);
+        assert!(app.reconnect_at.is_some());
+        assert!(app.next_deadline().is_some());
+        assert!(app.status.contains("reconnecting"));
+    }
+
+    #[test]
+    fn pending_input_is_bounded_while_attaching() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        app.queue_pending_input(PendingTerminalInput::Paste(vec![
+            0;
+            MAX_PENDING_HYDRATION_INPUT_BYTES
+        ]));
+        assert!(app.error.is_none());
+        app.queue_pending_input(PendingTerminalInput::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("attach bound"))
+        );
+        assert_eq!(
+            app.attach_hydration
+                .as_ref()
+                .map(|hydration| hydration.pending_input.len()),
+            Some(1)
+        );
     }
 }
