@@ -4,13 +4,14 @@
 //!
 //! - the Crossterm `EventStream` input thread,
 //! - one socket reader thread and one socket writer thread per Hub connection,
-//! - one reader thread per dedicated entity-stream connection (Hub converts a
-//!   connection into an entity stream on `SubscribeEntities`),
 //! - the absolute-deadline table for outstanding host-control requests.
 //!
 //! The application thread never blocks on a socket, the filesystem, or a timer
 //! that is not an absolute deadline. It waits on exactly one channel with
 //! `recv_timeout` to the earliest deadline and applies the `AppWake` it gets.
+//!
+//! Every frame of one connection rides that connection: correlated responses,
+//! unsolicited events, entity subscription frames, and routed terminal frames.
 //!
 //! Bounds (section 6 of the implementation contract):
 //!
@@ -41,11 +42,11 @@ use std::{
 
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEntityFrame, DaemonEvent,
-    DaemonHelloAck, DaemonRequest, DaemonRequestError, DaemonResponse,
-    DaemonResponseKind as ServerResponseKind, DaemonTransportError, DaemonUnixFrameReader,
-    DaemonUnixMuxFrame, DaemonUnixTerminalFrame, MAX_OUTSTANDING_REQUESTS, RequestIdSequence,
-    ServerFrame, TerminalCompatibilityRequirement, connect_and_hello_with_terminal_requirement,
-    encode_client_frame, encode_request_id, encode_unix_terminal_frame, parse_request_id,
+    DaemonHelloAck, DaemonRequest, DaemonRequestError, DaemonResponse, DaemonTransportError,
+    DaemonUnixFrameReader, DaemonUnixMuxFrame, DaemonUnixTerminalFrame, MAX_OUTSTANDING_REQUESTS,
+    RequestIdSequence, ServerFrame, TerminalCompatibilityRequirement,
+    connect_and_hello_with_terminal_requirement, encode_client_frame, encode_request_id,
+    encode_unix_terminal_frame, parse_request_id,
 };
 use botster_terminal_protocol_client::{RouteId, RoutedTerminalFrame, TerminalFrame};
 use crossterm::event::{Event, EventStream};
@@ -55,6 +56,9 @@ use futures_lite::{StreamExt, future};
 pub const MAX_PENDING_WAKE_ITEMS: usize = 256;
 /// Pending wake bytes before a terminal route is shed.
 pub const MAX_PENDING_WAKE_BYTES: usize = 8 * 1024 * 1024;
+/// Client-to-Hub input containers carry a reserved epoch of 0; Hub validates
+/// only the route and the fixed attachment generation.
+const INPUT_CONTAINER_EPOCH: u32 = 0;
 
 /// One wake delivered to the application loop.
 #[derive(Debug)]
@@ -70,21 +74,8 @@ pub enum AppWake {
     },
     /// One unsolicited host event on the current connection.
     Event(DaemonEvent),
-    /// One frame from an entity-stream connection.
-    Entity {
-        subscription_id: String,
-        frame: DaemonEntityFrame,
-    },
-    /// One entity-stream connection completed its SubscribeEntities handshake.
-    EntitySubscribed {
-        subscription_id: String,
-        result: Result<(), String>,
-    },
-    /// One entity-stream connection ended before `unsubscribe_entities`.
-    EntityClosed {
-        subscription_id: String,
-        error: DaemonTransportError,
-    },
+    /// One entity subscription frame on the current connection.
+    Entity(DaemonEntityFrame),
     /// The connection with this generation completed its Hello.
     Connected {
         generation: u64,
@@ -128,21 +119,8 @@ enum IoMessage {
         event: DaemonEvent,
     },
     Entity {
-        subscription_id: String,
+        generation: u64,
         frame: DaemonEntityFrame,
-    },
-    EntityOpened {
-        subscription_id: String,
-        stream: UnixStream,
-        stopped: Receiver<()>,
-    },
-    EntitySubscribed {
-        subscription_id: String,
-        result: Result<(), String>,
-    },
-    EntityClosed {
-        subscription_id: String,
-        error: DaemonTransportError,
     },
     Connected {
         generation: u64,
@@ -198,23 +176,6 @@ impl HubLink {
 
 struct PendingRequest {
     deadline: Instant,
-}
-
-/// One dedicated entity-stream connection.
-///
-/// Hub converts a connection into an entity stream on `SubscribeEntities`;
-/// a mux connection with bound routes refuses the request. The owner keeps
-/// the stream so it can end the reader thread within a bound.
-enum EntityLink {
-    /// Connect thread running; no stream yet.
-    Connecting,
-    /// Stream open; the reader thread signals `stopped` when it exits.
-    Open {
-        stream: UnixStream,
-        stopped: Receiver<()>,
-    },
-    /// `unsubscribe_entities` ran before the stream arrived.
-    Closing,
 }
 
 /// Shared pending-wake accounting between the reader thread and the owner.
@@ -340,8 +301,6 @@ pub struct HubIo {
     ready: VecDeque<AppWake>,
     input: Option<InputPump>,
     link: Option<HubLink>,
-    /// Dedicated entity-stream connections by subscription id.
-    entity_links: BTreeMap<String, EntityLink>,
     /// Generation of the newest connection attempt (connecting or connected).
     generation: u64,
     request_ids: RequestIdSequence,
@@ -360,7 +319,6 @@ impl HubIo {
             ready: VecDeque::new(),
             input: None,
             link: None,
-            entity_links: BTreeMap::new(),
             generation: 0,
             request_ids: RequestIdSequence::new(),
             pending: BTreeMap::new(),
@@ -439,98 +397,35 @@ impl HubIo {
         self.link.is_some()
     }
 
-    /// Close the current connection and every entity stream, and fail every
-    /// pending request.
+    /// Close the current connection, if any, and fail every pending request.
     ///
     /// Waits at most `bound` for the reader and writer threads to stop.
     pub fn disconnect(&mut self, bound: Duration) {
-        let deadline = Instant::now() + bound;
         if let Some(link) = self.link.take() {
             link.close(bound);
         }
-        let ids: Vec<String> = self.entity_links.keys().cloned().collect();
-        for subscription_id in ids {
-            self.unsubscribe_entities(
-                &subscription_id,
-                deadline.saturating_duration_since(Instant::now()),
-            );
-        }
-        self.fail_pending(DaemonRequestError::ConnectionClosed);
+        self.fail_pending();
     }
 
-    /// Open one dedicated entity-stream connection and subscribe.
-    ///
-    /// The handshake runs on its own thread. `AppWake::EntitySubscribed`
-    /// reports admission; frames follow as `AppWake::Entity`; the stream ends
-    /// with `AppWake::EntityClosed` unless `unsubscribe_entities` closed it.
-    pub fn subscribe_entities(
-        &mut self,
-        endpoint: DaemonEndpoint,
-        host_requirement: DaemonCompatibilityRequirement,
-        entity_type: &str,
-        subscription_id: &str,
-    ) {
-        if self.entity_links.contains_key(subscription_id) {
-            return;
-        }
-        self.entity_links
-            .insert(subscription_id.to_string(), EntityLink::Connecting);
-        let sender = self.wake_tx.clone();
-        let budget = Arc::clone(&self.budget);
-        let entity_type = entity_type.to_string();
-        let id = subscription_id.to_string();
-        let spawned = thread::Builder::new()
-            .name(format!("botster-tui-entity-{entity_type}"))
-            .spawn(move || {
-                run_entity_thread(
-                    &endpoint,
-                    &host_requirement,
-                    &entity_type,
-                    &id,
-                    &sender,
-                    &budget,
-                );
-            });
-        if let Err(error) = spawned {
-            self.entity_links.remove(subscription_id);
-            self.ready.push_back(AppWake::EntityClosed {
-                subscription_id: subscription_id.to_string(),
-                error: DaemonTransportError::Io(error),
-            });
-        }
-    }
-
-    /// End one entity stream within `bound`. Hub drops the subscription on EOF.
-    pub fn unsubscribe_entities(&mut self, subscription_id: &str, bound: Duration) {
-        match self.entity_links.remove(subscription_id) {
-            None => {}
-            Some(EntityLink::Connecting) | Some(EntityLink::Closing) => {
-                self.entity_links
-                    .insert(subscription_id.to_string(), EntityLink::Closing);
-            }
-            Some(EntityLink::Open { stream, stopped }) => {
-                let _ = stream.shutdown(Shutdown::Both);
-                let _ = stopped.recv_timeout(bound);
-            }
-        }
-    }
-
-    /// Whether an entity stream is connecting or open for this id.
-    pub fn has_entity_stream(&self, subscription_id: &str) -> bool {
-        matches!(
-            self.entity_links.get(subscription_id),
-            Some(EntityLink::Connecting | EntityLink::Open { .. })
-        )
-    }
-
-    fn fail_pending(&mut self, error: DaemonRequestError) {
+    fn fail_pending(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         for request_id in pending.into_keys() {
             self.ready.push_back(AppWake::Completed {
                 request_id,
-                result: Err(error.clone()),
+                result: Err(DaemonRequestError::ConnectionClosed),
             });
         }
+    }
+
+    /// Close the current link from the owner side and queue `Disconnected`.
+    fn end_link(&mut self, error: DaemonTransportError) {
+        let generation = self.generation;
+        if let Some(link) = self.link.take() {
+            link.close(Duration::ZERO);
+        }
+        self.fail_pending();
+        self.ready
+            .push_back(AppWake::Disconnected { generation, error });
     }
 
     /// Submit one host-control request with an absolute deadline.
@@ -579,17 +474,6 @@ impl HubIo {
         request_id
     }
 
-    /// Close the current link from the owner side and queue `Disconnected`.
-    fn end_link(&mut self, error: DaemonTransportError) {
-        let generation = self.generation;
-        if let Some(link) = self.link.take() {
-            link.close(Duration::ZERO);
-        }
-        self.fail_pending(DaemonRequestError::ConnectionClosed);
-        self.ready
-            .push_back(AppWake::Disconnected { generation, error });
-    }
-
     /// Drop the local completion for one request. A late response for the id
     /// is discarded. Returns whether the request was still pending.
     pub fn cancel(&mut self, request_id: u64) -> bool {
@@ -609,7 +493,9 @@ impl HubIo {
         let Some(link) = self.link.as_ref() else {
             return false;
         };
-        let Some(bytes) = encode_unix_terminal_frame(route, generation, body) else {
+        let Some(bytes) =
+            encode_unix_terminal_frame(route, generation, INPUT_CONTAINER_EPOCH, body)
+        else {
             return false;
         };
         link.writer.send(WriteCommand::Bytes(bytes)).is_ok()
@@ -755,54 +641,9 @@ impl HubIo {
                 self.budget.release_control();
                 self.current(generation).then_some(AppWake::Event(event))
             }
-            IoMessage::Entity {
-                subscription_id,
-                frame,
-            } => {
+            IoMessage::Entity { generation, frame } => {
                 self.budget.release_control();
-                self.has_entity_stream(&subscription_id)
-                    .then_some(AppWake::Entity {
-                        subscription_id,
-                        frame,
-                    })
-            }
-            IoMessage::EntityOpened {
-                subscription_id,
-                stream,
-                stopped,
-            } => {
-                match self.entity_links.get(&subscription_id) {
-                    Some(EntityLink::Connecting) => {
-                        self.entity_links
-                            .insert(subscription_id, EntityLink::Open { stream, stopped });
-                    }
-                    _ => {
-                        // Unsubscribed before the stream arrived, or unknown.
-                        let _ = stream.shutdown(Shutdown::Both);
-                        self.entity_links.remove(&subscription_id);
-                    }
-                }
-                None
-            }
-            IoMessage::EntitySubscribed {
-                subscription_id,
-                result,
-            } => self
-                .has_entity_stream(&subscription_id)
-                .then_some(AppWake::EntitySubscribed {
-                    subscription_id,
-                    result,
-                }),
-            IoMessage::EntityClosed {
-                subscription_id,
-                error,
-            } => {
-                let live = self.has_entity_stream(&subscription_id);
-                self.entity_links.remove(&subscription_id);
-                live.then_some(AppWake::EntityClosed {
-                    subscription_id,
-                    error,
-                })
+                self.current(generation).then_some(AppWake::Entity(frame))
             }
             IoMessage::Connected {
                 generation,
@@ -832,7 +673,7 @@ impl HubIo {
                 if let Some(link) = self.link.take() {
                     link.close(Duration::ZERO);
                 }
-                self.fail_pending(DaemonRequestError::ConnectionClosed);
+                self.fail_pending();
                 Some(AppWake::Disconnected { generation, error })
             }
             IoMessage::RouteFault {
@@ -969,125 +810,6 @@ fn run_connect_thread(
     });
 }
 
-/// Connect, Hello, SubscribeEntities, then read entity frames until the
-/// stream ends. The first Response must be EntitySubscribed.
-fn run_entity_thread(
-    endpoint: &DaemonEndpoint,
-    host_requirement: &DaemonCompatibilityRequirement,
-    entity_type: &str,
-    subscription_id: &str,
-    sender: &Sender<IoMessage>,
-    budget: &WakeBudget,
-) {
-    let closed = |error: DaemonTransportError| IoMessage::EntityClosed {
-        subscription_id: subscription_id.to_string(),
-        error,
-    };
-    let (mut stream, _ack) =
-        match connect_and_hello_with_terminal_requirement(endpoint, host_requirement, None) {
-            Ok(connected) => connected,
-            Err(error) => {
-                let _ = sender.send(closed(error));
-                return;
-            }
-        };
-    let owner_stream = match stream.try_clone() {
-        Ok(owner_stream) => owner_stream,
-        Err(error) => {
-            let _ = sender.send(closed(DaemonTransportError::Io(error)));
-            return;
-        }
-    };
-    let (stopped_tx, stopped_rx) = mpsc::channel();
-    if sender
-        .send(IoMessage::EntityOpened {
-            subscription_id: subscription_id.to_string(),
-            stream: owner_stream,
-            stopped: stopped_rx,
-        })
-        .is_err()
-    {
-        return;
-    }
-    let frame = ClientFrame::Request {
-        request_id: encode_request_id(1),
-        request: DaemonRequest::SubscribeEntities {
-            entity_type: entity_type.to_string(),
-            subscription_id: subscription_id.to_string(),
-        },
-    };
-    let bytes = match encode_client_frame(&frame) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = sender.send(closed(error));
-            let _ = stopped_tx.send(());
-            return;
-        }
-    };
-    if let Err(error) = stream.write_all(&bytes) {
-        let _ = sender.send(closed(DaemonTransportError::Io(error)));
-        let _ = stopped_tx.send(());
-        return;
-    }
-    let mut reader = BufReader::new(stream);
-    let mut decoder = DaemonUnixFrameReader::new();
-    let mut subscribed = false;
-    loop {
-        let frame = match decoder.read_frame(&mut reader) {
-            Ok(frame) => frame,
-            Err(error) => {
-                let _ = sender.send(closed(error));
-                break;
-            }
-        };
-        let message = match frame {
-            DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. }) if !subscribed => {
-                subscribed = true;
-                let result = if response.kind == ServerResponseKind::EntitySubscribed
-                    && response.error.is_none()
-                {
-                    Ok(())
-                } else {
-                    Err(response
-                        .error
-                        .map(|error| error.message)
-                        .unwrap_or_else(|| format!("{:?}", response.kind)))
-                };
-                let admitted = result.is_ok();
-                let _ = sender.send(IoMessage::EntitySubscribed {
-                    subscription_id: subscription_id.to_string(),
-                    result,
-                });
-                if !admitted {
-                    break;
-                }
-                continue;
-            }
-            DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) if subscribed => {
-                budget.reserve_control();
-                IoMessage::Entity {
-                    subscription_id: subscription_id.to_string(),
-                    frame: entity,
-                }
-            }
-            DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
-                let _ = sender.send(closed(DaemonTransportError::ClosedByHub(reason)));
-                break;
-            }
-            _ => {
-                let _ = sender.send(closed(DaemonTransportError::Protocol(
-                    "unexpected frame on an entity stream",
-                )));
-                break;
-            }
-        };
-        if sender.send(message).is_err() {
-            break;
-        }
-    }
-    let _ = stopped_tx.send(());
-}
-
 fn run_writer_thread(
     generation: u64,
     mut stream: UnixStream,
@@ -1158,15 +880,12 @@ fn run_reader_thread(
                 budget.reserve_control();
                 IoMessage::Event { generation, event }
             }
-            DaemonUnixMuxFrame::Server(ServerFrame::Entity { .. }) => {
-                // Entity frames travel only on dedicated entity-stream connections.
-                let _ = sender.send(IoMessage::Disconnected {
+            DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) => {
+                budget.reserve_control();
+                IoMessage::Entity {
                     generation,
-                    error: DaemonTransportError::Protocol(
-                        "entity frame on the host-control connection",
-                    ),
-                });
-                return;
+                    frame: entity,
+                }
             }
             DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
                 let _ = sender.send(IoMessage::Disconnected {
@@ -1226,6 +945,7 @@ fn admit_terminal_frame(
     let DaemonUnixTerminalFrame {
         route,
         generation,
+        stream_epoch,
         body,
     } = terminal;
     if budget.is_faulted(&route, generation) {
@@ -1259,6 +979,7 @@ fn admit_terminal_frame(
     Ok(Some(RoutedTerminalFrame {
         route: route_id,
         generation,
+        stream_epoch,
         frame,
     }))
 }
@@ -1272,6 +993,7 @@ mod tests {
         DaemonUnixTerminalFrame {
             route: route.to_string(),
             generation,
+            stream_epoch: 0,
             body: encode_output(body)
                 .expect("encode output")
                 .as_bytes()
@@ -1288,6 +1010,7 @@ mod tests {
             .expect("first frame is admitted");
         assert_eq!(admitted.route.as_str(), "r");
         assert_eq!(admitted.generation, 1);
+        assert_eq!(admitted.stream_epoch, 0);
         assert_eq!(admitted.frame.body(), b"hi");
         assert_eq!(budget.items.load(Ordering::Acquire), 1);
         for _ in 1..MAX_PENDING_WAKE_ITEMS {
@@ -1319,6 +1042,7 @@ mod tests {
         let malformed = DaemonUnixTerminalFrame {
             route: "r".to_string(),
             generation: 2,
+            stream_epoch: 0,
             body: vec![9, 9, 9],
         };
         match admit_terminal_frame(malformed, &budget) {
@@ -1383,21 +1107,26 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe_before_the_stream_arrives_marks_the_link_closing() {
+    fn frames_from_a_previous_connection_generation_are_discarded() {
         let mut io = HubIo::new();
-        io.entity_links
-            .insert("e".to_string(), EntityLink::Connecting);
-        assert!(io.has_entity_stream("e"));
-        io.unsubscribe_entities("e", Duration::ZERO);
-        assert!(matches!(
-            io.entity_links.get("e"),
-            Some(EntityLink::Closing)
-        ));
-        assert!(!io.has_entity_stream("e"));
         assert!(
-            io.map_message(IoMessage::EntitySubscribed {
-                subscription_id: "e".to_string(),
-                result: Ok(()),
+            io.map_message(IoMessage::Event {
+                generation: 7,
+                event: DaemonEvent::RuntimeObservation {
+                    kind: "stale".to_string(),
+                },
+            })
+            .is_none()
+        );
+        assert!(
+            io.map_message(IoMessage::Entity {
+                generation: 7,
+                frame: DaemonEntityFrame::Remove {
+                    subscription_id: "s".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 1,
+                    id: "x".to_string(),
+                },
             })
             .is_none()
         );
