@@ -532,6 +532,7 @@ impl InputWindow {
 
     /// Bytes waiting in the local queue.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }

@@ -161,13 +161,15 @@ struct HubLink {
 }
 
 impl HubLink {
+    /// Close within `bound`: let the writer drain queued frames (for example a
+    /// final Detach) first, then shut the socket so the reader unblocks.
     fn close(self, bound: Duration) {
-        let _ = self.writer.send(WriteCommand::Stop);
-        let _ = self.stream.shutdown(Shutdown::Both);
         let deadline = Instant::now() + bound;
+        let _ = self.writer.send(WriteCommand::Stop);
         let _ = self
             .writer_stopped
             .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let _ = self.stream.shutdown(Shutdown::Both);
         let _ = self
             .reader_stopped
             .recv_timeout(deadline.saturating_duration_since(Instant::now()));
@@ -476,11 +478,16 @@ impl HubIo {
 
     /// Drop the local completion for one request. A late response for the id
     /// is discarded. Returns whether the request was still pending.
+    ///
+    /// Part of the owner contract (section 4.4); the application currently
+    /// lets deadlines expire instead of cancelling.
+    #[allow(dead_code)]
     pub fn cancel(&mut self, request_id: u64) -> bool {
         self.pending.remove(&request_id).is_some()
     }
 
     /// Number of outstanding host-control requests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn outstanding(&self) -> usize {
         self.pending.len()
     }
@@ -505,6 +512,19 @@ impl HubIo {
     /// route id is admitted again.
     pub fn forget_route(&mut self, route: &str) {
         self.budget.forget_route(route);
+    }
+
+    /// Charge one frame the application retains after dequeue (for example a
+    /// terminal frame parked until its Attach response) against the same
+    /// 256-item / 8 MiB pending budget as queued wakes. Returns false at the
+    /// bound; the caller then fails only the affected route.
+    pub fn try_retain(&self, bytes: usize) -> bool {
+        self.budget.try_reserve_terminal(bytes)
+    }
+
+    /// Release one retained frame charged with `try_retain`.
+    pub fn release_retained(&self, bytes: usize) {
+        self.budget.release_terminal(bytes);
     }
 
     /// Earliest absolute deadline among outstanding requests.

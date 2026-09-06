@@ -93,8 +93,6 @@ const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// Live OUTPUT retained while SNAPSHOT_HISTORY is still arriving for a route.
 const MAX_HYDRATION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
-/// Frames retained before the Attach response fixes the attachment generation.
-const MAX_PRE_ATTACH_FRAMES: usize = 64;
 /// Encoded input retained while a route is still attaching.
 const MAX_PENDING_HYDRATION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Package events parked per candidate subscription until EventSubscribed lands.
@@ -298,7 +296,9 @@ struct AttachHydration {
     session_id: String,
     route: String,
     /// Frames that arrived before the trusted Attach response fixed the
-    /// attachment generation. Replayed once the response lands.
+    /// attachment generation. Charged against the connection's aggregate
+    /// pending budget through `HubIo::try_retain`; replayed once the response
+    /// lands, released when the campaign ends.
     pending_frames: VecDeque<RoutedTerminalFrame>,
     pending_frame_bytes: usize,
     buffered_live_output: Vec<u8>,
@@ -2603,7 +2603,7 @@ impl TuiApp {
     /// Forget the current route: attachment, hydration, projection, modes, input window.
     fn clear_route_state(&mut self) {
         self.attached = None;
-        self.attach_hydration = None;
+        self.drop_attach_hydration();
         self.route_generation = None;
         self.route_epoch = None;
         self.terminal_modes = None;
@@ -3793,6 +3793,7 @@ impl TuiApp {
         self.resolve_unknown_input_operations("route replaced");
         self.terminal_modes = None;
         self.clear_ghostty_projection();
+        self.drop_attach_hydration();
         self.attach_hydration = Some(AttachHydration::new(session_id, route));
     }
 
@@ -3825,7 +3826,7 @@ impl TuiApp {
             self.clear_ghostty_projection();
         }
         self.retire_subscription(&route);
-        self.attach_hydration = None;
+        self.drop_attach_hydration();
         self.attached = None;
         self.terminal_modes = None;
         self.send_bounded_detach(session_id, route);
@@ -4390,40 +4391,58 @@ impl TuiApp {
     }
 
     /// Retain one frame until the Attach response fixes the generation.
+    ///
+    /// The frame is charged against the connection's aggregate pending budget,
+    /// not a separate per-route buffer. At the bound only this route fails.
     fn park_pre_attach_frame(&mut self, routed: RoutedTerminalFrame) {
-        let Some(hydration) = self.attach_hydration.as_mut() else {
+        let Some(hydration) = self.attach_hydration.as_ref() else {
             return;
         };
         let bytes = routed.frame.len();
-        if hydration.pending_frames.len() >= MAX_PRE_ATTACH_FRAMES
-            || hydration.pending_frame_bytes.saturating_add(bytes) > MAX_HYDRATION_OUTPUT_BYTES
-        {
+        if !self.hub_io.try_retain(bytes) {
             let session_id = hydration.session_id.clone();
             let route = hydration.route.clone();
             self.recover_current_subscription(
                 &session_id,
                 &route,
-                "frames before the attach response exceeded the retention bound",
+                "frames before the attach response exceeded the pending budget",
             );
             return;
         }
-        hydration.pending_frame_bytes += bytes;
-        hydration.pending_frames.push_back(routed);
+        if let Some(hydration) = self.attach_hydration.as_mut() {
+            hydration.pending_frame_bytes += bytes;
+            hydration.pending_frames.push_back(routed);
+        }
     }
 
-    /// Replay frames parked before the Attach response, in arrival order.
-    fn replay_pre_attach_frames(&mut self) {
+    /// Take the parked frames out of the campaign and release their budget.
+    fn take_parked_frames(&mut self) -> VecDeque<RoutedTerminalFrame> {
         let Some(hydration) = self.attach_hydration.as_mut() else {
-            return;
+            return VecDeque::new();
         };
         let parked = std::mem::take(&mut hydration.pending_frames);
         hydration.pending_frame_bytes = 0;
-        for routed in parked {
+        for routed in &parked {
+            self.hub_io.release_retained(routed.frame.len());
+        }
+        parked
+    }
+
+    /// Replay frames parked before the Attach response, in arrival order.
+    /// Output only: queued user input is never replayed here.
+    fn replay_pre_attach_frames(&mut self) {
+        for routed in self.take_parked_frames() {
             if self.attach_hydration.is_none() && self.attached.is_none() {
                 return;
             }
             self.apply_routed_terminal_frame(routed);
         }
+    }
+
+    /// Drop the attach campaign and release every frame it retained.
+    fn drop_attach_hydration(&mut self) {
+        let _ = self.take_parked_frames();
+        self.attach_hydration = None;
     }
 
     /// The route restarts from a fresh SNAPSHOT_READY. The decoder state is
@@ -4439,6 +4458,7 @@ impl TuiApp {
         }
         self.clear_ghostty_projection();
         let was_attached = self.attached.take().is_some();
+        let _ = self.take_parked_frames();
         let mut hydration = AttachHydration::new(&session_id, &route);
         if let Some(previous) = self.attach_hydration.take() {
             hydration.attached_seen = previous.attached_seen;
@@ -4607,7 +4627,7 @@ impl TuiApp {
         self.terminal_modes = None;
         self.clear_ghostty_projection();
         if hydration_matches {
-            self.attach_hydration = None;
+            self.drop_attach_hydration();
         }
         let _ = session_id;
     }
@@ -4637,7 +4657,7 @@ impl TuiApp {
                 }
                 self.retire_subscription(&route);
                 self.attached = None;
-                self.attach_hydration = None;
+                self.drop_attach_hydration();
                 self.terminal_modes = None;
                 self.clear_ghostty_projection();
             }
@@ -16281,16 +16301,20 @@ mod tests {
     }
 
     #[test]
-    fn frames_before_the_attach_response_are_bounded() {
+    fn frames_before_the_attach_response_share_the_pending_budget() {
         let mut app = workspace_fixture();
         app.begin_attach_hydration("session-alpha", "route-1");
-        for _ in 0..MAX_PRE_ATTACH_FRAMES {
+        for _ in 0..crate::hub_io::MAX_PENDING_WAKE_ITEMS {
             app.apply_wake(routed("route-1", 1, modes_frame(0)));
         }
         assert!(app.attach_hydration.is_some());
+        assert!(!app.hub_io.try_retain(0));
         app.apply_wake(routed("route-1", 1, modes_frame(0)));
         assert!(app.retired_subscription_ids.contains("route-1"));
         assert!(app.attach_recovery_used);
+        // The failed campaign released every parked frame from the budget.
+        assert!(app.hub_io.try_retain(0));
+        app.hub_io.release_retained(0);
     }
 
     #[test]
