@@ -372,7 +372,7 @@ fn entity_frame_type(frame: &DaemonEntityFrame) -> &str {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AttachedRoute {
     session_id: String,
-    route: RouteId,
+    route: String,
 }
 
 /// Last MODES frame for the current route.
@@ -973,15 +973,6 @@ enum ListForTargetStub {
     TransportError,
 }
 
-enum ListForTargetLoadError {
-    Operator {
-        code: String,
-        operation: String,
-        message: String,
-    },
-    Transport(DaemonTransportError),
-}
-
 fn join_tokens(values: &[String]) -> String {
     values.join(", ")
 }
@@ -1249,7 +1240,6 @@ fn run_loop(
     app.connect();
     let mut router = InputRouter::new(renderer::action_request_context());
     let mut routed_surface_id = None;
-    let mut hit_map = HitMap::default();
     let mut running = true;
     while running {
         let active_surface_id = app.active_plugin_surface_id().map(ToOwned::to_owned);
@@ -1263,7 +1253,7 @@ fn run_loop(
         app.set_drafts(router.draft_values());
 
         let render_state = router.render_state();
-        hit_map = HitMap::default();
+        let mut hit_map = HitMap::default();
         app.prepare_paint();
         terminal.draw(|frame| draw(frame, &mut hit_map, &app, &render_state))?;
         app.apply_terminal_mouse_mode(&mut hit_map);
@@ -8295,7 +8285,7 @@ fn ensure_membership_family_demanded(
         .is_some()
         || app
             .entity_options_subscriptions
-            .contains_key(WORKSPACES_MEMBERSHIP_FAMILY)
+            .contains(WORKSPACES_MEMBERSHIP_FAMILY)
     {
         return Ok(());
     }
