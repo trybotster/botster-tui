@@ -1707,17 +1707,6 @@ impl TuiApp {
         Self::new_with_runtime_context(endpoint, connection_error, false, HubIo::new())
     }
 
-    #[cfg(test)]
-    fn new_for_attach_occupancy(endpoint: Option<DaemonEndpoint>) -> Self {
-        Self::new_with_runtime_context_and_requirement(
-            endpoint,
-            None,
-            true,
-            tui_attach_occupancy_requirement(),
-            HubIo::new(),
-        )
-    }
-
     fn new_with_runtime_context(
         endpoint: Option<DaemonEndpoint>,
         connection_error: Option<String>,
@@ -9203,16 +9192,6 @@ fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonT
     ))
 }
 
-#[cfg(test)]
-fn wait_for_attached_projection(app: &mut TuiApp, session_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    app.pump_until(deadline, |app| {
-        (app.ghostty_projection.is_some() && app.attached_session_id() == Some(session_id))
-            || app.error.is_some()
-            || app.terminal_close_evidence.is_some()
-    });
-}
-
 /// Wait until the projected viewport contains `needle`.
 fn wait_for_app_output(app: &mut TuiApp, needle: &str) -> DaemonTransportResult<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -9340,22 +9319,6 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
         minimum_conformance_fixture_revision: MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         client_name: "botster-tui".to_string(),
     }
-}
-
-#[cfg(test)]
-fn tui_attach_occupancy_requirement() -> DaemonCompatibilityRequirement {
-    let mut requirement = DaemonCompatibilityRequirement::for_attach_occupancy();
-    requirement.client_name = "botster-tui".to_string();
-    for feature in tui_compatibility_requirement().required_features {
-        if !requirement
-            .required_features
-            .iter()
-            .any(|existing| existing == &feature)
-        {
-            requirement.required_features.push(feature);
-        }
-    }
-    requirement
 }
 
 fn tui_terminal_compatibility_requirement() -> TerminalCompatibilityRequirement {
@@ -9903,50 +9866,6 @@ fn stamp_entity_option_invalid_errors_child(
             }
         }
     }
-}
-
-#[cfg(test)]
-fn surface_has_options_source(node: &UiNode) -> bool {
-    if node.kind == UiNodeKind::Select && node.props.contains_key("options_source") {
-        return true;
-    }
-    node.children.iter().any(|child| match child {
-        UiChild::Node(node)
-        | UiChild::Conditional(UiConditional::When { node, .. })
-        | UiChild::Conditional(UiConditional::Hidden { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. }) => {
-            surface_has_options_source(node)
-        }
-        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
-            item_template,
-            empty_template,
-            ..
-        }) => {
-            surface_has_options_source(item_template)
-                || empty_template
-                    .as_ref()
-                    .is_some_and(|template| surface_has_options_source(template))
-        }
-    }) || node.slots.values().flatten().any(|child| match child {
-        UiChild::Node(node)
-        | UiChild::Conditional(UiConditional::When { node, .. })
-        | UiChild::Conditional(UiConditional::Hidden { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. })
-        | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. }) => {
-            surface_has_options_source(node)
-        }
-        UiChild::BindList(botster_ui_contract::UiBindList::BindList {
-            item_template,
-            empty_template,
-            ..
-        }) => {
-            surface_has_options_source(item_template)
-                || empty_template
-                    .as_ref()
-                    .is_some_and(|template| surface_has_options_source(template))
-        }
-    })
 }
 
 fn collect_invalid_entity_option_fields(
@@ -10900,65 +10819,12 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 mod tests {
 
     use super::*;
+    use botster_hub_client::TerminalCompatibility;
+    use botster_terminal_protocol_client::mode_bits;
 
     use botster_ui_contract::{
         UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
     };
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard};
-
-    static UNIX_STUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    static UNIX_STUB_BIND: Mutex<()> = Mutex::new(());
-    static UNIX_STUB_TEST: Mutex<()> = Mutex::new(());
-
-    fn lock_unix_stub_test() -> MutexGuard<'static, ()> {
-        UNIX_STUB_TEST
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum SessionEntityExpectation<'a> {
-        Lifecycle(&'a str),
-        Absent,
-    }
-
-    fn session_entity_expectation_satisfied(
-        state: &SessionEntityState,
-        session_id: &str,
-        expectation: SessionEntityExpectation<'_>,
-    ) -> bool {
-        state.subscription_id.is_some()
-            && state.has_snapshot
-            && match expectation {
-                SessionEntityExpectation::Lifecycle(lifecycle_class) => state
-                    .entities
-                    .get(session_id)
-                    .is_some_and(|entity| entity.lifecycle_class == lifecycle_class),
-                SessionEntityExpectation::Absent => !state.entities.contains_key(session_id),
-            }
-    }
-
-    fn session_entity_expectation_diagnostic(
-        state: &SessionEntityState,
-        session_id: &str,
-        expectation: SessionEntityExpectation<'_>,
-    ) -> String {
-        let observed = state.entities.get(session_id).map_or_else(
-            || "absent".to_string(),
-            |entity| {
-                format!(
-                    "lifecycle_class={} lifecycle={:?} registry_state={}",
-                    entity.lifecycle_class, entity.lifecycle, entity.registry_state
-                )
-            },
-        );
-        format!(
-            "subscription_id={:?} has_snapshot={} snapshot_seq={:?} expected_session_id={session_id} expected={expectation:?} observed={observed}",
-            state.subscription_id, state.has_snapshot, state.snapshot_seq
-        )
-    }
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11005,72 +10871,6 @@ mod tests {
             hit_map,
         )
     }
-
-    fn find_ui_node_by_id<'a>(root: &'a UiNode, node_id: &str) -> Option<&'a UiNode> {
-        if root
-            .id
-            .as_ref()
-            .and_then(UiAuthoredNodeId::as_literal)
-            .is_some_and(|id| id.0 == node_id)
-        {
-            return Some(root);
-        }
-        root.children
-            .iter()
-            .chain(root.slots.values().flatten())
-            .filter_map(static_child_node)
-            .find_map(|child| find_ui_node_by_id(child, node_id))
-    }
-
-    fn node_action(node: &UiNode) -> botster_ui_contract::UiAction {
-        serde_json::from_value(
-            node.props
-                .get("action")
-                .cloned()
-                .expect("rendered action-bearing node has action metadata"),
-        )
-        .expect("rendered action metadata follows the Hub contract")
-    }
-
-    fn find_presentation_bound_node<'a>(
-        root: &'a UiNode,
-        key: &str,
-        equals: Option<&Value>,
-    ) -> Option<&'a UiNode> {
-        for child in root.children.iter().chain(root.slots.values().flatten()) {
-            if let UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf {
-                predicate,
-                node,
-            }) = child
-            {
-                let matches = match predicate {
-                    botster_ui_contract::UiPresentationPredicate::Present {
-                        key: predicate_key,
-                    } => predicate_key.0 == key && equals.is_none(),
-                    botster_ui_contract::UiPresentationPredicate::Equals {
-                        key: predicate_key,
-                        value,
-                    } => predicate_key.0 == key && equals == Some(value),
-                    botster_ui_contract::UiPresentationPredicate::Truthy { .. } => false,
-                };
-                if matches {
-                    return Some(node);
-                }
-            }
-            if let Some(node) = static_child_node(child)
-                && let Some(found) = find_presentation_bound_node(node, key, equals)
-            {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    const WORKSPACES_PACKAGE_NAME: &str = "botster-workspaces";
-
-    const WORKSPACES_SURFACE_ID: &str = "workspaces";
-
-    const WORKSPACES_DOWNSTREAM_TICKET: &str = "ticket_1785296184_677408";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum WorkspacesProfile {
@@ -11211,245 +11011,6 @@ mod tests {
                 ))
             }
         }
-    }
-
-    fn validate_workspaces_package(path: &Path) -> Result<PathBuf, String> {
-        if !path.is_dir() {
-            return Err(format!(
-                "BOTSTER_WORKSPACES_PACKAGE_PATH is not a directory: {}",
-                path.display()
-            ));
-        }
-        let manifest_path = path.join("botster-package.json");
-        let plugin_path = path.join("plugin.lua");
-        if !manifest_path.is_file() || !plugin_path.is_file() {
-            return Err(format!(
-                "BOTSTER_WORKSPACES_PACKAGE_PATH must contain botster-package.json and plugin.lua: {}",
-                path.display()
-            ));
-        }
-        let manifest: Value = serde_json::from_slice(
-            &std::fs::read(&manifest_path)
-                .map_err(|error| format!("read {}: {error}", manifest_path.display()))?,
-        )
-        .map_err(|error| format!("parse {}: {error}", manifest_path.display()))?;
-        if manifest.get("name").and_then(Value::as_str) != Some(WORKSPACES_PACKAGE_NAME) {
-            return Err(format!(
-                "BOTSTER_WORKSPACES_PACKAGE_PATH manifest name must be {WORKSPACES_PACKAGE_NAME}: {}",
-                manifest_path.display()
-            ));
-        }
-        std::fs::canonicalize(path)
-            .map_err(|error| format!("canonicalize {}: {error}", path.display()))
-    }
-
-    fn find_action_node<'a>(
-        root: &'a UiNode,
-        action_id: &str,
-        payload_key: &str,
-        payload_value: &str,
-    ) -> Option<&'a UiNode> {
-        let matches = root
-            .props
-            .get("action")
-            .and_then(|value| {
-                serde_json::from_value::<botster_ui_contract::UiAction>(value.clone()).ok()
-            })
-            .is_some_and(|action| {
-                action.id.0 == action_id
-                    && action.payload.as_ref().is_some_and(|payload| {
-                        payload.get(payload_key).and_then(Value::as_str) == Some(payload_value)
-                    })
-            });
-        if matches {
-            return Some(root);
-        }
-        root.children
-            .iter()
-            .chain(root.slots.values().flatten())
-            .find_map(|child| match child {
-                UiChild::BindList(botster_ui_contract::UiBindList::BindList {
-                    item_template,
-                    empty_template,
-                    ..
-                }) => find_action_node(item_template, action_id, payload_key, payload_value)
-                    .or_else(|| {
-                        empty_template.as_deref().and_then(|node| {
-                            find_action_node(node, action_id, payload_key, payload_value)
-                        })
-                    }),
-                _ => static_child_node(child)
-                    .and_then(|node| find_action_node(node, action_id, payload_key, payload_value)),
-            })
-    }
-
-    fn unique_hit_action(
-        hit_map: &HitMap,
-        action_id: &str,
-        payload_key: &str,
-        payload_value: &str,
-    ) -> Result<(UiNodeId, botster_ui_contract::UiAction), String> {
-        let matches = hit_map
-            .regions()
-            .iter()
-            .filter(|region| {
-                region.action.as_ref().is_some_and(|action| {
-                    action.id.0 == action_id
-                        && action.payload.as_ref().is_some_and(|payload| {
-                            payload.get(payload_key).and_then(Value::as_str) == Some(payload_value)
-                        })
-                })
-            })
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            return Ok((
-                UiNodeId(matches[0].node_id.clone()),
-                matches[0]
-                    .action
-                    .clone()
-                    .expect("matching hit region has action metadata"),
-            ));
-        }
-        let matching_node_ids = matches
-            .iter()
-            .take(8)
-            .map(|region| region.node_id.clone())
-            .collect::<Vec<_>>();
-        Err(format!(
-            "expected exactly one production hit region for {action_id} with {payload_key}={payload_value:?}, found {}; matching_node_ids={matching_node_ids:?}",
-            matches.len()
-        ))
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    struct SessionBindingDescriptor {
-        filters: std::collections::BTreeMap<String, Value>,
-        item_template: UiNode,
-        empty_template: Option<UiNode>,
-    }
-
-    impl SessionBindingDescriptor {
-        fn session_uuid(&self) -> Option<&str> {
-            self.filters.get("session_uuid").and_then(Value::as_str)
-        }
-
-        fn lifecycle_class(&self) -> Option<&str> {
-            self.filters.get("lifecycle_class").and_then(Value::as_str)
-        }
-
-        fn item_root_id(&self) -> Option<&str> {
-            self.item_template
-                .id
-                .as_ref()
-                .and_then(UiAuthoredNodeId::as_literal)
-                .map(|id| id.0.as_str())
-        }
-
-        fn empty_root_id(&self) -> Option<&str> {
-            self.empty_template
-                .as_ref()
-                .and_then(|node| node.id.as_ref())
-                .and_then(UiAuthoredNodeId::as_literal)
-                .map(|id| id.0.as_str())
-        }
-    }
-
-    fn collect_session_bindings(root: &UiNode) -> Vec<SessionBindingDescriptor> {
-        fn visit_child(child: &UiChild, descriptors: &mut Vec<SessionBindingDescriptor>) {
-            match child {
-                UiChild::Node(node)
-                | UiChild::Conditional(UiConditional::When { node, .. })
-                | UiChild::Conditional(UiConditional::Hidden { node, .. })
-                | UiChild::BindIf(botster_ui_contract::UiBindIf::BindIf { node, .. })
-                | UiChild::BindIf(botster_ui_contract::UiBindIf::PresentationIf { node, .. }) => {
-                    visit_node(node, descriptors)
-                }
-                UiChild::BindList(botster_ui_contract::UiBindList::BindList {
-                    source,
-                    r#where,
-                    item_template,
-                    empty_template,
-                }) => {
-                    if source == "/session" {
-                        descriptors.push(SessionBindingDescriptor {
-                            filters: r#where.clone(),
-                            item_template: item_template.as_ref().clone(),
-                            empty_template: empty_template.as_deref().cloned(),
-                        });
-                    }
-                    visit_node(item_template, descriptors);
-                    if let Some(empty_template) = empty_template {
-                        visit_node(empty_template, descriptors);
-                    }
-                }
-            }
-        }
-
-        fn visit_node(node: &UiNode, descriptors: &mut Vec<SessionBindingDescriptor>) {
-            for child in node.children.iter().chain(node.slots.values().flatten()) {
-                visit_child(child, descriptors);
-            }
-        }
-
-        let mut descriptors = Vec::new();
-        visit_node(root, &mut descriptors);
-        descriptors
-    }
-
-    fn session_binding<'a>(
-        bindings: &'a [SessionBindingDescriptor],
-        session_uuid: &str,
-        lifecycle_class: Option<&str>,
-    ) -> &'a SessionBindingDescriptor {
-        bindings
-            .iter()
-            .find(|binding| {
-                binding.session_uuid() == Some(session_uuid)
-                    && binding.lifecycle_class() == lifecycle_class
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "owner surface must provide /session binding for session_uuid={session_uuid} lifecycle_class={lifecycle_class:?}; required by {WORKSPACES_DOWNSTREAM_TICKET}"
-                )
-            })
-    }
-
-    fn assert_binding_realization(
-        materialized: &UiNode,
-        binding: &SessionBindingDescriptor,
-        expect_item: bool,
-        expect_empty: bool,
-    ) {
-        let item_id = binding
-            .item_root_id()
-            .expect("Workspaces keeps per-reference item root identity literal");
-        assert_eq!(
-            find_ui_node_by_id(materialized, item_id).is_some(),
-            expect_item
-        );
-        match binding.empty_root_id() {
-            Some(empty_id) => {
-                assert_eq!(
-                    find_ui_node_by_id(materialized, empty_id).is_some(),
-                    expect_empty
-                )
-            }
-            None => assert!(!expect_empty, "expected empty template is absent"),
-        }
-    }
-
-    fn materialized_plugin_root(app: &TuiApp) -> UiNode {
-        materialize_plugin_surface(
-            &app.plugin_surface
-                .as_ref()
-                .expect("active plugin surface")
-                .body,
-            &app.session_entities,
-            &app.entity_options_projection_store(),
-            &app.drafts,
-            &app.entity_options_invalid_fields,
-        )
-        .expect("owner-authored Workspaces bindings materialize through TuiApp")
     }
 
     fn assert_realized_roots_follow_reference_order(
@@ -11980,384 +11541,6 @@ mod tests {
                 "terminal Hello must require {terminal_feature}"
             );
         }
-    }
-
-    fn session_binding_values(root: &UiNode, references: &[String]) -> BTreeMap<String, String> {
-        references
-            .iter()
-            .enumerate()
-            .map(|(index, session_uuid)| {
-                let lifecycle_id = format!("contract-session-{}-lifecycle", index + 1);
-                let unavailable_id = format!("contract-session-{}-unavailable", index + 1);
-                let value = if let Some(node) = find_ui_node_by_id(root, &lifecycle_id) {
-                    node.props
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .expect("materialized lifecycle text")
-                        .to_string()
-                } else {
-                    assert!(find_ui_node_by_id(root, &unavailable_id).is_some());
-                    "unavailable".to_string()
-                };
-                (session_uuid.clone(), value)
-            })
-            .collect()
-    }
-
-    fn assert_session_binding_frame(
-        app: &TuiApp,
-        expected: &BTreeMap<String, String>,
-        references: &[String],
-        expected_rows: &[botster_hub_test_support::SessionPluginMaterializedRow],
-    ) {
-        let root = materialize_plugin_surface(
-            &app.plugin_surface.as_ref().expect("active surface").body,
-            &app.session_entities,
-            &app.entity_options_projection_store(),
-            &app.drafts,
-            &app.entity_options_invalid_fields,
-        )
-        .expect("canonical session bindings materialize");
-        assert_eq!(session_binding_values(&root, references), *expected);
-        let mut actual_rows = Vec::new();
-        collect_session_action_rows(&root, &mut actual_rows);
-        assert_eq!(actual_rows, expected_rows);
-
-        let (lines, hit_map) = renderer::render_to_lines(&app.surface(), 180, 60);
-        let rendered = lines.join("\n");
-        for fallback in ["bind /", "bind @/", "bound list: waiting for entities"] {
-            assert!(!rendered.contains(fallback), "{rendered}");
-        }
-        for (index, session_uuid) in references.iter().enumerate() {
-            let value = expected
-                .get(session_uuid)
-                .expect("published expected value");
-            let (suffix, text) = if value == "unavailable" {
-                ("unavailable", "Session unavailable")
-            } else {
-                ("lifecycle", value.as_str())
-            };
-            assert!(rendered.contains(text), "{rendered}");
-            let node_id = format!("contract-session-{}-{suffix}", index + 1);
-            assert!(
-                hit_map
-                    .regions()
-                    .iter()
-                    .any(|region| region.node_id == node_id),
-                "{node_id} should be present in the production frame hit map"
-            );
-        }
-    }
-
-    fn collect_session_action_rows(
-        node: &UiNode,
-        rows: &mut Vec<botster_hub_test_support::SessionPluginMaterializedRow>,
-    ) {
-        if let Some(id) = node.id.as_ref().and_then(UiAuthoredNodeId::as_literal) {
-            let controls = node
-                .children
-                .iter()
-                .filter_map(static_child_node)
-                .filter_map(|control| {
-                    let action: botster_ui_contract::UiAction = control
-                        .props
-                        .get("action")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())?;
-                    (action.id.0 == "contract.action").then(|| {
-                        let action_payload = action
-                            .payload
-                            .expect("canonical descendant action has a payload");
-                        let key = action_payload
-                            .get("operation")
-                            .and_then(Value::as_str)
-                            .expect("canonical descendant action names its operation")
-                            .to_string();
-                        let node_id = control
-                            .id
-                            .as_ref()
-                            .and_then(UiAuthoredNodeId::as_literal)
-                            .expect("canonical descendant identity is materialized")
-                            .0
-                            .clone();
-                        let label = control
-                            .props
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .expect("canonical descendant label is materialized")
-                            .to_string();
-                        botster_hub_test_support::SessionPluginMaterializedControl {
-                            key,
-                            node_id,
-                            label,
-                            action_payload,
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            if !controls.is_empty() {
-                rows.push(botster_hub_test_support::SessionPluginMaterializedRow {
-                    node_id: id.0.clone(),
-                    controls,
-                });
-            }
-        }
-        for child in node
-            .children
-            .iter()
-            .chain(node.slots.values().flatten())
-            .filter_map(static_child_node)
-        {
-            collect_session_action_rows(child, rows);
-        }
-    }
-
-    fn assert_keyboard_and_mouse_dispatch(
-        app: &mut TuiApp,
-        expected_rows: &[botster_hub_test_support::SessionPluginMaterializedRow],
-    ) {
-        assert!(
-            !expected_rows.is_empty(),
-            "published oracle must retain an action row"
-        );
-        for row in expected_rows {
-            assert_eq!(
-                row.controls
-                    .iter()
-                    .map(|control| control.key.as_str())
-                    .collect::<Vec<_>>(),
-                ["spawn", "rename", "remove"],
-                "published row {} must retain the three ordered controls",
-                row.node_id
-            );
-        }
-        let keyboard_target = expected_rows
-            .last()
-            .expect("checked nonempty rows")
-            .controls
-            .iter()
-            .find(|control| control.key == "rename")
-            .expect("published final row retains the rename control");
-        let mouse_target = expected_rows[0]
-            .controls
-            .iter()
-            .find(|control| control.key == "remove")
-            .expect("published first row retains the remove control");
-        let expected_controls = expected_rows
-            .iter()
-            .flat_map(|row| row.controls.iter())
-            .collect::<Vec<_>>();
-        assert_eq!(expected_controls.len(), expected_rows.len() * 3);
-        let mut router =
-            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
-        let (_lines, hit_map) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            180,
-            60,
-            &router.render_state(),
-            &app.plugin_presentation,
-        );
-        router.reconcile(&hit_map);
-        let region_rects = expected_controls
-            .iter()
-            .map(|control| {
-                hit_map
-                    .regions()
-                    .iter()
-                    .find(|region| region.node_id == control.node_id)
-                    .map(|region| {
-                        (
-                            region.rect.x,
-                            region.rect.y,
-                            region.rect.width,
-                            region.rect.height,
-                        )
-                    })
-                    .expect("each producer control has a distinct production hit region")
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(region_rects.len(), expected_controls.len());
-
-        let first_region = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == expected_controls[0].node_id)
-            .expect("first producer control has a hit region");
-        let second_region = hit_map
-            .regions()
-            .iter()
-            .find(|region| region.node_id == expected_controls[1].node_id)
-            .expect("second producer control has a hit region");
-        assert!(matches!(
-            router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
-                    first_region.rect.x,
-                    first_region.rect.y,
-                ),
-                &hit_map,
-            ),
-            InputDispatch::Focus { .. }
-        ));
-        assert!(matches!(
-            router.dispatch_event(
-                mouse_event(
-                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                    second_region.rect.x,
-                    second_region.rect.y,
-                ),
-                &hit_map,
-            ),
-            InputDispatch::Ignored
-        ));
-        assert_eq!(
-            router.focused_node_id(),
-            Some(expected_controls[0].node_id.as_str())
-        );
-        let mut focused = vec![expected_controls[0].node_id.clone()];
-        for _ in 0..=(2 * hit_map.regions().len() + 1) {
-            if let InputDispatch::Focus { node_id } = router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &hit_map,
-            ) && expected_controls
-                .iter()
-                .any(|control| control.node_id == node_id)
-                && !focused.contains(&node_id)
-            {
-                focused.push(node_id);
-            }
-            if focused.len() == expected_controls.len() {
-                break;
-            }
-        }
-        assert_eq!(
-            focused,
-            expected_controls
-                .iter()
-                .map(|control| control.node_id.clone())
-                .collect::<Vec<_>>(),
-            "Tab traversal must follow producer control order"
-        );
-        for _ in 0..=hit_map.regions().len() {
-            if router.focused_node_id() == Some(keyboard_target.node_id.as_str()) {
-                break;
-            }
-            router.dispatch_event(
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                &hit_map,
-            );
-        }
-        assert_eq!(
-            router.focused_node_id(),
-            Some(keyboard_target.node_id.as_str())
-        );
-
-        let mut keyboard_request = None;
-        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
-            let dispatch = router.dispatch_event(
-                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
-                &hit_map,
-            );
-            let InputDispatch::Action(request) = &dispatch else {
-                panic!("focused control must dispatch for {code:?}, got {dispatch:?}");
-            };
-            assert_eq!(
-                request.node_id,
-                Some(UiNodeId(keyboard_target.node_id.clone()))
-            );
-            assert_eq!(
-                request.payload.as_ref(),
-                Some(&keyboard_target.action_payload)
-            );
-            keyboard_request.get_or_insert_with(|| request.clone());
-        }
-
-        let mut mouse_router =
-            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
-        let (_lines, mouse_hits) = renderer::render_to_lines_with_presentation_state(
-            &app.surface(),
-            180,
-            60,
-            &mouse_router.render_state(),
-            &app.plugin_presentation,
-        );
-        let region = mouse_hits
-            .regions()
-            .iter()
-            .find(|region| region.node_id == mouse_target.node_id)
-            .expect("target control remains in the production hit map");
-        let down = mouse_router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                region.rect.x,
-                region.rect.y,
-            ),
-            &mouse_hits,
-        );
-        assert!(matches!(down, InputDispatch::Focus { .. }));
-        let up = mouse_router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                region.rect.x,
-                region.rect.y,
-            ),
-            &mouse_hits,
-        );
-        let InputDispatch::Action(request) = &up else {
-            panic!("target control mouse release must dispatch, got {up:?}");
-        };
-        assert_eq!(
-            request.node_id,
-            Some(UiNodeId(mouse_target.node_id.clone()))
-        );
-        assert_eq!(request.payload.as_ref(), Some(&mouse_target.action_payload));
-
-        let neighboring_region = mouse_hits
-            .regions()
-            .iter()
-            .find(|candidate| candidate.node_id == keyboard_target.node_id)
-            .expect("neighboring control remains in the production hit map");
-        let mut mismatched_router =
-            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
-        let mismatched_down = mismatched_router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                region.rect.x,
-                region.rect.y,
-            ),
-            &mouse_hits,
-        );
-        assert!(matches!(mismatched_down, InputDispatch::Focus { .. }));
-        let mismatched_up = mismatched_router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                neighboring_region.rect.x,
-                neighboring_region.rect.y,
-            ),
-            &mouse_hits,
-        );
-        assert!(matches!(mismatched_up, InputDispatch::Ignored));
-        let mut unpaired_router =
-            InputRouter::new(renderer::action_request_context_for("contract.sessions"));
-        let unpaired_up = unpaired_router.dispatch_event(
-            mouse_event(
-                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                neighboring_region.rect.x,
-                neighboring_region.rect.y,
-            ),
-            &mouse_hits,
-        );
-        assert!(matches!(unpaired_up, InputDispatch::Ignored));
-        app.observed_requests.clear();
-        app.handle_dispatch(InputDispatch::Action(
-            keyboard_request.expect("Enter produced a typed request"),
-        ));
-        assert!(app.observed_requests.iter().any(|observed| matches!(
-            observed,
-            ObservedRequest::PluginSurfaceAction { request, .. }
-                if request.node_id == Some(UiNodeId(keyboard_target.node_id.clone()))
-                    && request.payload.as_ref() == Some(&keyboard_target.action_payload)
-        )));
     }
 
     #[test]
@@ -13674,107 +12857,6 @@ mod tests {
         assert_eq!(app.selected_session.as_deref(), Some("session-alpha"));
     }
 
-    fn producer_ghostsnp(size: TerminalScreenSize, bytes: &[u8]) -> Vec<u8> {
-        use botster_terminal_ghostty::{GhosttyAdapterConfig, GhosttyTerminal};
-        let mut producer = GhosttyTerminal::with_config(
-            size,
-            GhosttyAdapterConfig::with_max_scrollback_bytes(512 * 1024),
-        )
-        .expect("producer GhosttyTerminal");
-        producer.write_output_bytes(bytes);
-        producer
-            .export_snapshot_bytes()
-            .expect("export GHOSTSNP producer bytes")
-    }
-
-    fn producer_incremental_ghostsnp(
-        size: TerminalScreenSize,
-        bytes: &[u8],
-    ) -> Vec<botster_terminal_ghostty::GhosttySnapshotFrame> {
-        use botster_terminal_ghostty::{GhosttyAdapterConfig, GhosttyTerminal};
-        let mut producer = GhosttyTerminal::with_config(
-            size,
-            GhosttyAdapterConfig::with_max_scrollback_bytes(8 * 1024 * 1024),
-        )
-        .expect("producer GhosttyTerminal");
-        producer.write_output_bytes(bytes);
-        let mut frames = Vec::new();
-        producer
-            .export_snapshot_frames(|frame| {
-                frames.push(frame);
-                true
-            })
-            .expect("export incremental GHOSTSNP frames");
-        frames
-    }
-
-    fn viewport_cache_contains(app: &TuiApp, needle: &str) -> bool {
-        let Some(viewport) = app.ghostty_viewport_cache.as_ref() else {
-            return false;
-        };
-        let mut row = String::new();
-        for (i, cell) in viewport.cells.iter().enumerate() {
-            if i > 0 && i % viewport.cols as usize == 0 {
-                if row.contains(needle) {
-                    return true;
-                }
-                row.clear();
-            }
-            row.push_str(&cell.grapheme);
-        }
-        row.contains(needle)
-    }
-
-    #[derive(Debug, Clone)]
-    struct PaintedCell {
-        x: u16,
-        y: u16,
-        symbol: char,
-        fg: Option<(u8, u8, u8)>,
-        bold: bool,
-    }
-
-    fn render_app_painted(
-        app: &TuiApp,
-        width: u16,
-        height: u16,
-    ) -> (String, HitMap, Vec<PaintedCell>) {
-        use ratatui::style::{Color, Modifier};
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("test backend should initialize");
-        let mut hit_map = HitMap::default();
-        terminal
-            .draw(|frame| draw(frame, &mut hit_map, app, &RenderState::default()))
-            .expect("application shell should render");
-        let buffer = terminal.backend().buffer();
-        let mut cells = Vec::new();
-        let mut lines = Vec::new();
-        for y in 0..height {
-            let mut line = String::new();
-            for x in 0..width {
-                let cell = &buffer[(x, y)];
-                let ch = cell.symbol().chars().next().unwrap_or(' ');
-                let style = cell.style();
-                let fg = match style.fg.unwrap_or(cell.fg) {
-                    Color::Rgb(r, g, b) => Some((r, g, b)),
-                    _ => None,
-                };
-                let bold = style.add_modifier.contains(Modifier::BOLD)
-                    || cell.modifier.contains(Modifier::BOLD);
-                cells.push(PaintedCell {
-                    x,
-                    y,
-                    symbol: ch,
-                    fg,
-                    bold,
-                });
-                line.push(ch);
-            }
-            lines.push(line);
-        }
-        (lines.join("\n"), hit_map, cells)
-    }
-
     #[test]
     fn missing_terminal_snapshot_delivery_on_hello_ack_fails_before_attach() {
         let mut compatibility = TerminalCompatibility::current();
@@ -13821,59 +12903,6 @@ mod tests {
         };
         admit_terminal_hello(&ack)
             .expect_err("omitted terminal_compatibility must fail before Attach");
-    }
-
-    #[derive(Clone, Copy)]
-    enum DetachStubMode {
-        WithholdResponse,
-        StopReadingAfterAttach,
-    }
-
-    #[derive(Debug)]
-    enum RecoveryStubEvent {
-        Hello,
-        Request(&'static str, Option<String>),
-        TerminalInput(String),
-    }
-
-    struct RecoveryHubStub {
-        root: PathBuf,
-        endpoint: DaemonEndpoint,
-        events: mpsc::Receiver<RecoveryStubEvent>,
-        running: Arc<AtomicBool>,
-        listener_thread: Option<thread::JoinHandle<()>>,
-    }
-
-    impl Drop for RecoveryHubStub {
-        fn drop(&mut self) {
-            self.running.store(false, Ordering::Release);
-            if let Some(listener_thread) = self.listener_thread.take() {
-                let _ = listener_thread.join();
-            }
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn assert_no_shutdown_session(app: &TuiApp) {
-        assert!(
-            !app.observed_requests
-                .iter()
-                .any(|request| matches!(request, ObservedRequest::ShutdownSession(_))),
-            "shared teardown must never send ShutdownSession: {:?}",
-            app.observed_requests
-        );
-    }
-
-    fn empty_mode_flags() -> TerminalModeFlags {
-        TerminalModeFlags {
-            kitty_enabled: false,
-            cursor_visible: false,
-            bracketed_paste: false,
-            mouse_mode: 0,
-            alt_screen: false,
-            focus_reporting: false,
-            application_cursor: false,
-        }
     }
 
     #[test]
@@ -14116,16 +13145,6 @@ mod tests {
         assert_ne!(request.action_id.0, "botster_workspaces.open");
     }
 
-    fn occupancy_has_pair(
-        occupancy: &[botster_hub_client::DaemonAttachOccupancy],
-        session_id: &str,
-        subscription_id: &str,
-    ) -> bool {
-        occupancy
-            .iter()
-            .any(|row| row.session_id == session_id && row.subscription_id == subscription_id)
-    }
-
     /// Hermetic: contract-matrix mode must fail closed when its fixture env is
     /// missing, independent of any Workspaces profile path.
     #[test]
@@ -14261,56 +13280,6 @@ mod tests {
         );
     }
 
-    fn run_fixture_command(directory: &Path, program: &str, args: &[&str]) {
-        let output = std::process::Command::new(program)
-            .args(args)
-            .current_dir(directory)
-            .output()
-            .unwrap_or_else(|error| panic!("run {program} {args:?}: {error}"));
-        assert!(
-            output.status.success(),
-            "{program} {args:?} failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn hex_path_component(value: &str) -> String {
-        value
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    }
-
-    fn assert_rendered_plugin_surface_contains(
-        surface: &DaemonPluginSurface,
-        expected_node_id: &str,
-        expected_text: &str,
-    ) -> String {
-        let body =
-            serde_json::to_string(&surface.body).expect("delivered surface body should serialize");
-        assert!(
-            body.contains(expected_node_id),
-            "delivered surface body should include node id {expected_node_id}: {body}",
-        );
-        let node = plugin_surface_body_node(surface).expect("delivered surface validates for TUI");
-        let (lines, _) = renderer::render_to_lines(&node, 180, 80);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.contains(expected_text),
-            "rendered plugin surface should contain {expected_text:?}: {rendered}"
-        );
-        rendered
-    }
-
-    fn skip_or_panic(variable: &'static str) {
-        if std::env::var_os("BOTSTER_TUI_REQUIRE_HUB_TEST").is_some() {
-            panic!("{variable} is required when BOTSTER_TUI_REQUIRE_HUB_TEST is set");
-        }
-        eprintln!("skipping isolated Hub live-runtime test; {variable} is not set");
-    }
-
     fn source_without_line_comments() -> String {
         let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         std::fs::read_dir(src_dir)
@@ -14374,12 +13343,6 @@ mod tests {
         }
     }
 
-    /// Renders a typed session entity as the [`Value`] record Hub entity frames
-    /// now carry, so frame construction sites do not duplicate entity literals.
-    fn session_entity_value(entity: DaemonSessionEntity) -> Value {
-        serde_json::to_value(entity).expect("session entity serializes as a value")
-    }
-
     fn status_response(lifecycle_state: &str, schema_version: u16) -> DaemonResponse {
         status_response_with_package_counts(lifecycle_state, schema_version, 0, 0)
     }
@@ -14393,6 +13356,7 @@ mod tests {
         let mut response = base_response(DaemonResponseKind::Status);
         response.status = Some(botster_hub_client::DaemonStatus {
             lifecycle_state: lifecycle_state.to_string(),
+            retention: None,
             compatibility: DaemonCompatibility {
                 protocol: PROTOCOL.to_string(),
                 protocol_version: 1,
@@ -14479,40 +13443,6 @@ mod tests {
         let mut response = base_response(DaemonResponseKind::PackageUpdateStatus);
         response.update_status = Some(status);
         response
-    }
-
-    fn plugin_surface_response(surface: DaemonPluginSurface) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::PluginSurface);
-        response.plugin_surface = Some(surface);
-        response
-    }
-
-    fn plugin_action_response(result: Value) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::PluginActionResult);
-        response.plugin_action_result =
-            Some(serde_json::from_value(result).expect("fixture action result should be valid"));
-        response
-    }
-
-    fn ui_node(value: Value) -> UiNode {
-        serde_json::from_value(value).expect("fixture UiNode should be valid")
-    }
-
-    fn plugin_request(
-        request_id: &str,
-        surface_id: &str,
-        action_id: &str,
-        node_id: &str,
-    ) -> UiActionRequest {
-        UiActionRequest {
-            request_id: UiActionRequestId(request_id.to_string()),
-            surface_id: UiSurfaceId(surface_id.to_string()),
-            action_id: UiActionId(action_id.to_string()),
-            node_id: Some(UiNodeId(node_id.to_string())),
-            kind: UiActionKind::Submit,
-            values: None,
-            payload: None,
-        }
     }
 
     fn plugin_contract_app_navigation() -> DaemonPackageNavigationEntry {
@@ -14909,21 +13839,6 @@ mod tests {
             operation: "spawn".to_string(),
             message: message.to_string(),
             diagnostics,
-        });
-        response
-    }
-
-    fn events_response(events: Vec<DaemonEvent>) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::Events);
-        response.events = events;
-        response
-    }
-
-    fn read_screen_response(session_id: &str, text: &str) -> DaemonResponse {
-        let mut response = base_response(DaemonResponseKind::ReadScreen);
-        response.read_screen = Some(botster_hub_client::DaemonReadScreen {
-            session_id: session_id.to_string(),
-            text: text.to_string(),
         });
         response
     }
@@ -15903,32 +14818,6 @@ mod tests {
         );
     }
 
-    fn rust_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
-        let start = source
-            .find(signature)
-            .unwrap_or_else(|| panic!("source is missing {signature}"));
-        let brace = source[start..]
-            .find('{')
-            .unwrap_or_else(|| panic!("{signature} has no body"));
-        let body_start = start + brace;
-        let mut depth = 0usize;
-        for (offset, ch) in source[body_start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .unwrap_or_else(|| panic!("{signature} brace underflow"));
-                    if depth == 0 {
-                        return &source[body_start..=body_start + offset];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("{signature} body did not close");
-    }
-
     #[test]
     fn session_type_real_input_create_button_dispatches_through_input_router() {
         let mut app = TuiApp::new(None);
@@ -15980,25 +14869,6 @@ mod tests {
         }
     }
 
-    fn matrix_package(ttl_ms: u32) -> DaemonPackage {
-        let mut pkg = package(MATRIX_OWNER, "1.0.0", "plugin", "enabled", Vec::new(), true);
-        pkg.notice_reactions = vec![matrix_descriptor(ttl_ms)];
-        pkg
-    }
-
-    fn notice_package(owner: &str, name: &str, ttl_ms: u32) -> DaemonPackage {
-        let mut pkg = package(owner, "1.0.0", "plugin", "enabled", Vec::new(), true);
-        pkg.notice_reactions = vec![PackageNoticeReactionDescriptor {
-            owner: owner.to_string(),
-            name: name.to_string(),
-            subject_scope: botster_ui_contract::PackageNoticeSubjectScope::Session,
-            text_pointer: "/notice".to_string(),
-            ttl_ms,
-            severity: botster_ui_contract::PackageNoticeSeverity::Info,
-        }];
-        pkg
-    }
-
     fn activate_notice(app: &mut TuiApp, subscription_id: &str, ttl_ms: u32, subject: &str) {
         let descriptor = matrix_descriptor(ttl_ms);
         let key = (descriptor.owner.clone(), descriptor.name.clone());
@@ -16012,32 +14882,6 @@ mod tests {
                 state: EventSubscriptionState::Active(subscription_id.to_string()),
             },
         );
-    }
-
-    fn package_event_line(
-        subscription_id: &str,
-        owner: &str,
-        name: &str,
-        payload: Value,
-    ) -> String {
-        serde_json::to_string(&json!({
-            "type": "package_event",
-            "subscription_id": subscription_id,
-            "owner": owner,
-            "name": name,
-            "payload": payload,
-        }))
-        .expect("serialize package_event")
-    }
-
-    fn event_gap_line(subscription_id: &str, owner: &str, name: &str) -> String {
-        serde_json::to_string(&json!({
-            "type": "event_gap",
-            "subscription_id": subscription_id,
-            "owner": owner,
-            "name": name,
-        }))
-        .expect("serialize event_gap")
     }
 
     fn rendered_workspace(app: &TuiApp) -> String {
@@ -16063,56 +14907,6 @@ mod tests {
                 .iter()
                 .any(|feature| feature == FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS)
         );
-    }
-
-    fn overlay_contract_matrix_emit(root: &Path) -> PathBuf {
-        let package_dir = botster_hub_test_support::copy_plugin_contract_matrix_fixture(root)
-            .expect("copy hub-owned plugin-contract-matrix fixture");
-        let plugin_path = package_dir.join("plugin.lua");
-        let original = std::fs::read_to_string(&plugin_path).expect("read fixture plugin.lua");
-        let injected = original.replace(
-            "return botster.register({\n  handlers = {",
-            r#"return botster.register({
-  tools = {
-    {
-      name = "contract.emit_ready",
-      description = "Emit the declared contract.ready notice event.",
-      input_schema = {
-        type = "object",
-        additionalProperties = false,
-        properties = {
-          subject = { type = "string" },
-          notice = { type = "string" },
-        },
-      },
-      handler = "emit_ready",
-      call = function(args)
-        local payload = {
-          notice = args.notice or "ready",
-        }
-        if args.subject ~= nil then
-          payload.subject = args.subject
-        end
-        return events.emit("contract.ready", payload)
-      end,
-    },
-  },
-  handlers = {"#,
-        );
-        assert_ne!(
-            injected, original,
-            "fixture plugin.lua must still start its register table with handlers"
-        );
-        std::fs::write(&plugin_path, injected).expect("write emit overlay");
-        package_dir
-    }
-
-    fn set_event_flush_stall(path: &Path, stalled: bool) {
-        if stalled {
-            std::fs::write(path, b"stall").expect("create event flush stall");
-        } else {
-            let _ = std::fs::remove_file(path);
-        }
     }
 
     #[test]
@@ -16146,6 +14940,8 @@ mod tests {
             terminal_reservation: None,
             subscription_reservation: None,
             capture_snapshot: None,
+            snapshot_page: None,
+            terminal_attach: None,
             spawn_targets: Vec::new(),
             spawn_target_validation: None,
             worktrees: Vec::new(),
@@ -16210,11 +15006,9 @@ mod tests {
     /// Complete the Attach request for `route` with the trusted generation.
     fn complete_attach(app: &mut TuiApp, session_id: &str, route: &str, generation: u64) {
         let mut response = base_response(DaemonResponseKind::TerminalAttached);
-        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach {
-            session_id: session_id.to_string(),
-            subscription_id: route.to_string(),
-            generation,
-        });
+        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach::new(
+            session_id, route, generation,
+        ));
         app.apply_completion(
             PendingReply::Attach {
                 session_id: session_id.to_string(),
@@ -16429,11 +15223,11 @@ mod tests {
         let mut app = workspace_fixture();
         app.begin_attach_hydration("session-alpha", "route-1");
         let mut response = base_response(DaemonResponseKind::TerminalAttached);
-        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach {
-            session_id: "session-alpha".to_string(),
-            subscription_id: "route-1".to_string(),
-            generation: 6,
-        });
+        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach::new(
+            "session-alpha",
+            "route-1",
+            6,
+        ));
         app.apply_completion(
             PendingReply::Attach {
                 session_id: "session-alpha".to_string(),

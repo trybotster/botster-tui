@@ -609,12 +609,6 @@ impl HubIo {
         self.ready.push_back(wake);
     }
 
-    /// Ids of outstanding requests in submission order. Test observation only.
-    #[cfg(test)]
-    pub fn pending_request_ids(&self) -> Vec<u64> {
-        self.pending.keys().copied().collect()
-    }
-
     /// Take one wake without waiting.
     pub fn try_next_wake(&mut self) -> Option<AppWake> {
         if let Some(wake) = self.ready.pop_front() {

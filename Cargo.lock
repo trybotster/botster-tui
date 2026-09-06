@@ -171,7 +171,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=bf6e7d996bca2786ad4142c870a13c57a490e241#bf6e7d996bca2786ad4142c870a13c57a490e241"
+source = "git+https://github.com/trybotster/botster-core.git?rev=a931125b027f5832845ae0365a8011d499f61ab6#a931125b027f5832845ae0365a8011d499f61ab6"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -179,6 +179,7 @@ dependencies = [
  "botster-terminal-protocol-client",
  "libc",
  "portable-pty",
+ "redb",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -190,7 +191,7 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=bf6e7d996bca2786ad4142c870a13c57a490e241#bf6e7d996bca2786ad4142c870a13c57a490e241"
+source = "git+https://github.com/trybotster/botster-core.git?rev=a931125b027f5832845ae0365a8011d499f61ab6#a931125b027f5832845ae0365a8011d499f61ab6"
 dependencies = [
  "botster-core",
  "botster-terminal-protocol",
@@ -201,7 +202,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=1a0df65230a476cfea362fdc5131e035d303a928#1a0df65230a476cfea362fdc5131e035d303a928"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=c64b3cc4f7a6428ee9e09fcf027a2c21eed66e3e#c64b3cc4f7a6428ee9e09fcf027a2c21eed66e3e"
 dependencies = [
  "base64",
  "botster-terminal-protocol",
@@ -213,11 +214,13 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=1a0df65230a476cfea362fdc5131e035d303a928#1a0df65230a476cfea362fdc5131e035d303a928"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=c64b3cc4f7a6428ee9e09fcf027a2c21eed66e3e#c64b3cc4f7a6428ee9e09fcf027a2c21eed66e3e"
 dependencies = [
+ "base64",
  "botster-core",
  "botster-hub-client",
  "botster-terminal-protocol",
+ "botster-terminal-protocol-client",
  "botster-ui-contract",
  "libc",
  "serde",
@@ -227,15 +230,16 @@ dependencies = [
 [[package]]
 name = "botster-terminal-ghostty"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=bf6e7d996bca2786ad4142c870a13c57a490e241#bf6e7d996bca2786ad4142c870a13c57a490e241"
+source = "git+https://github.com/trybotster/botster-core.git?rev=a931125b027f5832845ae0365a8011d499f61ab6#a931125b027f5832845ae0365a8011d499f61ab6"
 dependencies = [
  "botster-core",
+ "botster-terminal-protocol",
 ]
 
 [[package]]
 name = "botster-terminal-protocol"
-version = "0.2.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=bf6e7d996bca2786ad4142c870a13c57a490e241#bf6e7d996bca2786ad4142c870a13c57a490e241"
+version = "0.4.0"
+source = "git+https://github.com/trybotster/botster-core.git?rev=a931125b027f5832845ae0365a8011d499f61ab6#a931125b027f5832845ae0365a8011d499f61ab6"
 dependencies = [
  "serde",
  "serde_json",
@@ -244,13 +248,10 @@ dependencies = [
 
 [[package]]
 name = "botster-terminal-protocol-client"
-version = "0.3.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=bf6e7d996bca2786ad4142c870a13c57a490e241#bf6e7d996bca2786ad4142c870a13c57a490e241"
+version = "0.5.0"
+source = "git+https://github.com/trybotster/botster-core.git?rev=a931125b027f5832845ae0365a8011d499f61ab6#a931125b027f5832845ae0365a8011d499f61ab6"
 dependencies = [
- "base64",
  "botster-terminal-protocol",
- "serde",
- "serde_json",
  "thiserror 2.0.20",
 ]
 
@@ -267,6 +268,7 @@ dependencies = [
  "botster-tui-kit",
  "botster-ui-contract",
  "crossterm",
+ "futures-lite",
  "jsonschema",
  "ratatui",
  "serde",
@@ -418,6 +420,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -657,6 +660,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -717,6 +726,25 @@ name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-io"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
+
+[[package]]
+name = "futures-lite"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f78e10609fe0e0b3f4157ffab1876319b5b0db102a2c60dc4626306dc46b44ad"
+dependencies = [
+ "fastrand",
+ "futures-core",
+ "futures-io",
+ "parking",
+ "pin-project-lite",
+]
 
 [[package]]
 name = "futures-task"
@@ -1395,6 +1423,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "parking"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1724,6 +1758,15 @@ dependencies = [
  "time",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
