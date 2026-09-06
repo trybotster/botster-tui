@@ -31,11 +31,6 @@ pub const SESSION_WORKER_BIN_ENV: &str = "BOTSTER_SESSION_WORKER_BIN";
 pub const HUB_BUILD_TARGET_DIR_ENV: &str = "BOTSTER_HUB_BUILD_TARGET_DIR";
 /// JSON build receipt written by the live harness after locked Hub builds.
 pub const CLAIM_BUILD_RECEIPT_ENV: &str = "BOTSTER_TUI_CLAIM_BUILD_RECEIPT";
-/// Optional path for the live test harness to copy validated claim evidence
-/// outside the tracked tree. The production claim driver never writes here.
-/// Named for `script/test-live-hub workspaces claim-driver`.
-#[cfg(test)]
-pub const CLAIM_EVIDENCE_OUT_ENV: &str = "BOTSTER_TUI_CLAIM_EVIDENCE_OUT";
 /// Parent ticket prose alias; maps to `BOTSTER_HUB_DATA_DIR` when that is unset.
 pub const LIVE_DATA_DIR_ENV: &str = "BOTSTER_LIVE_DATA_DIR";
 
