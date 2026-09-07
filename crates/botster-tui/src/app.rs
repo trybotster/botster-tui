@@ -86,6 +86,7 @@ const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(8);
+const UNSAFE_PASTE_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Live OUTPUT retained while SNAPSHOT_HISTORY is still arriving for a route.
 const MAX_HYDRATION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// Encoded input retained while a route is still attaching.
@@ -378,6 +379,39 @@ struct TerminalModeState {
 enum DestructiveAction {
     Shutdown(String),
     Remove(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnsafePasteConsentStage {
+    Review,
+    Armed,
+}
+
+#[derive(Debug)]
+enum PendingUnsafePaste {
+    AwaitingResult {
+        operation_id: u64,
+        route: String,
+        generation: u64,
+        payload: Vec<u8>,
+    },
+    AwaitingConsent {
+        route: String,
+        generation: u64,
+        payload: Vec<u8>,
+        deadline: Instant,
+        stage: UnsafePasteConsentStage,
+    },
+}
+
+impl PendingUnsafePaste {
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::AwaitingResult { payload, .. } | Self::AwaitingConsent { payload, .. } => {
+                payload.len()
+            }
+        }
+    }
 }
 
 /// What the application does with one host-control completion.
@@ -1657,6 +1691,8 @@ struct TuiApp {
     terminal_modes: Option<TerminalModeState>,
     /// Client-side input window for the current route generation.
     input_window: InputWindow,
+    /// One raw paste retained only until its result or explicit consent ends.
+    pending_unsafe_paste: Option<PendingUnsafePaste>,
     terminal_viewport_size: TerminalScreenSize,
     drafts: BTreeMap<String, Value>,
     system_details_visible: bool,
@@ -1782,6 +1818,7 @@ impl TuiApp {
             terminal_close_evidence: None,
             terminal_modes: None,
             input_window: InputWindow::new(),
+            pending_unsafe_paste: None,
             terminal_viewport_size: TerminalScreenSize::new(
                 DEFAULT_TERMINAL_ROWS,
                 DEFAULT_TERMINAL_COLS,
@@ -1876,6 +1913,14 @@ impl TuiApp {
         consider(self.reconnect_at);
         consider(self.transient_notice.as_ref().map(|notice| notice.deadline));
         consider(
+            self.pending_unsafe_paste
+                .as_ref()
+                .and_then(|pending| match pending {
+                    PendingUnsafePaste::AwaitingConsent { deadline, .. } => Some(*deadline),
+                    PendingUnsafePaste::AwaitingResult { .. } => None,
+                }),
+        );
+        consider(
             self.entity_options_retry
                 .values()
                 .map(|state| state.next_attempt_at)
@@ -1920,6 +1965,7 @@ impl TuiApp {
     fn apply_deadlines(&mut self) {
         let now = Instant::now();
         self.expire_transient_notice();
+        self.expire_unsafe_paste_consent(now);
         if self.reconnect_at.is_some_and(|at| at <= now) {
             self.reconnect_at = None;
             self.connect();
@@ -1932,6 +1978,7 @@ impl TuiApp {
     /// Project the viewport once when the projection changed since last paint.
     fn prepare_paint(&mut self) {
         self.expire_transient_notice();
+        self.expire_unsafe_paste_consent(Instant::now());
         if self.projection_dirty {
             self.refresh_ghostty_viewport_cache();
         }
@@ -2029,6 +2076,9 @@ impl TuiApp {
     }
 
     fn handle_focused_terminal_paste(&mut self, text: &str, focused_node_id: Option<&str>) -> bool {
+        // Every new paste event invalidates a prior retry, even when a modal
+        // currently owns focus. The current event is never replayed.
+        self.invalidate_unsafe_paste();
         if !is_terminal_node(focused_node_id) {
             return false;
         }
@@ -2182,6 +2232,13 @@ impl TuiApp {
         if key.code != KeyCode::Esc || key.modifiers != KeyModifiers::NONE {
             return false;
         }
+        if matches!(
+            self.pending_unsafe_paste.as_ref(),
+            Some(PendingUnsafePaste::AwaitingConsent { .. })
+        ) {
+            self.invalidate_unsafe_paste();
+            return true;
+        }
         if self.confirmation.is_some() {
             self.confirmation = None;
             return true;
@@ -2313,6 +2370,15 @@ impl TuiApp {
                     }
                 }
             }
+            "botster.tui.unsafe_paste.review" => {
+                if let Some(PendingUnsafePaste::AwaitingConsent { stage, .. }) =
+                    self.pending_unsafe_paste.as_mut()
+                {
+                    *stage = UnsafePasteConsentStage::Armed;
+                }
+            }
+            "botster.tui.unsafe_paste.cancel" => self.invalidate_unsafe_paste(),
+            "botster.tui.unsafe_paste.confirm" => self.confirm_unsafe_paste(),
             "botster.tui.navigation.open" => {
                 if let Some((package_name, surface_id, route_id)) =
                     navigation_open_payload(&payload)
@@ -2560,6 +2626,7 @@ impl TuiApp {
     /// one explicit line instead of a silently dropped result.
     fn resolve_unknown_input_operations(&mut self, reason: &str) {
         let unresolved = self.input_window.in_flight_len();
+        self.invalidate_unsafe_paste();
         self.input_window = InputWindow::new();
         if unresolved > 0 {
             self.action_feedback = Some(format!(
@@ -4398,6 +4465,7 @@ impl TuiApp {
         let Some((session_id, route)) = self.current_owner_pair() else {
             return;
         };
+        self.invalidate_unsafe_paste();
         if let Some(projection) = self.ghostty_projection.as_mut() {
             projection.abort_ghostsnp_history();
         }
@@ -4475,6 +4543,43 @@ impl TuiApp {
             ));
         }
         self.send_encoded_frames(released);
+        let retry_matches = matches!(
+            self.pending_unsafe_paste.as_ref(),
+            Some(PendingUnsafePaste::AwaitingResult {
+                operation_id,
+                route: pending_route,
+                generation,
+                ..
+            }) if *operation_id == result.operation_id
+                && pending_route == route
+                && self.route_generation == Some(*generation)
+        );
+        if retry_matches {
+            let may_retry = completed.as_ref().is_some_and(|operation| operation.paste)
+                && result.outcome == InputOutcome::RejectedUnsafePaste
+                && result.accepted_payload_bytes == Some(0)
+                && result.written_pty_bytes == Some(0);
+            if may_retry {
+                let Some(PendingUnsafePaste::AwaitingResult {
+                    route,
+                    generation,
+                    payload,
+                    ..
+                }) = self.pending_unsafe_paste.take()
+                else {
+                    unreachable!("matching unsafe paste state changed")
+                };
+                self.pending_unsafe_paste = Some(PendingUnsafePaste::AwaitingConsent {
+                    route,
+                    generation,
+                    payload,
+                    deadline: Instant::now() + UNSAFE_PASTE_CONSENT_TIMEOUT,
+                    stage: UnsafePasteConsentStage::Review,
+                });
+            } else {
+                self.invalidate_unsafe_paste();
+            }
+        }
         match result.outcome {
             InputOutcome::Written => {
                 if completed.is_some() {
@@ -4985,6 +5090,14 @@ impl TuiApp {
         let Some(operation_id) = self.next_input_operation_id() else {
             return;
         };
+        let Some((_, route)) = self.current_owner_pair() else {
+            self.error = Some("terminal stream unavailable: no attached route".to_string());
+            return;
+        };
+        let Some(generation) = self.route_generation else {
+            self.error = Some("terminal stream unavailable: route generation unknown".to_string());
+            return;
+        };
         let frames = match encode_paste(operation_id, false, &data) {
             Ok(frames) => frames,
             Err(error) => {
@@ -5002,7 +5115,100 @@ impl TuiApp {
             .into_iter()
             .map(botster_terminal_protocol_client::TerminalInputFrame::into_bytes)
             .collect();
-        self.send_operation_frames(operation_id, true, frames);
+        match self
+            .input_window
+            .admit_retaining(operation_id, true, frames, data.len())
+        {
+            Ok(ready) => {
+                self.pending_unsafe_paste = Some(PendingUnsafePaste::AwaitingResult {
+                    operation_id,
+                    route,
+                    generation,
+                    payload: data,
+                });
+                self.send_encoded_frames(ready);
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn invalidate_unsafe_paste(&mut self) {
+        if let Some(pending) = self.pending_unsafe_paste.take() {
+            self.input_window.release_retained(pending.payload_len());
+        }
+    }
+
+    fn expire_unsafe_paste_consent(&mut self, now: Instant) {
+        let expired = matches!(
+            self.pending_unsafe_paste.as_ref(),
+            Some(PendingUnsafePaste::AwaitingConsent { deadline, .. }) if *deadline <= now
+        );
+        if expired {
+            self.invalidate_unsafe_paste();
+        }
+    }
+
+    fn confirm_unsafe_paste(&mut self) {
+        let ready = matches!(
+            self.pending_unsafe_paste.as_ref(),
+            Some(PendingUnsafePaste::AwaitingConsent {
+                stage: UnsafePasteConsentStage::Armed,
+                ..
+            })
+        );
+        if !ready {
+            return;
+        }
+        let Some(PendingUnsafePaste::AwaitingConsent {
+            route,
+            generation,
+            payload,
+            deadline,
+            ..
+        }) = self.pending_unsafe_paste.take()
+        else {
+            return;
+        };
+        let payload_bytes = payload.len();
+        if deadline <= Instant::now()
+            || self.route_generation != Some(generation)
+            || !self.attachment_matches_route(&route)
+        {
+            self.input_window.release_retained(payload_bytes);
+            return;
+        }
+        let Some(operation_id) = self.next_input_operation_id() else {
+            self.input_window.release_retained(payload_bytes);
+            return;
+        };
+        let frames = match encode_paste(operation_id, true, &payload) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.input_window.release_retained(payload_bytes);
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        #[cfg(test)]
+        self.observed_terminal_inputs.extend(
+            frames
+                .iter()
+                .filter_map(|frame| decode_terminal_input(frame).ok()),
+        );
+        let frames = frames
+            .into_iter()
+            .map(botster_terminal_protocol_client::TerminalInputFrame::into_bytes)
+            .collect();
+        match self.input_window.admit(operation_id, true, frames) {
+            Ok(ready) => {
+                self.input_window.release_retained(payload_bytes);
+                self.send_encoded_frames(ready);
+            }
+            Err(error) => {
+                self.input_window.release_retained(payload_bytes);
+                self.error = Some(error.to_string());
+            }
+        }
     }
 
     fn send_mouse(&mut self, mouse: MouseEvent, inner: Rect) -> bool {
@@ -5401,6 +5607,18 @@ impl TuiApp {
     }
 
     fn surface(&self) -> UiNode {
+        if matches!(
+            self.pending_unsafe_paste.as_ref(),
+            Some(PendingUnsafePaste::AwaitingConsent { .. })
+        ) {
+            let root = self.unsafe_paste_consent_surface();
+            root.validate()
+                .expect("unsafe paste consent UiNode should satisfy the core UI contract");
+            renderer::tui_capabilities()
+                .validate_node(&root)
+                .expect("unsafe paste consent UiNode should fit TUI renderer capabilities");
+            return root;
+        }
         if self.confirmation.is_some() {
             let root = self.confirmation_surface();
             root.validate()
@@ -5470,7 +5688,10 @@ impl TuiApp {
     }
 
     fn uses_workspace_shell(&self) -> bool {
-        if self.confirmation.is_some()
+        if matches!(
+            self.pending_unsafe_paste.as_ref(),
+            Some(PendingUnsafePaste::AwaitingConsent { .. })
+        ) || self.confirmation.is_some()
             || self.target_first_spawn.is_some()
             || self.plugin_surface.is_some()
             || self.system_details_visible
@@ -5866,6 +6087,64 @@ impl TuiApp {
             UiNodeKind::Dialog,
             "workspace-confirmation",
             json!({ "title": format!("Confirm {}", verb.to_lowercase()), "presentation": "auto" }),
+        );
+        dialog.slots.insert("body".to_string(), vec![child(body)]);
+        dialog
+    }
+
+    fn unsafe_paste_consent_surface(&self) -> UiNode {
+        let stage = match self.pending_unsafe_paste.as_ref() {
+            Some(PendingUnsafePaste::AwaitingConsent { stage, .. }) => *stage,
+            _ => panic!("unsafe paste consent surface requires pending consent"),
+        };
+        let mut actions = node(
+            UiNodeKind::Inline,
+            "workspace-unsafe-paste-actions",
+            json!({}),
+        );
+        actions.children.push(child(workspace_button(
+            "workspace-unsafe-paste-primary",
+            if stage == UnsafePasteConsentStage::Review {
+                "Review paste"
+            } else {
+                "Cancel"
+            },
+            if stage == UnsafePasteConsentStage::Review {
+                "botster.tui.unsafe_paste.review"
+            } else {
+                "botster.tui.unsafe_paste.cancel"
+            },
+            json!({}),
+            "never",
+            None,
+        )));
+        if stage == UnsafePasteConsentStage::Armed {
+            actions.children.push(child(workspace_button(
+                "workspace-unsafe-paste-confirm",
+                "Paste anyway",
+                "botster.tui.unsafe_paste.confirm",
+                json!({}),
+                "never",
+                Some("danger"),
+            )));
+        }
+        let mut body = node(
+            UiNodeKind::Stack,
+            "workspace-unsafe-paste-body",
+            json!({ "direction": "vertical" }),
+        );
+        body.children = vec![
+            child(node(
+                UiNodeKind::Text,
+                "workspace-unsafe-paste-warning",
+                json!({ "text": "This paste contains multiple lines or terminal control characters. It can run commands or change terminal state." }),
+            )),
+            child(actions),
+        ];
+        let mut dialog = node(
+            UiNodeKind::Dialog,
+            "workspace-unsafe-paste-consent",
+            json!({ "title": "Unsafe paste blocked", "presentation": "auto" }),
         );
         dialog.slots.insert("body".to_string(), vec![child(body)]);
         dialog
@@ -15338,5 +15617,287 @@ mod tests {
                 .is_some_and(|error| error.contains("no attached route"))
         );
         assert!(app.hub_io.take_captured_terminal_frames().is_empty());
+    }
+
+    fn paste_awaiting_result(payload: &[u8]) -> (TuiApp, u64) {
+        let mut app = workspace_fixture();
+        app.hub_io.capture_terminal_frames();
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.subscription_id = "route-1".to_string();
+        app.route_generation = Some(7);
+        app.route_epoch = Some(0);
+        app.send_paste(payload.to_vec());
+        let operation_id = match app.pending_unsafe_paste.as_ref() {
+            Some(PendingUnsafePaste::AwaitingResult { operation_id, .. }) => *operation_id,
+            other => panic!("paste payload was not retained: {other:?}"),
+        };
+        (app, operation_id)
+    }
+
+    fn apply_paste_result(
+        app: &mut TuiApp,
+        operation_id: u64,
+        outcome: InputOutcome,
+        accepted_payload_bytes: Option<u64>,
+        written_pty_bytes: Option<u64>,
+    ) {
+        app.apply_terminal_input_result(
+            "route-1",
+            InputResultBody {
+                operation_id,
+                outcome,
+                accepted_payload_bytes,
+                written_pty_bytes,
+                mode_bits: 0,
+                detail: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn unsafe_paste_consent_requires_an_exact_zero_byte_rejection() {
+        let (mut app, operation_id) = paste_awaiting_result(b"echo one\necho two\n");
+        apply_paste_result(
+            &mut app,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        assert!(matches!(
+            app.pending_unsafe_paste,
+            Some(PendingUnsafePaste::AwaitingConsent {
+                stage: UnsafePasteConsentStage::Review,
+                ..
+            })
+        ));
+        assert_eq!(app.input_window.retained_bytes(), 18);
+
+        for (outcome, accepted, written) in [
+            (InputOutcome::PartialWrite, Some(18), Some(1)),
+            (InputOutcome::OutcomeUnknown, None, None),
+            (InputOutcome::RejectedUnsafePaste, None, Some(0)),
+            (InputOutcome::RejectedUnsafePaste, Some(1), Some(0)),
+        ] {
+            let (mut app, operation_id) = paste_awaiting_result(b"echo one\necho two\n");
+            apply_paste_result(&mut app, operation_id, outcome, accepted, written);
+            assert!(app.pending_unsafe_paste.is_none());
+            assert_eq!(app.input_window.retained_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn unsafe_paste_confirmation_uses_a_new_id_once() {
+        let (mut app, operation_id) = paste_awaiting_result(b"echo one\necho two\n");
+        apply_paste_result(
+            &mut app,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        app.handle_action("botster.tui.unsafe_paste.review".to_string(), None, None);
+        app.handle_action("botster.tui.unsafe_paste.confirm".to_string(), None, None);
+        let paste_begins = app
+            .observed_terminal_inputs
+            .iter()
+            .filter_map(|command| match command {
+                TerminalInputCommand::PasteBegin {
+                    operation_id,
+                    allow_unsafe,
+                    ..
+                } => Some((*operation_id, *allow_unsafe)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(paste_begins, vec![(1, false), (2, true)]);
+        assert!(app.pending_unsafe_paste.is_none());
+        assert_eq!(app.input_window.retained_bytes(), 0);
+
+        app.handle_action("botster.tui.unsafe_paste.confirm".to_string(), None, None);
+        assert_eq!(app.observed_terminal_inputs.len(), 6);
+    }
+
+    #[test]
+    fn unsafe_paste_confirmation_refusal_releases_the_payload() {
+        let payload = vec![b'\n'; botster_terminal_protocol_client::MAX_PASTE_BYTES];
+        let (mut app, operation_id) = paste_awaiting_result(&payload);
+        apply_paste_result(
+            &mut app,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        for _ in 0..crate::terminal_input::MAX_IN_FLIGHT_OPERATIONS {
+            let id = app.input_window.next_operation_id().expect("id");
+            app.input_window
+                .admit(id, false, vec![vec![1]])
+                .expect("fill the input window");
+        }
+        app.handle_action("botster.tui.unsafe_paste.review".to_string(), None, None);
+        app.handle_action("botster.tui.unsafe_paste.confirm".to_string(), None, None);
+        assert!(app.pending_unsafe_paste.is_none());
+        assert_eq!(app.input_window.retained_bytes(), 0);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("client bound"))
+        );
+    }
+
+    #[test]
+    fn unsafe_paste_cancel_expiry_and_resync_drop_only_the_retry() {
+        let (mut cancelled, operation_id) = paste_awaiting_result(b"one\ntwo");
+        apply_paste_result(
+            &mut cancelled,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        cancelled.handle_action("botster.tui.unsafe_paste.cancel".to_string(), None, None);
+        assert!(cancelled.pending_unsafe_paste.is_none());
+        assert_eq!(cancelled.input_window.retained_bytes(), 0);
+
+        let (mut expired, operation_id) = paste_awaiting_result(b"one\ntwo");
+        apply_paste_result(
+            &mut expired,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        if let Some(PendingUnsafePaste::AwaitingConsent { deadline, .. }) =
+            expired.pending_unsafe_paste.as_mut()
+        {
+            *deadline = Instant::now();
+        }
+        expired.prepare_paint();
+        assert!(expired.pending_unsafe_paste.is_none());
+        assert_eq!(expired.input_window.retained_bytes(), 0);
+
+        let (mut resync, operation_id) = paste_awaiting_result(b"one\ntwo");
+        apply_paste_result(
+            &mut resync,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        let key_id = resync.input_window.next_operation_id().expect("id");
+        resync
+            .input_window
+            .admit(key_id, false, vec![vec![1]])
+            .expect("unrelated input remains admitted");
+        resync.begin_route_resync();
+        assert!(resync.pending_unsafe_paste.is_none());
+        assert_eq!(resync.input_window.in_flight_len(), 1);
+        assert_eq!(resync.input_window.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn a_new_paste_replaces_consent_without_replaying_the_old_payload() {
+        let (mut app, operation_id) = paste_awaiting_result(b"old\npayload");
+        apply_paste_result(
+            &mut app,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        assert!(app.handle_focused_terminal_paste("new\npayload", Some("tui-terminal")));
+        assert!(matches!(
+            app.pending_unsafe_paste,
+            Some(PendingUnsafePaste::AwaitingResult {
+                operation_id: 2,
+                ..
+            })
+        ));
+        let paste_begins = app
+            .observed_terminal_inputs
+            .iter()
+            .filter_map(|command| match command {
+                TerminalInputCommand::PasteBegin {
+                    operation_id,
+                    allow_unsafe,
+                    ..
+                } => Some((*operation_id, *allow_unsafe)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(paste_begins, vec![(1, false), (2, false)]);
+    }
+
+    #[test]
+    fn queued_enter_cannot_confirm_unsafe_paste() {
+        let (mut app, operation_id) =
+            paste_awaiting_result(b"SECRET_UNSAFE_PASTE\nSECOND_SECRET_LINE");
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let (_, workspace_map) = render_app_to_lines(&app, 96, 30, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &workspace_map, "tui-terminal");
+        apply_paste_result(
+            &mut app,
+            operation_id,
+            InputOutcome::RejectedUnsafePaste,
+            Some(0),
+            Some(0),
+        );
+        let (review_lines, review_map) = render_app_to_lines(&app, 96, 30, &router.render_state());
+        assert!(!review_lines.join("\n").contains("SECRET_UNSAFE_PASTE"));
+        app.apply_wake(routed(
+            "route-1",
+            7,
+            botster_terminal_protocol_client::encode_output(b"terminal output continues")
+                .expect("output frame"),
+        ));
+        assert_eq!(
+            app.applied_live_payloads,
+            vec![b"terminal output continues"]
+        );
+        router.reconcile(&review_map);
+        assert_eq!(
+            router.focused_node_id(),
+            Some("workspace-unsafe-paste-primary")
+        );
+        let enter = || Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(route_input_event(
+            &mut app,
+            &mut router,
+            &review_map,
+            enter()
+        ));
+        assert!(route_input_event(
+            &mut app,
+            &mut router,
+            &review_map,
+            enter()
+        ));
+        assert!(matches!(
+            app.pending_unsafe_paste,
+            Some(PendingUnsafePaste::AwaitingConsent {
+                stage: UnsafePasteConsentStage::Armed,
+                ..
+            })
+        ));
+        assert_eq!(app.observed_terminal_inputs.len(), 3);
+
+        let (_, armed_map) = render_app_to_lines(&app, 96, 30, &router.render_state());
+        router.reconcile(&armed_map);
+        assert_eq!(
+            router.focused_node_id(),
+            Some("workspace-unsafe-paste-primary")
+        );
+        assert!(route_input_event(
+            &mut app,
+            &mut router,
+            &armed_map,
+            enter()
+        ));
+        assert!(app.pending_unsafe_paste.is_none());
+        assert_eq!(app.observed_terminal_inputs.len(), 3);
     }
 }
