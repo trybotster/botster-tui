@@ -922,7 +922,7 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             &mut tui,
             &mut screen,
             &mut identity,
-            "Attach",
+            "[ Attach ]",
             MARKER_TWO,
             Some(&first),
         );
