@@ -1,8 +1,13 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 0 ]; then
+usage() {
   echo "usage: script/test-live-tui" >&2
+  echo "Hub producer: script/build-dev-artifacts --out-dir <candidate-dir>" >&2
+}
+
+if [ "$#" -ne 0 ]; then
+  usage
   exit 1
 fi
 
@@ -11,6 +16,7 @@ require_executable() {
   path="$2"
   if [ -z "$path" ]; then
     echo "$variable_name is required" >&2
+    usage
     exit 1
   fi
   if [ ! -x "$path" ]; then
@@ -24,6 +30,7 @@ require_file() {
   path="$2"
   if [ -z "$path" ]; then
     echo "$variable_name is required" >&2
+    usage
     exit 1
   fi
   if [ ! -f "$path" ]; then
