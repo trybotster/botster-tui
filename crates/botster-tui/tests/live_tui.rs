@@ -715,21 +715,21 @@ fn t_s1_connect_select_session_and_see_echo() {
     {
         let mut tui = TuiChild::spawn(&hub);
         let mut screen = Screen::attach(&tui);
+        let session_row = format!("{} · running", identity.session_id);
         screen
             .wait_for(
                 "session_row_visible",
-                &identity.session_id,
+                &session_row,
                 SCREEN_DEADLINE,
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let session_id = identity.session_id.clone();
         let occupancy = attach_and_echo(
             hub.endpoint(),
             &mut tui,
             &mut screen,
             &mut identity,
-            &session_id,
+            &session_row,
             MARKER_ONE,
             None,
         );
@@ -753,21 +753,21 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
     {
         let mut tui = TuiChild::spawn(&hub);
         let mut screen = Screen::attach(&tui);
+        let session_row = format!("{} · running", identity.session_id);
         screen
             .wait_for(
                 "session_row_visible",
-                &identity.session_id,
+                &session_row,
                 SCREEN_DEADLINE,
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let session_id = identity.session_id.clone();
         let first = attach_and_echo(
             hub.endpoint(),
             &mut tui,
             &mut screen,
             &mut identity,
-            &session_id,
+            &session_row,
             MARKER_ONE,
             None,
         );
