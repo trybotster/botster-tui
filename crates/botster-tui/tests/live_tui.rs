@@ -57,6 +57,8 @@ const MARKER_TWO: &str = "tui-live-marker-two";
 const SESSION_RUNNING_DEADLINE: Duration = Duration::from_secs(20);
 const SCREEN_DEADLINE: Duration = Duration::from_secs(20);
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
+/// One absolute budget shared by every wait in one exact smoke test.
+const TEST_DEADLINE: Duration = Duration::from_secs(120);
 const LAST_PANE_TITLES: usize = 16;
 const STREAM_EPOCH_UNAVAILABLE: &str = "unavailable";
 static SHORT_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -303,6 +305,7 @@ struct Screen {
     bytes: Receiver<Vec<u8>>,
     last_pane_titles: VecDeque<String>,
     last_title: String,
+    test_deadline: Instant,
 }
 
 struct ScreenRow {
@@ -311,7 +314,7 @@ struct ScreenRow {
 }
 
 impl Screen {
-    fn attach(child: &TuiChild) -> Self {
+    fn attach(child: &TuiChild, test_deadline: Instant) -> Self {
         let mut reader = child.reader();
         let (sender, bytes) = mpsc::channel();
         thread::Builder::new()
@@ -338,7 +341,12 @@ impl Screen {
             bytes,
             last_pane_titles: VecDeque::new(),
             last_title: String::new(),
+            test_deadline,
         }
+    }
+
+    fn remaining(&self, requested: Duration) -> Duration {
+        requested.min(self.test_deadline.saturating_duration_since(Instant::now()))
     }
 
     /// Apply PTY bytes until `until`; returns true when anything arrived.
@@ -438,6 +446,7 @@ impl Screen {
         identity: &Identity,
     ) -> Result<(u16, u16), StepFailure> {
         let started = Instant::now();
+        let deadline = self.remaining(deadline);
         let until = started + deadline;
         loop {
             if let Some(at) = self.locate(needle) {
@@ -453,7 +462,7 @@ impl Screen {
                     format!("{needle:?} not visible; last rows: {tail_rows:?}"),
                 ));
             }
-            self.pump(Instant::now() + Duration::from_millis(100));
+            self.pump((Instant::now() + Duration::from_millis(100)).min(until));
         }
     }
 
@@ -463,6 +472,15 @@ impl Screen {
             .map(|row| row.trim_end().to_string())
             .filter(|row| !row.is_empty())
             .rev()
+            .take(6)
+            .collect()
+    }
+
+    fn head_rows(&mut self) -> Vec<String> {
+        self.rows()
+            .into_iter()
+            .map(|row| row.trim_end().to_string())
+            .filter(|row| !row.is_empty())
             .take(6)
             .collect()
     }
@@ -526,7 +544,7 @@ fn expect_ok(step: &'static str, identity: &Identity, response: DaemonResponse) 
 }
 
 /// Spawn the echo shell session through the Hub before the TUI starts.
-fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
+fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity, test_deadline: Instant) {
     identity.session_id = format!(
         "live-tui-{}",
         std::time::SystemTime::now()
@@ -544,7 +562,8 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
     .expect("spawn request transport");
     expect_ok("spawn", identity, response);
     let started = Instant::now();
-    let until = started + SESSION_RUNNING_DEADLINE;
+    let deadline = SESSION_RUNNING_DEADLINE.min(test_deadline.saturating_duration_since(started));
+    let until = started + deadline;
     loop {
         let response = expect_ok(
             "list_sessions",
@@ -565,7 +584,7 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
                 subscription_id: String::new(),
                 generation: String::new(),
                 stream_epoch: STREAM_EPOCH_UNAVAILABLE.to_string(),
-                deadline_ms: SESSION_RUNNING_DEADLINE.as_millis(),
+                deadline_ms: deadline.as_millis(),
                 elapsed_ms: started.elapsed().as_millis(),
                 last_pane_titles: Vec::new(),
                 cause: format!(
@@ -579,7 +598,9 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
             };
             panic!("{failure}");
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(
+            Duration::from_millis(200).min(until.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -609,29 +630,41 @@ fn wait_for_occupancy(
     previous: Option<&DaemonAttachOccupancy>,
 ) -> DaemonAttachOccupancy {
     let started = Instant::now();
+    let deadline = screen.remaining(SCREEN_DEADLINE);
+    let until = started + deadline;
+    let mut attached_control_seen = false;
     loop {
-        if let Some(occupancy) = occupancies(endpoint, identity)
-            .into_iter()
+        let actual = occupancies(endpoint, identity);
+        if let Some(occupancy) = actual
+            .iter()
             .find(|occupancy| {
                 previous.is_none_or(|previous| {
                     occupancy.subscription_id != previous.subscription_id
                         || occupancy.generation != previous.generation
                 })
             })
+            .cloned()
         {
             return occupancy;
         }
-        if started.elapsed() >= SCREEN_DEADLINE {
+        if Instant::now() >= until {
+            let head_rows = screen.head_rows();
+            let tail_rows = screen.tail_rows();
             let failure = screen.failure(
                 "attach_occupancy",
                 identity,
-                SCREEN_DEADLINE,
+                deadline,
                 started,
-                "hub did not publish live attach occupancy after the pane rendered".to_string(),
+                format!(
+                    "hub did not publish new live attach occupancy; attached_control_seen={attached_control_seen} actual_occupancies={actual:?}; first_rows={head_rows:?}; last_rows={tail_rows:?}"
+                ),
             );
             panic!("{failure}");
         }
-        thread::sleep(Duration::from_millis(100));
+        let poll_until = (Instant::now() + Duration::from_millis(100)).min(until);
+        screen.pump(poll_until);
+        attached_control_seen |= screen.contains("Detach");
+        thread::sleep(poll_until.saturating_duration_since(Instant::now()));
     }
 }
 
@@ -679,19 +712,45 @@ fn attach_and_echo(
         )
         .unwrap_or_else(|failure| panic!("{failure}"));
     tui.click(col, row);
-    let ready = screen
-        .wait_for(
-            "session_ready_visible",
-            SESSION_READY_MARKER,
-            SCREEN_DEADLINE,
-            identity,
-        )
-        .unwrap_or_else(|failure| panic!("{failure}"));
-    let occupancy = wait_for_occupancy(endpoint, screen, identity, previous_occupancy);
-    identity.adopt(&occupancy);
+    let (ready, occupancy) = if previous_occupancy.is_some() {
+        let occupancy = wait_for_occupancy(endpoint, screen, identity, previous_occupancy);
+        identity.adopt(&occupancy);
+        screen
+            .wait_for(
+                "reattach_control_visible",
+                "Detach",
+                SCREEN_DEADLINE,
+                identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let ready = screen
+            .wait_for(
+                "session_ready_visible",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        (ready, occupancy)
+    } else {
+        // The initial projection is empty, so this marker cannot be retained
+        // from an earlier attachment.
+        let ready = screen
+            .wait_for(
+                "session_ready_visible",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let occupancy = wait_for_occupancy(endpoint, screen, identity, previous_occupancy);
+        identity.adopt(&occupancy);
+        (ready, occupancy)
+    };
     // Focus the terminal pane by clicking a cell inside it, then type.
     tui.click(ready.0, ready.1);
-    screen.pump(Instant::now() + Duration::from_millis(200));
+    let focus_until = Instant::now() + screen.remaining(Duration::from_millis(200));
+    screen.pump(focus_until);
     tui.type_line(marker);
     screen
         .wait_for(
@@ -726,23 +785,16 @@ fn detach_and_quit(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity)
     // moved focus to the toolbar button.
     tui.write_all(b"q");
     let started = Instant::now();
-    let status = tui
-        .wait_exit(started + EXIT_DEADLINE)
-        .unwrap_or_else(|cause| {
-            let failure = screen.failure(
-                "tui_exit_after_detach",
-                identity,
-                EXIT_DEADLINE,
-                started,
-                cause,
-            );
-            panic!("{failure}");
-        });
+    let deadline = screen.remaining(EXIT_DEADLINE);
+    let status = tui.wait_exit(started + deadline).unwrap_or_else(|cause| {
+        let failure = screen.failure("tui_exit_after_detach", identity, deadline, started, cause);
+        panic!("{failure}");
+    });
     if !status.success() {
         let failure = screen.failure(
             "tui_exit_after_detach",
             identity,
-            EXIT_DEADLINE,
+            deadline,
             started,
             format!(
                 "TUI exited unsuccessfully: exit_code={} signal={:?}",
@@ -757,14 +809,15 @@ fn detach_and_quit(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity)
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s1_connect_select_session_and_see_echo() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity);
+    spawn_session(hub.endpoint(), &mut identity, test_deadline);
     {
         let mut tui = TuiChild::spawn(&hub);
-        let mut screen = Screen::attach(&tui);
+        let mut screen = Screen::attach(&tui, test_deadline);
         let session_row = format!("{} · running", identity.session_id);
         screen
             .wait_for(
@@ -795,14 +848,15 @@ fn t_s1_connect_select_session_and_see_echo() {
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity);
+    spawn_session(hub.endpoint(), &mut identity, test_deadline);
     {
         let mut tui = TuiChild::spawn(&hub);
-        let mut screen = Screen::attach(&tui);
+        let mut screen = Screen::attach(&tui, test_deadline);
         let session_row = format!("{} · running", identity.session_id);
         screen
             .wait_for(
@@ -836,6 +890,8 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             .wait_for("detached_visible", "detached", SCREEN_DEADLINE, &identity)
             .unwrap_or_else(|failure| panic!("{failure}"));
         let detach_started = Instant::now();
+        let detach_deadline = screen.remaining(SCREEN_DEADLINE);
+        let detach_until = detach_started + detach_deadline;
         while occupancies(hub.endpoint(), &identity)
             .iter()
             .any(|occupancy| {
@@ -843,17 +899,20 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
                     && occupancy.generation == first.generation
             })
         {
-            if detach_started.elapsed() >= SCREEN_DEADLINE {
+            if Instant::now() >= detach_until {
                 let failure = screen.failure(
                     "detach_occupancy_released",
                     &identity,
-                    SCREEN_DEADLINE,
+                    detach_deadline,
                     detach_started,
                     "hub still reports the attachment after detach".to_string(),
                 );
                 panic!("{failure}");
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(
+                Duration::from_millis(100)
+                    .min(detach_until.saturating_duration_since(Instant::now())),
+            );
         }
 
         // Re-attach through the toolbar: the restored snapshot shows the first
