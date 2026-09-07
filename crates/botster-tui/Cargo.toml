@@ -22,3 +22,5 @@ serde_json = "1.0"
 botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "347bd99bf7fa59a62975111eedabe2db16479335", default-features = false }
 botster-hub-test-support = { git = "https://github.com/trybotster/botster-hub.git", rev = "469fca538d8ea81fefede723b51f63e92af4757f" }
 jsonschema = { version = "0.49.2", default-features = false }
+# Real-PTY driver for the actual-client live tests (tests/live_tui.rs).
+portable-pty = "0.9.0"
