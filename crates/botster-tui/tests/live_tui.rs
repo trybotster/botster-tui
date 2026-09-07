@@ -663,7 +663,7 @@ fn wait_for_occupancy(
         }
         let poll_until = (Instant::now() + Duration::from_millis(100)).min(until);
         screen.pump(poll_until);
-        attached_control_seen |= screen.contains("Detach");
+        attached_control_seen |= screen.contains("[ Detach ]");
         thread::sleep(poll_until.saturating_duration_since(Instant::now()));
     }
 }
@@ -718,7 +718,7 @@ fn attach_and_echo(
         screen
             .wait_for(
                 "reattach_control_visible",
-                "Detach",
+                "[ Detach ]",
                 SCREEN_DEADLINE,
                 identity,
             )
@@ -767,7 +767,7 @@ fn detach_and_quit(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity)
     let (col, row) = screen
         .wait_for(
             "detach_control_visible_before_quit",
-            "Detach",
+            "[ Detach ]",
             SCREEN_DEADLINE,
             identity,
         )
@@ -880,7 +880,7 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
         let (col, row) = screen
             .wait_for(
                 "detach_control_visible",
-                "Detach",
+                "[ Detach ]",
                 SCREEN_DEADLINE,
                 &identity,
             )

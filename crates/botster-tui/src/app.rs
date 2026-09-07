@@ -76,9 +76,6 @@ use crate::projection_paint::tui_terminal_region;
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
-const DEFAULT_COMMAND: &str = "printf 'botster-tui-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
-const HEADLESS_INPUT: &str = "botster-tui-headless\n";
-const HEADLESS_OUTPUT: &str = "echo:botster-tui-headless";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
 const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 49;
 /// Absolute deadline for an ordinary host-control request.
@@ -87,8 +84,6 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 const DETACH_ON_DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 /// Bound for stopping the I/O owner at exit.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
-/// Connection deadline for the headless live runtime smoke.
-const HEADLESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(750);
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// Live OUTPUT retained while SNAPSHOT_HISTORY is still arriving for a route.
@@ -167,7 +162,6 @@ pub struct AppArgs {
     pub hub_connection: Option<RunnableEntrypointHubConnection>,
     pub connection_error: Option<String>,
     pub hub_data_dir: Option<PathBuf>,
-    pub headless_live_runtime: bool,
 }
 
 impl AppArgs {
@@ -180,7 +174,6 @@ impl AppArgs {
             args,
             std::env::var_os("BOTSTER_HUB_CONNECTION"),
             hub_data_dir,
-            std::env::var_os("BOTSTER_TUI_HEADLESS_LIVE_RUNTIME").is_some(),
         )
     }
 
@@ -188,13 +181,11 @@ impl AppArgs {
         args: impl IntoIterator<Item = String>,
         hub_connection: Option<std::ffi::OsString>,
         hub_data_dir: Option<std::ffi::OsString>,
-        headless_live_runtime: bool,
     ) -> Self {
         let mut parsed = Self::default();
         for arg in args {
             match arg.as_str() {
                 "--smoke" => parsed.smoke = true,
-                "--headless-live-runtime" => parsed.headless_live_runtime = true,
                 _ => {}
             }
         }
@@ -202,9 +193,6 @@ impl AppArgs {
         parsed.hub_connection = connection;
         parsed.connection_error = connection_error;
         parsed.hub_data_dir = hub_data_dir.map(PathBuf::from);
-        if headless_live_runtime {
-            parsed.headless_live_runtime = true;
-        }
         parsed
     }
 
@@ -1157,11 +1145,6 @@ pub fn run(args: AppArgs) -> io::Result<()> {
         }
         None => {}
     }
-    if args.headless_live_runtime {
-        return run_headless_live_runtime(args)
-            .map_err(|error| io::Error::other(format!("headless live runtime failed: {error}")));
-    }
-
     let hub_io = HubIo::with_terminal_input()?;
     let mut terminal = setup_terminal()?;
     let run_result = run_loop(&mut terminal, args, hub_io);
@@ -1878,30 +1861,6 @@ impl TuiApp {
     /// Harness helper: apply wakes until no host-control request is outstanding.
     fn settle(&mut self, deadline: Instant) -> bool {
         self.pump_until(deadline, |app| app.pending_requests.is_empty())
-    }
-
-    /// Text of the projected viewport, rows joined by newlines.
-    fn viewport_text(&mut self) -> String {
-        self.prepare_paint();
-        let Some(viewport) = self.ghostty_viewport_cache.as_ref() else {
-            return String::new();
-        };
-        let cols = viewport.cols as usize;
-        if cols == 0 {
-            return String::new();
-        }
-        let mut text = String::new();
-        for (index, cell) in viewport.cells.iter().enumerate() {
-            if index > 0 && index % cols == 0 {
-                text.push('\n');
-            }
-            if cell.grapheme.is_empty() {
-                text.push(' ');
-            } else {
-                text.push_str(&cell.grapheme);
-            }
-        }
-        text
     }
 
     /// Earliest absolute deadline the loop must wake for.
@@ -9045,193 +9004,6 @@ fn configuration_secret_state(value: Option<&Value>) -> &'static str {
     }
 }
 
-fn run_headless_live_runtime(args: AppArgs) -> DaemonTransportResult<()> {
-    if let Some(error) = &args.connection_error {
-        eprintln!("headless-live-runtime-error: {error}");
-        return Err(DaemonTransportError::Protocol(
-            "invalid Hub connection configuration",
-        ));
-    }
-    let Some(endpoint) = args.daemon_endpoint() else {
-        return Err(DaemonTransportError::NotRunning);
-    };
-    if let Some(data_dir) = args.hub_data_dir.as_ref() {
-        if !data_dir.is_dir() {
-            return Err(DaemonTransportError::Protocol(
-                "injected hub data dir is not a directory",
-            ));
-        }
-        println!("package-storage-context: configured");
-    }
-    let mut app = TuiApp::new(Some(endpoint));
-    #[cfg(test)]
-    {
-        app.workspace_test_mode = true;
-    }
-    app.connect();
-    let connect_deadline = Instant::now() + HEADLESS_CONNECT_TIMEOUT;
-    app.pump_until(connect_deadline, |app| {
-        app.is_connected() || app.connection_error.is_some()
-    });
-    if !app.is_connected() {
-        eprintln!(
-            "headless-live-runtime-error: {}",
-            app.connection_error
-                .clone()
-                .unwrap_or_else(|| "hub connection did not complete".to_string())
-        );
-        return Err(DaemonTransportError::NotRunning);
-    }
-    // Harness smoke only: freeform Spawn seeds a shell session so contract-matrix /
-    // attach paths can run without writing into Hub's device session-types root.
-    // Product launch remains target-first SpawnSessionType (toolbar dialog).
-    let session_id = format!("btui-{}", short_suffix());
-    app.pending_sessions
-        .insert(session_id.clone(), SessionRow::pending(session_id.clone()));
-    app.selected_session = Some(session_id.clone());
-    app.rebuild_session_rows();
-    app.action_feedback = Some(format!("spawn pending: {session_id}"));
-    app.submit(
-        DaemonRequest::Spawn {
-            session_id: session_id.clone(),
-            command: DEFAULT_COMMAND.to_string(),
-        },
-        PendingReply::Spawn {
-            session_id: session_id.clone(),
-        },
-        REQUEST_DEADLINE,
-    );
-    if !app.settle(Instant::now() + REQUEST_DEADLINE) {
-        eprintln!("headless-live-runtime-error: spawn request did not complete");
-        return Err(DaemonTransportError::Protocol(
-            "headless spawn request did not complete",
-        ));
-    }
-    if let Some(error) = &app.error {
-        eprintln!("headless-live-runtime-error: {error}");
-        return Err(DaemonTransportError::Protocol(
-            "headless live runtime app error",
-        ));
-    }
-    #[cfg(test)]
-    {
-        let rendered = render_app_to_lines(&app, 200, 48, &RenderState::default())
-            .0
-            .join("\n");
-        assert!(rendered.contains("pending spawn"));
-        assert_eq!(app.attached, None);
-    }
-    let session_id = app
-        .selected_session
-        .clone()
-        .ok_or(DaemonTransportError::Protocol(
-            "headless session was not selected",
-        ))?;
-
-    wait_for_authoritative_session(&mut app, &session_id)?;
-    app.attach_selected_or_first();
-    wait_for_app_output(&mut app, "botster-tui-ready")?;
-    // The live path already sent RESIZE. The smoke input is typed as KEY frames.
-    for character in HEADLESS_INPUT.chars() {
-        let code = if character == '\n' {
-            KeyCode::Enter
-        } else {
-            KeyCode::Char(character)
-        };
-        app.send_key(KeyEvent::new(code, KeyModifiers::NONE));
-    }
-    wait_for_app_output(&mut app, HEADLESS_OUTPUT)?;
-    #[cfg(test)]
-    {
-        let (lines, hit_map) = render_app_to_lines(&app, 200, 48, &RenderState::default());
-        let rendered = lines.join("\n");
-        let compatibility = app
-            .compatibility
-            .as_ref()
-            .expect("live hub status should include compatibility descriptor");
-        assert_eq!(compatibility.protocol, PROTOCOL);
-        assert!(compatibility.protocol_version > 0);
-        assert!(!compatibility.features.is_empty());
-        for required_feature in [
-            FEATURE_SESSIONS,
-            FEATURE_PACKAGE_NAVIGATION,
-            FEATURE_PLUGIN_SURFACE_RENDER,
-            FEATURE_PLUGIN_SURFACE_ACTION,
-            FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
-            FEATURE_UNIX_TERMINAL_ADAPTER,
-            FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-            FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
-        ] {
-            assert!(
-                compatibility
-                    .features
-                    .iter()
-                    .any(|feature| feature == required_feature)
-            );
-        }
-        assert!(rendered.contains("Sessions"));
-        assert!(rendered.contains("Terminal ·"));
-        assert!(rendered.contains(HEADLESS_OUTPUT));
-        assert!(
-            !hit_map
-                .regions()
-                .iter()
-                .any(|region| region.node_id == "tui-terminal-output")
-        );
-    }
-    println!("terminal-output: {HEADLESS_OUTPUT}");
-    app.submit_apply(DaemonRequest::ShutdownSession { session_id });
-    let _ = app.settle(Instant::now() + REQUEST_DEADLINE);
-    app.shutdown();
-    Ok(())
-}
-
-fn wait_for_authoritative_session(app: &mut TuiApp, session_id: &str) -> DaemonTransportResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let ready = app.pump_until(deadline, |app| {
-        app.sessions.iter().any(|session| {
-            session.session_id == session_id && session.is_attachable() && !session.pending
-        })
-    });
-    if ready {
-        return Ok(());
-    }
-    eprintln!(
-        "authoritative-session-timeout: id={session_id} error={:?} connection_error={:?} status={} sessions={:?} pending={:?} has_snapshot={} sub={:?}",
-        app.error,
-        app.connection_error,
-        app.status,
-        app.sessions
-            .iter()
-            .map(|session| format!(
-                "{}:{}:pending={}",
-                session.session_id, session.lifecycle, session.pending
-            ))
-            .collect::<Vec<_>>(),
-        app.pending_sessions.keys().cloned().collect::<Vec<_>>(),
-        app.session_entities.has_snapshot,
-        app.session_entities.subscription_id,
-    );
-    Err(DaemonTransportError::Protocol(
-        "timed out waiting for authoritative session entity",
-    ))
-}
-
-/// Wait until the projected viewport contains `needle`.
-fn wait_for_app_output(app: &mut TuiApp, needle: &str) -> DaemonTransportResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    if app.pump_until(deadline, |app| app.viewport_text().contains(needle)) {
-        return Ok(());
-    }
-    let observed_prefix = app.viewport_text().chars().take(256).collect::<String>();
-    eprintln!(
-        "timed out waiting for terminal output {needle:?}; terminal-output-prefix: {observed_prefix:?}"
-    );
-    Err(DaemonTransportError::Protocol(
-        "timed out waiting for terminal output",
-    ))
-}
-
 fn node(kind: UiNodeKind, id: &str, props: Value) -> UiNode {
     UiNode {
         kind,
@@ -11369,15 +11141,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_typed_hub_connection_and_headless_mode() {
+    fn parses_typed_hub_connection_and_data_dir() {
         let args = AppArgs::parse_with_environment(
-            ["--headless-live-runtime".to_string()],
+            [],
             Some(
                 botster_core_test_support::fixtures::runnable_entrypoint_hub_connection::VALID_UNIX_SOCKET_JSON
                     .into(),
             ),
             Some("target/hub-data".into()),
-            false,
         );
 
         assert_eq!(
@@ -11386,7 +11157,6 @@ mod tests {
         );
         assert_eq!(args.connection_error, None);
         assert_eq!(args.hub_data_dir, Some(PathBuf::from("target/hub-data")));
-        assert!(args.headless_live_runtime);
     }
 
     #[test]
@@ -11412,7 +11182,6 @@ mod tests {
             ["--hub-socket".to_string(), "/tmp/retired.sock".to_string()],
             None,
             None,
-            false,
         );
 
         assert_eq!(args.hub_connection, None);
@@ -13168,80 +12937,6 @@ mod tests {
             Some(UiNodeId("visible-spawn-generic-decoy".to_string()))
         );
         assert_ne!(request.action_id.0, "botster_workspaces.open");
-    }
-
-    /// Hermetic: contract-matrix mode must fail closed when its fixture env is
-    /// missing, independent of any Workspaces profile path.
-    #[test]
-    fn contract_matrix_mode_requires_its_fixture_env_var() {
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../script/test-live-hub");
-        let contract_matrix = std::process::Command::new(&script)
-            .arg("contract-matrix")
-            .env_remove("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE")
-            .output()
-            .expect("contract-matrix mode runs");
-        let stderr = String::from_utf8_lossy(&contract_matrix.stderr);
-        assert!(
-            !contract_matrix.status.success(),
-            "contract-matrix without fixture must exit non-zero"
-        );
-        assert!(
-            stderr.contains("BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE is required"),
-            "contract-matrix must reach its own validation; stderr was: {stderr}"
-        );
-    }
-
-    #[test]
-    fn ghostty_shared_wrapper_fails_closed_without_caller_injectors() {
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../script/test-live-hub");
-        let missing_connection = std::process::Command::new(&script)
-            .arg("ghostty-shared")
-            .env_remove("BOTSTER_HUB_CONNECTION")
-            .env_remove("BOTSTER_HUB_BIN")
-            .env("BOTSTER_SHARED_SESSION_ID", "north-star-shared")
-            .output()
-            .expect("ghostty-shared missing connection");
-        let stderr = String::from_utf8_lossy(&missing_connection.stderr);
-        assert!(!missing_connection.status.success());
-        assert!(
-            stderr.contains("BOTSTER_HUB_CONNECTION is required"),
-            "stderr was: {stderr}"
-        );
-        assert!(
-            !stderr.contains("BOTSTER_HUB_BIN"),
-            "shared wrapper must not require Hub binaries; stderr was: {stderr}"
-        );
-
-        let missing_session = std::process::Command::new(&script)
-            .arg("ghostty-shared-exit")
-            .env(
-                "BOTSTER_HUB_CONNECTION",
-                r#"{"transport":{"type":"unix_socket","path":"/tmp/hub.sock"}}"#,
-            )
-            .env_remove("BOTSTER_SHARED_SESSION_ID")
-            .env_remove("BOTSTER_HUB_BIN")
-            .output()
-            .expect("ghostty-shared-exit missing session");
-        let stderr = String::from_utf8_lossy(&missing_session.stderr);
-        assert!(!missing_session.status.success());
-        assert!(
-            stderr.contains("BOTSTER_SHARED_SESSION_ID is required"),
-            "stderr was: {stderr}"
-        );
-
-        let malformed = std::process::Command::new(&script)
-            .arg("ghostty-shared")
-            .env("BOTSTER_HUB_CONNECTION", "not-json")
-            .env("BOTSTER_SHARED_SESSION_ID", "north-star-shared")
-            .env_remove("BOTSTER_HUB_BIN")
-            .output()
-            .expect("ghostty-shared malformed connection");
-        let stderr = String::from_utf8_lossy(&malformed.stderr);
-        assert!(!malformed.status.success());
-        assert!(
-            stderr.contains("BOTSTER_HUB_CONNECTION is malformed"),
-            "stderr was: {stderr}"
-        );
     }
 
     /// Default-gate cold-cut invariant: the installed Workspaces spawn-form driver
