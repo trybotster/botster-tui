@@ -1,0 +1,70 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  echo "usage: script/test-live-tui" >&2
+  exit 1
+fi
+
+require_executable() {
+  variable_name="$1"
+  path="$2"
+  if [ -z "$path" ]; then
+    echo "$variable_name is required" >&2
+    exit 1
+  fi
+  if [ ! -x "$path" ]; then
+    echo "$variable_name is not executable: $path" >&2
+    exit 1
+  fi
+}
+
+require_file() {
+  variable_name="$1"
+  path="$2"
+  if [ -z "$path" ]; then
+    echo "$variable_name is required" >&2
+    exit 1
+  fi
+  if [ ! -f "$path" ]; then
+    echo "$variable_name is not a file: $path" >&2
+    exit 1
+  fi
+}
+
+require_executable BOTSTER_HUB_BIN "${BOTSTER_HUB_BIN:-}"
+require_executable BOTSTER_SESSION_WORKER_BIN "${BOTSTER_SESSION_WORKER_BIN:-}"
+require_file BOTSTER_CANDIDATE_MANIFEST "${BOTSTER_CANDIDATE_MANIFEST:-}"
+
+export CARGO_INCREMENTAL=0
+
+# The Hub creates these inputs with:
+# script/build-dev-artifacts --out-dir <candidate-dir>
+# IsolatedHubBuilder validates the manifest size and hash records before it
+# starts either candidate binary. This script checks only input availability.
+run_exact_test() {
+  test_name="$1"
+  output="$(mktemp "${TMPDIR:-/tmp}/botster-tui-live-test.XXXXXX")"
+  if cargo test --locked --jobs 2 -p botster-tui --test live_tui \
+    "$test_name" -- --ignored --exact --nocapture >"$output" 2>&1
+  then
+    status=0
+  else
+    status=$?
+  fi
+  cat "$output"
+  if [ "$status" -ne 0 ]; then
+    rm -f "$output"
+    return "$status"
+  fi
+  summaries="$(awk '/^test result: ok\. 1 passed; 0 failed;/ { count += 1 } END { print count + 0 }' "$output")"
+  rm -f "$output"
+  if [ "$summaries" -ne 1 ]; then
+    echo "candidate-smoke: test=$test_name executed=0 cause=expected exactly one passing test summary" >&2
+    return 1
+  fi
+  echo "candidate-smoke: test=$test_name executed=1"
+}
+
+run_exact_test t_s1_connect_select_session_and_see_echo
+run_exact_test t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation

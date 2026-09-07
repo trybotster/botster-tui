@@ -6,10 +6,10 @@ rust-version.workspace = true
 license-file = "../../LICENSE"
 
 [dependencies]
-botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "347bd99bf7fa59a62975111eedabe2db16479335", default-features = false }
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "347bd99bf7fa59a62975111eedabe2db16479335", features = ["libghostty-vt"] }
-botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "347bd99bf7fa59a62975111eedabe2db16479335" }
-botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", rev = "469fca538d8ea81fefede723b51f63e92af4757f" }
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "98a50ef43f62bd9da6e062bd4d44d961fa3c78c9", default-features = false }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "98a50ef43f62bd9da6e062bd4d44d961fa3c78c9", features = ["libghostty-vt"] }
+botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "98a50ef43f62bd9da6e062bd4d44d961fa3c78c9" }
+botster-hub-client = { git = "https://github.com/trybotster/botster-hub.git", rev = "3fcb3f26f664c64e124349a066aac5dc78001332" }
 botster-tui-kit = { git = "https://github.com/trybotster/botster-tui-kit.git", rev = "7940306b0d7461a12575b3856a96c0fbb23784f3" }
 botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.3" }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
@@ -19,8 +19,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
-botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "347bd99bf7fa59a62975111eedabe2db16479335", default-features = false }
-botster-hub-test-support = { git = "https://github.com/trybotster/botster-hub.git", rev = "469fca538d8ea81fefede723b51f63e92af4757f" }
+botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "98a50ef43f62bd9da6e062bd4d44d961fa3c78c9", default-features = false }
+botster-hub-test-support = { git = "https://github.com/trybotster/botster-hub.git", rev = "3fcb3f26f664c64e124349a066aac5dc78001332" }
 jsonschema = { version = "0.49.2", default-features = false }
 # Real-PTY driver for the actual-client live tests (tests/live_tui.rs).
 portable-pty = "0.9.0"

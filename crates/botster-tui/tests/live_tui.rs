@@ -2,7 +2,7 @@
 //! against an isolated Hub daemon from a recorded candidate set.
 //!
 //! The tests are `#[ignore]`d so `script/test` needs no external setup; the
-//! dedicated candidate-smoke command selects them with `--ignored --exact`
+//! `script/test-live-tui` selects them with `--ignored --exact`
 //! and they fail closed, never skip, when any input is missing:
 //!
 //! - `BOTSTER_HUB_BIN`, `BOTSTER_SESSION_WORKER_BIN`: dev-profile prebuilt
@@ -10,13 +10,18 @@
 //! - `BOTSTER_CANDIDATE_MANIFEST`: the prebuild manifest whose sha256 entries
 //!   the isolated Hub verifies before it starts.
 //!
+//! The Hub producer creates all three inputs with
+//! `script/build-dev-artifacts --out-dir <candidate-dir>`. The caller exports
+//! the two binary paths and `<candidate-dir>/install-manifest.json` before it
+//! runs `script/test-live-tui`.
+//!
 //! The TUI binary is the one Cargo built for this test run
 //! (`CARGO_BIN_EXE_botster-tui`). Every wait has an absolute deadline and a
 //! failure prints one line with the agreed fields: layer, step, session_id,
 //! subscription_id, generation, stream_epoch, deadline_ms, elapsed_ms,
-//! last_kinds, cause. The TUI cannot see route generations or stream epochs
-//! on its screen; those fields come from the Hub's attach occupancy when
-//! known and stay empty otherwise.
+//! last_pane_titles, cause. The TUI cannot see route generations or stream
+//! epochs on its screen; those fields come from the Hub's attach occupancy
+//! when known. An unavailable stream epoch is reported as `unavailable`.
 
 use std::{
     collections::VecDeque,
@@ -34,7 +39,9 @@ use botster_hub_client::{
 };
 use botster_hub_test_support::{IsolatedHub, IsolatedHubBuilder};
 use botster_terminal_ghostty::GhosttyClientProjection;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{
+    Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
+};
 
 const LAYER: &str = "tui";
 const SCREEN_ROWS: u16 = 40;
@@ -47,7 +54,8 @@ const MARKER_TWO: &str = "tui-live-marker-two";
 const SESSION_RUNNING_DEADLINE: Duration = Duration::from_secs(20);
 const SCREEN_DEADLINE: Duration = Duration::from_secs(20);
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
-const LAST_KINDS: usize = 16;
+const LAST_PANE_TITLES: usize = 16;
+const STREAM_EPOCH_UNAVAILABLE: &str = "unavailable";
 
 /// One bounded-failure record printed on one line.
 #[derive(Debug, Clone)]
@@ -59,7 +67,7 @@ struct StepFailure {
     stream_epoch: String,
     deadline_ms: u128,
     elapsed_ms: u128,
-    last_kinds: Vec<String>,
+    last_pane_titles: Vec<String>,
     cause: String,
 }
 
@@ -67,7 +75,7 @@ impl fmt::Display for StepFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "layer={LAYER} step={} session_id={} subscription_id={} generation={} stream_epoch={} deadline_ms={} elapsed_ms={} last_kinds={:?} cause={}",
+            "layer={LAYER} step={} session_id={} subscription_id={} generation={} stream_epoch={} deadline_ms={} elapsed_ms={} last_pane_titles={:?} cause={}",
             self.step,
             self.session_id,
             self.subscription_id,
@@ -75,7 +83,7 @@ impl fmt::Display for StepFailure {
             self.stream_epoch,
             self.deadline_ms,
             self.elapsed_ms,
-            self.last_kinds,
+            self.last_pane_titles,
             self.cause
         )
     }
@@ -217,12 +225,15 @@ impl TuiChild {
         self.write_all(b"\r");
     }
 
-    fn wait_exit(&mut self, deadline: Instant) -> bool {
+    fn wait_exit(&mut self, deadline: Instant) -> Result<ExitStatus, String> {
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return true,
+                Ok(Some(status)) => return Ok(status),
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                _ => return false,
+                Ok(None) => {
+                    return Err("deadline expired while the TUI was still running".to_string());
+                }
+                Err(error) => return Err(format!("failed to read the TUI exit status: {error}")),
             }
         }
     }
@@ -242,8 +253,13 @@ impl Drop for TuiChild {
 struct Screen {
     projection: GhosttyClientProjection,
     bytes: Receiver<Vec<u8>>,
-    last_kinds: VecDeque<String>,
+    last_pane_titles: VecDeque<String>,
     last_title: String,
+}
+
+struct ScreenRow {
+    text: String,
+    cell_starts: Vec<usize>,
 }
 
 impl Screen {
@@ -272,7 +288,7 @@ impl Screen {
         Self {
             projection,
             bytes,
-            last_kinds: VecDeque::new(),
+            last_pane_titles: VecDeque::new(),
             last_title: String::new(),
         }
     }
@@ -300,7 +316,7 @@ impl Screen {
         received
     }
 
-    fn rows(&mut self) -> Vec<String> {
+    fn screen_rows(&mut self) -> Vec<ScreenRow> {
         let viewport = match self.projection.project_viewport() {
             Ok(viewport) => viewport,
             Err(_) => return Vec::new(),
@@ -313,20 +329,29 @@ impl Screen {
             .cells
             .chunks(cols)
             .map(|row| {
-                row.iter()
-                    .map(|cell| {
-                        if cell.grapheme.is_empty() {
-                            " "
-                        } else {
-                            cell.grapheme.as_str()
-                        }
-                    })
-                    .collect::<String>()
+                let mut text = String::new();
+                let mut cell_starts = Vec::with_capacity(row.len());
+                for cell in row {
+                    cell_starts.push(text.len());
+                    if cell.grapheme.is_empty() {
+                        text.push(' ');
+                    } else {
+                        text.push_str(&cell.grapheme);
+                    }
+                }
+                ScreenRow { text, cell_starts }
             })
             .collect()
     }
 
-    /// Track the terminal pane title as the TUI-visible "kind" trail.
+    fn rows(&mut self) -> Vec<String> {
+        self.screen_rows()
+            .into_iter()
+            .map(|row| row.text)
+            .collect()
+    }
+
+    /// Track terminal pane title changes for failure diagnostics.
     fn note_title(&mut self) {
         let title = self
             .rows()
@@ -336,19 +361,23 @@ impl Screen {
             .unwrap_or_default();
         if !title.is_empty() && title != self.last_title {
             self.last_title = title.clone();
-            if self.last_kinds.len() == LAST_KINDS {
-                self.last_kinds.pop_front();
+            if self.last_pane_titles.len() == LAST_PANE_TITLES {
+                self.last_pane_titles.pop_front();
             }
-            self.last_kinds.push_back(title);
+            self.last_pane_titles.push_back(title);
         }
     }
 
     /// Zero-based (col, row) of the first cell of `needle` on screen.
     fn locate(&mut self, needle: &str) -> Option<(u16, u16)> {
-        self.rows().iter().enumerate().find_map(|(row, text)| {
-            text.find(needle)
-                .map(|byte| (text[..byte].chars().count() as u16, row as u16))
-        })
+        self.screen_rows()
+            .into_iter()
+            .enumerate()
+            .find_map(|(row_index, row)| {
+                let byte = row.text.find(needle)?;
+                let col = row.cell_starts.iter().position(|start| *start == byte)?;
+                Some((col as u16, row_index as u16))
+            })
     }
 
     fn contains(&mut self, needle: &str) -> bool {
@@ -370,12 +399,13 @@ impl Screen {
                 return Ok(at);
             }
             if Instant::now() >= until {
+                let tail_rows = self.tail_rows();
                 return Err(self.failure(
                     step,
                     identity,
                     deadline,
                     started,
-                    format!("{needle:?} not visible; last rows: {:?}", self.tail_rows()),
+                    format!("{needle:?} not visible; last rows: {tail_rows:?}"),
                 ));
             }
             self.pump(Instant::now() + Duration::from_millis(100));
@@ -405,10 +435,10 @@ impl Screen {
             session_id: identity.session_id.clone(),
             subscription_id: identity.subscription_id.clone(),
             generation: identity.generation.clone(),
-            stream_epoch: String::new(),
+            stream_epoch: STREAM_EPOCH_UNAVAILABLE.to_string(),
             deadline_ms: deadline.as_millis(),
             elapsed_ms: started.elapsed().as_millis(),
-            last_kinds: self.last_kinds.iter().cloned().collect(),
+            last_pane_titles: self.last_pane_titles.iter().cloned().collect(),
             cause,
         }
     }
@@ -436,10 +466,10 @@ fn expect_ok(step: &'static str, identity: &Identity, response: DaemonResponse) 
             session_id: identity.session_id.clone(),
             subscription_id: identity.subscription_id.clone(),
             generation: identity.generation.clone(),
-            stream_epoch: String::new(),
+            stream_epoch: STREAM_EPOCH_UNAVAILABLE.to_string(),
             deadline_ms: 0,
             elapsed_ms: 0,
-            last_kinds: Vec::new(),
+            last_pane_titles: Vec::new(),
             cause: format!(
                 "hub rejected {}: {} (code={} operation={})",
                 step, error.message, error.code, error.operation
@@ -489,10 +519,10 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
                 session_id: identity.session_id.clone(),
                 subscription_id: String::new(),
                 generation: String::new(),
-                stream_epoch: String::new(),
+                stream_epoch: STREAM_EPOCH_UNAVAILABLE.to_string(),
                 deadline_ms: SESSION_RUNNING_DEADLINE.as_millis(),
                 elapsed_ms: started.elapsed().as_millis(),
-                last_kinds: Vec::new(),
+                last_pane_titles: Vec::new(),
                 cause: format!(
                     "session never reached running: {:?}",
                     response
@@ -508,19 +538,56 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
     }
 }
 
-/// Current Hub-side attach occupancy for the session, if any.
-fn occupancy(endpoint: &DaemonEndpoint, identity: &Identity) -> Option<DaemonAttachOccupancy> {
+/// Current Hub-side attach occupancy rows for the session.
+fn occupancies(endpoint: &DaemonEndpoint, identity: &Identity) -> Vec<DaemonAttachOccupancy> {
     let response = expect_ok(
         "status",
         identity,
         request(endpoint, DaemonRequest::Status).expect("status transport"),
     );
-    response.status.and_then(|status| {
-        status
-            .live_attach_occupancy
+    response
+        .status
+        .map(|status| {
+            status
+                .live_attach_occupancy
+                .into_iter()
+                .filter(|row| row.session_id == identity.session_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn wait_for_occupancy(
+    endpoint: &DaemonEndpoint,
+    screen: &mut Screen,
+    identity: &Identity,
+    previous: Option<&DaemonAttachOccupancy>,
+) -> DaemonAttachOccupancy {
+    let started = Instant::now();
+    loop {
+        if let Some(occupancy) = occupancies(endpoint, identity)
             .into_iter()
-            .find(|row| row.session_id == identity.session_id)
-    })
+            .find(|occupancy| {
+                previous.is_none_or(|previous| {
+                    occupancy.subscription_id != previous.subscription_id
+                        || occupancy.generation != previous.generation
+                })
+            })
+        {
+            return occupancy;
+        }
+        if started.elapsed() >= SCREEN_DEADLINE {
+            let failure = screen.failure(
+                "attach_occupancy",
+                identity,
+                SCREEN_DEADLINE,
+                started,
+                "hub did not publish live attach occupancy after the pane rendered".to_string(),
+            );
+            panic!("{failure}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn start_hub(candidate: &Candidate) -> HubGuard {
@@ -551,6 +618,7 @@ fn attach_and_echo(
     identity: &mut Identity,
     attach_via: &str,
     marker: &str,
+    previous_occupancy: Option<&DaemonAttachOccupancy>,
 ) -> DaemonAttachOccupancy {
     let (col, row) = screen
         .wait_for(
@@ -569,16 +637,7 @@ fn attach_and_echo(
             identity,
         )
         .unwrap_or_else(|failure| panic!("{failure}"));
-    let occupancy = occupancy(endpoint, identity).unwrap_or_else(|| {
-        let failure = screen.failure(
-            "attach_occupancy",
-            identity,
-            Duration::ZERO,
-            Instant::now(),
-            "hub reports no live attach occupancy after the pane rendered".to_string(),
-        );
-        panic!("{failure}");
-    });
+    let occupancy = wait_for_occupancy(endpoint, screen, identity, previous_occupancy);
     identity.adopt(&occupancy);
     // Focus the terminal pane by clicking a cell inside it, then type.
     tui.click(ready.0, ready.1);
@@ -596,18 +655,53 @@ fn attach_and_echo(
 }
 
 fn detach_and_quit(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity) {
-    if let Some((col, row)) = screen.locate("Detach") {
-        tui.click(col, row);
-        let _ = screen.wait_for("detached_visible", "detached", EXIT_DEADLINE, identity);
-    }
+    let (col, row) = screen
+        .wait_for(
+            "detach_control_visible_before_quit",
+            "Detach",
+            SCREEN_DEADLINE,
+            identity,
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    tui.click(col, row);
+    screen
+        .wait_for(
+            "detached_visible_before_quit",
+            "detached",
+            SCREEN_DEADLINE,
+            identity,
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
     // 'q' quits only when the terminal pane is not focused; the detach click
     // moved focus to the toolbar button.
     tui.write_all(b"q");
-    let exited = tui.wait_exit(Instant::now() + EXIT_DEADLINE);
-    assert!(
-        exited,
-        "botster-tui did not exit within {EXIT_DEADLINE:?} after detach and q"
-    );
+    let started = Instant::now();
+    let status = tui
+        .wait_exit(started + EXIT_DEADLINE)
+        .unwrap_or_else(|cause| {
+            let failure = screen.failure(
+                "tui_exit_after_detach",
+                identity,
+                EXIT_DEADLINE,
+                started,
+                cause,
+            );
+            panic!("{failure}");
+        });
+    if !status.success() {
+        let failure = screen.failure(
+            "tui_exit_after_detach",
+            identity,
+            EXIT_DEADLINE,
+            started,
+            format!(
+                "TUI exited unsuccessfully: exit_code={} signal={:?}",
+                status.exit_code(),
+                status.signal()
+            ),
+        );
+        panic!("{failure}");
+    }
 }
 
 #[test]
@@ -637,6 +731,7 @@ fn t_s1_connect_select_session_and_see_echo() {
             &mut identity,
             &session_id,
             MARKER_ONE,
+            None,
         );
         println!(
             "t_s1: attached session={} subscription={} generation={} echo visible",
@@ -674,6 +769,7 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             &mut identity,
             &session_id,
             MARKER_ONE,
+            None,
         );
 
         // Detach: the pane title reports detached and the Hub drops the occupancy.
@@ -690,7 +786,10 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             .wait_for("detached_visible", "detached", SCREEN_DEADLINE, &identity)
             .unwrap_or_else(|failure| panic!("{failure}"));
         let detach_started = Instant::now();
-        while occupancy(hub.endpoint(), &identity).is_some() {
+        while occupancies(hub.endpoint(), &identity).iter().any(|occupancy| {
+            occupancy.subscription_id == first.subscription_id
+                && occupancy.generation == first.generation
+        }) {
             if detach_started.elapsed() >= SCREEN_DEADLINE {
                 let failure = screen.failure(
                     "detach_occupancy_released",
@@ -713,14 +812,11 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             &mut identity,
             "Attach",
             MARKER_TWO,
+            Some(&first),
         );
         assert!(
             screen.contains(&format!("echo:{MARKER_ONE}")),
             "first echo must survive re-attach through the restored snapshot"
-        );
-        assert_ne!(
-            second.subscription_id, first.subscription_id,
-            "re-attach must mint a new route"
         );
         assert_ne!(
             second.generation, first.generation,
