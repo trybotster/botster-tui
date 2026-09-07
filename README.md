@@ -68,13 +68,9 @@ The attach socket reads the Unix mux with a persistent byte buffer
 go idle. It does not send terminal Drain. `TerminalSubscriptionClosed`
 for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
-`generation` is close-event evidence only. IsolatedHub Ghostty proof is
-`script/test-live-hub ghostty`. Caller-owned attach proof is
-`script/test-live-hub ghostty-shared` then `script/test-live-hub ghostty-shared-exit`.
-Generic package-event notice consumption is
-`script/test-live-hub package-events` against the Hub-owned
-`plugin-contract-matrix` fixture. Shared live lanes need a caller Hub at
-`9a02e55` or later.
+`generation` is close-event evidence only. The real-client attach proof is
+`script/test-live-tui`. The smoke verifies attach, echo, detach, occupancy
+release, and reattach through a real pseudo-terminal.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -186,63 +182,19 @@ BOTSTER_HUB_DATA_DIR="$hub_dir" \
 botster-hub shutdown --data-dir "$hub_dir"
 ```
 
-The headless live-runtime path proves the same client/app surface without opening the
-alternate screen:
+The candidate smoke uses a real pseudo-terminal. It drives the production TUI with mouse and keyboard input:
 
 ```sh
-BOTSTER_HUB_CONNECTION="{\"transport\":{\"type\":\"unix_socket\",\"path\":\"$hub_dir/botster-hub.sock\"}}" \
-BOTSTER_HUB_DATA_DIR="$hub_dir" \
-  cargo run -p botster-tui -- --headless-live-runtime
+export BOTSTER_HUB_BIN=/path/to/candidate/botster-hub
+export BOTSTER_SESSION_WORKER_BIN=/path/to/candidate/botster-session-worker
+export BOTSTER_CANDIDATE_MANIFEST=/path/to/candidate/install-manifest.json
+script/test-live-tui
 ```
 
-Incremental Ghostty live proof (protocol 8 / floor 48). Build Hub
-`1a0df65230a476cfea362fdc5131e035d303a928` and Core worker
-`bf6e7d996bca2786ad4142c870a13c57a490e241` into a fresh target directory,
-then:
-
-```sh
-export BOTSTER_HUB_BIN=/path/to/fresh-hub-target/debug/botster-hub
-export BOTSTER_SESSION_WORKER_BIN=/path/to/fresh-hub-target/debug/botster-session-worker
-export BOTSTER_HUB_BIN_REV=1a0df65230a476cfea362fdc5131e035d303a928
-export BOTSTER_SESSION_WORKER_BIN_REV=bf6e7d996bca2786ad4142c870a13c57a490e241
-script/test-live-hub ghostty
-```
-
-`script/test` does not forward arguments and is not the live IsolatedHub gate.
-Missing binaries fail `script/test-live-hub ghostty` closed.
-
-Caller-owned attach proof joins a Hub session the TUI does not create. The
-caller supplies only `BOTSTER_HUB_CONNECTION` and `BOTSTER_SHARED_SESSION_ID`
-(default parent id `north-star-shared`). Do not set `BOTSTER_HUB_BIN` or
-`BOTSTER_SESSION_WORKER_BIN`. Only `ghostty-shared` Hello requires
-`attach_occupancy`; empty `Status.live_attach_occupancy` without that
-advertised token is not release proof. Default TUI Hello stays at floor 48
-and requires `package_event_subscriptions`. Shared live lanes need a caller
-Hub at `7a09292` or later. Write
-`NORTH_STAR_HISTORY` before the first TUI attach and echo TUI
-`NORTH_STAR_TUI_<suffix>` input.
-
-```sh
-export BOTSTER_HUB_CONNECTION='{"transport":{"type":"unix_socket","path":"<hub.sock>"}}'
-export BOTSTER_SHARED_SESSION_ID=north-star-shared
-export BOTSTER_TUI_REQUIRE_HUB_TEST=1
-# Do not set BOTSTER_HUB_BIN or BOTSTER_SESSION_WORKER_BIN.
-
-script/test-live-hub ghostty-shared
-# session must still be running
-
-# Start the exit profile, wait for ghostty-shared-exit-attached, then
-# end the session from the caller Hub control plane (not from TUI).
-script/test-live-hub ghostty-shared-exit
-```
-
-`ghostty-shared` prints `ghostty-shared-complete` after attach, cancel,
-socket-cut occupancy release, and reconnect. `ghostty-shared-exit` streams
-`ghostty-shared-exit-attached` while the test stays connected so the caller
-can end the session, then prints `ghostty-shared-exit-complete` after
-observing ProcessExited or the exact session entity `exited`/`failed`. TUI
-sends no `ShutdownSession` on either profile. Missing or malformed injectors
-fail the wrapper closed.
+The manifest must contain matching size, hash, Hub revision, and Core revision records.
+The script fails if a required file is missing or if an exact test does not execute.
+T-S1 proves selection, attach, input, and visible echo.
+T-S2 proves detach, occupancy release, reattach with a new generation, and visible echo.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
@@ -268,8 +220,8 @@ Session types are authoritative Hub descriptors consumed through the
   calls Hub `ListSessionTypesForTarget { target_id: T }` and renders the returned
   available winners (including device Globals projected for `T`). Spawn carries
   the Hub effective `session_type_id` with `request.target_id = T`. Freeform
-  `DaemonRequest::Spawn { command }` is not a product affordance (headless /
-  Workspaces harness seeding may still use raw Spawn).
+  `DaemonRequest::Spawn { command }` is not a product affordance.
+  Workspaces acceptance setup may still use raw Spawn.
 - Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 48` and does
   **not** require `session_type_entity_subscriptions` globally; when the feature
   is missing, Session types shows a surface-local unsupported notice.
@@ -278,42 +230,6 @@ Session types are authoritative Hub descriptors consumed through the
   `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
   `botster-ui-contract-v0.3.3`, and kit
   `7940306b0d7461a12575b3856a96c0fbb23784f3`.
-
-Live proof (independent of contract-matrix):
-
-```sh
-# Use Hub 1a0df65 and Core bf6e7d9 binaries (same pins as Foundation).
-# In pipeline worktrees whose path contains `:`, set a colon-free target dir:
-export CARGO_TARGET_DIR="/tmp/botster-tui-cargo-tgt-session-types"
-export BOTSTER_HUB_BIN=/path/to/pin-matched/botster-hub
-export BOTSTER_SESSION_WORKER_BIN=/path/to/pin-matched/botster-session-worker
-script/test-live-hub session-types
-```
-
-The IsolatedHub session-types profile refreshes `SubscribeEntities` after
-Create (agent, accessory, and service), harness launch-type creation, and
-Delete, so the store receives a request-path snapshot for those asserted ids.
-It does not wait through the owner-loop cadence. Authoring Update is
-`ShowSessionTypeDefinition` proof only; it does not refresh subscribe. The
-profile fail-closes when the live handshake reports conformance &lt; 33 or
-missing `session_type_entity_subscriptions`. It proves product launch through
-list-for-target for a real admitted spawn point `T` (not `device:local`).
-
-### Workspaces live-acceptance lanes
-
-`script/test-live-hub workspaces installed-driver`, `plumbing`, and `lifecycle`
-are the repository-owned runtime proof that the installed Workspaces package,
-including the spawn-form `session_type_id` field and lifecycle bindings, works
-against a protocol-7 Hub. They require pin-matched Hub binaries (the revision
-this crate pins, currently `1a0df65230a476cfea362fdc5131e035d303a928`) and an
-explicit clean post-migration `botster-workspaces` package path via
-`BOTSTER_WORKSPACES_PACKAGE_PATH`. A hermetic source-scan under `script/test`
-also pins the acceptance driver field key so a silent `template_id` revert
-cannot hide behind env-gated live tests.
-
-`ticket_1786036326_597046` owns restoring and proving these three lanes. Open
-sibling `ticket_1786038825_352271` owns the separate `contract-matrix` live
-failure when that lane is red; it is not the Workspaces proof path.
 
 ## Caller-owned Workspaces Spawn acceptance
 
@@ -365,17 +281,7 @@ carried into evidence for the caller's independent Git/worktree verification;
 the TUI verifies returned target, branch, worktree, action, and entity facts but
 does not infer the producer's Git resolution class.
 
-The repository-owned installed-binary proof is:
-
-```sh
-BOTSTER_HUB_BIN=/path/to/botster-hub \
-BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
-BOTSTER_WORKSPACES_PACKAGE_PATH=/clean/path/to/botster-workspaces \
-  script/test-live-hub workspaces installed-driver
-```
-
-That test alone owns an isolated Hub and Git matrix so it can execute the exact
-installed package through `apps open` before merge. Production acceptance mode
+Production acceptance mode
 never starts or stops a Hub, installs or enables packages, creates fixtures, or
 performs shared cleanup. The downstream Workspaces integration remains
 responsible for independently proving Hub, Git, worktree, package, membership,
@@ -497,17 +403,6 @@ SHAs and ancestry booleans.
 Hermetic unit coverage:
 `app::tests::workspaces_claim_keyboard_select_submit_membership_and_exclusion`
 drives real InputRouter keys for select + submit + membership exclusion.
-
-Repository-owned live proof (isolated Hub, pin-matched sources). The wrapper
-rebuilds Hub + session-worker with `--locked` into a fresh target dir and writes
-a build receipt — callers must not pre-point at a stale `target/release`:
-
-```sh
-BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/botster-workspaces \  # ≥ 7ab4d133…
-BOTSTER_HUB_SOURCE_PATH=/path/to/botster-hub-source \         # ≥ de6b099… clean
-BOTSTER_TUI_CLAIM_EVIDENCE_OUT=/tmp/claim-evidence.jsonl \
-  script/test-live-hub workspaces claim-driver
-```
 
 The System details diagnostics distinguish:
 
@@ -659,8 +554,7 @@ botster-hub packages enable --data-dir "$hub_dir" botster-tui
 
 The manifest command is `target/debug/botster-tui` relative to the package root,
 so source-checkout installs must build or stage that debug binary before
-opening the app. `script/test-live-hub` does this staging when it uses an
-external `CARGO_TARGET_DIR`.
+opening the app.
 
 The app-open flow launches the checked-in runnable entrypoint through the
 hub-resolved foreground terminal contract. The hub supplies
@@ -681,110 +575,6 @@ BOTSTER_HUB_CONNECTION="{\"transport\":{\"type\":\"unix_socket\",\"path\":\"$hub
 BOTSTER_HUB_DATA_DIR="$hub_dir" \
   cargo run -p botster-tui
 ```
-
-There is also an automated isolated-Hub test using
-`botster-hub-test-support`. The wrapper accepts explicit matching
-`botster-hub` and `botster-session-worker` binaries, or resolves those command
-names from `PATH`; it does not discover or build a sibling Hub checkout. It
-starts an isolated daemon, runs the TUI live-runtime path, runs the
-revision-25 session lifecycle/presentation conformance runner and plugin
-contract matrix conformance harness, renders the delivered fixture
-surfaces through the TUI renderer, and tears the daemon down. The renderer
-coverage includes the composite application primitive fixture for `metric_grid`,
-`table`, `toolbar`, `status_badge`, `section`, `empty_state`, enhanced
-panel/list semantics, and form/action feedback. It also
-installs/enables this checkout as a local package and opens `botster-tui`
-through `botster-hub apps open` with a headless live-runtime env switch so the
-foreground app exits cleanly under automation:
-
-```sh
-BOTSTER_HUB_BIN=/path/to/botster-hub \
-BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
-BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE=/path/to/hub/packages/hub-test-support/fixtures/plugin-contract-matrix \
-CARGO_TARGET_DIR=/tmp/botster-tui-live-target \
-  script/test-live-hub
-```
-
-The wrapper also exposes one production-shaped Workspaces mode with an explicit
-profile. It never discovers a sibling checkout: the caller supplies a clean
-`botster-workspaces` package path, and the harness validates the package
-manifest before starting an isolated Hub.
-
-```sh
-BOTSTER_HUB_BIN=/path/to/botster-hub \
-BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
-BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/clean/botster-workspaces \
-CARGO_TARGET_DIR=/tmp/botster-tui-workspaces-plumbing-target \
-  script/test-live-hub workspaces plumbing
-```
-
-The `plumbing` profile installs, enables, and reloads the real package through
-public Hub requests; opens admitted Workspaces navigation; renders the
-owner-authored index and detail; and routes both mouse and keyboard actions
-from the production frame and hit map using the exact delivered node, action,
-and payload identity. It exits zero only after its named completion ledger and
-isolated-Hub cleanup are complete. This is package plumbing and generic TUI
-action proof, not Workspaces lifecycle product proof.
-
-The strict-superset lifecycle command is the downstream consumer gate:
-
-```sh
-BOTSTER_HUB_BIN=/path/to/botster-hub \
-BOTSTER_SESSION_WORKER_BIN=/path/to/botster-session-worker \
-BOTSTER_WORKSPACES_PACKAGE_PATH=/path/to/clean/botster-workspaces \
-CARGO_TARGET_DIR=/tmp/botster-tui-workspaces-lifecycle-target \
-  script/test-live-hub workspaces lifecycle
-```
-
-That profile requires 16 retained references and the producer-authored
-`/session` binding contract: exact `session_uuid` plus `lifecycle_class`
-filters for `current`, `ended`, and `indeterminate`, plus a separate exact-UUID
-absence binding. Before spawning its two controlled lifecycle sessions, the
-harness establishes the TUI-owned subscription and authoritative baseline and
-proves both UUIDs are absent. It then requires both exact rows to become
-authoritative `current` rows before opening the Workspaces surface. The
-subsequent `current` -> `ended` -> removal barriers also match the exact UUID
-and state; an empty snapshot alone is never readiness for an expected row.
-Timeout diagnostics retain only the active subscription id, snapshot state and
-sequence, expected UUID/state, and that row's last observed state or absence.
-It joins the delivered descriptors to realized
-`item_template`/`empty_template` roots, so it does not depend on headings,
-incidental node-id spelling, prose, or geometric renderer position. It also
-requires an individual group's realized roots to preserve the
-retained-reference order in structural render traversal, including when
-producer-authored wrappers sit between the group and its roots; lifecycle class
-is never inferred from that order. The profile further requires an
-entity-driven current-to-ended transition without a new surface request, an
-absent/deleted historical reference, inert presence-detection templates,
-unique canonical realized identity, real membership removal, a fresh
-reconnect subscription/snapshot, explicit surface reopen, historical
-rehydration, stale-generation rejection, and clean shutdown.
-
-Producer lifecycle bindings for current/ended/unavailable groups shipped on
-`botster-workspaces` (closed `ticket_1785296184_677408`). The TUI lifecycle
-consumer gate is proven by a green `script/test-live-hub workspaces lifecycle`
-against a pin-matched Hub and a real `botster-workspaces` checkout; a fixture
-or a composed summary cannot replace that combined consumer proof.
-
-Under the hood, the Rust harness accepts explicit `BOTSTER_HUB_BIN` and
-`BOTSTER_SESSION_WORKER_BIN` paths because `botster-tui` does not own those
-binaries. If a variable is omitted, the wrapper looks up the corresponding
-command on `PATH` and fails with a setup diagnostic if it is unavailable.
-`CARGO_TARGET_DIR` is optional; omitting it creates and cleans up a fresh
-temporary target. In the default `contract-matrix` mode,
-`BOTSTER_PLUGIN_CONTRACT_MATRIX_FIXTURE` is required and must name a Hub
-contract-matrix fixture directory containing `botster-package.json` and
-`plugin.lua`; the parent acceptance run uses the extracted
-`package/fixtures/plugin-contract-matrix` directory from public
-`@trybotster/hub-test-support@0.1.39`. The wrapper fails before building when
-the selected mode's fixture/package path or Workspaces profile is missing or
-invalid. Normal unit tests skip the isolated runtime when the required live
-inputs are absent; the wrapper sets
-`BOTSTER_TUI_REQUIRE_HUB_TEST=1`, so missing
-binaries or plugin-surface proof cannot silently pass. The live-Hub test also
-asserts non-default compatibility descriptor values from the isolated daemon
-and exercises a compatibility mismatch through
-`connect_and_hello_with_requirement` with an unsatisfied required feature.
 
 ## Scope
 
