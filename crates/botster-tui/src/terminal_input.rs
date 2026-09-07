@@ -435,6 +435,7 @@ pub struct InputWindow {
     in_flight: VecDeque<InFlightOperation>,
     queued: VecDeque<QueuedOperation>,
     queued_bytes: usize,
+    retained_bytes: usize,
 }
 
 impl InputWindow {
@@ -446,6 +447,7 @@ impl InputWindow {
             in_flight: VecDeque::new(),
             queued: VecDeque::new(),
             queued_bytes: 0,
+            retained_bytes: 0,
         }
     }
 
@@ -467,14 +469,35 @@ impl InputWindow {
         paste: bool,
         frames: Vec<Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>, InputWindowError> {
+        self.admit_retaining(operation_id, paste, frames, 0)
+    }
+
+    /// Admit one operation and reserve bytes retained by its caller.
+    ///
+    /// The check counts each live allocation. Immediate frames are not retained
+    /// by this window. Queued frames are retained until a slot becomes free.
+    pub fn admit_retaining(
+        &mut self,
+        operation_id: u64,
+        paste: bool,
+        frames: Vec<Vec<u8>>,
+        retained_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, InputWindowError> {
         let bytes = frames.iter().map(Vec::len).sum::<usize>();
+        let retained_total = self.retained_bytes.saturating_add(retained_bytes);
         if !self.queued.is_empty() || self.in_flight.len() >= MAX_IN_FLIGHT_OPERATIONS {
-            if self.queued_bytes.saturating_add(bytes) > MAX_QUEUED_INPUT_BYTES {
+            if self
+                .queued_bytes
+                .saturating_add(bytes)
+                .saturating_add(retained_total)
+                > MAX_QUEUED_INPUT_BYTES
+            {
                 return Err(InputWindowError::QueueFull {
-                    queued_bytes: self.queued_bytes,
+                    queued_bytes: self.queued_bytes.saturating_add(self.retained_bytes),
                 });
             }
             self.queued_bytes += bytes;
+            self.retained_bytes = retained_total;
             self.queued.push_back(QueuedOperation {
                 operation_id,
                 paste,
@@ -483,11 +506,22 @@ impl InputWindow {
             });
             return Ok(self.release());
         }
+        if retained_total > MAX_QUEUED_INPUT_BYTES {
+            return Err(InputWindowError::QueueFull {
+                queued_bytes: self.retained_bytes,
+            });
+        }
+        self.retained_bytes = retained_total;
         self.in_flight.push_back(InFlightOperation {
             operation_id,
             paste,
         });
         Ok(frames)
+    }
+
+    /// Release bytes that the caller no longer retains.
+    pub fn release_retained(&mut self, bytes: usize) {
+        self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
     }
 
     /// Complete one operation by id. Returns the completed entry and the frames
@@ -535,6 +569,13 @@ impl InputWindow {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
+    }
+
+    /// Bytes retained by callers under this window's memory bound.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -721,5 +762,39 @@ mod tests {
             window.admit(id, false, vec![vec![0; MAX_QUEUED_INPUT_BYTES + 1]]),
             Err(InputWindowError::QueueFull { queued_bytes: 0 })
         ));
+    }
+
+    #[test]
+    fn window_counts_retained_payload_and_only_queued_frames() {
+        let mut immediate = InputWindow::new();
+        let id = immediate.next_operation_id().expect("id");
+        let frames = immediate
+            .admit_retaining(id, true, vec![vec![0; 64]], MAX_QUEUED_INPUT_BYTES)
+            .expect("immediate frames are not retained by the window");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(immediate.retained_bytes(), MAX_QUEUED_INPUT_BYTES);
+
+        let mut queued = InputWindow::new();
+        for _ in 0..MAX_IN_FLIGHT_OPERATIONS {
+            let id = queued.next_operation_id().expect("id");
+            queued.admit(id, false, vec![vec![1]]).expect("admitted");
+        }
+        let id = queued.next_operation_id().expect("id");
+        assert!(matches!(
+            queued.admit_retaining(id, true, vec![vec![0; 1]], MAX_QUEUED_INPUT_BYTES),
+            Err(InputWindowError::QueueFull { queued_bytes: 0 })
+        ));
+        assert_eq!(queued.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn retained_payload_is_released_explicitly() {
+        let mut window = InputWindow::new();
+        let id = window.next_operation_id().expect("id");
+        window
+            .admit_retaining(id, true, vec![vec![1]], 10)
+            .expect("admitted");
+        window.release_retained(10);
+        assert_eq!(window.retained_bytes(), 0);
     }
 }
