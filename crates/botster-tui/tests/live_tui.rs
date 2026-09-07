@@ -1,8 +1,9 @@
 //! Actual-client live tests: the built `botster-tui` binary under a real PTY
 //! against an isolated Hub daemon from a recorded candidate set.
 //!
-//! Inputs (all required; the tests fail closed when any is missing while the
-//! candidate manifest is set, and report a skip when the manifest is unset):
+//! The tests are `#[ignore]`d so `script/test` needs no external setup; the
+//! dedicated candidate-smoke command selects them with `--ignored --exact`
+//! and they fail closed, never skip, when any input is missing:
 //!
 //! - `BOTSTER_HUB_BIN`, `BOTSTER_SESSION_WORKER_BIN`: dev-profile prebuilt
 //!   executables from the candidate set.
@@ -88,19 +89,66 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// `None` when no candidate manifest is configured (the run reports a
-    /// skip); a set manifest with a missing binary path fails closed.
-    fn from_env() -> Option<Self> {
-        let manifest = std::env::var("BOTSTER_CANDIDATE_MANIFEST").ok()?;
-        let hub_bin = std::env::var("BOTSTER_HUB_BIN")
-            .expect("BOTSTER_HUB_BIN is required with BOTSTER_CANDIDATE_MANIFEST");
-        let worker_bin = std::env::var("BOTSTER_SESSION_WORKER_BIN")
-            .expect("BOTSTER_SESSION_WORKER_BIN is required with BOTSTER_CANDIDATE_MANIFEST");
-        Some(Self {
+    /// Fails closed with every missing input named; a live test never skips.
+    fn from_env() -> Self {
+        let mut missing = Vec::new();
+        let mut read = |name: &'static str| {
+            let value = std::env::var(name).unwrap_or_default();
+            if value.is_empty() {
+                missing.push(name);
+            }
+            value
+        };
+        let hub_bin = read("BOTSTER_HUB_BIN");
+        let worker_bin = read("BOTSTER_SESSION_WORKER_BIN");
+        let manifest = read("BOTSTER_CANDIDATE_MANIFEST");
+        assert!(
+            missing.is_empty(),
+            "layer={LAYER} step=candidate_inputs cause=missing environment {missing:?}; the candidate smoke needs the prebuilt Hub, worker, and manifest"
+        );
+        for (name, path) in [
+            ("BOTSTER_HUB_BIN", &hub_bin),
+            ("BOTSTER_SESSION_WORKER_BIN", &worker_bin),
+            ("BOTSTER_CANDIDATE_MANIFEST", &manifest),
+        ] {
+            assert!(
+                std::path::Path::new(path).is_file(),
+                "layer={LAYER} step=candidate_inputs cause={name} is not a file: {path}"
+            );
+        }
+        Self {
             hub_bin,
             worker_bin,
             manifest,
-        })
+        }
+    }
+}
+
+/// Owns the isolated Hub for the whole test. Normal completion runs the
+/// explicit shutdown and fails the test if it errors; an assertion panic
+/// leaves teardown to `IsolatedHub`'s own panicking cleanup.
+struct HubGuard {
+    hub: Option<IsolatedHub>,
+}
+
+impl HubGuard {
+    fn hub(&self) -> &IsolatedHub {
+        self.hub
+            .as_ref()
+            .expect("hub is alive until the guard drops")
+    }
+}
+
+impl Drop for HubGuard {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            return;
+        }
+        if let Some(hub) = self.hub.take()
+            && let Err(error) = hub.shutdown()
+        {
+            panic!("layer={LAYER} step=hub_shutdown cause={error}");
+        }
     }
 }
 
@@ -475,7 +523,7 @@ fn occupancy(endpoint: &DaemonEndpoint, identity: &Identity) -> Option<DaemonAtt
     })
 }
 
-fn start_hub(candidate: &Candidate) -> IsolatedHub {
+fn start_hub(candidate: &Candidate) -> HubGuard {
     println!(
         "provenance: manifest={} hub_bin={} worker_bin={} tui_bin={} tui_version={}",
         candidate.manifest,
@@ -484,13 +532,14 @@ fn start_hub(candidate: &Candidate) -> IsolatedHub {
         env!("CARGO_BIN_EXE_botster-tui"),
         env!("CARGO_PKG_VERSION")
     );
-    IsolatedHubBuilder::new()
+    let hub = IsolatedHubBuilder::new()
         .hub_bin(&candidate.hub_bin)
         .session_worker_bin(&candidate.worker_bin)
         .manifest(&candidate.manifest)
         .name("live-tui")
         .start()
-        .expect("isolated hub starts from the verified candidate set")
+        .expect("isolated hub starts from the verified candidate set");
+    HubGuard { hub: Some(hub) }
 }
 
 /// Attach through the session row, focus the pane, type a marker, and wait
@@ -562,14 +611,11 @@ fn detach_and_quit(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity)
 }
 
 #[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s1_connect_select_session_and_see_echo() {
-    let Some(candidate) = Candidate::from_env() else {
-        println!(
-            "skipped: BOTSTER_CANDIDATE_MANIFEST is not set; the live TUI test needs the candidate set"
-        );
-        return;
-    };
-    let hub = start_hub(&candidate);
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
     let mut identity = Identity::default();
     spawn_session(hub.endpoint(), &mut identity);
     {
@@ -598,18 +644,15 @@ fn t_s1_connect_select_session_and_see_echo() {
         );
         detach_and_quit(&mut tui, &mut screen, &identity);
     }
-    hub.shutdown().expect("isolated hub shuts down cleanly");
+    drop(guard);
 }
 
 #[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
-    let Some(candidate) = Candidate::from_env() else {
-        println!(
-            "skipped: BOTSTER_CANDIDATE_MANIFEST is not set; the live TUI test needs the candidate set"
-        );
-        return;
-    };
-    let hub = start_hub(&candidate);
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
     let mut identity = Identity::default();
     spawn_session(hub.endpoint(), &mut identity);
     {
@@ -693,5 +736,5 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
         );
         detach_and_quit(&mut tui, &mut screen, &identity);
     }
-    hub.shutdown().expect("isolated hub shuts down cleanly");
+    drop(guard);
 }
