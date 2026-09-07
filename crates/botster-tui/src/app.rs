@@ -1683,10 +1683,12 @@ struct TuiApp {
 impl TuiApp {
     /// Application state without a terminal input thread. The caller starts
     /// the connection with `connect`.
+    #[cfg(test)]
     fn new(endpoint: Option<DaemonEndpoint>) -> Self {
         Self::new_with_connection(endpoint, None)
     }
 
+    #[cfg(test)]
     fn new_with_connection(
         endpoint: Option<DaemonEndpoint>,
         connection_error: Option<String>,
