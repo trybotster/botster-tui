@@ -25,9 +25,14 @@
 
 use std::{
     collections::VecDeque,
-    fmt,
+    fmt, fs,
     io::{Read, Write},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    os::unix::fs::DirBuilderExt,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -39,9 +44,7 @@ use botster_hub_client::{
 };
 use botster_hub_test_support::{IsolatedHub, IsolatedHubBuilder};
 use botster_terminal_ghostty::GhosttyClientProjection;
-use portable_pty::{
-    Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
-};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
 const LAYER: &str = "tui";
 const SCREEN_ROWS: u16 = 40;
@@ -56,6 +59,7 @@ const SCREEN_DEADLINE: Duration = Duration::from_secs(20);
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
 const LAST_PANE_TITLES: usize = 16;
 const STREAM_EPOCH_UNAVAILABLE: &str = "unavailable";
+static SHORT_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// One bounded-failure record printed on one line.
 #[derive(Debug, Clone)]
@@ -137,6 +141,7 @@ impl Candidate {
 /// leaves teardown to `IsolatedHub`'s own panicking cleanup.
 struct HubGuard {
     hub: Option<IsolatedHub>,
+    _short_root: ShortTempRoot,
 }
 
 impl HubGuard {
@@ -144,6 +149,49 @@ impl HubGuard {
         self.hub
             .as_ref()
             .expect("hub is alive until the guard drops")
+    }
+}
+
+/// Owns one short absolute root for the Hub's macOS Unix socket.
+///
+/// Atomic directory creation prevents collisions. Successful tests remove the
+/// root. Failed tests preserve it with the Hub's diagnostic state.
+struct ShortTempRoot {
+    path: PathBuf,
+}
+
+impl ShortTempRoot {
+    fn create() -> Self {
+        loop {
+            let sequence = SHORT_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = PathBuf::from(format!("/tmp/btui-{}-{sequence}", std::process::id()));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Self { path },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!(
+                    "layer={LAYER} step=short_temp_root cause=failed to create {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for ShortTempRoot {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!(
+                "layer={LAYER} step=short_temp_root_cleanup cause=failed to remove {}: {error}",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -345,10 +393,7 @@ impl Screen {
     }
 
     fn rows(&mut self) -> Vec<String> {
-        self.screen_rows()
-            .into_iter()
-            .map(|row| row.text)
-            .collect()
+        self.screen_rows().into_iter().map(|row| row.text).collect()
     }
 
     /// Track terminal pane title changes for failure diagnostics.
@@ -599,14 +644,19 @@ fn start_hub(candidate: &Candidate) -> HubGuard {
         env!("CARGO_BIN_EXE_botster-tui"),
         env!("CARGO_PKG_VERSION")
     );
+    let short_root = ShortTempRoot::create();
     let hub = IsolatedHubBuilder::new()
         .hub_bin(&candidate.hub_bin)
         .session_worker_bin(&candidate.worker_bin)
         .manifest(&candidate.manifest)
+        .root(&short_root.path)
         .name("live-tui")
         .start()
         .expect("isolated hub starts from the verified candidate set");
-    HubGuard { hub: Some(hub) }
+    HubGuard {
+        hub: Some(hub),
+        _short_root: short_root,
+    }
 }
 
 /// Attach through the session row, focus the pane, type a marker, and wait
@@ -786,10 +836,13 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             .wait_for("detached_visible", "detached", SCREEN_DEADLINE, &identity)
             .unwrap_or_else(|failure| panic!("{failure}"));
         let detach_started = Instant::now();
-        while occupancies(hub.endpoint(), &identity).iter().any(|occupancy| {
-            occupancy.subscription_id == first.subscription_id
-                && occupancy.generation == first.generation
-        }) {
+        while occupancies(hub.endpoint(), &identity)
+            .iter()
+            .any(|occupancy| {
+                occupancy.subscription_id == first.subscription_id
+                    && occupancy.generation == first.generation
+            })
+        {
             if detach_started.elapsed() >= SCREEN_DEADLINE {
                 let failure = screen.failure(
                     "detach_occupancy_released",
