@@ -308,6 +308,10 @@ pub struct HubIo {
     request_ids: RequestIdSequence,
     pending: BTreeMap<u64, PendingRequest>,
     budget: Arc<WakeBudget>,
+    /// Test seam: when set, terminal input frames are recorded instead of
+    /// written, so a test without a Hub can observe the write path.
+    #[cfg(test)]
+    captured_terminal: Option<Vec<(String, u64, Vec<u8>)>>,
 }
 
 impl HubIo {
@@ -325,7 +329,24 @@ impl HubIo {
             request_ids: RequestIdSequence::new(),
             pending: BTreeMap::new(),
             budget: Arc::new(WakeBudget::new()),
+            #[cfg(test)]
+            captured_terminal: None,
         }
+    }
+
+    /// Record terminal input frames instead of writing them. Test only.
+    #[cfg(test)]
+    pub fn capture_terminal_frames(&mut self) {
+        self.captured_terminal = Some(Vec::new());
+    }
+
+    /// Frames recorded since the last call: (route, generation, body). Test only.
+    #[cfg(test)]
+    pub fn take_captured_terminal_frames(&mut self) -> Vec<(String, u64, Vec<u8>)> {
+        self.captured_terminal
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Create the owner and start the Crossterm `EventStream` input thread.
@@ -497,6 +518,11 @@ impl HubIo {
     /// Returns false when no connection is installed or the container cannot
     /// carry the route and body.
     pub fn send_terminal(&mut self, route: &str, generation: u64, body: &[u8]) -> bool {
+        #[cfg(test)]
+        if let Some(captured) = self.captured_terminal.as_mut() {
+            captured.push((route.to_string(), generation, body.to_vec()));
+            return true;
+        }
         let Some(link) = self.link.as_ref() else {
             return false;
         };

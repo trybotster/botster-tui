@@ -311,6 +311,9 @@ struct AttachHydration {
     snapshot_finished: bool,
     /// True after the matching attached state arrives.
     attached_seen: bool,
+    /// True when this hydration restarts a route that was already live
+    /// (ROUTE_RESYNC): the attachment and its input window survive.
+    resync: bool,
 }
 
 impl AttachHydration {
@@ -327,6 +330,7 @@ impl AttachHydration {
             snapshot_ready: false,
             snapshot_finished: false,
             attached_seen: false,
+            resync: false,
         }
     }
 }
@@ -4425,9 +4429,10 @@ impl TuiApp {
     }
 
     /// The route restarts from a fresh SNAPSHOT_READY. The decoder state is
-    /// reset, never continued. Input captured so far stays queued; in-flight
-    /// operations keep their window slots because INPUT_RESULT frames are
-    /// accepted on every epoch of the attachment.
+    /// reset, never continued. The attachment itself survives: Core keeps the
+    /// route attached across a resync and Hub never gates input, so the
+    /// hydration is marked `resync` and the input window keeps its slots.
+    /// Input captured so far stays queued and is never replayed.
     fn begin_route_resync(&mut self) {
         let Some((session_id, route)) = self.current_owner_pair() else {
             return;
@@ -4441,13 +4446,82 @@ impl TuiApp {
         let mut hydration = AttachHydration::new(&session_id, &route);
         if let Some(previous) = self.attach_hydration.take() {
             hydration.attached_seen = previous.attached_seen;
+            hydration.resync = previous.resync;
             hydration.pending_input = previous.pending_input;
             hydration.pending_input_bytes = previous.pending_input_bytes;
             hydration.pending_resize = previous.pending_resize;
         }
         hydration.attached_seen |= was_attached;
+        hydration.resync |= was_attached;
         self.attach_hydration = Some(hydration);
         self.action_feedback = Some(format!("terminal route resync: {session_id}"));
+    }
+
+    /// Whether `route` names the current valid attachment for input purposes:
+    /// the live attached route, or a resync hydration of a route that was
+    /// live, with the trusted attachment generation known. Initial hydration
+    /// before the Attach response and retired or replaced routes never match.
+    fn attachment_matches_route(&self, route: &str) -> bool {
+        if self.route_generation.is_none() {
+            return false;
+        }
+        self.attached_matches_route(route)
+            || self
+                .attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.resync && hydration.route == route)
+    }
+
+    fn send_encoded_frames(&mut self, frames: Vec<Vec<u8>>) {
+        if frames.is_empty() {
+            return;
+        }
+        let Some((_, route)) = self.current_owner_pair() else {
+            self.error = Some("terminal stream unavailable: no attached route".to_string());
+            return;
+        };
+        if !self.attachment_matches_route(&route) {
+            self.error = Some("terminal stream unavailable: no attached route".to_string());
+            return;
+        }
+        let Some(generation) = self.route_generation else {
+            self.error = Some("terminal stream unavailable: route generation unknown".to_string());
+            return;
+        };
+        for frame in frames {
+            if !self.hub_io.send_terminal(&route, generation, &frame) {
+                self.error = Some("terminal stream unavailable: not connected".to_string());
+                return;
+            }
+        }
+        self.error = None;
+    }
+
+    /// INPUT_RESULT is correlated by operation id within the current
+    /// attachment, including a resync hydration of that attachment. Results
+    /// for a lost or replaced attachment never reach the window.
+    fn apply_terminal_input_result(&mut self, route: &str, result: InputResultBody) {
+        if !self.attachment_matches_route(route) {
+            return;
+        }
+        // `result.mode_bits` is the mode set at the time of that operation;
+        // current stream state comes only from epoch-valid MODES frames.
+        let (completed, released) = self.input_window.complete(result.operation_id);
+        if completed.is_none() {
+            self.error = Some(format!(
+                "terminal input result {} has no pending operation",
+                result.operation_id
+            ));
+        }
+        self.send_encoded_frames(released);
+        match result.outcome {
+            InputOutcome::Written => {
+                if completed.is_some() {
+                    self.error = None;
+                }
+            }
+            _ => self.error = Some(input_outcome_message(&result)),
+        }
     }
 
     fn apply_terminal_event(&mut self, route: &str, event: TerminalEvent) {
@@ -4913,31 +4987,6 @@ impl TuiApp {
         }
     }
 
-    fn send_encoded_frames(&mut self, frames: Vec<Vec<u8>>) {
-        if frames.is_empty() {
-            return;
-        }
-        let Some(route) = self
-            .attached
-            .as_ref()
-            .map(|attached| attached.route.clone())
-        else {
-            self.error = Some("terminal stream unavailable: no attached route".to_string());
-            return;
-        };
-        let Some(generation) = self.route_generation else {
-            self.error = Some("terminal stream unavailable: route generation unknown".to_string());
-            return;
-        };
-        for frame in frames {
-            if !self.hub_io.send_terminal(&route, generation, &frame) {
-                self.error = Some("terminal stream unavailable: not connected".to_string());
-                return;
-            }
-        }
-        self.error = None;
-    }
-
     fn send_key(&mut self, key: KeyEvent) {
         let Some(operation_id) = self.next_input_operation_id() else {
             return;
@@ -5022,30 +5071,6 @@ impl TuiApp {
         hydration.pending_input_bytes += bytes;
         hydration.pending_input.push(input);
         self.error = None;
-    }
-
-    fn apply_terminal_input_result(&mut self, route: &str, result: InputResultBody) {
-        if !self.attached_matches_route(route) {
-            return;
-        }
-        // `result.mode_bits` is the mode set at the time of that operation;
-        // current stream state comes only from epoch-valid MODES frames.
-        let (completed, released) = self.input_window.complete(result.operation_id);
-        if completed.is_none() {
-            self.error = Some(format!(
-                "terminal input result {} has no pending operation",
-                result.operation_id
-            ));
-        }
-        self.send_encoded_frames(released);
-        match result.outcome {
-            InputOutcome::Written => {
-                if completed.is_some() {
-                    self.error = None;
-                }
-            }
-            _ => self.error = Some(input_outcome_message(&result)),
-        }
     }
 
     #[cfg(test)]
@@ -15493,5 +15518,128 @@ mod tests {
                 .map(|hydration| hydration.pending_input.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn released_queued_frames_are_sent_on_the_same_attachment_during_resync() {
+        let mut app = workspace_fixture();
+        app.hub_io.capture_terminal_frames();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 3);
+        app.apply_wake(routed(
+            "route-1",
+            3,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.attach_hydration = None;
+        for _ in 0..crate::terminal_input::MAX_IN_FLIGHT_OPERATIONS {
+            let id = app.input_window.next_operation_id().expect("id");
+            app.input_window
+                .admit(id, false, vec![vec![1]])
+                .expect("admitted");
+        }
+        let queued_id = app.input_window.next_operation_id().expect("id");
+        app.input_window
+            .admit(queued_id, false, vec![vec![0xAB]])
+            .expect("queued");
+        app.apply_wake(routed_at_epoch("route-1", 3, 1, resync_frame(0, 1)));
+        assert!(app.attached.is_none());
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.resync)
+        );
+        let result = InputResultBody {
+            operation_id: 1,
+            outcome: InputOutcome::Written,
+            accepted_payload_bytes: Some(1),
+            written_pty_bytes: Some(1),
+            mode_bits: 0,
+            detail: String::new(),
+        };
+        app.apply_wake(routed_at_epoch(
+            "route-1",
+            3,
+            1,
+            botster_terminal_protocol_client::encode_input_result(&result).expect("result frame"),
+        ));
+        let sent = app.hub_io.take_captured_terminal_frames();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the released queued frame is written on the attachment"
+        );
+        assert_eq!(sent[0].0, "route-1");
+        assert_eq!(sent[0].1, 3);
+        assert_eq!(sent[0].2, vec![0xAB]);
+        assert_eq!(
+            app.input_window.in_flight_len(),
+            crate::terminal_input::MAX_IN_FLIGHT_OPERATIONS
+        );
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn input_results_are_rejected_after_the_attachment_is_lost_or_replaced() {
+        let mut app = workspace_fixture();
+        app.hub_io.capture_terminal_frames();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 1);
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.attach_hydration = None;
+        let id = app.input_window.next_operation_id().expect("id");
+        app.input_window
+            .admit(id, false, vec![vec![1]])
+            .expect("admitted");
+        let result = InputResultBody {
+            operation_id: id,
+            outcome: InputOutcome::Written,
+            accepted_payload_bytes: Some(1),
+            written_pty_bytes: Some(1),
+            mode_bits: 0,
+            detail: String::new(),
+        };
+        let result_frame = || {
+            botster_terminal_protocol_client::encode_input_result(&result).expect("result frame")
+        };
+        // Lost attachment: the route is retired, the operation is resolved as
+        // unknown, and a late result for it is dropped without effect.
+        app.retire_subscription("route-1");
+        app.attached = None;
+        app.error = None;
+        app.apply_wake(routed("route-1", 1, result_frame()));
+        assert_eq!(app.input_window.in_flight_len(), 0);
+        assert!(app.error.is_none());
+        // Replaced attachment: a fresh campaign before its live path is not a
+        // valid target for results or released frames.
+        app.begin_attach_hydration("session-alpha", "route-2");
+        complete_attach(&mut app, "session-alpha", "route-2", 2);
+        app.apply_wake(routed(
+            "route-2",
+            2,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        assert!(!app.attachment_matches_route("route-2"));
+        app.apply_wake(routed("route-2", 2, result_frame()));
+        assert!(app.error.is_none());
+        app.send_encoded_frames(vec![vec![1]]);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("no attached route"))
+        );
+        assert!(app.hub_io.take_captured_terminal_frames().is_empty());
     }
 }
