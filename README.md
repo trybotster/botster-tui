@@ -70,7 +70,13 @@ for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. The real-client attach proof is
 `script/test-live-tui`. The smoke verifies attach, echo, detach, occupancy
-release, and reattach through a real pseudo-terminal.
+release, reattach, unsafe-paste consent, and resize through a real
+pseudo-terminal.
+
+An actual-client test does not verify control-connection loss and reconnect at
+this candidate. The pinned Hub test support cannot sever one client connection.
+Each isolated Hub start also creates a new socket path. Focused tests cover the
+client reconnect paths.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -195,6 +201,12 @@ The manifest must contain matching size, hash, Hub revision, and Core revision r
 The script fails if a required file is missing or if an exact test does not execute.
 T-S1 proves selection, attach, input, and visible echo.
 T-S2 proves detach, occupancy release, reattach with a new generation, and visible echo.
+T-S3 proves zero-byte unsafe-paste rejection, deliberate consent, cancellation,
+continued output, a fresh accepted retry, and no raw payload rendering.
+T-S4 proves that an outer pseudo-terminal resize reaches the attached session
+and that the resized session continues to accept input and produce output.
+The smoke does not prove control-connection loss and recovery. The public
+isolated Hub harness cannot sever one client connection or restart at a stable endpoint.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.

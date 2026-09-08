@@ -28,7 +28,7 @@ use std::{
     fmt, fs,
     io::{Read, Write},
     os::unix::fs::DirBuilderExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
@@ -39,8 +39,8 @@ use std::{
 
 use botster_core::contract::terminal_screen::TerminalScreenSize;
 use botster_hub_client::{
-    DaemonAttachOccupancy, DaemonEndpoint, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    request,
+    DaemonAttachOccupancy, DaemonEndpoint, DaemonModeFlags, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, request,
 };
 use botster_hub_test_support::{IsolatedHub, IsolatedHubBuilder};
 use botster_terminal_ghostty::GhosttyClientProjection;
@@ -52,8 +52,16 @@ const SCREEN_COLS: u16 = 140;
 const SESSION_READY_MARKER: &str = "live-ready";
 const SHELL_COMMAND: &str =
     "printf 'live-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
+const RESIZE_SHELL_COMMAND: &str = "printf 'live-ready\\n'; while IFS= read -r line; do if [ \"$line\" = tui-report-size ]; then set -- $(stty size); printf 'size:%s:%s\\n' \"$1\" \"$2\"; else printf 'echo:%s\\n' \"$line\"; fi; done";
 const MARKER_ONE: &str = "tui-live-marker-one";
 const MARKER_TWO: &str = "tui-live-marker-two";
+const CONSENT_NORMAL_MARKER: &str = "tui-consent-normal-input";
+const CONSENT_OUTPUT_MARKER: &str = "tui-consent-output-while-dialog-open";
+const CONSENT_FIRST_ACCEPTED: &str = "tui-consent-first-line-accepted";
+const CONSENT_SECOND_ACCEPTED: &str = "tui-consent-second-line-accepted";
+const RAW_CONTROL_TOKEN: &str = "TUI_RAW_CONTROL_PAYLOAD";
+const RAW_SECOND_TOKEN: &str = "TUI_PRIVATE_SECOND_LINE";
+const UNSAFE_PASTE: &str = "\x1b[31mTUI_RAW_CONTROL_PAYLOAD\x1b[0m\nTUI_PRIVATE_SECOND_LINE\n";
 const SESSION_RUNNING_DEADLINE: Duration = Duration::from_secs(20);
 const SCREEN_DEADLINE: Duration = Duration::from_secs(20);
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
@@ -275,6 +283,24 @@ impl TuiChild {
         self.write_all(b"\r");
     }
 
+    /// Send one real Crossterm bracketed-paste event through the outer PTY.
+    fn paste(&mut self, text: &str) {
+        self.write_all(b"\x1b[200~");
+        self.write_all(text.as_bytes());
+        self.write_all(b"\x1b[201~");
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the tui pty");
+    }
+
     fn wait_exit(&mut self, deadline: Instant) -> Result<ExitStatus, String> {
         loop {
             match self.child.try_wait() {
@@ -437,6 +463,12 @@ impl Screen {
         self.rows().iter().any(|row| row.contains(needle))
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.projection
+            .resize(TerminalScreenSize::new(rows, cols))
+            .expect("resize the tui screen projection");
+    }
+
     /// Wait until `needle` is visible. Bounded; failure carries the record.
     fn wait_for(
         &mut self,
@@ -544,7 +576,12 @@ fn expect_ok(step: &'static str, identity: &Identity, response: DaemonResponse) 
 }
 
 /// Spawn the echo shell session through the Hub before the TUI starts.
-fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity, test_deadline: Instant) {
+fn spawn_session(
+    endpoint: &DaemonEndpoint,
+    identity: &mut Identity,
+    test_deadline: Instant,
+    command: &str,
+) {
     identity.session_id = format!(
         "live-tui-{}",
         std::time::SystemTime::now()
@@ -556,7 +593,7 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity, test_deadli
         endpoint,
         DaemonRequest::Spawn {
             session_id: identity.session_id.clone(),
-            command: SHELL_COMMAND.to_string(),
+            command: command.to_string(),
         },
     )
     .expect("spawn request transport");
@@ -601,6 +638,139 @@ fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity, test_deadli
         thread::sleep(
             Duration::from_millis(200).min(until.saturating_duration_since(Instant::now())),
         );
+    }
+}
+
+/// Build the consent test shell with one test-owned output trigger.
+///
+/// The shell emits neutral acceptance markers. It does not write the raw paste
+/// payload to the terminal. The client screen can therefore check for leaks.
+fn consent_shell_command(output_trigger: &Path) -> String {
+    let trigger = output_trigger.display().to_string();
+    assert!(
+        trigger
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte)),
+        "consent output trigger must be safe for the fixed test shell: {trigger}"
+    );
+    format!(
+        "stty -echo; \
+         (while [ ! -f '{trigger}' ]; do sleep 0.05; done; printf '{CONSENT_OUTPUT_MARKER}\\n') & \
+         printf '{SESSION_READY_MARKER}\\n'; \
+         while IFS= read -r line; do \
+           case \"$line\" in \
+             *{RAW_CONTROL_TOKEN}*) printf '{CONSENT_FIRST_ACCEPTED}\\n' ;; \
+             {RAW_SECOND_TOKEN}) printf '{CONSENT_SECOND_ACCEPTED}\\n' ;; \
+             *) printf 'echo:%s\\n' \"$line\" ;; \
+           esac; \
+         done"
+    )
+}
+
+fn read_session_screen(endpoint: &DaemonEndpoint, identity: &Identity) -> String {
+    let response = expect_ok(
+        "read_screen",
+        identity,
+        request(
+            endpoint,
+            DaemonRequest::ReadScreen {
+                session_id: identity.session_id.clone(),
+            },
+        )
+        .expect("read screen transport"),
+    );
+    assert_eq!(response.kind, DaemonResponseKind::ReadScreen);
+    let readback = response
+        .read_screen
+        .expect("read screen response includes its payload");
+    assert_eq!(readback.session_id, identity.session_id);
+    assert!(
+        readback.unavailable.is_none(),
+        "read screen is available during the consent test: {:?}",
+        readback.unavailable
+    );
+    readback.text
+}
+
+fn wait_for_session_screen(
+    endpoint: &DaemonEndpoint,
+    screen: &mut Screen,
+    identity: &Identity,
+    needle: &str,
+) -> String {
+    let started = Instant::now();
+    let deadline = screen.remaining(SCREEN_DEADLINE);
+    let until = started + deadline;
+    loop {
+        let readback = read_session_screen(endpoint, identity);
+        if readback.contains(needle) {
+            return readback;
+        }
+        if Instant::now() >= until {
+            let failure = screen.failure(
+                "read_screen_marker",
+                identity,
+                deadline,
+                started,
+                format!("{needle:?} not present in terminal readback: {readback:?}"),
+            );
+            panic!("{failure}");
+        }
+        screen.pump((Instant::now() + Duration::from_millis(100)).min(until));
+    }
+}
+
+fn read_mode_flags(endpoint: &DaemonEndpoint, identity: &Identity) -> DaemonModeFlags {
+    let response = expect_ok(
+        "read_mode_flags",
+        identity,
+        request(
+            endpoint,
+            DaemonRequest::ReadModeFlags {
+                session_id: identity.session_id.clone(),
+            },
+        )
+        .expect("read mode flags transport"),
+    );
+    assert_eq!(response.kind, DaemonResponseKind::ReadModeFlags);
+    let mode_flags = response
+        .mode_flags
+        .expect("read mode flags response includes its payload");
+    assert_eq!(mode_flags.session_id, identity.session_id);
+    assert!(
+        mode_flags.unavailable.is_none(),
+        "mode flags are available during the resize test: {:?}",
+        mode_flags.unavailable
+    );
+    mode_flags
+}
+
+fn wait_for_terminal_resize(
+    endpoint: &DaemonEndpoint,
+    screen: &mut Screen,
+    identity: &Identity,
+    previous: (u16, u16),
+) -> (u16, u16) {
+    let started = Instant::now();
+    let deadline = screen.remaining(SCREEN_DEADLINE);
+    let until = started + deadline;
+    loop {
+        let mode_flags = read_mode_flags(endpoint, identity);
+        let actual = (mode_flags.rows, mode_flags.cols);
+        if actual != previous && mode_flags.rows > 0 && mode_flags.cols > 0 {
+            return actual;
+        }
+        if Instant::now() >= until {
+            let failure = screen.failure(
+                "terminal_resize",
+                identity,
+                deadline,
+                started,
+                format!("terminal size stayed at {previous:?}; last size={actual:?}"),
+            );
+            panic!("{failure}");
+        }
+        screen.pump((Instant::now() + Duration::from_millis(100)).min(until));
     }
 }
 
@@ -814,7 +984,7 @@ fn t_s1_connect_select_session_and_see_echo() {
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity, test_deadline);
+    spawn_session(hub.endpoint(), &mut identity, test_deadline, SHELL_COMMAND);
     {
         let mut tui = TuiChild::spawn(&hub);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -853,7 +1023,7 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity, test_deadline);
+    spawn_session(hub.endpoint(), &mut identity, test_deadline, SHELL_COMMAND);
     {
         let mut tui = TuiChild::spawn(&hub);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -941,6 +1111,250 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             first.generation,
             second.subscription_id,
             second.generation
+        );
+        detach_and_quit(&mut tui, &mut screen, &identity);
+    }
+    drop(guard);
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let output_trigger = hub.data_dir().join("consent-output.trigger");
+    let command = consent_shell_command(&output_trigger);
+    let mut identity = Identity::default();
+    spawn_session(hub.endpoint(), &mut identity, test_deadline, &command);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let session_row = format!("{} · running", identity.session_id);
+        screen
+            .wait_for(
+                "session_row_visible",
+                &session_row,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let occupancy = attach_and_echo(
+            hub.endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut identity,
+            &session_row,
+            MARKER_ONE,
+            None,
+        );
+
+        // The first attempt opens the dialog. The first Enter arms the primary
+        // control. The next Enter activates Cancel.
+        tui.paste(UNSAFE_PASTE);
+        screen
+            .wait_for(
+                "unsafe_paste_dialog_visible",
+                "Unsafe paste blocked",
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(screen.contains("Review paste"));
+        assert!(!screen.contains("Paste anyway"));
+        assert!(!screen.contains(RAW_CONTROL_TOKEN));
+        assert!(!screen.contains(RAW_SECOND_TOKEN));
+        let before_consent = read_session_screen(hub.endpoint(), &identity);
+        assert!(!before_consent.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(!before_consent.contains(CONSENT_SECOND_ACCEPTED));
+
+        fs::write(&output_trigger, b"emit\n").expect("release output while consent is open");
+        let during_dialog = wait_for_session_screen(
+            hub.endpoint(),
+            &mut screen,
+            &identity,
+            CONSENT_OUTPUT_MARKER,
+        );
+        assert!(!during_dialog.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(!during_dialog.contains(CONSENT_SECOND_ACCEPTED));
+        assert!(screen.contains("Unsafe paste blocked"));
+
+        tui.write_all(b"\r");
+        screen
+            .wait_for(
+                "unsafe_paste_armed",
+                "Paste anyway",
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let armed = read_session_screen(hub.endpoint(), &identity);
+        assert!(!armed.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(!armed.contains(CONSENT_SECOND_ACCEPTED));
+        tui.write_all(b"\r");
+        let terminal = screen
+            .wait_for(
+                "unsafe_paste_cancelled",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let cancelled = read_session_screen(hub.endpoint(), &identity);
+        assert!(!cancelled.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(!cancelled.contains(CONSENT_SECOND_ACCEPTED));
+        screen
+            .wait_for(
+                "dialog_output_visible_after_cancel",
+                CONSENT_OUTPUT_MARKER,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        // Cancellation restores terminal input. The second unsafe paste opens
+        // Review. Tab selects Paste anyway. Enter sends a fresh retry.
+        tui.click(terminal.0, terminal.1);
+        tui.type_line(CONSENT_NORMAL_MARKER);
+        screen
+            .wait_for(
+                "normal_input_after_cancel",
+                &format!("echo:{CONSENT_NORMAL_MARKER}"),
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.paste(UNSAFE_PASTE);
+        screen
+            .wait_for(
+                "second_unsafe_paste_dialog_visible",
+                "Unsafe paste blocked",
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(!screen.contains(RAW_CONTROL_TOKEN));
+        assert!(!screen.contains(RAW_SECOND_TOKEN));
+        tui.write_all(b"\r");
+        screen
+            .wait_for(
+                "second_unsafe_paste_armed",
+                "Paste anyway",
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let one_click = read_session_screen(hub.endpoint(), &identity);
+        assert!(!one_click.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(!one_click.contains(CONSENT_SECOND_ACCEPTED));
+        tui.write_all(b"\t");
+        tui.write_all(b"\r");
+        screen
+            .wait_for(
+                "unsafe_paste_first_line_retried",
+                CONSENT_FIRST_ACCEPTED,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        screen
+            .wait_for(
+                "unsafe_paste_second_line_retried",
+                CONSENT_SECOND_ACCEPTED,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(!screen.contains(RAW_CONTROL_TOKEN));
+        assert!(!screen.contains(RAW_SECOND_TOKEN));
+        let accepted = read_session_screen(hub.endpoint(), &identity);
+        assert!(accepted.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(accepted.contains(CONSENT_SECOND_ACCEPTED));
+        assert!(!accepted.contains(RAW_CONTROL_TOKEN));
+        assert!(!accepted.contains(RAW_SECOND_TOKEN));
+
+        println!(
+            "t_s3: consent session={} subscription={} generation={} zero-before-consent cancel-safe output-preserved retry-accepted raw-payload-hidden",
+            occupancy.session_id, occupancy.subscription_id, occupancy.generation
+        );
+        detach_and_quit(&mut tui, &mut screen, &identity);
+    }
+    drop(guard);
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s4_outer_pty_resize_reaches_the_attached_session() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let mut identity = Identity::default();
+    spawn_session(
+        hub.endpoint(),
+        &mut identity,
+        test_deadline,
+        RESIZE_SHELL_COMMAND,
+    );
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let session_row = format!("{} · running", identity.session_id);
+        screen
+            .wait_for(
+                "session_row_visible",
+                &session_row,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let occupancy = attach_and_echo(
+            hub.endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut identity,
+            &session_row,
+            MARKER_ONE,
+            None,
+        );
+        let initial = read_mode_flags(hub.endpoint(), &identity);
+        let initial_size = (initial.rows, initial.cols);
+        assert!(initial.rows > 0 && initial.cols > 0);
+
+        const RESIZED_ROWS: u16 = 30;
+        const RESIZED_COLS: u16 = 100;
+        tui.resize(RESIZED_ROWS, RESIZED_COLS);
+        screen.resize(RESIZED_ROWS, RESIZED_COLS);
+        let resized =
+            wait_for_terminal_resize(hub.endpoint(), &mut screen, &identity, initial_size);
+
+        let terminal = screen
+            .wait_for(
+                "resized_terminal_visible",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(terminal.0, terminal.1);
+        tui.type_line("tui-report-size");
+        screen
+            .wait_for(
+                "session_reports_resized_pty",
+                &format!("size:{}:{}", resized.0, resized.1),
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        println!(
+            "t_s4: resized session={} subscription={} generation={} initial={:?} final={:?}",
+            occupancy.session_id,
+            occupancy.subscription_id,
+            occupancy.generation,
+            initial_size,
+            resized
         );
         detach_and_quit(&mut tui, &mut screen, &identity);
     }

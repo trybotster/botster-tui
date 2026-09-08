@@ -985,20 +985,6 @@ struct LaunchTargetOption {
     label: String,
 }
 
-/// Test-only stub for list-for-target responses so hermetic handlers can prove
-/// success and operator/transport failure without a live Hub client.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-enum ListForTargetStub {
-    Ok(Vec<DaemonSessionType>),
-    OperatorError {
-        code: String,
-        operation: String,
-        message: String,
-    },
-    TransportError,
-}
-
 fn join_tokens(values: &[String]) -> String {
     values.join(", ")
 }
@@ -1705,8 +1691,6 @@ struct TuiApp {
     observed_requests: Vec<ObservedRequest>,
     #[cfg(test)]
     observed_terminal_inputs: Vec<TerminalInputCommand>,
-    #[cfg(test)]
-    list_for_target_stub: Option<ListForTargetStub>,
     /// Exact live payloads passed to the Ghostty apply path (test observer only).
     #[cfg(test)]
     applied_live_payloads: Vec<Vec<u8>>,
@@ -1834,8 +1818,6 @@ impl TuiApp {
             observed_requests: Vec::new(),
             #[cfg(test)]
             observed_terminal_inputs: Vec::new(),
-            #[cfg(test)]
-            list_for_target_stub: None,
             #[cfg(test)]
             applied_live_payloads: Vec::new(),
             #[cfg(test)]
@@ -3338,41 +3320,6 @@ impl TuiApp {
         self.target_first_spawn = Some(TargetFirstSpawnFlow {
             step: TargetFirstSpawnStep::PickTarget,
         });
-        #[cfg(test)]
-        if let Some(stub) = self.list_for_target_stub.take() {
-            match stub {
-                ListForTargetStub::Ok(session_types) => {
-                    self.target_first_spawn = Some(TargetFirstSpawnFlow {
-                        step: TargetFirstSpawnStep::PickSessionType {
-                            target_id: target.target_id.clone(),
-                            target_label: target.label.clone(),
-                            session_types,
-                        },
-                    });
-                    self.action_feedback =
-                        Some(format!("select a session type for {}", target.label));
-                }
-                ListForTargetStub::OperatorError {
-                    code,
-                    operation,
-                    message,
-                } => {
-                    self.error = Some(format!("{message} (code={code} operation={operation})"));
-                    self.action_feedback = Some(format!(
-                        "session types for {} unavailable; pick another target or cancel",
-                        target.label
-                    ));
-                }
-                ListForTargetStub::TransportError => self.apply_request_failure(
-                    PendingReply::ListForTarget {
-                        target_id: target.target_id.clone(),
-                        target_label: target.label.clone(),
-                    },
-                    DaemonRequestError::ConnectionClosed,
-                ),
-            }
-            return;
-        }
         self.submit(
             DaemonRequest::ListSessionTypesForTarget {
                 target_id: target.target_id.clone(),
@@ -11552,12 +11499,13 @@ mod tests {
 
     #[test]
     fn missing_hub_connection_renders_connection_diagnostic() {
-        let app = TuiApp::new_with_connection(
+        let mut app = TuiApp::new_with_connection(
             None,
             Some("BOTSTER_HUB_CONNECTION is required".to_string()),
         );
+        app.connect();
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app_to_lines(&app, 120, 48, &RenderState::default());
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("Hub connection not configured"));
@@ -12822,20 +12770,26 @@ mod tests {
     }
 
     #[test]
-    fn terminal_input_before_attach_renders_stream_unavailable_error() {
+    fn terminal_paste_before_attach_renders_stream_unavailable_error() {
         let mut app = TuiApp::new(None);
         app.sessions = vec![SessionRow::running("session-alpha")];
         app.selected_session = Some("session-alpha".to_string());
+        app.status = "connected".to_string();
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let (_, hit_map) = render_app_to_lines(&app, 120, 48, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &hit_map, "tui-terminal");
 
-        app.handle_dispatch(InputDispatch::TerminalForward {
-            node_id: "tui-terminal".to_string(),
-            bytes: b"echo hello\n".to_vec(),
-        });
+        assert!(route_input_event(
+            &mut app,
+            &mut router,
+            &hit_map,
+            Event::Paste("x".to_string()),
+        ));
 
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 120, 48);
+        let (lines, _) = render_app_to_lines(&app, 120, 48, &router.render_state());
         let rendered = lines.join("\n");
         assert!(rendered.contains("terminal stream unavailable"));
-        assert!(rendered.contains("terminal stream unavailable"));
+        assert!(app.observed_terminal_inputs.is_empty());
     }
 
     #[test]
@@ -14280,7 +14234,6 @@ mod tests {
         let mut global = sample_session_type("device/shell", "device", true);
         global.target_id = "repo-a".to_string();
         global.available = true;
-        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![global]));
         app.observed_requests.clear();
         app.handle_action("botster.tui.spawn".to_string(), None, None);
         app.handle_action(
@@ -14297,6 +14250,17 @@ mod tests {
             "pick target must observe ListSessionTypesForTarget: {:?}",
             app.observed_requests
         );
+        let request_id = *app
+            .pending_requests
+            .last_key_value()
+            .expect("list-for-target request should be pending")
+            .0;
+        let mut response = base_response(DaemonResponseKind::SessionTypes);
+        response.session_types = vec![global];
+        app.apply_wake(AppWake::Completed {
+            request_id,
+            result: Ok(response),
+        });
         app.handle_action(
             "botster.tui.spawn.pick_session_type".to_string(),
             None,
@@ -14496,11 +14460,6 @@ mod tests {
                 session_types: vec![prior],
             },
         });
-        app.list_for_target_stub = Some(ListForTargetStub::OperatorError {
-            code: "target_unavailable".to_string(),
-            operation: "list_session_types_for_target".to_string(),
-            message: "spawn target is not eligible".to_string(),
-        });
         app.observed_requests.clear();
         app.handle_action(
             "botster.tui.spawn.pick_target".to_string(),
@@ -14516,6 +14475,19 @@ mod tests {
             "{:?}",
             app.observed_requests
         );
+        let request_id = *app
+            .pending_requests
+            .last_key_value()
+            .expect("list-for-target request should be pending")
+            .0;
+        let mut response = operator_error_response("spawn target is not eligible");
+        let error = response.error.as_mut().expect("operator error payload");
+        error.code = "target_unavailable".to_string();
+        error.operation = "list_session_types_for_target".to_string();
+        app.apply_wake(AppWake::Completed {
+            request_id,
+            result: Ok(response),
+        });
         assert!(
             app.error
                 .as_deref()
@@ -14551,13 +14523,23 @@ mod tests {
         // Recovery: re-pick after a successful list.
         let mut recovered = sample_session_type("device/shell", "device", true);
         recovered.target_id = "repo-a".to_string();
-        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![recovered]));
         app.error = None;
         app.handle_action(
             "botster.tui.spawn.pick_target".to_string(),
             None,
             Some(json!({ "target_id": "repo-a" })),
         );
+        let request_id = *app
+            .pending_requests
+            .last_key_value()
+            .expect("recovery list-for-target request should be pending")
+            .0;
+        let mut response = base_response(DaemonResponseKind::SessionTypes);
+        response.session_types = vec![recovered];
+        app.apply_wake(AppWake::Completed {
+            request_id,
+            result: Ok(response),
+        });
         assert_eq!(app.error, None);
         match &app.target_first_spawn.as_ref().unwrap().step {
             TargetFirstSpawnStep::PickSessionType { session_types, .. } => {
@@ -14589,12 +14571,26 @@ mod tests {
                 session_types: vec![prior],
             },
         });
-        app.list_for_target_stub = Some(ListForTargetStub::TransportError);
+        app.observed_requests.clear();
         app.handle_action(
             "botster.tui.spawn.pick_target".to_string(),
             None,
             Some(json!({ "target_id": "repo-a" })),
         );
+        assert!(app.observed_requests.iter().any(|request| matches!(
+            request,
+            ObservedRequest::ListSessionTypesForTarget { target_id }
+                if target_id == "repo-a"
+        )));
+        let request_id = *app
+            .pending_requests
+            .last_key_value()
+            .expect("list-for-target request should be pending")
+            .0;
+        app.apply_wake(AppWake::Completed {
+            request_id,
+            result: Err(DaemonRequestError::ConnectionClosed),
+        });
         match app.target_first_spawn.as_ref().map(|flow| &flow.step) {
             Some(TargetFirstSpawnStep::PickTarget) => {}
             other => panic!("transport failure must stay on PickTarget, got {other:?}"),
@@ -14625,7 +14621,6 @@ mod tests {
         }];
         let mut listed = sample_session_type("device/shell", "device", true);
         listed.target_id = "repo-a".to_string();
-        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![listed]));
         app.handle_action("botster.tui.spawn".to_string(), None, None);
         let mut router = InputRouter::new(renderer::action_request_context());
         // Mouse path (hit-map click activation).
@@ -14662,6 +14657,17 @@ mod tests {
             "{:?}",
             app.observed_requests
         );
+        let request_id = *app
+            .pending_requests
+            .last_key_value()
+            .expect("list-for-target request should be pending")
+            .0;
+        let mut response = base_response(DaemonResponseKind::SessionTypes);
+        response.session_types = vec![listed];
+        app.apply_wake(AppWake::Completed {
+            request_id,
+            result: Ok(response),
+        });
         let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
         let type_region = hit_map
             .regions()
@@ -14716,7 +14722,6 @@ mod tests {
         }];
         let mut listed = sample_session_type("device/shell", "device", true);
         listed.target_id = "repo-a".to_string();
-        app.list_for_target_stub = Some(ListForTargetStub::Ok(vec![listed]));
         app.observed_requests.clear();
         app.handle_action("botster.tui.spawn".to_string(), None, None);
         let mut router = InputRouter::new(renderer::action_request_context());
@@ -14735,6 +14740,17 @@ mod tests {
             app.observed_requests
         );
         assert_eq!(app.error, None, "keyboard list-for-target should succeed");
+        let request_id = *app
+            .pending_requests
+            .last_key_value()
+            .expect("list-for-target request should be pending")
+            .0;
+        let mut response = base_response(DaemonResponseKind::SessionTypes);
+        response.session_types = vec![listed];
+        app.apply_wake(AppWake::Completed {
+            request_id,
+            result: Ok(response),
+        });
 
         // Keyboard path: Tab focus Hub-listed Global, Enter → SpawnSessionType target_id=T.
         let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &router.render_state());
