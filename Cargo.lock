@@ -171,7 +171,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 [[package]]
 name = "botster-core"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=98a50ef43f62bd9da6e062bd4d44d961fa3c78c9#98a50ef43f62bd9da6e062bd4d44d961fa3c78c9"
+source = "git+https://github.com/trybotster/botster-core.git?rev=b9e989be3232c72e966ce3fdb63878c82b70d94d#b9e989be3232c72e966ce3fdb63878c82b70d94d"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -191,7 +191,7 @@ dependencies = [
 [[package]]
 name = "botster-core-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=98a50ef43f62bd9da6e062bd4d44d961fa3c78c9#98a50ef43f62bd9da6e062bd4d44d961fa3c78c9"
+source = "git+https://github.com/trybotster/botster-core.git?rev=b9e989be3232c72e966ce3fdb63878c82b70d94d#b9e989be3232c72e966ce3fdb63878c82b70d94d"
 dependencies = [
  "botster-core",
  "botster-terminal-ghostty",
@@ -205,7 +205,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-client"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=6e4b3501b1486dab025f6b22ca949bbc91825335#6e4b3501b1486dab025f6b22ca949bbc91825335"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=b60ca68dcae7c8025d69784c9f77efdb9ea5a827#b60ca68dcae7c8025d69784c9f77efdb9ea5a827"
 dependencies = [
  "base64",
  "botster-terminal-protocol",
@@ -217,7 +217,7 @@ dependencies = [
 [[package]]
 name = "botster-hub-test-support"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-hub.git?rev=6e4b3501b1486dab025f6b22ca949bbc91825335#6e4b3501b1486dab025f6b22ca949bbc91825335"
+source = "git+https://github.com/trybotster/botster-hub.git?rev=b60ca68dcae7c8025d69784c9f77efdb9ea5a827#b60ca68dcae7c8025d69784c9f77efdb9ea5a827"
 dependencies = [
  "base64",
  "botster-core",
@@ -235,7 +235,7 @@ dependencies = [
 [[package]]
 name = "botster-terminal-ghostty"
 version = "0.1.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=98a50ef43f62bd9da6e062bd4d44d961fa3c78c9#98a50ef43f62bd9da6e062bd4d44d961fa3c78c9"
+source = "git+https://github.com/trybotster/botster-core.git?rev=b9e989be3232c72e966ce3fdb63878c82b70d94d#b9e989be3232c72e966ce3fdb63878c82b70d94d"
 dependencies = [
  "botster-core",
  "botster-terminal-protocol",
@@ -244,7 +244,7 @@ dependencies = [
 [[package]]
 name = "botster-terminal-protocol"
 version = "0.4.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=98a50ef43f62bd9da6e062bd4d44d961fa3c78c9#98a50ef43f62bd9da6e062bd4d44d961fa3c78c9"
+source = "git+https://github.com/trybotster/botster-core.git?rev=b9e989be3232c72e966ce3fdb63878c82b70d94d#b9e989be3232c72e966ce3fdb63878c82b70d94d"
 dependencies = [
  "serde",
  "serde_json",
@@ -254,7 +254,7 @@ dependencies = [
 [[package]]
 name = "botster-terminal-protocol-client"
 version = "0.5.0"
-source = "git+https://github.com/trybotster/botster-core.git?rev=98a50ef43f62bd9da6e062bd4d44d961fa3c78c9#98a50ef43f62bd9da6e062bd4d44d961fa3c78c9"
+source = "git+https://github.com/trybotster/botster-core.git?rev=b9e989be3232c72e966ce3fdb63878c82b70d94d#b9e989be3232c72e966ce3fdb63878c82b70d94d"
 dependencies = [
  "botster-terminal-protocol",
  "thiserror 2.0.20",

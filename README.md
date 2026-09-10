@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `1a0df65230a476cfea362fdc5131e035d303a928` |
+| `botster-hub-client` / live hub | Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `1a0df65230a476cfea362fdc5131e035d303a928` (`@trybotster/hub-test-support@0.1.43`) |
+| `botster-hub-test-support` package | Hub git `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` (`@trybotster/hub-test-support@0.1.45`) |
 | `botster-tui-kit` | `7940306b0d7461a12575b3856a96c0fbb23784f3` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `bf6e7d996bca2786ad4142c870a13c57a490e241` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `b9e989be3232c72e966ce3fdb63878c82b70d94d` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -70,13 +70,10 @@ for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. The real-client attach proof is
 `script/test-live-tui`. The smoke verifies attach, echo, detach, occupancy
-release, reattach, unsafe-paste consent, and resize through a real
-pseudo-terminal.
-
-An actual-client test does not verify control-connection loss and reconnect at
-this candidate. The pinned Hub test support cannot sever one client connection.
-Each isolated Hub start also creates a new socket path. Focused tests cover the
-client reconnect paths.
+release, reattach, unsafe-paste consent, resize, and control reconnect through
+a real pseudo-terminal. The reconnect test restarts an isolated Hub at its
+existing endpoint. It verifies a fresh empty session snapshot, stale attachment
+cleanup, explicit attachment to a new session, and new terminal input/output.
 
 Native Ghostty builds need Zig **0.16** and the vendored Ghostty submodule
 inside the resolved `botster-terminal-ghostty` package source (Cargo git
@@ -205,8 +202,33 @@ T-S3 proves zero-byte unsafe-paste rejection, deliberate consent, cancellation,
 continued output, a fresh accepted retry, and no raw payload rendering.
 T-S4 proves that an outer pseudo-terminal resize reaches the attached session
 and that the resized session continues to accept input and produce output.
-The smoke does not prove control-connection loss and recovery. The public
-isolated Hub harness cannot sever one client connection or restart at a stable endpoint.
+T-S5 proves control-connection loss and reconnect at a stable endpoint. It also
+proves stale attachment cleanup, a fresh session snapshot, explicit attachment
+to a new session, and new terminal input/output. It does not compare terminal
+generations across the Core restart because the new daemon owns fresh sessions.
+
+Final matched execution, September 9, 2026: all five cases passed with Rust
+1.97.0 against Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` and Core
+`b9e989be3232c72e966ce3fdb63878c82b70d94d`. The locked workspace run also
+passed 163 unit tests and two integration tests. The source did not change
+between these runs and this documentation checkpoint.
+The live run used two jobs with incremental compilation disabled. The tested
+`botster-tui` binary had SHA-256
+`cbdb60dcddbd099229ce622b7a38d5b88372ce03e2490234d946148a42118a17`.
+
+The first live attempt failed during Hub startup under the managed sandbox.
+An approved retry passed with the default Rust 1.92 toolchain. A separate run
+with explicit Rust 1.97.0 passed all five cases and supplies the final evidence.
+These results establish the tested client behavior, not performance acceptance.
+
+Earlier execution status: T-S1 and T-S2 passed at TUI
+`3ed7d203f7026fe5c739aa9b16b3021906773f0e` against Hub
+`e2cc0ed5d0ccbeab3690dfd0930bf9edc9e2691c` and Core
+`98a50ef43f62bd9da6e062bd4d44d961fa3c78c9`. T-S3, T-S4, and T-S5 passed
+against Hub `76c4df8d4891752bd3bacb5d88c762914eec02db` and Core
+`ca243281bc21adb30f13913d38669bbad27083a8` from uncommitted TUI source based
+on `89c0be33a452ef4e58a08b299efefcb6bcdc0db5`. These separate runs do not
+establish final acceptance for one revision tuple.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.

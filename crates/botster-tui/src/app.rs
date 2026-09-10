@@ -2269,13 +2269,9 @@ impl TuiApp {
             Ok(transition) => {
                 let body_replaced = transition.replacement.is_some();
                 if let Some(replacement) = transition.replacement {
-                    // Owner-authored replacement is authoritative, including success /
-                    // confirmation trees that drop entity-options producers.
-                    surface.body = replacement;
-                    // The snapshot validates the Hub-delivered tree at ingestion. An accepted
-                    // action replacement is app-owned active state and must not leave a second,
-                    // stale structural tree that looks current.
-                    surface.ui_tree_snapshot = None;
+                    // The accepted owner replacement is canonical, including
+                    // confirmation trees that drop entity-option producers.
+                    surface.ui_tree_snapshot.body = replacement;
                 }
                 self.pending_plugin_request = None;
                 self.action_feedback = Some(plugin_action_result_text(&result));
@@ -3636,7 +3632,7 @@ impl TuiApp {
         let mut owned = BTreeSet::new();
         if let Some(surface) = self.plugin_surface.as_ref() {
             owned.extend(
-                demanded_entity_option_families(&surface.body)
+                demanded_entity_option_families(&surface.ui_tree_snapshot.body)
                     .into_iter()
                     .filter(|family| !is_process_wide_entity_family(family)),
             );
@@ -3665,7 +3661,12 @@ impl TuiApp {
         };
         let store = self.entity_options_projection_store();
         let mut invalid = BTreeSet::new();
-        collect_invalid_entity_option_fields(&surface.body, &store, &self.drafts, &mut invalid);
+        collect_invalid_entity_option_fields(
+            &surface.ui_tree_snapshot.body,
+            &store,
+            &self.drafts,
+            &mut invalid,
+        );
         for field in &invalid {
             self.drafts.remove(field);
             self.entity_options_invalid_fields.insert(field.clone());
@@ -9787,15 +9788,16 @@ fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, Str
     // Authored validation owns binding context and descendant-key diagnostics.
     // Renderer capabilities still inspect only concrete trees because bound prop
     // sentinels are materialized in plugin_surface_render_root.
-    surface.body.validate().map_err(|error| {
+    let body = &surface.ui_tree_snapshot.body;
+    body.validate().map_err(|error| {
         format!(
             "plugin surface {}:{} failed UiNode validate: {error}",
             surface.package_name, surface.surface_id
         )
     })?;
-    if !node_requires_binding_materialization(&surface.body) {
+    if !node_requires_binding_materialization(body) {
         renderer::tui_capabilities()
-            .validate_node(&surface.body)
+            .validate_node(body)
             .map_err(|error| {
                 format!(
                     "plugin surface {}:{} unsupported TUI primitive: {error}",
@@ -9803,22 +9805,14 @@ fn plugin_surface_body_node(surface: &DaemonPluginSurface) -> Result<UiNode, Str
                 )
             })?;
     }
-    Ok(surface.body.clone())
+    Ok(body.clone())
 }
 
 fn normalize_plugin_surface(surface: DaemonPluginSurface) -> Result<DaemonPluginSurface, String> {
-    let snapshot = surface.ui_tree_snapshot.as_ref().ok_or_else(|| {
-        format!(
-            "plugin surface {}:{} omitted ui_tree_snapshot",
-            surface.package_name, surface.surface_id
-        )
-    })?;
-    if snapshot.package_name != surface.package_name
-        || snapshot.surface_id != surface.surface_id
-        || snapshot.body != surface.body
-    {
+    let snapshot = &surface.ui_tree_snapshot;
+    if snapshot.package_name != surface.package_name || snapshot.surface_id != surface.surface_id {
         return Err(format!(
-            "plugin surface {}:{} ui_tree_snapshot identity/body mismatch",
+            "plugin surface {}:{} ui_tree_snapshot identity mismatch",
             surface.package_name, surface.surface_id
         ));
     }
@@ -10370,7 +10364,7 @@ fn binding_truthy(value: &Value) -> bool {
 }
 
 fn iframe_unsupported_diagnostic(surface: &DaemonPluginSurface) -> Option<String> {
-    let iframe = find_iframe_node(&surface.body)?;
+    let iframe = find_iframe_node(&surface.ui_tree_snapshot.body)?;
     let title = iframe
         .props
         .get("title")
@@ -10844,12 +10838,31 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 mod tests {
 
     use super::*;
-    use botster_hub_client::TerminalCompatibility;
+    use botster_hub_client::{DaemonUiTreeSnapshot, TerminalCompatibility};
     use botster_terminal_protocol_client::mode_bits;
 
     use botster_ui_contract::{
-        UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiSurfaceId,
+        UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResultState,
+        UiSurfaceId,
     };
+
+    fn plugin_surface_fixture(body: UiNode) -> DaemonPluginSurface {
+        DaemonPluginSurface {
+            package_name: "plugin.test".to_string(),
+            surface_id: "test.surface".to_string(),
+            ui_tree_snapshot: DaemonUiTreeSnapshot {
+                package_name: "plugin.test".to_string(),
+                surface_id: "test.surface".to_string(),
+                body,
+            },
+        }
+    }
+
+    fn plugin_surface_response(surface: DaemonPluginSurface) -> DaemonResponse {
+        let mut response = base_response(DaemonResponseKind::PluginSurface);
+        response.plugin_surface = Some(surface);
+        response
+    }
 
     fn mouse_event(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11995,6 +12008,109 @@ mod tests {
             app.action_feedback.as_deref(),
             Some("navigation open requested: botster.plugin-contract-matrix surface:contract.app")
         );
+    }
+
+    #[test]
+    fn plugin_surface_renders_only_the_identity_matched_snapshot_body() {
+        let body = node(
+            UiNodeKind::Text,
+            "canonical-snapshot-body",
+            json!({ "text": "canonical snapshot" }),
+        );
+        let mut app = TuiApp::new(None);
+
+        app.apply_response(plugin_surface_response(plugin_surface_fixture(
+            body.clone(),
+        )));
+
+        let surface = app
+            .plugin_surface
+            .as_ref()
+            .expect("accepted plugin surface");
+        assert_eq!(plugin_surface_body_node(surface), Ok(body));
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn plugin_surface_rejects_snapshot_identity_mismatch() {
+        let mut surface = plugin_surface_fixture(node(
+            UiNodeKind::Text,
+            "mismatched-snapshot-body",
+            json!({ "text": "mismatched snapshot" }),
+        ));
+        surface.ui_tree_snapshot.surface_id = "wrong.surface".to_string();
+        let mut app = TuiApp::new(None);
+
+        app.apply_response(plugin_surface_response(surface));
+
+        assert!(app.plugin_surface.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("ui_tree_snapshot identity mismatch")),
+            "{:?}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn plugin_action_replacement_updates_the_single_snapshot_body() {
+        let initial = node(
+            UiNodeKind::Text,
+            "initial-snapshot-body",
+            json!({ "text": "initial snapshot" }),
+        );
+        let replacement = node(
+            UiNodeKind::Text,
+            "replacement-snapshot-body",
+            json!({ "text": "replacement snapshot" }),
+        );
+        let request = UiActionRequest {
+            request_id: UiActionRequestId("request-replace".to_string()),
+            surface_id: UiSurfaceId("test.surface".to_string()),
+            action_id: UiActionId("plugin.replace".to_string()),
+            node_id: Some(UiNodeId("replace-button".to_string())),
+            kind: UiActionKind::Submit,
+            values: None,
+            payload: None,
+        };
+        let result = UiActionResult {
+            request_id: request.request_id.clone(),
+            surface_id: request.surface_id.clone(),
+            action_id: request.action_id.clone(),
+            node_id: request.node_id.clone(),
+            state: UiActionResultState::Accepted,
+            field_errors: BTreeMap::new(),
+            form_errors: Vec::new(),
+            warnings: Vec::new(),
+            normalized_values: None,
+            presentation: None,
+            replacement: Some(Box::new(replacement.clone())),
+            payload: None,
+            error: None,
+        };
+        let mut app = TuiApp::new(None);
+        app.plugin_surface = Some(plugin_surface_fixture(initial));
+        app.pending_plugin_request = Some(request);
+
+        app.apply_plugin_action_result(result);
+
+        let surface = app.plugin_surface.as_ref().expect("active plugin surface");
+        assert_eq!(surface.ui_tree_snapshot.body, replacement);
+        assert_eq!(surface.ui_tree_snapshot.package_name, surface.package_name);
+        assert_eq!(surface.ui_tree_snapshot.surface_id, surface.surface_id);
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn plugin_surface_without_required_snapshot_fails_deserialization() {
+        let error = serde_json::from_value::<DaemonPluginSurface>(json!({
+            "package_name": "plugin.test",
+            "surface_id": "test.surface"
+        }))
+        .expect_err("required ui_tree_snapshot must fail closed");
+
+        assert!(error.to_string().contains("ui_tree_snapshot"), "{error}");
     }
 
     #[test]
@@ -13353,6 +13469,7 @@ mod tests {
             lifecycle_counters: botster_hub_client::DaemonLifecycleCounters::default(),
             live_attach_occupancy: Vec::new(),
             observability: botster_hub_client::DaemonObservabilityCounters::default(),
+            local_webrtc_terminal_records: Vec::new(),
             diagnostics: Vec::new(),
         });
         response
