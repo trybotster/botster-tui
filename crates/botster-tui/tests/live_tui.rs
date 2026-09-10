@@ -64,6 +64,7 @@ const RAW_SECOND_TOKEN: &str = "TUI_PRIVATE_SECOND_LINE";
 const UNSAFE_PASTE: &str = "\x1b[31mTUI_RAW_CONTROL_PAYLOAD\x1b[0m\nTUI_PRIVATE_SECOND_LINE\n";
 const SESSION_RUNNING_DEADLINE: Duration = Duration::from_secs(20);
 const SCREEN_DEADLINE: Duration = Duration::from_secs(20);
+const CONTROL_RECONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
 /// One absolute budget shared by every wait in one exact smoke test.
 const TEST_DEADLINE: Duration = Duration::from_secs(120);
@@ -159,6 +160,14 @@ impl HubGuard {
         self.hub
             .as_ref()
             .expect("hub is alive until the guard drops")
+    }
+
+    fn restart(&mut self) {
+        let hub = self.hub.take().expect("hub is alive before restart");
+        self.hub = Some(
+            hub.restart()
+                .expect("isolated hub restarts at its existing endpoint"),
+        );
     }
 }
 
@@ -1357,6 +1366,118 @@ fn t_s4_outer_pty_resize_reaches_the_attached_session() {
             resized
         );
         detach_and_quit(&mut tui, &mut screen, &identity);
+    }
+    drop(guard);
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let mut guard = start_hub(&candidate);
+    let mut stale_identity = Identity::default();
+    spawn_session(
+        guard.hub().endpoint(),
+        &mut stale_identity,
+        test_deadline,
+        SHELL_COMMAND,
+    );
+    {
+        let mut tui = TuiChild::spawn(guard.hub());
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let stale_session_row = format!("{} · running", stale_identity.session_id);
+        screen
+            .wait_for(
+                "stale_session_row_visible",
+                &stale_session_row,
+                SCREEN_DEADLINE,
+                &stale_identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let stale_occupancy = attach_and_echo(
+            guard.hub().endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut stale_identity,
+            &stale_session_row,
+            MARKER_ONE,
+            None,
+        );
+
+        guard.restart();
+
+        // The reconnect must consume a fresh empty session snapshot. The old
+        // attachment, projection, and toolbar control must not survive it.
+        screen
+            .wait_for(
+                "control_reconnect_connected",
+                "Hub: connected (running) · 0 sessions",
+                CONTROL_RECONNECT_DEADLINE,
+                &stale_identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        screen
+            .wait_for(
+                "control_reconnect_fresh_snapshot",
+                "No sessions yet",
+                SCREEN_DEADLINE,
+                &stale_identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(!screen.contains(&stale_session_row));
+        assert!(!screen.contains(SESSION_READY_MARKER));
+        assert!(!screen.contains(&format!("echo:{MARKER_ONE}")));
+        assert!(!screen.contains("[ Detach ]"));
+        assert!(
+            occupancies(guard.hub().endpoint(), &stale_identity).is_empty(),
+            "the fresh hub must not retain the stale attachment: {stale_occupancy:?}"
+        );
+
+        let mut fresh_identity = Identity::default();
+        spawn_session(
+            guard.hub().endpoint(),
+            &mut fresh_identity,
+            test_deadline,
+            SHELL_COMMAND,
+        );
+        assert_ne!(fresh_identity.session_id, stale_identity.session_id);
+        let fresh_session_row = format!("{} · running", fresh_identity.session_id);
+        screen
+            .wait_for(
+                "fresh_session_row_visible",
+                &fresh_session_row,
+                SCREEN_DEADLINE,
+                &fresh_identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let detached_hold = Instant::now() + screen.remaining(Duration::from_millis(500));
+        screen.pump(detached_hold);
+        assert!(!screen.contains(SESSION_READY_MARKER));
+        assert!(!screen.contains("[ Detach ]"));
+        assert!(
+            occupancies(guard.hub().endpoint(), &fresh_identity).is_empty(),
+            "a fresh session must stay detached until explicit activation"
+        );
+        let fresh_occupancy = attach_and_echo(
+            guard.hub().endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut fresh_identity,
+            &fresh_session_row,
+            MARKER_TWO,
+            None,
+        );
+        assert!(!screen.contains(&stale_session_row));
+        assert!(!screen.contains(&format!("echo:{MARKER_ONE}")));
+        println!(
+            "t_s5: reconnected stale_session={} stale_subscription={} fresh_session={} fresh_subscription={} input-output-visible",
+            stale_identity.session_id,
+            stale_occupancy.subscription_id,
+            fresh_identity.session_id,
+            fresh_occupancy.subscription_id
+        );
+        detach_and_quit(&mut tui, &mut screen, &fresh_identity);
     }
     drop(guard);
 }
