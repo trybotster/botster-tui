@@ -53,6 +53,10 @@ const SESSION_READY_MARKER: &str = "live-ready";
 const SHELL_COMMAND: &str =
     "printf 'live-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
 const RESIZE_SHELL_COMMAND: &str = "printf 'live-ready\\n'; while IFS= read -r line; do if [ \"$line\" = tui-report-size ]; then set -- $(stty size); printf 'size:%s:%s\\n' \"$1\" \"$2\"; else printf 'echo:%s\\n' \"$line\"; fi; done";
+const LAUNCH_TARGET_ID: &str = "tui-launch";
+const LAUNCH_TARGET_LABEL: &str = "TUI launch";
+const LAUNCH_SESSION_TYPE: &str = "shell";
+const LAUNCH_SESSION_TYPE_LABEL: &str = "TUI launch shell";
 const MARKER_ONE: &str = "tui-live-marker-one";
 const MARKER_TWO: &str = "tui-live-marker-two";
 const CONSENT_NORMAL_MARKER: &str = "tui-consent-normal-input";
@@ -1478,6 +1482,134 @@ fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session()
             fresh_occupancy.subscription_id
         );
         detach_and_quit(&mut tui, &mut screen, &fresh_identity);
+    }
+    drop(guard);
+}
+
+/// Admit a spawn target whose repo file defines one shell session type.
+fn admit_launch_target(endpoint: &DaemonEndpoint, root: &Path, identity: &Identity) {
+    let botster_dir = root.join(".botster");
+    fs::create_dir_all(&botster_dir).expect("create the launch target .botster dir");
+    let definition = serde_json::json!({
+        "session_types": [{
+            "id": LAUNCH_SESSION_TYPE,
+            "label": LAUNCH_SESSION_TYPE_LABEL,
+            "role": "botster.shell",
+            "interaction": "interactive",
+            "traits": [],
+            "lifecycle": "task",
+            "execution": { "mode": "shell_command" },
+            "command": SHELL_COMMAND,
+            "working_directory": { "policy": "package_root" }
+        }]
+    });
+    fs::write(
+        botster_dir.join("session-types.json"),
+        serde_json::to_vec_pretty(&definition).expect("session types json"),
+    )
+    .expect("write the launch target session types");
+    let response = request(
+        endpoint,
+        DaemonRequest::CreateSpawnTarget {
+            target_id: Some(LAUNCH_TARGET_ID.to_string()),
+            label: Some(LAUNCH_TARGET_LABEL.to_string()),
+            root: root.to_path_buf(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: std::collections::BTreeMap::new(),
+        },
+    )
+    .expect("create spawn target transport");
+    expect_ok("create_spawn_target", identity, response);
+}
+
+/// Wait until the Hub lists exactly one running session, and adopt its id.
+fn adopt_only_running_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
+    let started = Instant::now();
+    let until = started + SESSION_RUNNING_DEADLINE;
+    loop {
+        let response = expect_ok(
+            "list_sessions",
+            identity,
+            request(endpoint, DaemonRequest::ListSessions).expect("list sessions transport"),
+        );
+        let running = response
+            .sessions
+            .iter()
+            .filter(|session| session.lifecycle == "running")
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>();
+        if let [session_id] = running.as_slice() {
+            identity.session_id = session_id.clone();
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "layer={LAYER} step=launch_dialog_session_running cause=expected one running session, got {running:?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s6_launch_dialog_spawns_a_session_type_at_an_admitted_target() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let target_root = ShortTempRoot::create();
+    let mut identity = Identity::default();
+    admit_launch_target(hub.endpoint(), &target_root.path, &identity);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let mut click = |screen: &mut Screen, step: &'static str, needle: &str| {
+            let (col, row) = screen
+                .wait_for(step, needle, SCREEN_DEADLINE, &identity)
+                .unwrap_or_else(|failure| panic!("{failure}"));
+            tui.click(col, row);
+        };
+        click(&mut screen, "spawn_control_visible", "[ Spawn ]");
+        click(
+            &mut screen,
+            "launch_target_visible",
+            &format!("[ {LAUNCH_TARGET_LABEL} ({LAUNCH_TARGET_ID}) ]"),
+        );
+        click(
+            &mut screen,
+            "launch_session_type_visible",
+            &format!("[ {LAUNCH_SESSION_TYPE_LABEL} · "),
+        );
+        adopt_only_running_session(hub.endpoint(), &mut identity);
+        let session_row = format!("{} · running", identity.session_id);
+        screen
+            .wait_for(
+                "launched_session_row_visible",
+                &session_row,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(
+            screen.contains("type="),
+            "the launched row carries its session type classification"
+        );
+        let occupancy = attach_and_echo(
+            hub.endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut identity,
+            &session_row,
+            MARKER_ONE,
+            None,
+        );
+        println!(
+            "t_s6: launched session={} via target={} subscription={} generation={} echo visible",
+            occupancy.session_id, LAUNCH_TARGET_ID, occupancy.subscription_id, occupancy.generation
+        );
+        detach_and_quit(&mut tui, &mut screen, &identity);
     }
     drop(guard);
 }
