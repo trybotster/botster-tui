@@ -1685,3 +1685,112 @@ fn t_s6_launch_dialog_spawns_a_session_type_at_an_admitted_target() {
     }
     drop(guard);
 }
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let mut first = Identity::default();
+    spawn_session(hub.endpoint(), &mut first, test_deadline, SHELL_COMMAND);
+    thread::sleep(Duration::from_millis(5));
+    let mut second = Identity::default();
+    spawn_session(hub.endpoint(), &mut second, test_deadline, SHELL_COMMAND);
+    assert_ne!(first.session_id, second.session_id);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let first_row = format!("{} · running", first.session_id);
+        let second_row = format!("{} · running", second.session_id);
+        for (step, row) in [
+            ("first_row_visible", &first_row),
+            ("second_row_visible", &second_row),
+        ] {
+            screen
+                .wait_for(step, row, SCREEN_DEADLINE, &first)
+                .unwrap_or_else(|failure| panic!("{failure}"));
+        }
+        // Leaves the first session's terminal pane focused.
+        attach_and_echo(
+            hub.endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut first,
+            &first_row,
+            MARKER_ONE,
+            None,
+        );
+
+        // Ctrl+J is 0x0A, a newline to a shell. It must select the other
+        // session instead; Enter on the focused row then attaches it.
+        tui.write_all(b"\x0a");
+        let settle = Instant::now() + screen.remaining(Duration::from_millis(300));
+        screen.pump(settle);
+        tui.write_all(b"\r");
+        let occupancy = wait_for_occupancy(hub.endpoint(), &mut screen, &second, None);
+        second.adopt(&occupancy);
+        screen
+            .wait_for(
+                "second_session_attached",
+                &format!("Terminal · {}", second.session_id),
+                SCREEN_DEADLINE,
+                &second,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let first_screen = read_session_screen(hub.endpoint(), &first);
+        assert_eq!(
+            first_screen.matches("echo:").count(),
+            1,
+            "Ctrl+J and Enter must not reach the first session: {first_screen:?}"
+        );
+
+        // Focus the second terminal and prove keys reach it.
+        let ready = screen
+            .wait_for(
+                "second_session_ready",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                &second,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(ready.0, ready.1);
+        let focus_until = Instant::now() + screen.remaining(Duration::from_millis(200));
+        screen.pump(focus_until);
+        tui.type_line(MARKER_TWO);
+        screen
+            .wait_for(
+                "second_echo_visible",
+                &format!("echo:{MARKER_TWO}"),
+                SCREEN_DEADLINE,
+                &second,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        // Ctrl+P (0x10) moves focus to the toolbar, so q quits instead of
+        // reaching the shell.
+        tui.write_all(b"\x10");
+        let settle = Instant::now() + screen.remaining(Duration::from_millis(300));
+        screen.pump(settle);
+        tui.write_all(b"q");
+        let started = Instant::now();
+        let deadline = screen.remaining(EXIT_DEADLINE);
+        let status = tui.wait_exit(started + deadline).unwrap_or_else(|cause| {
+            let failure =
+                screen.failure("tui_exit_after_ctrl_p", &second, deadline, started, cause);
+            panic!("{failure}");
+        });
+        assert!(status.success(), "TUI exited unsuccessfully: {status:?}");
+        let second_screen = read_session_screen(hub.endpoint(), &second);
+        assert!(
+            !second_screen.lines().any(|line| line.trim() == "q"),
+            "q after Ctrl+P must not reach the session: {second_screen:?}"
+        );
+        println!(
+            "t_s7: ctrl+j switched {} -> {} without stray input; ctrl+p left the terminal; q quit",
+            first.session_id, second.session_id
+        );
+    }
+    drop(guard);
+}

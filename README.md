@@ -34,7 +34,7 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 | `botster-hub-client` / live hub | Hub `46fa2e65a2b81ff3218239b7c8051a40ef53f262` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
 | `botster-hub-test-support` package | Hub git `46fa2e65a2b81ff3218239b7c8051a40ef53f262` (`@trybotster/hub-test-support@0.1.45`) |
-| `botster-tui-kit` | `7940306b0d7461a12575b3856a96c0fbb23784f3` |
+| `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
 | `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `891e220295427fd93991638d7c62ba40fa25d4ae` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
@@ -70,8 +70,9 @@ for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. The real-client attach proof is
 `script/test-live-tui`. The smoke verifies attach, echo, detach, occupancy
-release, reattach, unsafe-paste consent, resize, control reconnect, and spawn
-through the launch dialog in a real pseudo-terminal. The reconnect test restarts an isolated Hub at its
+release, reattach, unsafe-paste consent, resize, control reconnect, spawn
+through the launch dialog, and the reserved host keys in a real
+pseudo-terminal. The reconnect test restarts an isolated Hub at its
 existing endpoint. It verifies a fresh empty session snapshot, stale attachment
 cleanup, explicit attachment to a new session, and new terminal input/output.
 
@@ -123,6 +124,18 @@ Tab and Shift-Tab move focus; arrows navigate focused controls; Enter or Space
 activates; PageUp/PageDown and the mouse wheel scroll; `Esc` cancels an open
 confirmation, returns from plugin-owned content to the System shell, or exits
 from the base shell. `q` and `Ctrl-C` also exit.
+
+While the terminal pane has focus, every key goes to the session except these
+reserved host keys, which work whatever has focus:
+
+- `Ctrl-P` moves focus to the toolbar (Spawn), so the terminal no longer
+  receives keys.
+- `Ctrl-J` / `Ctrl-K` select and focus the next / previous session row
+  (wrapping). Selection does not attach; `Enter` on the row attaches.
+- `Shift-PageUp` / `Shift-PageDown` / `Shift-Home` / `Shift-End` scroll the
+  terminal view.
+
+`Shift-Tab` is not reserved; it reaches the session.
 
 Activating a running session row attaches that session. Moving selection with
 the keyboard does not attach until Enter or Space activates the row. Clicking
@@ -211,6 +224,9 @@ generations across the Core restart because the new daemon owns fresh sessions.
 T-S6 admits a spawn target whose `.botster/session-types.json` defines one
 shell session type. It spawns through the toolbar Spawn dialog (target, then
 session type), attaches the launched session, and verifies echo.
+T-S7 attaches one of two sessions, then proves that `Ctrl-J` selects the other
+without sending input to the attached session, that `Enter` attaches it, and
+that `Ctrl-P` moves focus off the terminal so `q` quits.
 
 Matched execution, September 25, 2026: all six cases passed with Rust 1.97.0
 against the Hub candidate built from Hub `0437cc4f` (production code equal to
