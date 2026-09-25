@@ -70,8 +70,8 @@ for the current `(session_id, subscription_id)` is the bounded adapter-close
 signal: one recovery Attach with a new `subscription_id`, then fail closed.
 `generation` is close-event evidence only. The real-client attach proof is
 `script/test-live-tui`. The smoke verifies attach, echo, detach, occupancy
-release, reattach, unsafe-paste consent, resize, and control reconnect through
-a real pseudo-terminal. The reconnect test restarts an isolated Hub at its
+release, reattach, unsafe-paste consent, resize, control reconnect, and spawn
+through the launch dialog in a real pseudo-terminal. The reconnect test restarts an isolated Hub at its
 existing endpoint. It verifies a fresh empty session snapshot, stale attachment
 cleanup, explicit attachment to a new session, and new terminal input/output.
 
@@ -200,35 +200,24 @@ T-S1 proves selection, attach, input, and visible echo.
 T-S2 proves detach, occupancy release, reattach with a new generation, and visible echo.
 T-S3 proves zero-byte unsafe-paste rejection, deliberate consent, cancellation,
 continued output, a fresh accepted retry, and no raw payload rendering.
-T-S4 proves that an outer pseudo-terminal resize reaches the attached session
-and that the resized session continues to accept input and produce output.
+T-S4 proves that the session PTY size equals the drawn Terminal pane after
+attach and after one outer pseudo-terminal resize, and that the resized
+session reports that size and continues to accept input and produce output.
 T-S5 proves control-connection loss and reconnect at a stable endpoint. It also
 proves stale attachment cleanup, a fresh session snapshot, explicit attachment
 to a new session, and new terminal input/output. It does not compare terminal
 generations across the Core restart because the new daemon owns fresh sessions.
 
-Final matched execution, September 9, 2026: all five cases passed with Rust
-1.97.0 against Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` and Core
-`b9e989be3232c72e966ce3fdb63878c82b70d94d`. The locked workspace run also
-passed 163 unit tests and two integration tests. The source did not change
-between these runs and this documentation checkpoint.
-The live run used two jobs with incremental compilation disabled. The tested
-`botster-tui` binary had SHA-256
-`cbdb60dcddbd099229ce622b7a38d5b88372ce03e2490234d946148a42118a17`.
+T-S6 admits a spawn target whose `.botster/session-types.json` defines one
+shell session type. It spawns through the toolbar Spawn dialog (target, then
+session type), attaches the launched session, and verifies echo.
 
-The first live attempt failed during Hub startup under the managed sandbox.
-An approved retry passed with the default Rust 1.92 toolchain. A separate run
-with explicit Rust 1.97.0 passed all five cases and supplies the final evidence.
-These results establish the tested client behavior, not performance acceptance.
-
-Earlier execution status: T-S1 and T-S2 passed at TUI
-`3ed7d203f7026fe5c739aa9b16b3021906773f0e` against Hub
-`e2cc0ed5d0ccbeab3690dfd0930bf9edc9e2691c` and Core
-`98a50ef43f62bd9da6e062bd4d44d961fa3c78c9`. T-S3, T-S4, and T-S5 passed
-against Hub `76c4df8d4891752bd3bacb5d88c762914eec02db` and Core
-`ca243281bc21adb30f13913d38669bbad27083a8` from uncommitted TUI source based
-on `89c0be33a452ef4e58a08b299efefcb6bcdc0db5`. These separate runs do not
-establish final acceptance for one revision tuple.
+Matched execution, September 25, 2026: all six cases passed with Rust 1.97.0
+against the Hub candidate built from Hub `0437cc4f` (production code equal to
+the `46fa2e65` pin) and Core `891e220295427fd93991638d7c62ba40fa25d4ae`. The
+locked workspace run passed 164 unit tests and two integration tests. The live
+run used two jobs with incremental compilation disabled. These results
+establish the tested client behavior, not performance acceptance.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
