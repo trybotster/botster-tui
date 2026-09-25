@@ -674,6 +674,18 @@ impl SessionEntityState {
     }
 }
 
+/// Outcome of one `session_type` entity frame for the current generation.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionTypeFrameOutcome {
+    /// The frame belongs to another generation or is stale.
+    Ignored,
+    /// The entity set changed. `replaced` is true for a full Snapshot.
+    Applied { replaced: bool },
+    /// Hub reported a catalog error. The subscription stays open, and the
+    /// next Snapshot replaces the whole entity set.
+    HubError(String),
+}
+
 #[derive(Default)]
 struct SessionTypeEntityState {
     subscription_id: Option<String>,
@@ -692,7 +704,7 @@ impl SessionTypeEntityState {
         self.entities.clear();
     }
 
-    fn apply(&mut self, frame: DaemonEntityFrame) -> Result<bool, String> {
+    fn apply(&mut self, frame: DaemonEntityFrame) -> Result<SessionTypeFrameOutcome, String> {
         match frame {
             DaemonEntityFrame::Snapshot {
                 subscription_id,
@@ -702,7 +714,7 @@ impl SessionTypeEntityState {
                 ..
             } => {
                 if !self.matches(&subscription_id, &entity_type) {
-                    return Ok(false);
+                    return Ok(SessionTypeFrameOutcome::Ignored);
                 }
                 let items = items
                     .into_iter()
@@ -718,7 +730,7 @@ impl SessionTypeEntityState {
                     .collect();
                 self.has_snapshot = true;
                 self.snapshot_seq = Some(snapshot_seq);
-                Ok(true)
+                Ok(SessionTypeFrameOutcome::Applied { replaced: true })
             }
             DaemonEntityFrame::Upsert {
                 subscription_id,
@@ -728,7 +740,7 @@ impl SessionTypeEntityState {
                 entity,
             } => {
                 if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
-                    return Ok(false);
+                    return Ok(SessionTypeFrameOutcome::Ignored);
                 }
                 let entity = decode_session_type_entity(entity)?;
                 if id != entity.session_type_id {
@@ -742,7 +754,7 @@ impl SessionTypeEntityState {
                 }
                 self.entities.insert(id, entity);
                 self.snapshot_seq = Some(snapshot_seq);
-                Ok(true)
+                Ok(SessionTypeFrameOutcome::Applied { replaced: false })
             }
             DaemonEntityFrame::Patch {
                 subscription_id,
@@ -750,7 +762,7 @@ impl SessionTypeEntityState {
                 ..
             } => {
                 if !self.matches(&subscription_id, &entity_type) {
-                    return Ok(false);
+                    return Ok(SessionTypeFrameOutcome::Ignored);
                 }
                 Err(
                     "session type entity patch is unsupported; expected snapshot/upsert/remove only"
@@ -764,12 +776,12 @@ impl SessionTypeEntityState {
                 id,
             } => {
                 if !self.accepts_delta(&subscription_id, &entity_type, snapshot_seq) {
-                    return Ok(false);
+                    return Ok(SessionTypeFrameOutcome::Ignored);
                 }
                 self.entities.remove(&id);
                 self.entity_order.retain(|entity_id| entity_id != &id);
                 self.snapshot_seq = Some(snapshot_seq);
-                Ok(true)
+                Ok(SessionTypeFrameOutcome::Applied { replaced: false })
             }
             DaemonEntityFrame::Error {
                 subscription_id,
@@ -778,11 +790,13 @@ impl SessionTypeEntityState {
                 message,
             } => {
                 if !self.matches(&subscription_id, &entity_type) {
-                    return Ok(false);
+                    return Ok(SessionTypeFrameOutcome::Ignored);
                 }
-                Err(format!(
-                    "session type entity subscription error: code={code} message={message}"
-                ))
+                // Non-terminal: refuse deltas until the replacement Snapshot.
+                self.has_snapshot = false;
+                Ok(SessionTypeFrameOutcome::HubError(format!(
+                    "code={code} message={message}"
+                )))
             }
         }
     }
@@ -2964,7 +2978,10 @@ impl TuiApp {
                 }
             },
             "session_type" => match self.session_type_entities.apply(frame) {
-                Ok(true) => {
+                Ok(SessionTypeFrameOutcome::Applied { replaced }) => {
+                    if replaced {
+                        self.session_type_subscription_error = None;
+                    }
                     if self
                         .selected_session_type_id
                         .as_ref()
@@ -2973,7 +2990,10 @@ impl TuiApp {
                         self.selected_session_type_id = None;
                     }
                 }
-                Ok(false) => {}
+                Ok(SessionTypeFrameOutcome::Ignored) => {}
+                Ok(SessionTypeFrameOutcome::HubError(error)) => {
+                    self.session_type_subscription_error = Some(error);
+                }
                 Err(error) => {
                     self.session_type_subscription_error = Some(error.clone());
                     self.error = Some(format!("session type sync: {error}"));
@@ -13895,6 +13915,87 @@ mod tests {
             target_id: "repo-a".to_string(),
             available: true,
         }
+    }
+
+    #[test]
+    fn session_type_entity_error_keeps_the_subscription_until_a_replacement_snapshot() {
+        let mut app = TuiApp::new(None);
+        app.session_type_entities.begin_generation("st".to_string());
+        let entity = |id: &str| {
+            serde_json::to_value(sample_session_type(id, "device", true)).expect("entity json")
+        };
+        app.apply_entity_frame(DaemonEntityFrame::Snapshot {
+            subscription_id: "st".to_string(),
+            entity_type: "session_type".to_string(),
+            snapshot_seq: 1,
+            items: vec![entity("device/old")],
+            resync_reason: None,
+        });
+        let pending_before = app.pending_requests.len();
+
+        app.apply_entity_frame(DaemonEntityFrame::Error {
+            subscription_id: "st".to_string(),
+            entity_type: "session_type".to_string(),
+            code: "invalid_repo_session_types".to_string(),
+            message: "repo catalog is invalid".to_string(),
+        });
+
+        assert_eq!(
+            app.session_type_entities.subscription_id.as_deref(),
+            Some("st")
+        );
+        assert_eq!(
+            app.pending_requests.len(),
+            pending_before,
+            "no unsubscribe or resubscribe"
+        );
+        assert!(
+            app.session_type_subscription_error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid_repo_session_types"))
+        );
+        assert!(
+            app.session_type_entities
+                .entities
+                .contains_key("device/old")
+        );
+
+        app.apply_entity_frame(DaemonEntityFrame::Upsert {
+            subscription_id: "st".to_string(),
+            entity_type: "session_type".to_string(),
+            snapshot_seq: 2,
+            id: "device/delta".to_string(),
+            entity: entity("device/delta"),
+        });
+        assert!(
+            !app.session_type_entities
+                .entities
+                .contains_key("device/delta"),
+            "deltas wait for the replacement snapshot"
+        );
+
+        app.apply_entity_frame(DaemonEntityFrame::Snapshot {
+            subscription_id: "st".to_string(),
+            entity_type: "session_type".to_string(),
+            snapshot_seq: 3,
+            items: vec![entity("device/new")],
+            resync_reason: None,
+        });
+
+        assert_eq!(
+            app.session_type_entities
+                .entities
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["device/new"],
+            "the snapshot replaces the whole set"
+        );
+        assert_eq!(app.session_type_subscription_error, None);
+        assert_eq!(
+            app.session_type_entities.subscription_id.as_deref(),
+            Some("st")
+        );
+        assert_eq!(app.pending_requests.len(), pending_before);
     }
 
     #[test]
