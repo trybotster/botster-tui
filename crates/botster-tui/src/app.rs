@@ -1331,10 +1331,10 @@ enum HostScroll {
     Bottom,
 }
 
+/// Matches every key kind, so a reserved chord's release never reaches a
+/// session either. Release reporting needs keyboard enhancement flags, which
+/// the TUI does not enable today.
 fn host_key(key: KeyEvent) -> Option<HostKey> {
-    if key.kind == KeyEventKind::Release {
-        return None;
-    }
     match (key.code, key.modifiers) {
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(HostKey::Menu),
         (KeyCode::Char('j'), KeyModifiers::CONTROL) => Some(HostKey::NextSession),
@@ -1405,7 +1405,9 @@ fn route_input_event(
 ) -> bool {
     match event {
         Event::Key(key) if let Some(host_key) = host_key(key) => {
-            apply_host_key(app, router, hit_map, host_key);
+            if key.kind != KeyEventKind::Release {
+                apply_host_key(app, router, hit_map, host_key);
+            }
         }
         Event::Key(key)
             if key.kind == KeyEventKind::Press
@@ -16189,9 +16191,28 @@ mod tests {
         ] {
             assert_eq!(host_key(free), None, "{free:?} belongs to the session");
         }
-        let mut release = key(KeyCode::Char('p'), control);
-        release.kind = KeyEventKind::Release;
-        assert_eq!(host_key(release), None);
+    }
+
+    #[test]
+    fn reserved_chord_releases_are_consumed_without_acting() {
+        let (mut app, mut router, map) = attached_workspace_with_focused_terminal();
+        for (code, modifiers) in [
+            (KeyCode::PageUp, KeyModifiers::SHIFT),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            let mut release = KeyEvent::new(code, modifiers);
+            release.kind = KeyEventKind::Release;
+            assert!(route_input_event(
+                &mut app,
+                &mut router,
+                &map,
+                Event::Key(release)
+            ));
+        }
+        assert!(app.observed_terminal_inputs.is_empty());
+        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
+        assert_eq!(app.selected_session.as_deref(), Some("session-alpha"));
     }
 
     fn attached_workspace_with_focused_terminal() -> (TuiApp, InputRouter, HitMap) {
