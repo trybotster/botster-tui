@@ -1277,6 +1277,7 @@ fn run_loop(
         app.prepare_paint();
         terminal.draw(|frame| draw(frame, &mut hit_map, &app, &render_state))?;
         app.apply_terminal_mouse_mode(&mut hit_map);
+        app.sync_terminal_pane_size(&hit_map);
         router.reconcile(&hit_map);
 
         let wake = app.next_wake();
@@ -1321,6 +1322,9 @@ fn route_input_event(
             if app.handle_focused_terminal_paste(text, router.focused_node_id()) => {}
         Event::Mouse(mouse)
             if app.handle_focused_terminal_mouse(mouse, router.focused_node_id(), hit_map) => {}
+        // The next draw measures the new pane; `sync_terminal_pane_size`
+        // sends it. The router would report the previous frame's pane.
+        Event::Resize(..) => {}
         Event::FocusGained => app.handle_host_focus(true),
         Event::FocusLost => app.handle_host_focus(false),
         Event::Key(key) if key.kind == KeyEventKind::Press && should_quit(key) => return false,
@@ -2024,15 +2028,6 @@ impl TuiApp {
                     self.handle_action(request.action_id.0, request.values, request.payload);
                 }
             }
-            InputDispatch::TerminalResize { rows, cols, .. } => {
-                let size = TerminalScreenSize::new(rows, cols);
-                if let Some(hydration) = self.attach_hydration.as_mut() {
-                    hydration.pending_resize = Some(size);
-                    return;
-                }
-                self.apply_local_resize(size);
-                self.send_resize(size);
-            }
             InputDispatch::Scroll { node_id, lines } => {
                 // Map kit scroll deltas on the terminal node to Ghostty ScrollOp.
                 // Non-terminal scroll areas are kit-owned presentation scroll.
@@ -2043,6 +2038,7 @@ impl TuiApp {
             // Kit classic key bytes never reach the PTY: the TUI intercepts
             // terminal-focused keys before the router and sends typed KEY frames.
             InputDispatch::TerminalForward { .. }
+            | InputDispatch::TerminalResize { .. }
             | InputDispatch::Hover { .. }
             | InputDispatch::Focus { .. }
             | InputDispatch::Ignored => {}
@@ -4904,14 +4900,41 @@ impl TuiApp {
         let size = hydration
             .pending_resize
             .unwrap_or(self.terminal_viewport_size);
-        self.apply_local_resize(size);
-        self.send_resize(size);
+        if self.send_resize(size) {
+            self.apply_local_resize(size);
+        }
         for input in hydration.pending_input {
             match input {
                 PendingTerminalInput::Key(key) => self.send_key(key),
                 PendingTerminalInput::Focus(focused) => self.send_focus(focused),
                 PendingTerminalInput::Paste(data) => self.send_paste(data),
             }
+        }
+    }
+
+    /// Keep the Hub PTY size equal to the terminal pane in the frame just drawn.
+    ///
+    /// Attach, outer resize, and layout changes all converge here whether or
+    /// not the pane has focus. An unchanged size sends nothing. A resize that
+    /// cannot be sent leaves the local size unchanged, so the next draw retries.
+    fn sync_terminal_pane_size(&mut self, hit_map: &HitMap) {
+        let Some(outer) = tui_terminal_region(hit_map) else {
+            return;
+        };
+        let inner = botster_tui_kit::terminal_inner_rect(outer);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let size = TerminalScreenSize::new(inner.height, inner.width);
+        if let Some(hydration) = self.attach_hydration.as_mut() {
+            hydration.pending_resize = Some(size);
+            return;
+        }
+        if self.attached.is_none() || self.terminal_viewport_size == size {
+            return;
+        }
+        if self.send_resize(size) {
+            self.apply_local_resize(size);
         }
     }
 
@@ -5010,15 +5033,17 @@ impl TuiApp {
         self.send_command(operation_id, command);
     }
 
-    fn send_resize(&mut self, size: TerminalScreenSize) {
+    /// Returns whether the RESIZE was sent.
+    fn send_resize(&mut self, size: TerminalScreenSize) -> bool {
         if self.attached.is_none() {
-            return;
+            return false;
         }
         let Some(operation_id) = self.next_input_operation_id() else {
-            return;
+            return false;
         };
         let command = terminal_input::resize_command(size.rows, size.cols, operation_id);
         self.send_command(operation_id, command);
+        true
     }
 
     fn send_paste(&mut self, data: Vec<u8>) {
@@ -15987,6 +16012,54 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(paste_begins, vec![(1, false), (2, false)]);
+    }
+
+    #[test]
+    fn drawn_terminal_pane_size_reaches_the_hub_once_per_change() {
+        let mut app = workspace_fixture();
+        app.hub_io.capture_terminal_frames();
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.subscription_id = "route-1".to_string();
+        app.route_generation = Some(7);
+        app.route_epoch = Some(0);
+        app.terminal_viewport_size = TerminalScreenSize::new(24, 80);
+        let router = InputRouter::new(renderer::action_request_context());
+        let resizes = |app: &TuiApp| {
+            app.observed_terminal_inputs
+                .iter()
+                .filter_map(|command| match command {
+                    TerminalInputCommand::Resize { rows, cols, .. } => Some((*rows, *cols)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let pane = |map: &HitMap| {
+            let inner = botster_tui_kit::terminal_inner_rect(
+                tui_terminal_region(map).expect("terminal pane drawn"),
+            );
+            (inner.height, inner.width)
+        };
+
+        let (_, first) = render_app_to_lines(&app, 140, 40, &router.render_state());
+        app.sync_terminal_pane_size(&first);
+        app.sync_terminal_pane_size(&first);
+        assert_eq!(
+            resizes(&app),
+            vec![pane(&first)],
+            "unchanged size sends nothing"
+        );
+
+        let (_, second) = render_app_to_lines(&app, 160, 48, &router.render_state());
+        assert_ne!(pane(&first), pane(&second));
+        app.sync_terminal_pane_size(&second);
+        assert_eq!(resizes(&app), vec![pane(&first), pane(&second)]);
+        assert_eq!(
+            app.terminal_viewport_size,
+            TerminalScreenSize::new(pane(&second).0, pane(&second).1)
+        );
     }
 
     #[test]
