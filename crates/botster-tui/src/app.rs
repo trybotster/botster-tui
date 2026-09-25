@@ -165,8 +165,25 @@ pub struct AppArgs {
     pub hub_data_dir: Option<PathBuf>,
 }
 
+/// What the command line asks the binary to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedCommand {
+    Run(AppArgs),
+    Help,
+    Version,
+}
+
+pub const fn usage() -> &'static str {
+    "usage: botster-tui [--smoke]\n\n\
+     The Hub host supplies the connection in BOTSTER_HUB_CONNECTION.\n\n\
+     Options:\n\
+     \x20 --smoke        Print a startup smoke message and exit\n\
+     \x20 -h, --help     Show this help\n\
+     \x20 -V, --version  Show the version"
+}
+
 impl AppArgs {
-    pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
         // Parent claim-stack prose uses BOTSTER_LIVE_DATA_DIR; prefer the established
         // BOTSTER_HUB_DATA_DIR injector when both are present.
         let hub_data_dir = std::env::var_os("BOTSTER_HUB_DATA_DIR")
@@ -182,18 +199,21 @@ impl AppArgs {
         args: impl IntoIterator<Item = String>,
         hub_connection: Option<std::ffi::OsString>,
         hub_data_dir: Option<std::ffi::OsString>,
-    ) -> Self {
+    ) -> Result<ParsedCommand, String> {
         let mut parsed = Self::default();
         for arg in args {
-            if arg == "--smoke" {
-                parsed.smoke = true;
+            match arg.as_str() {
+                "--smoke" => parsed.smoke = true,
+                "-h" | "--help" => return Ok(ParsedCommand::Help),
+                "-V" | "--version" => return Ok(ParsedCommand::Version),
+                _ => return Err(format!("unknown option: {arg}")),
             }
         }
         let (connection, connection_error) = parse_hub_connection(hub_connection);
         parsed.hub_connection = connection;
         parsed.connection_error = connection_error;
         parsed.hub_data_dir = hub_data_dir.map(PathBuf::from);
-        parsed
+        Ok(ParsedCommand::Run(parsed))
     }
 
     fn daemon_endpoint(&self) -> Option<DaemonEndpoint> {
@@ -11474,14 +11494,16 @@ mod tests {
 
     #[test]
     fn parses_typed_hub_connection_and_data_dir() {
-        let args = AppArgs::parse_with_environment(
+        let Ok(ParsedCommand::Run(args)) = AppArgs::parse_with_environment(
             [],
             Some(
                 botster_core_test_support::fixtures::runnable_entrypoint_hub_connection::VALID_UNIX_SOCKET_JSON
                     .into(),
             ),
             Some("target/hub-data".into()),
-        );
+        ) else {
+            panic!("expected run arguments");
+        };
 
         assert_eq!(
             args.daemon_endpoint().map(|endpoint| endpoint.socket_path),
@@ -11509,12 +11531,10 @@ mod tests {
     }
 
     #[test]
-    fn retired_raw_socket_inputs_do_not_provide_a_connection() {
-        let args = AppArgs::parse_with_environment(
-            ["--hub-socket".to_string(), "/tmp/retired.sock".to_string()],
-            None,
-            None,
-        );
+    fn missing_hub_connection_is_reported() {
+        let Ok(ParsedCommand::Run(args)) = AppArgs::parse_with_environment([], None, None) else {
+            panic!("expected run arguments");
+        };
 
         assert_eq!(args.hub_connection, None);
         assert_eq!(args.daemon_endpoint(), None);
@@ -11522,6 +11542,25 @@ mod tests {
             args.connection_error.as_deref(),
             Some("BOTSTER_HUB_CONNECTION is required")
         );
+    }
+
+    #[test]
+    fn cli_rejects_unknown_options_and_answers_help_and_version() {
+        let parse = |args: &[&str]| {
+            AppArgs::parse_with_environment(args.iter().map(ToString::to_string), None, None)
+        };
+        assert_eq!(
+            parse(&["--hub-socket", "/tmp/retired.sock"]),
+            Err("unknown option: --hub-socket".to_string())
+        );
+        assert_eq!(parse(&["--help"]), Ok(ParsedCommand::Help));
+        assert_eq!(parse(&["-h"]), Ok(ParsedCommand::Help));
+        assert_eq!(parse(&["--version"]), Ok(ParsedCommand::Version));
+        assert_eq!(parse(&["-V"]), Ok(ParsedCommand::Version));
+        assert!(matches!(
+            parse(&["--smoke"]),
+            Ok(ParsedCommand::Run(AppArgs { smoke: true, .. }))
+        ));
     }
 
     #[test]
