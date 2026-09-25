@@ -125,6 +125,10 @@ activates; PageUp/PageDown and the mouse wheel scroll; `Esc` cancels an open
 confirmation, returns from plugin-owned content to the System shell, or exits
 from the base shell. `q` and `Ctrl-C` also exit.
 
+`botster-tui --help` prints usage, `--version` prints the version, and an
+unknown option prints usage and exits with status 2. The Hub host supplies the
+connection in `BOTSTER_HUB_CONNECTION`; there is no socket option.
+
 While the terminal pane has focus, every key goes to the session except these
 reserved host keys, which work whatever has focus:
 
