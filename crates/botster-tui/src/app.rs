@@ -345,6 +345,9 @@ impl PendingTerminalInput {
 }
 
 /// Whether a kit node id names the production terminal view.
+/// Ctrl+P focus target: the always-present primary toolbar action.
+const WORKSPACE_MENU_NODE: &str = "tui-spawn";
+
 fn is_terminal_node(node_id: Option<&str>) -> bool {
     matches!(node_id, Some("tui-terminal" | "tui-terminal-output"))
 }
@@ -1307,6 +1310,93 @@ fn apply_wake(app: &mut TuiApp, router: &mut InputRouter, hit_map: &HitMap, wake
     }
 }
 
+/// Chords the TUI keeps for itself. They never reach a session, whatever has focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostKey {
+    /// Ctrl+P: move focus out of the terminal to the workspace toolbar.
+    Menu,
+    /// Ctrl+J: select the next session row.
+    NextSession,
+    /// Ctrl+K: select the previous session row.
+    PreviousSession,
+    /// Shift+PageUp / PageDown / Home / End: scroll the terminal projection.
+    Scroll(HostScroll),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostScroll {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+fn host_key(key: KeyEvent) -> Option<HostKey> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(HostKey::Menu),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) => Some(HostKey::NextSession),
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) => Some(HostKey::PreviousSession),
+        (KeyCode::PageUp, KeyModifiers::SHIFT) => Some(HostKey::Scroll(HostScroll::PageUp)),
+        (KeyCode::PageDown, KeyModifiers::SHIFT) => Some(HostKey::Scroll(HostScroll::PageDown)),
+        (KeyCode::Home, KeyModifiers::SHIFT) => Some(HostKey::Scroll(HostScroll::Top)),
+        (KeyCode::End, KeyModifiers::SHIFT) => Some(HostKey::Scroll(HostScroll::Bottom)),
+        _ => None,
+    }
+}
+
+fn apply_host_key(app: &mut TuiApp, router: &mut InputRouter, hit_map: &HitMap, host_key: HostKey) {
+    match host_key {
+        HostKey::Menu => {
+            let focused = matches!(
+                router.focus_node(WORKSPACE_MENU_NODE, hit_map),
+                InputDispatch::Focus { .. }
+            );
+            // The toolbar can overflow at narrow widths; still leave the terminal.
+            if !focused && is_terminal_node(router.focused_node_id()) {
+                router.focus_next(hit_map);
+            }
+        }
+        HostKey::NextSession | HostKey::PreviousSession => {
+            let count = app.sessions.len();
+            if count == 0 {
+                return;
+            }
+            let current = app.selected_session.as_deref().and_then(|id| {
+                app.sessions
+                    .iter()
+                    .position(|session| session.session_id == id)
+            });
+            let next = match (host_key, current) {
+                (HostKey::NextSession, Some(index)) => (index + 1) % count,
+                (HostKey::NextSession, None) => 0,
+                (_, Some(index)) => (index + count - 1) % count,
+                (_, None) => count - 1,
+            };
+            let session_id = app.sessions[next].session_id.clone();
+            // Focus the row so Enter attaches it. A modal hides the list, and
+            // then the chord changes nothing.
+            if matches!(
+                router.focus_node(&format!("tui-session-{session_id}"), hit_map),
+                InputDispatch::Focus { .. }
+            ) {
+                app.set_selected_session(Some(session_id));
+            }
+        }
+        HostKey::Scroll(scroll) => {
+            let page = i32::from(app.terminal_viewport_size.rows);
+            app.scroll_projection(match scroll {
+                HostScroll::PageUp => ScrollOp::Delta(-page),
+                HostScroll::PageDown => ScrollOp::Delta(page),
+                HostScroll::Top => ScrollOp::Top,
+                HostScroll::Bottom => ScrollOp::Bottom,
+            });
+        }
+    }
+}
+
 fn route_input_event(
     app: &mut TuiApp,
     router: &mut InputRouter,
@@ -1314,6 +1404,9 @@ fn route_input_event(
     event: Event,
 ) -> bool {
     match event {
+        Event::Key(key) if let Some(host_key) = host_key(key) => {
+            apply_host_key(app, router, hit_map, host_key);
+        }
         Event::Key(key)
             if key.kind == KeyEventKind::Press
                 && app.handle_tui_owned_key(key, router.focused_node_id()) => {}
@@ -2038,7 +2131,7 @@ impl TuiApp {
             // Kit classic key bytes never reach the PTY: the TUI intercepts
             // terminal-focused keys before the router and sends typed KEY frames.
             InputDispatch::TerminalForward { .. }
-            | InputDispatch::TerminalResize { .. }
+            | InputDispatch::HostKey(_)
             | InputDispatch::Hover { .. }
             | InputDispatch::Focus { .. }
             | InputDispatch::Ignored => {}
@@ -16060,6 +16153,126 @@ mod tests {
             app.terminal_viewport_size,
             TerminalScreenSize::new(pane(&second).0, pane(&second).1)
         );
+    }
+
+    #[test]
+    fn host_keys_are_the_reserved_set_and_exclude_shift_tab() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let control = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        assert_eq!(
+            host_key(key(KeyCode::Char('p'), control)),
+            Some(HostKey::Menu)
+        );
+        assert_eq!(
+            host_key(key(KeyCode::Char('j'), control)),
+            Some(HostKey::NextSession)
+        );
+        assert_eq!(
+            host_key(key(KeyCode::Char('k'), control)),
+            Some(HostKey::PreviousSession)
+        );
+        for (code, scroll) in [
+            (KeyCode::PageUp, HostScroll::PageUp),
+            (KeyCode::PageDown, HostScroll::PageDown),
+            (KeyCode::Home, HostScroll::Top),
+            (KeyCode::End, HostScroll::Bottom),
+        ] {
+            assert_eq!(host_key(key(code, shift)), Some(HostKey::Scroll(scroll)));
+        }
+        for free in [
+            key(KeyCode::BackTab, shift),
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            key(KeyCode::Char('p'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), control),
+            key(KeyCode::PageUp, KeyModifiers::NONE),
+        ] {
+            assert_eq!(host_key(free), None, "{free:?} belongs to the session");
+        }
+        let mut release = key(KeyCode::Char('p'), control);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(host_key(release), None);
+    }
+
+    fn attached_workspace_with_focused_terminal() -> (TuiApp, InputRouter, HitMap) {
+        let mut app = workspace_fixture();
+        app.sessions = session_rows([
+            ("session-alpha", "running"),
+            ("session-beta", "running"),
+            ("session-gamma", "running"),
+        ]);
+        app.hub_io.capture_terminal_frames();
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.subscription_id = "route-1".to_string();
+        app.route_generation = Some(7);
+        app.route_epoch = Some(0);
+        let mut router = InputRouter::new(renderer::action_request_context());
+        let (_, map) = render_app_to_lines(&app, 140, 40, &router.render_state());
+        focus_hit_map_node_by_tab(&mut router, &map, "tui-terminal");
+        (app, router, map)
+    }
+
+    #[test]
+    fn ctrl_p_moves_focus_from_the_terminal_to_the_toolbar() {
+        let (mut app, mut router, map) = attached_workspace_with_focused_terminal();
+        let ctrl_p = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(route_input_event(&mut app, &mut router, &map, ctrl_p));
+
+        assert_eq!(router.focused_node_id(), Some(WORKSPACE_MENU_NODE));
+        assert!(app.observed_terminal_inputs.is_empty());
+        let q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(
+            !route_input_event(&mut app, &mut router, &map, q),
+            "after Ctrl+P a keyboard user can quit"
+        );
+    }
+
+    #[test]
+    fn ctrl_j_and_ctrl_k_select_sessions_without_attaching_or_typing() {
+        let (mut app, mut router, map) = attached_workspace_with_focused_terminal();
+        let chord = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+
+        assert!(route_input_event(&mut app, &mut router, &map, chord('j')));
+        assert_eq!(app.selected_session.as_deref(), Some("session-beta"));
+        assert_eq!(router.focused_node_id(), Some("tui-session-session-beta"));
+        assert!(route_input_event(&mut app, &mut router, &map, chord('j')));
+        assert_eq!(app.selected_session.as_deref(), Some("session-gamma"));
+        assert!(route_input_event(&mut app, &mut router, &map, chord('k')));
+        assert!(route_input_event(&mut app, &mut router, &map, chord('k')));
+        assert_eq!(app.selected_session.as_deref(), Some("session-alpha"));
+        assert!(route_input_event(&mut app, &mut router, &map, chord('k')));
+        assert_eq!(
+            app.selected_session.as_deref(),
+            Some("session-gamma"),
+            "wraps"
+        );
+
+        assert_eq!(
+            app.attached_session_id(),
+            Some("session-alpha"),
+            "selection never attaches"
+        );
+        assert!(app.observed_terminal_inputs.is_empty());
+    }
+
+    #[test]
+    fn shift_page_keys_scroll_and_never_reach_the_session() {
+        let (mut app, mut router, map) = attached_workspace_with_focused_terminal();
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT));
+            assert!(route_input_event(&mut app, &mut router, &map, event));
+        }
+        assert!(app.observed_terminal_inputs.is_empty());
+        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
     }
 
     #[test]
