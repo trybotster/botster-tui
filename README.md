@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` |
+| `botster-hub-client` / live hub | Hub `46fa2e65a2b81ff3218239b7c8051a40ef53f262` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` (`@trybotster/hub-test-support@0.1.45`) |
+| `botster-hub-test-support` package | Hub git `46fa2e65a2b81ff3218239b7c8051a40ef53f262` (`@trybotster/hub-test-support@0.1.45`) |
 | `botster-tui-kit` | `7940306b0d7461a12575b3856a96c0fbb23784f3` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `b9e989be3232c72e966ce3fdb63878c82b70d94d` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `891e220295427fd93991638d7c62ba40fa25d4ae` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -168,7 +168,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`1a0df65230a476cfea362fdc5131e035d303a928` (same Hub pin as Foundation above).
+`46fa2e65a2b81ff3218239b7c8051a40ef53f262` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
