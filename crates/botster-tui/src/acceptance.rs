@@ -52,9 +52,6 @@ pub struct ClaimConfig {
     pub evidence_path: PathBuf,
 }
 
-/// Backward-compatible name used by the spawn acceptance driver.
-pub type Config = SpawnConfig;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {

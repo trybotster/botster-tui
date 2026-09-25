@@ -256,14 +256,10 @@ Session types are authoritative Hub descriptors consumed through the
   the Hub effective `session_type_id` with `request.target_id = T`. Freeform
   `DaemonRequest::Spawn { command }` is not a product affordance.
   Workspaces acceptance setup may still use raw Spawn.
-- Client handshake keeps `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 48` and does
-  **not** require `session_type_entity_subscriptions` globally; when the feature
-  is missing, Session types shows a surface-local unsupported notice.
-- Pins: Hub crates `1a0df65230a476cfea362fdc5131e035d303a928`, Core crates
-  `bf6e7d996bca2786ad4142c870a13c57a490e241`, Ghostty
-  `eb72ec61304ea256be1d86ed8fa961c84e43ecbd`, UI contract tag
-  `botster-ui-contract-v0.3.3`, and kit
-  `7940306b0d7461a12575b3856a96c0fbb23784f3`.
+- Client handshake requires `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 49` and
+  `session_type_entity_subscriptions`. A Hub without the feature fails the
+  handshake with a compatibility diagnostic.
+- Pins: see the Foundation table above.
 
 ## Caller-owned Workspaces Spawn acceptance
 

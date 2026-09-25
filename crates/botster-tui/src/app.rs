@@ -69,8 +69,8 @@ use ratatui::{
 use serde_json::{Value, json};
 
 use crate::acceptance::{
-    AcceptanceMode, CLAIM_SCHEMA, ClaimConfig, Config as AcceptanceConfig, EvidenceWriter,
-    FailureContext, SCHEMA, ScenarioCase, verify_claim_pins,
+    AcceptanceMode, CLAIM_SCHEMA, ClaimConfig, EvidenceWriter, FailureContext, SCHEMA,
+    ScenarioCase, SpawnConfig, verify_claim_pins,
 };
 use crate::projection_paint::tui_terminal_region;
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
@@ -1638,7 +1638,6 @@ struct TuiApp {
     notice_parked: BTreeMap<String, ParkedNoticeEvents>,
     notice_overflow_dropped: usize,
     transient_notice: Option<TransientNotice>,
-    session_types_supported: bool,
     spawn_targets: Vec<DaemonSpawnTarget>,
     selected_session_type_id: Option<String>,
     session_type_form: Option<SessionTypeFormDraft>,
@@ -1779,7 +1778,6 @@ impl TuiApp {
             notice_parked: BTreeMap::new(),
             notice_overflow_dropped: 0,
             transient_notice: None,
-            session_types_supported: true,
             spawn_targets: Vec::new(),
             selected_session_type_id: None,
             session_type_form: None,
@@ -2630,7 +2628,7 @@ impl TuiApp {
         self.record_diagnostics(ack.diagnostics);
         self.refresh_read_models();
         self.start_session_subscription();
-        self.start_session_type_subscription_if_supported();
+        self.start_session_type_subscription();
         self.sync_notice_subscriptions();
         self.sync_entity_options_subscriptions();
     }
@@ -2913,17 +2911,6 @@ impl TuiApp {
         self.rebuild_session_rows();
     }
 
-    fn start_session_type_subscription_if_supported(&mut self) {
-        self.session_types_supported =
-            Self::session_types_supported_from_compatibility(self.compatibility.as_ref());
-        if !self.session_types_supported {
-            self.invalidate_session_type_generation();
-            self.session_type_subscription_error = None;
-            return;
-        }
-        self.start_session_type_subscription();
-    }
-
     fn start_session_type_subscription(&mut self) {
         let subscription_id = format!("btui-session-types-{}", short_suffix());
         self.session_type_entities
@@ -2991,7 +2978,7 @@ impl TuiApp {
                     self.error = Some(format!("session type sync: {error}"));
                     self.invalidate_session_type_generation();
                     self.session_type_subscription_error = Some(error);
-                    if self.is_connected() && self.session_types_supported {
+                    if self.is_connected() {
                         self.start_session_type_subscription();
                     }
                 }
@@ -3283,13 +3270,6 @@ impl TuiApp {
     fn begin_target_first_spawn(&mut self) {
         self.error = None;
         self.session_type_form = None;
-        if !self.session_types_supported {
-            self.error = Some(
-                "session types unavailable: hub does not provide session_type_entity_subscriptions"
-                    .to_string(),
-            );
-            return;
-        }
         if self.launch_target_options().is_empty() {
             self.error =
                 Some("no launch targets available (no enabled admitted spawn targets)".to_string());
@@ -3588,16 +3568,6 @@ impl TuiApp {
                 self.error = Some("spawn form is incomplete".to_string());
             }
         }
-    }
-
-    fn session_types_supported_from_compatibility(
-        compatibility: Option<&DaemonCompatibility>,
-    ) -> bool {
-        // Permissive only before Hub status arrives (web parity).
-        let Some(compatibility) = compatibility else {
-            return true;
-        };
-        compatibility.supports_feature(FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS)
     }
 
     /// Build the multi-family store for shared projection, injecting process-wide
@@ -5417,18 +5387,6 @@ impl TuiApp {
             self.status = format!("connected ({})", status.lifecycle_state);
             self.package_count = status.package_count;
             self.enabled_package_count = status.enabled_package_count;
-            let supported =
-                Self::session_types_supported_from_compatibility(self.compatibility.as_ref());
-            if supported != self.session_types_supported {
-                self.session_types_supported = supported;
-                if supported {
-                    if self.session_type_entities.subscription_id.is_none() {
-                        self.start_session_type_subscription_if_supported();
-                    }
-                } else {
-                    self.invalidate_session_type_generation();
-                }
-            }
         }
 
         if matches!(
@@ -6617,16 +6575,6 @@ impl TuiApp {
             "tui-session-types-heading",
             json!({ "text": "Session types" }),
         )];
-        if !self.session_types_supported {
-            nodes.push(node(
-                UiNodeKind::Text,
-                "tui-session-types-unsupported",
-                json!({
-                    "text": "This hub does not provide session_type_entity_subscriptions."
-                }),
-            ));
-            return nodes;
-        }
         if let Some(error) = &self.session_type_subscription_error {
             nodes.push(node(
                 UiNodeKind::Text,
@@ -7480,7 +7428,7 @@ const WORKSPACES_ADD_SESSION_FIELD: &str = "session_id";
 const WORKSPACES_ADD_SESSION_NODE: &str = "botster-workspaces-add-session-id";
 const WORKSPACES_MEMBERSHIP_FAMILY: &str = "botster-workspaces.membership";
 
-fn run_workspaces_acceptance(args: AppArgs, config: AcceptanceConfig) -> io::Result<()> {
+fn run_workspaces_acceptance(args: AppArgs, config: SpawnConfig) -> io::Result<()> {
     let mut evidence = EvidenceWriter::create(&config.evidence_path, SCHEMA)?;
     let mut diagnostics = AcceptanceDiagnostics {
         last_observation: json!({}),
@@ -7503,7 +7451,7 @@ fn run_workspaces_acceptance(args: AppArgs, config: AcceptanceConfig) -> io::Res
 
 fn drive_workspaces_acceptance(
     args: AppArgs,
-    config: &AcceptanceConfig,
+    config: &SpawnConfig,
     evidence: &mut EvidenceWriter,
     diagnostics: &mut AcceptanceDiagnostics,
 ) -> io::Result<()> {
@@ -9338,6 +9286,7 @@ fn tui_compatibility_requirement() -> DaemonCompatibilityRequirement {
             FEATURE_PLUGIN_SURFACE_ACTION.to_string(),
             FEATURE_TERMINAL_READBACK.to_string(),
             FEATURE_SESSION_ENTITY_SUBSCRIPTIONS.to_string(),
+            FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS.to_string(),
             FEATURE_UNIX_TERMINAL_ADAPTER.to_string(),
             FEATURE_TERMINAL_SUBSCRIPTION_CLOSED.to_string(),
             FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string(),
@@ -11437,7 +11386,6 @@ mod tests {
     fn session_type_form_fields_render_in_system_details() {
         let mut app = TuiApp::new(None);
         app.system_details_visible = true;
-        app.session_types_supported = true;
         let mut form = SessionTypeFormDraft::create_default();
         form.id = "shell".to_string();
         form.label = "Shell".to_string();
@@ -11495,7 +11443,6 @@ mod tests {
     #[test]
     fn blank_target_first_spawn_validation_renders_visible_error_state() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.begin_target_first_spawn();
 
         assert_eq!(
@@ -12843,7 +12790,6 @@ mod tests {
     #[test]
     fn corrected_user_action_clears_stale_validation_error() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.system_details_visible = true;
         app.begin_target_first_spawn();
         assert_eq!(
@@ -13953,7 +13899,6 @@ mod tests {
     fn session_types_render_package_read_only_and_unknown_literals() {
         let mut app = TuiApp::new(None);
         app.system_details_visible = true;
-        app.session_types_supported = true;
         app.session_type_entities.begin_generation("st".to_string());
         let mut package = sample_session_type("package.demo/init", "package", false);
         package.role = "custom.role.token".to_string();
@@ -14208,7 +14153,6 @@ mod tests {
     #[test]
     fn launch_targets_are_enabled_admitted_spawn_targets_only() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.spawn_targets = vec![
             DaemonSpawnTarget {
                 target_id: "repo-a".to_string(),
@@ -14258,7 +14202,6 @@ mod tests {
     #[test]
     fn toolbar_spawn_dialog_is_reachable_without_system_details() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.system_details_visible = false;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
@@ -14288,7 +14231,6 @@ mod tests {
     fn session_type_form_draft_keystrokes_render_before_submit() {
         let mut app = TuiApp::new(None);
         app.system_details_visible = true;
-        app.session_types_supported = true;
         let mut form = SessionTypeFormDraft::create_default();
         form.command = String::new();
         app.session_type_form = Some(form);
@@ -14337,7 +14279,6 @@ mod tests {
     #[test]
     fn product_toolbar_spawn_emits_spawn_session_type_request() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.system_details_visible = false;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
@@ -14444,7 +14385,6 @@ mod tests {
     #[test]
     fn product_toolbar_spawn_opens_target_first_flow_not_freeform_spawn() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.system_details_visible = true;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
@@ -14479,22 +14419,8 @@ mod tests {
     }
 
     #[test]
-    fn session_types_unsupported_surface_when_feature_missing() {
-        let mut app = TuiApp::new(None);
-        app.system_details_visible = true;
-        app.session_types_supported = false;
-        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 60);
-        let rendered = lines.join("\n");
-        assert!(
-            rendered.contains("does not provide session_type_entity_subscriptions"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
     fn target_first_spawn_picker_uses_list_rows_not_entity_target_equality() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
             label: "Repo A".to_string(),
@@ -14558,7 +14484,6 @@ mod tests {
     #[test]
     fn product_pick_target_list_failure_keeps_flow_recoverable_without_stale_rows() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
             label: "Repo A".to_string(),
@@ -14670,7 +14595,6 @@ mod tests {
     #[test]
     fn product_pick_target_transport_error_keeps_no_stale_selectable_rows() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
             label: "Repo A".to_string(),
@@ -14725,7 +14649,6 @@ mod tests {
     #[test]
     fn product_spawn_list_and_pick_are_reachable_through_input_router() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.system_details_visible = false;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
@@ -14826,7 +14749,6 @@ mod tests {
     #[test]
     fn product_spawn_list_and_pick_are_reachable_through_keyboard_input_router() {
         let mut app = TuiApp::new(None);
-        app.session_types_supported = true;
         app.system_details_visible = false;
         app.spawn_targets = vec![DaemonSpawnTarget {
             target_id: "repo-a".to_string(),
@@ -14956,7 +14878,6 @@ mod tests {
     fn session_type_real_input_create_button_dispatches_through_input_router() {
         let mut app = TuiApp::new(None);
         app.system_details_visible = true;
-        app.session_types_supported = true;
         let (lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
         let _ = lines;
         let region = hit_map
