@@ -5030,8 +5030,10 @@ impl TuiApp {
     /// Keep the Hub PTY size equal to the terminal pane in the frame just drawn.
     ///
     /// Attach, outer resize, and layout changes all converge here whether or
-    /// not the pane has focus. An unchanged size sends nothing. A resize that
-    /// cannot be sent leaves the local size unchanged, so the next draw retries.
+    /// not the pane has focus. An unchanged size sends nothing. A RESIZE the
+    /// input window refuses (for example QueueFull) leaves the local size
+    /// unchanged, so the next draw retries; draws follow wakes such as the
+    /// INPUT_RESULT that frees window capacity. There is no timer.
     fn sync_terminal_pane_size(&mut self, hit_map: &HitMap) {
         let Some(outer) = tui_terminal_region(hit_map) else {
             return;
@@ -5107,26 +5109,42 @@ impl TuiApp {
         }
     }
 
-    /// Encode one typed command, admit it into the window, and write it.
-    fn send_command(&mut self, operation_id: u64, command: TerminalInputCommand) {
+    /// Encode one typed command, admit it into the window, and write what the
+    /// window releases. Returns whether the window admitted the command.
+    fn send_command(&mut self, operation_id: u64, command: TerminalInputCommand) -> bool {
         let frame = match encode_terminal_input(&command) {
             Ok(frame) => frame,
             Err(error) => {
                 self.error = Some(error.to_string());
-                return;
+                return false;
             }
         };
         #[cfg(test)]
         self.observed_terminal_inputs.push(command);
-        self.send_operation_frames(operation_id, false, vec![frame.into_bytes()]);
+        self.send_operation_frames(operation_id, false, vec![frame.into_bytes()])
     }
 
     /// Admit one operation of encoded frames into the window and write what
     /// the window releases, in order.
-    fn send_operation_frames(&mut self, operation_id: u64, paste: bool, frames: Vec<Vec<u8>>) {
+    ///
+    /// Returns whether the window admitted the operation. Admission means the
+    /// frames were written now or queued behind in-flight operations; it does
+    /// not confirm transport delivery or the Hub's INPUT_RESULT.
+    fn send_operation_frames(
+        &mut self,
+        operation_id: u64,
+        paste: bool,
+        frames: Vec<Vec<u8>>,
+    ) -> bool {
         match self.input_window.admit(operation_id, paste, frames) {
-            Ok(ready) => self.send_encoded_frames(ready),
-            Err(error) => self.error = Some(error.to_string()),
+            Ok(ready) => {
+                self.send_encoded_frames(ready);
+                true
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+                false
+            }
         }
     }
 
@@ -5148,7 +5166,9 @@ impl TuiApp {
         self.send_command(operation_id, command);
     }
 
-    /// Returns whether the RESIZE was sent.
+    /// Returns whether the input window admitted the RESIZE (written now or
+    /// queued). A refusal leaves the caller's local size unchanged, so the
+    /// next draw retries.
     fn send_resize(&mut self, size: TerminalScreenSize) -> bool {
         if self.attached.is_none() {
             return false;
@@ -5157,8 +5177,7 @@ impl TuiApp {
             return false;
         };
         let command = terminal_input::resize_command(size.rows, size.cols, operation_id);
-        self.send_command(operation_id, command);
-        true
+        self.send_command(operation_id, command)
     }
 
     fn send_paste(&mut self, data: Vec<u8>) {
@@ -16333,6 +16352,67 @@ mod tests {
         }
         assert!(app.observed_terminal_inputs.is_empty());
         assert_eq!(router.focused_node_id(), Some("tui-terminal"));
+    }
+
+    #[test]
+    fn refused_resize_keeps_the_local_size_and_retries_on_the_next_draw() {
+        let mut app = workspace_fixture();
+        app.hub_io.capture_terminal_frames();
+        app.attached = Some(AttachedRoute {
+            session_id: "session-alpha".to_string(),
+            route: "route-1".to_string(),
+        });
+        app.subscription_id = "route-1".to_string();
+        app.route_generation = Some(7);
+        app.route_epoch = Some(0);
+        let stale = TerminalScreenSize::new(24, 80);
+        app.terminal_viewport_size = stale;
+        // Fill every in-flight slot, then the local queue to its byte bound.
+        let mut in_flight = Vec::new();
+        for _ in 0..terminal_input::MAX_IN_FLIGHT_OPERATIONS {
+            let id = app.input_window.next_operation_id().expect("operation id");
+            app.input_window
+                .admit(id, false, vec![vec![0; 8]])
+                .expect("in-flight slot");
+            in_flight.push(id);
+        }
+        let id = app.input_window.next_operation_id().expect("operation id");
+        app.input_window
+            .admit(
+                id,
+                false,
+                vec![vec![0; terminal_input::MAX_QUEUED_INPUT_BYTES]],
+            )
+            .expect("queue fills to its bound");
+        let router = InputRouter::new(renderer::action_request_context());
+        let (_, map) = render_app_to_lines(&app, 140, 40, &router.render_state());
+        let inner = botster_tui_kit::terminal_inner_rect(
+            tui_terminal_region(&map).expect("terminal pane drawn"),
+        );
+        let pane = TerminalScreenSize::new(inner.height, inner.width);
+        assert_ne!(pane, stale);
+
+        app.sync_terminal_pane_size(&map);
+        assert_eq!(
+            app.terminal_viewport_size, stale,
+            "a refused RESIZE is not applied"
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("byte client bound"))
+        );
+
+        // An INPUT_RESULT frees a slot: the queued bulk operation moves into
+        // flight, and the next draw retries the same size.
+        app.input_window.complete(in_flight[0]);
+        assert_eq!(app.input_window.queued_bytes(), 0);
+        app.sync_terminal_pane_size(&map);
+        assert_eq!(app.terminal_viewport_size, pane);
+        assert!(
+            app.input_window.queued_bytes() > 0,
+            "the retried RESIZE is admitted behind in-flight operations"
+        );
     }
 
     #[test]
