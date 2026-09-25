@@ -727,7 +727,7 @@ fn sanitize_build_command(
         }
     }
     // Longest match first so nested roots do not leave prefixes behind.
-    replacements.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.len()));
     replacements.dedup_by(|left, right| left.0 == right.0);
 
     // Collapse mktemp/TMPDIR `//` forms before replacement so canonical roots match.

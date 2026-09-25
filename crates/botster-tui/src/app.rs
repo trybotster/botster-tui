@@ -185,9 +185,8 @@ impl AppArgs {
     ) -> Self {
         let mut parsed = Self::default();
         for arg in args {
-            match arg.as_str() {
-                "--smoke" => parsed.smoke = true,
-                _ => {}
+            if arg == "--smoke" {
+                parsed.smoke = true;
             }
         }
         let (connection, connection_error) = parse_hub_connection(hub_connection);
@@ -1925,7 +1924,9 @@ impl TuiApp {
         match wake {
             AppWake::Input(_) | AppWake::Shutdown => {}
             AppWake::Terminal(routed) => self.apply_routed_terminal_frame(routed),
-            AppWake::Completed { request_id, result } => self.complete_request(request_id, result),
+            AppWake::Completed { request_id, result } => {
+                self.complete_request(request_id, result.map(|response| *response))
+            }
             AppWake::Event(event) => self.apply_mux_event(event),
             AppWake::Entity(frame) => self.apply_entity_frame(frame),
             AppWake::Connected { generation, ack } => self.apply_connected(generation, *ack),
@@ -6301,10 +6302,11 @@ impl TuiApp {
                     json!({ "text": format!("app diagnostic: {}", package_diagnostic_text(diagnostic)) }),
                 ));
             }
-            nodes.extend(
-                action_state_nodes(&app.actions, "app action", &format!("tui-app-{app_index}"))
-                    .into_iter(),
-            );
+            nodes.extend(action_state_nodes(
+                &app.actions,
+                "app action",
+                &format!("tui-app-{app_index}"),
+            ));
             if let Some(route) = &app.route {
                 nodes.push(node(
                     UiNodeKind::Text,
@@ -14317,7 +14319,7 @@ mod tests {
         response.session_types = vec![global];
         app.apply_wake(AppWake::Completed {
             request_id,
-            result: Ok(response),
+            result: Ok(Box::new(response)),
         });
         app.handle_action(
             "botster.tui.spawn.pick_session_type".to_string(),
@@ -14528,7 +14530,7 @@ mod tests {
         error.operation = "list_session_types_for_target".to_string();
         app.apply_wake(AppWake::Completed {
             request_id,
-            result: Ok(response),
+            result: Ok(Box::new(response)),
         });
         assert!(
             app.error
@@ -14580,7 +14582,7 @@ mod tests {
         response.session_types = vec![recovered];
         app.apply_wake(AppWake::Completed {
             request_id,
-            result: Ok(response),
+            result: Ok(Box::new(response)),
         });
         assert_eq!(app.error, None);
         match &app.target_first_spawn.as_ref().unwrap().step {
@@ -14706,7 +14708,7 @@ mod tests {
         response.session_types = vec![listed];
         app.apply_wake(AppWake::Completed {
             request_id,
-            result: Ok(response),
+            result: Ok(Box::new(response)),
         });
         let (_lines, hit_map) = render_app_to_lines(&app, 220, 70, &RenderState::default());
         let type_region = hit_map
@@ -14788,7 +14790,7 @@ mod tests {
         response.session_types = vec![listed];
         app.apply_wake(AppWake::Completed {
             request_id,
-            result: Ok(response),
+            result: Ok(Box::new(response)),
         });
 
         // Keyboard path: Tab focus Hub-listed Global, Enter → SpawnSessionType target_id=T.
