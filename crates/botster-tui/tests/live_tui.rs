@@ -472,6 +472,63 @@ impl Screen {
             })
     }
 
+    /// Inner (rows, cols) of the drawn Terminal pane, measured from its border.
+    fn terminal_pane_inner_size(&mut self) -> Option<(u16, u16)> {
+        let grid: Vec<Vec<char>> = self
+            .rows()
+            .iter()
+            .map(|row| row.chars().collect())
+            .collect();
+        let (top, left) = grid.iter().enumerate().find_map(|(y, row)| {
+            let text: String = row.iter().collect();
+            let byte = text.find("┌Terminal")?;
+            Some((y, text[..byte].chars().count()))
+        })?;
+        let right = left
+            + 1
+            + grid[top]
+                .iter()
+                .skip(left + 1)
+                .position(|cell| *cell == '┐')?;
+        let bottom = top
+            + 1
+            + grid
+                .iter()
+                .skip(top + 1)
+                .position(|row| row.get(left) == Some(&'└'))?;
+        Some(((bottom - top - 1) as u16, (right - left - 1) as u16))
+    }
+
+    /// Wait until the drawn Terminal pane is measurable and differs from `previous`.
+    fn wait_for_pane(
+        &mut self,
+        step: &'static str,
+        previous: Option<(u16, u16)>,
+        identity: &Identity,
+    ) -> (u16, u16) {
+        let started = Instant::now();
+        let deadline = self.remaining(SCREEN_DEADLINE);
+        let until = started + deadline;
+        loop {
+            if let Some(size) = self.terminal_pane_inner_size()
+                && Some(size) != previous
+            {
+                return size;
+            }
+            if Instant::now() >= until {
+                let failure = self.failure(
+                    step,
+                    identity,
+                    deadline,
+                    started,
+                    format!("terminal pane not measurable or unchanged from {previous:?}"),
+                );
+                panic!("{failure}");
+            }
+            self.pump((Instant::now() + Duration::from_millis(100)).min(until));
+        }
+    }
+
     fn contains(&mut self, needle: &str) -> bool {
         self.rows().iter().any(|row| row.contains(needle))
     }
@@ -758,28 +815,30 @@ fn read_mode_flags(endpoint: &DaemonEndpoint, identity: &Identity) -> DaemonMode
     mode_flags
 }
 
-fn wait_for_terminal_resize(
+/// Wait until the Hub reports exactly the drawn pane size for the session.
+fn wait_for_terminal_size(
     endpoint: &DaemonEndpoint,
     screen: &mut Screen,
     identity: &Identity,
-    previous: (u16, u16),
-) -> (u16, u16) {
+    step: &'static str,
+    expected: (u16, u16),
+) {
     let started = Instant::now();
     let deadline = screen.remaining(SCREEN_DEADLINE);
     let until = started + deadline;
     loop {
         let mode_flags = read_mode_flags(endpoint, identity);
         let actual = (mode_flags.rows, mode_flags.cols);
-        if actual != previous && mode_flags.rows > 0 && mode_flags.cols > 0 {
-            return actual;
+        if actual == expected {
+            return;
         }
         if Instant::now() >= until {
             let failure = screen.failure(
-                "terminal_resize",
+                step,
                 identity,
                 deadline,
                 started,
-                format!("terminal size stayed at {previous:?}; last size={actual:?}"),
+                format!("hub terminal size {actual:?} never matched the drawn pane {expected:?}"),
             );
             panic!("{failure}");
         }
@@ -1331,16 +1390,29 @@ fn t_s4_outer_pty_resize_reaches_the_attached_session() {
             MARKER_ONE,
             None,
         );
-        let initial = read_mode_flags(hub.endpoint(), &identity);
-        let initial_size = (initial.rows, initial.cols);
-        assert!(initial.rows > 0 && initial.cols > 0);
+        // Attach fits the session PTY to the drawn pane, not the spawn default.
+        let initial_size = screen.wait_for_pane("attached_pane_measured", None, &identity);
+        wait_for_terminal_size(
+            hub.endpoint(),
+            &mut screen,
+            &identity,
+            "attach_fits_pane",
+            initial_size,
+        );
 
+        // One outer resize, with no follow-up event, must reach the session.
         const RESIZED_ROWS: u16 = 30;
         const RESIZED_COLS: u16 = 100;
         tui.resize(RESIZED_ROWS, RESIZED_COLS);
         screen.resize(RESIZED_ROWS, RESIZED_COLS);
-        let resized =
-            wait_for_terminal_resize(hub.endpoint(), &mut screen, &identity, initial_size);
+        let resized = screen.wait_for_pane("resized_pane_measured", Some(initial_size), &identity);
+        wait_for_terminal_size(
+            hub.endpoint(),
+            &mut screen,
+            &identity,
+            "resize_fits_pane",
+            resized,
+        );
 
         let terminal = screen
             .wait_for(
