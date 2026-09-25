@@ -485,7 +485,7 @@ impl Screen {
         needle: &str,
         deadline: Duration,
         identity: &Identity,
-    ) -> Result<(u16, u16), StepFailure> {
+    ) -> Result<(u16, u16), Box<StepFailure>> {
         let started = Instant::now();
         let deadline = self.remaining(deadline);
         let until = started + deadline;
@@ -495,13 +495,13 @@ impl Screen {
             }
             if Instant::now() >= until {
                 let tail_rows = self.tail_rows();
-                return Err(self.failure(
+                return Err(Box::new(self.failure(
                     step,
                     identity,
                     deadline,
                     started,
                     format!("{needle:?} not visible; last rows: {tail_rows:?}"),
-                ));
+                )));
             }
             self.pump((Instant::now() + Duration::from_millis(100)).min(until));
         }
@@ -995,7 +995,7 @@ fn t_s1_connect_select_session_and_see_echo() {
     let mut identity = Identity::default();
     spawn_session(hub.endpoint(), &mut identity, test_deadline, SHELL_COMMAND);
     {
-        let mut tui = TuiChild::spawn(&hub);
+        let mut tui = TuiChild::spawn(hub);
         let mut screen = Screen::attach(&tui, test_deadline);
         let session_row = format!("{} · running", identity.session_id);
         screen
@@ -1034,7 +1034,7 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
     let mut identity = Identity::default();
     spawn_session(hub.endpoint(), &mut identity, test_deadline, SHELL_COMMAND);
     {
-        let mut tui = TuiChild::spawn(&hub);
+        let mut tui = TuiChild::spawn(hub);
         let mut screen = Screen::attach(&tui, test_deadline);
         let session_row = format!("{} · running", identity.session_id);
         screen

@@ -70,7 +70,7 @@ pub enum AppWake {
     /// One host-control request completed, expired, cancelled, or lost.
     Completed {
         request_id: u64,
-        result: Result<DaemonResponse, DaemonRequestError>,
+        result: Result<Box<DaemonResponse>, DaemonRequestError>,
     },
     /// One unsolicited host event on the current connection.
     Event(DaemonEvent),
@@ -674,7 +674,7 @@ impl HubIo {
                 self.pending.remove(&request_id)?;
                 Some(AppWake::Completed {
                     request_id,
-                    result: Ok(*response),
+                    result: Ok(response),
                 })
             }
             IoMessage::Event { generation, event } => {
