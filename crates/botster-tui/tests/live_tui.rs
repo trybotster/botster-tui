@@ -246,6 +246,7 @@ struct TuiChild {
     exit: Option<ExitStatus>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
+    pid: u32,
 }
 
 impl TuiChild {
@@ -279,6 +280,7 @@ impl TuiChild {
             .spawn_command(command)
             .expect("spawn botster-tui under the pty");
         drop(pair.slave);
+        let pid = child.process_id().expect("botster-tui pid");
         let killer = child.clone_killer();
         let (exit_tx, exited) = mpsc::channel();
         thread::spawn(move || {
@@ -291,7 +293,17 @@ impl TuiChild {
             exit: None,
             master: pair.master,
             writer,
+            pid,
         }
+    }
+
+    /// Send `signal` to the TUI process (SIGSTOP / SIGCONT in T-S11).
+    fn signal(&self, signal: rustix::process::Signal) {
+        let pid = i32::try_from(self.pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("botster-tui pid");
+        rustix::process::kill_process(pid, signal).expect("signal botster-tui");
     }
 
     fn reader(&self) -> Box<dyn Read + Send> {
@@ -2567,6 +2579,120 @@ fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
             "t_s10: {} flood screen samples showed the attachment; stop key reached the running flood; input after the flood echoed",
             flood_samples.get()
         );
+        detach_and_quit(&mut tui, &mut screen, &identity);
+    }
+    drop(guard);
+}
+
+/// Starts `yes flood` on `f`; any other byte stops the flood and is echoed as
+/// `key:<hex>`.
+const STALL_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo min 1; p=; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); if [ \"$b\" = 66 ]; then yes flood & p=$!; else if [ -n \"$p\" ]; then kill $p 2>/dev/null; wait $p 2>/dev/null; p=; fi; printf 'key:%s\\n' \"$b\"; fi; done";
+
+/// Core `READER_PROGRESS_DEADLINE` (Core 6a8fc22): a route with output
+/// pending whose client completes no write for this long is closed.
+const CORE_READER_PROGRESS_DEADLINE: Duration = Duration::from_secs(10);
+/// Slack after the Core deadline for the Hub to close the route.
+const READER_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s11_stopped_tui_recovers_from_each_reader_deadline_close() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let mut identity = Identity::default();
+    spawn_session(hub.endpoint(), &mut identity, STALL_SHELL_COMMAND);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let row = format!("{} · running", identity.session_id);
+        let (col, line) = screen
+            .wait_for("session_row_visible", &row, SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(col, line);
+        let ready = screen
+            .wait_for(
+                "session_ready_visible",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(ready.0, ready.1);
+        screen
+            .wait_for("attach_complete", "[ Detach ]", SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let mut occupancy = attached_occupancy(hub.endpoint(), &identity, None);
+
+        // Two independent stops: each close must recover on its own.
+        for cycle in 1..=2 {
+            // The Core deadline runs only while output is pending, so the
+            // session floods while the TUI is stopped.
+            tui.write_all(b"f");
+            screen
+                .wait_for("flood_visible", "flood", SCREEN_DEADLINE, &identity)
+                .unwrap_or_else(|failure| panic!("cycle {cycle}: {failure}"));
+            tui.signal(rustix::process::Signal::STOP);
+            // timer: deadline — hub-status-entity: waits for Hub status entity (attach occupancy); remove when it lands
+            thread::sleep(CORE_READER_PROGRESS_DEADLINE + READER_DEADLINE_MARGIN);
+            tui.signal(rustix::process::Signal::CONT);
+
+            // The TUI's own screen reports each completed recovery with its
+            // typed cause and a count per attachment; a recovery that fails
+            // closed says so instead.
+            let notice = format!("reconnected {cycle}× after core_adapter_closed");
+            let failed_closed = screen
+                .wait_until(
+                    "reader_deadline_close_recovered",
+                    SCREEN_DEADLINE,
+                    &identity,
+                    |screen| {
+                        if screen.contains("failed closed after recovery") {
+                            Some(true)
+                        } else {
+                            (screen.contains(&notice) && screen.contains("[ Detach ]"))
+                                .then_some(false)
+                        }
+                    },
+                    |screen| format!("cycle {cycle}; view: {:?}", screen.head_rows()),
+                )
+                .unwrap_or_else(|failure| panic!("{failure}"));
+            assert!(
+                !failed_closed,
+                "cycle {cycle}: the close recovered instead of failing closed"
+            );
+            // A new route owns the session: the old one was closed.
+            let recovered = attached_occupancy(hub.endpoint(), &identity, Some(&occupancy));
+            println!(
+                "t_s11: cycle {cycle} route {} -> {}",
+                occupancy.subscription_id, recovered.subscription_id
+            );
+            occupancy = recovered;
+
+            // Input works on the recovered route: a key distinct per cycle
+            // (`x`, then `y`) stops the flood and is echoed; the notice stays.
+            let (key, echo) = if cycle == 1 {
+                (b"x", "78")
+            } else {
+                (b"y", "79")
+            };
+            tui.write_all(key);
+            screen
+                .wait_until(
+                    "input_after_recovery_echoes",
+                    SCREEN_DEADLINE,
+                    &identity,
+                    |screen| {
+                        let echoed = visible_key_bytes(&screen.rows()).last().map(String::as_str)
+                            == Some(echo);
+                        (echoed && screen.contains(&notice)).then_some(())
+                    },
+                    |screen| format!("cycle {cycle}; view: {:?}", screen.head_rows()),
+                )
+                .unwrap_or_else(|failure| panic!("{failure}"));
+        }
         detach_and_quit(&mut tui, &mut screen, &identity);
     }
     drop(guard);

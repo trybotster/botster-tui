@@ -260,6 +260,13 @@ failed 5 of 7 runs on Core `891e220` (Hub candidate `f18179ec`), 1 of 1 on Hub
 `178512e1`, and 7 of 7 on Core `a499d5a` with Hub `8ff59ed3`. Core `ac35e32`
 stops counting session-output wakes toward the adapter write-attempt budget.
 
+T-S11 stops the TUI process (SIGSTOP) while its session floods, past the Core
+reader-progress deadline, then resumes it (SIGCONT), twice. Each time the TUI
+must show `reconnected N× after core_adapter_closed` with the count for that
+cycle, re-attach on a new route (Hub `Status` occupancy), and echo input. The second stop proves that a completed
+recovery restores the recovery for the next independent close. The wait while
+the TUI is stopped is fixed; see Known issues.
+
 Current pins, September 26, 2026: T-S1 to T-S10 passed against the Hub
 candidate built from Hub `fe51ce50` (Core `6a8fc22`; Hub `e9cd8445` adds only
 a docs plan file) with Rust 1.97.0; T-S10 passed 3 of 3 runs. The 1-minute
@@ -270,9 +277,14 @@ the integration tests.
 Core `6a8fc22` closes a route (`core_adapter_closed`) when the route has output
 pending and its client completes no write for 10 s. On a route close or another
 route failure (for example a decode or phase gap), the TUI re-attaches
-automatically only if the current attach campaign has not used its one
-recovery; otherwise it fails closed with `terminal attach failed closed after
-recovery`. A user attach or a Hub connection teardown starts a new campaign.
+automatically once. A failure during that recovery's own hydration fails closed
+with `terminal attach failed closed after recovery`. A completed recovery (the
+snapshot finished and the route attached) restores the recovery, so each later
+independent failure recovers once. A user attach or a Hub connection teardown
+also starts a new campaign. After each completed recovery an informational line
+under the status line reads `reconnected N× after <cause>` (the typed close
+reason, such as `core_adapter_closed`, or the failure). It stays until the next
+user attach or detach or a Hub connection teardown; sends never clear it.
 
 Hub `38f54ce8` (Core `ac35e32`), September 26, 2026: T-S1 to T-S10 passed,
 and T-S10 passed 10 of 10 repeated runs.
@@ -328,6 +340,18 @@ Session types are authoritative Hub descriptors consumed through the
 - Pins: see the Foundation table above.
 
 ## Known issues
+
+### T-S11 waits a fixed time for the reader-deadline close (hub-status-entity)
+
+While the TUI is stopped, only the Hub can observe the route close, and Hub
+`e9cd8445` publishes no event for it to a sibling client (attach occupancy is
+only in the `Status` response). T-S11 therefore waits a fixed
+`CORE_READER_PROGRESS_DEADLINE` (10 s, from Core `6a8fc22`) plus a 5 s margin
+before it resumes the TUI, and then proves the close through the TUI's own
+screen and a new `Status` occupancy. This is the only named exception in the
+timer guard (`hub-status-entity`). When the Hub lifecycle-status entity with
+attach occupancy lands, T-S11 waits for the occupancy change as an event and
+the exception is removed.
 
 ### Output can stop after a Hub restart (owner unresolved; fix after cutover)
 
