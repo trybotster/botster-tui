@@ -617,6 +617,7 @@ impl HubIo {
             let message = match wait_until {
                 Some(deadline) => {
                     let timeout = deadline.saturating_duration_since(now);
+                    // timer: deadline — earliest request or app deadline; expiry delivers AppWake::Deadline
                     match self.wakes.recv_timeout(timeout) {
                         Ok(message) => Some(message),
                         Err(RecvTimeoutError::Timeout) => None,
@@ -1123,6 +1124,7 @@ mod tests {
         let mut io = HubIo::new();
         let request_id = io.submit(
             &DaemonRequest::Status,
+            // timer: deadline — test request expiry bound
             Instant::now() + Duration::from_secs(1),
         );
         match io.next_wake(Some(Instant::now())) {
@@ -1138,6 +1140,7 @@ mod tests {
     #[test]
     fn deadline_wake_returns_only_after_the_deadline() {
         let mut io = HubIo::new();
+        // timer: deadline — exercises the request-expiry path; expiry is the asserted outcome
         let until = Instant::now() + Duration::from_millis(20);
         assert!(matches!(io.next_wake(Some(until)), AppWake::Deadline));
         assert!(Instant::now() >= until);
