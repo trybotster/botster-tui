@@ -10,6 +10,8 @@
 //! - `// timer: rate-limit — <what is capped and why>`
 //! - `// timer: os-no-event — <which OS fact has no event source>`
 //! - `// timer: ui-lifetime — <element, duration source>`
+//! - `// timer: measurement-window — <what rate is measured>` (resource probes
+//!   and benchmarks only; this repository has none today)
 //!
 //! The scan covers Rust sources under `crates/` and every file in `script/`,
 //! including shell `sleep` inside Rust string literals. Comment-only lines are
@@ -36,12 +38,13 @@ const PENDING_DEFECTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-const CATEGORIES: [&str; 5] = [
+const CATEGORIES: [&str; 6] = [
     "deadline",
     "backoff",
     "rate-limit",
     "os-no-event",
     "ui-lifetime",
+    "measurement-window",
 ];
 
 /// Whether `line` starts, waits on, or creates a timer.
@@ -188,6 +191,8 @@ fn guard_flags_unmarked_timers_and_accepts_marked_ones() {
     assert!(violations(previous).is_empty());
     let same = "let until = Instant::now() + TTL; // timer: ui-lifetime — notice, server ttl_ms\n";
     assert!(violations(same).is_empty());
+    let window = "// timer: measurement-window — idle wake rate over one second\nstd::thread::sleep(window);\n";
+    assert!(violations(window).is_empty());
 
     let no_reason = "// timer: deadline —\nrx.recv_timeout(left);\n";
     assert_eq!(violations(no_reason), vec![2], "a marker needs a reason");
