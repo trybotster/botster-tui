@@ -241,10 +241,21 @@ struct TuiChild {
 
 impl TuiChild {
     fn spawn(hub: &IsolatedHub) -> Self {
-        Self::spawn_at(hub.endpoint(), hub.data_dir(), hub.working_directory())
+        Self::spawn_at(
+            hub.endpoint(),
+            hub.data_dir(),
+            hub.working_directory(),
+            None,
+        )
     }
 
-    fn spawn_at(endpoint: &DaemonEndpoint, data_dir: &Path, working_directory: &Path) -> Self {
+    /// `route_trace` enables the TUI's opt-in route counters at that path.
+    fn spawn_at(
+        endpoint: &DaemonEndpoint,
+        data_dir: &Path,
+        working_directory: &Path,
+        route_trace: Option<&Path>,
+    ) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -262,6 +273,9 @@ impl TuiChild {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_botster-tui"));
         command.env("BOTSTER_HUB_CONNECTION", connection);
         command.env("BOTSTER_HUB_DATA_DIR", data_dir.display().to_string());
+        if let Some(path) = route_trace {
+            command.env("BOTSTER_TUI_ROUTE_TRACE", path.display().to_string());
+        }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.cwd(working_directory.display().to_string());
@@ -2139,7 +2153,13 @@ fn restart_recovery(how: HubStop, label: &str) {
     );
     println!("{label}: workers_before_stop={workers:?}");
     {
-        let mut tui = TuiChild::spawn_at(hub.endpoint(), &hub.data_dir(), &hub.root.path);
+        let route_trace = hub.root.path.join("tui-route-trace.json");
+        let mut tui = TuiChild::spawn_at(
+            hub.endpoint(),
+            &hub.data_dir(),
+            &hub.root.path,
+            Some(&route_trace),
+        );
         let mut screen = Screen::attach(&tui, test_deadline);
         let running_row = format!("{} · running", identity.session_id);
         screen
@@ -2184,14 +2204,13 @@ fn restart_recovery(how: HubStop, label: &str) {
 
         let outcome = match lifecycle.as_deref() {
             Some("running") => {
-                let occupancy = attach_and_echo(
-                    hub.endpoint(),
+                let occupancy = reattach_and_echo_after_restart(
+                    &hub,
                     &mut tui,
                     &mut screen,
                     &mut identity,
                     &running_row,
-                    MARKER_TWO,
-                    None,
+                    &route_trace,
                 );
                 assert!(
                     occupancy.subscription_id != before.subscription_id
@@ -2219,6 +2238,15 @@ fn restart_recovery(how: HubStop, label: &str) {
                 };
                 let history = screen.contains(&format!("echo:{MARKER_ONE}"));
                 detach_and_quit(&mut tui, &mut screen, &identity);
+                let trace =
+                    read_route_trace(&route_trace).unwrap_or_else(|error| panic!("{error}"));
+                println!(
+                    "{label}: post_restart_route_frames={:?}",
+                    route_frames(&trace, &occupancy.subscription_id)
+                );
+                // The complete counters and Attach records (no payload bytes)
+                // outlive the temp root in the run log.
+                println!("{label}: tui_route_trace_json={trace}");
                 format!(
                     "running_after_restart continuity={continuity} fresh_subscription={} generation={} history_visible={history}",
                     occupancy.subscription_id, occupancy.generation
@@ -2262,6 +2290,95 @@ fn restart_recovery(how: HubStop, label: &str) {
         );
     }
     hub.finish();
+}
+
+/// Attach the recovered session and require new output on the fresh route.
+///
+/// On an echo timeout, capture evidence before anything stops: trigger the
+/// restarted Hub's ring dump (diagnostic candidates only), then quit the TUI
+/// so it writes its route trace on exit, and report both with ReadScreen.
+fn reattach_and_echo_after_restart(
+    hub: &PersistentHub,
+    tui: &mut TuiChild,
+    screen: &mut Screen,
+    identity: &mut Identity,
+    row: &str,
+    route_trace: &Path,
+) -> DaemonAttachOccupancy {
+    let (col, line) = screen
+        .wait_for("recovered_row_visible", row, SCREEN_DEADLINE, identity)
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    tui.click(col, line);
+    let ready = screen
+        .wait_for(
+            "recovered_session_ready_visible",
+            SESSION_READY_MARKER,
+            SCREEN_DEADLINE,
+            identity,
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    let occupancy = wait_for_occupancy(hub.endpoint(), screen, identity, None);
+    identity.adopt(&occupancy);
+    tui.click(ready.0, ready.1);
+    let focus_until = Instant::now() + screen.remaining(Duration::from_millis(200));
+    screen.pump(focus_until);
+    tui.type_line(MARKER_TWO);
+    let Err(failure) = screen.wait_for(
+        "echo_visible",
+        &format!("echo:{MARKER_TWO}"),
+        SCREEN_DEADLINE,
+        identity,
+    ) else {
+        return occupancy;
+    };
+    let restarted_hub = hub.owned_groups.last().copied().unwrap_or_default();
+    let ring_trigger =
+        Path::new("/private/tmp/botster-diagr").join(format!("dump-{restarted_hub}"));
+    let ring_triggered =
+        ring_trigger.parent().is_some_and(Path::is_dir) && fs::write(&ring_trigger, b"").is_ok();
+    thread::sleep(Duration::from_millis(1500));
+    let hub_screen = read_session_screen(hub.endpoint(), identity);
+    let reached = hub_screen.contains(&format!("echo:{MARKER_TWO}"));
+    quit_with_ctrl_p(tui, screen, identity);
+    let (route_counters, trace_json) = match read_route_trace(route_trace) {
+        Ok(trace) => (
+            route_frames(&trace, &occupancy.subscription_id),
+            trace.to_string(),
+        ),
+        Err(error) => (Vec::new(), format!("MISSING: {error}")),
+    };
+    panic!(
+        "{failure} restarted_hub_pid={restarted_hub} ring_trigger={} triggered={ring_triggered} \
+         hub_screen_has_echo={reached} hub_screen={hub_screen:?} tui_route_trace={} \
+         post_restart_route_frames={route_counters:?} tui_route_trace_json={trace_json}",
+        ring_trigger.display(),
+        route_trace.display()
+    );
+}
+
+/// Read the TUI route trace written at detach or exit.
+///
+/// A missing or invalid file is an error, never an empty trace, so it cannot
+/// read as "zero frames received".
+fn read_route_trace(route_trace: &Path) -> Result<serde_json::Value, String> {
+    let bytes = fs::read(route_trace)
+        .map_err(|error| format!("route trace {} unreadable: {error}", route_trace.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("route trace {} invalid: {error}", route_trace.display()))
+}
+
+/// Frame counters for one subscription, from a parsed route trace.
+fn route_frames(trace: &serde_json::Value, subscription_id: &str) -> Vec<String> {
+    trace["routes"]
+        .as_object()
+        .map(|routes| {
+            routes
+                .iter()
+                .filter(|(key, _)| key.starts_with(subscription_id))
+                .map(|(key, counters)| format!("{key}: {}", counters["frames"]))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Ctrl+P moves focus off the terminal, then q quits; the exit must succeed.

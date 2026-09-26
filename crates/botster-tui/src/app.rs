@@ -74,6 +74,7 @@ use crate::acceptance::{
 };
 use crate::projection_paint::tui_terminal_region;
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
+use crate::route_trace;
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
@@ -367,6 +368,23 @@ impl PendingTerminalInput {
 /// Whether a kit node id names the production terminal view.
 /// Ctrl+P focus target: the always-present primary toolbar action.
 const WORKSPACE_MENU_NODE: &str = "tui-spawn";
+
+/// Stable name of one terminal event kind for the route trace.
+fn terminal_event_kind(event: &TerminalEvent) -> &'static str {
+    match event {
+        TerminalEvent::Output(_) => "output",
+        TerminalEvent::SnapshotReady(_) => "snapshot_ready",
+        TerminalEvent::SnapshotHistory(_) => "snapshot_history",
+        TerminalEvent::SnapshotFinish => "snapshot_finish",
+        TerminalEvent::ProcessExit(_) => "process_exit",
+        TerminalEvent::Modes(_) => "modes",
+        TerminalEvent::AttachState(AttachStateCode::Attached) => "attach_state_attached",
+        TerminalEvent::AttachState(_) => "attach_state_other",
+        TerminalEvent::InputResult(_) => "input_result",
+        TerminalEvent::HistoryUnavailable(_) => "history_unavailable",
+        TerminalEvent::RouteResync(_) => "route_resync",
+    }
+}
 
 fn is_terminal_node(node_id: Option<&str>) -> bool {
     matches!(node_id, Some("tui-terminal" | "tui-terminal-output"))
@@ -1204,6 +1222,7 @@ pub fn run(args: AppArgs) -> io::Result<()> {
     let hub_io = HubIo::with_terminal_input()?;
     let mut terminal = setup_terminal()?;
     let run_result = run_loop(&mut terminal, args, hub_io);
+    route_trace::dump("exit");
     let restore_result = restore_terminal(&mut terminal);
 
     match (run_result, restore_result) {
@@ -2056,7 +2075,15 @@ impl TuiApp {
     fn apply_wake(&mut self, wake: AppWake) {
         match wake {
             AppWake::Input(_) | AppWake::Shutdown => {}
-            AppWake::Terminal(routed) => self.apply_routed_terminal_frame(routed),
+            AppWake::Terminal(routed) => {
+                route_trace::count(
+                    routed.route.as_str(),
+                    routed.generation,
+                    "app_received",
+                    routed.frame.len(),
+                );
+                self.apply_routed_terminal_frame(routed);
+            }
             AppWake::Completed { request_id, result } => {
                 self.complete_request(request_id, result.map(|response| *response))
             }
@@ -2891,6 +2918,15 @@ impl TuiApp {
                 }
             }
             PendingReply::Attach { session_id, route } => {
+                route_trace::attach(|| {
+                    json!({
+                        "event": "attach_response",
+                        "session_id": session_id,
+                        "route": route,
+                        "hydration_matches_route": self.hydration_matches_route(&route),
+                        "response": serde_json::to_value(&response).unwrap_or(Value::Null),
+                    })
+                });
                 let failed = response.error.clone();
                 let attached = response.terminal_attach.clone();
                 self.apply_response(response);
@@ -2959,6 +2995,14 @@ impl TuiApp {
                 }
             }
             PendingReply::Attach { session_id, route } => {
+                route_trace::attach(|| {
+                    json!({
+                        "event": "attach_failure",
+                        "session_id": session_id,
+                        "route": route,
+                        "message": message,
+                    })
+                });
                 if self.hydration_matches_route(&route) {
                     // The Hub may have attached after the deadline; retire the route
                     // with a bounded Detach so a late attachment cannot leak.
@@ -3835,6 +3879,13 @@ impl TuiApp {
         self.reset_attach_campaign();
         let route = self.mint_subscription_id();
         self.begin_attach_hydration(&session_id, &route);
+        route_trace::attach(|| {
+            json!({
+                "event": "attach_request",
+                "session_id": session_id,
+                "route": route,
+            })
+        });
         self.submit(
             DaemonRequest::Attach {
                 session_id: session_id.clone(),
@@ -3894,6 +3945,7 @@ impl TuiApp {
     }
 
     fn send_bounded_detach(&mut self, session_id: String, route: String) {
+        route_trace::dump("detach");
         self.submit(
             DaemonRequest::Detach {
                 session_id,
@@ -4400,15 +4452,21 @@ impl TuiApp {
     ///   resync; unknown or already completed ids are reported, not tracked.
     fn apply_routed_terminal_frame(&mut self, routed: RoutedTerminalFrame) {
         let route = routed.route.as_str().to_string();
+        let trace = |stage: &str| {
+            route_trace::count(&route, routed.generation, stage, routed.frame.len());
+        };
         if self.retired_subscription_ids.contains(&route) {
+            trace("drop_retired_subscription");
             return;
         }
         if !self.hydration_matches_route(&route) && !self.attached_matches_route(&route) {
+            trace("drop_not_current_route");
             return;
         }
         let event = match decode_terminal_event(&routed.frame) {
             Ok(event) => event,
             Err(error) => {
+                trace("drop_decode_error");
                 self.recover_from_decode_or_phase_gap(&format!(
                     "terminal event decode failed: {error}"
                 ));
@@ -4419,10 +4477,17 @@ impl TuiApp {
         // response. Frames that arrive first wait, bounded, and replay once the
         // response lands; a frame is never allowed to set the reservation.
         let Some(generation) = self.route_generation else {
+            trace("parked_pre_attach");
             self.park_pre_attach_frame(routed);
             return;
         };
         if routed.generation != generation {
+            if route_trace::enabled() {
+                trace(&format!(
+                    "drop_generation_mismatch expected={generation} actual={}",
+                    routed.generation
+                ));
+            }
             return;
         }
         let epoch_ok = match &event {
@@ -4439,7 +4504,18 @@ impl TuiApp {
             _ => self.route_epoch == Some(routed.stream_epoch),
         };
         if !epoch_ok {
+            if route_trace::enabled() {
+                trace(&format!(
+                    "drop_epoch_mismatch kind={} incoming={} accepted={:?}",
+                    terminal_event_kind(&event),
+                    routed.stream_epoch,
+                    self.route_epoch
+                ));
+            }
             return;
+        }
+        if route_trace::enabled() {
+            trace(&format!("accepted {}", terminal_event_kind(&event)));
         }
         match &event {
             TerminalEvent::AttachState(AttachStateCode::Attached) => self.route_epoch = Some(0),
@@ -4496,6 +4572,12 @@ impl TuiApp {
             if self.attach_hydration.is_none() && self.attached.is_none() {
                 return;
             }
+            route_trace::count(
+                routed.route.as_str(),
+                routed.generation,
+                "replayed_from_park",
+                routed.frame.len(),
+            );
             self.apply_routed_terminal_frame(routed);
         }
     }
@@ -4662,7 +4744,9 @@ impl TuiApp {
                         return;
                     }
                     hydration.buffered_live_output.extend_from_slice(bytes);
+                    self.trace_output(route, "output_buffered_hydration", bytes.len());
                 } else {
+                    self.trace_output(route, "output_live", bytes.len());
                     self.apply_live_terminal_output(bytes);
                 }
             }
@@ -4967,6 +5051,20 @@ impl TuiApp {
         self.maybe_open_attach_live_path(session_id);
     }
 
+    /// Count output at `stage`, split by whether a projection will paint it.
+    fn trace_output(&self, route: &str, stage: &str, bytes: usize) {
+        if !route_trace::enabled() {
+            return;
+        }
+        let generation = self.route_generation.unwrap_or_default();
+        let painted = if self.ghostty_projection.is_some() {
+            "projection"
+        } else {
+            "no_projection"
+        };
+        route_trace::count(route, generation, &format!("{stage} {painted}"), bytes);
+    }
+
     fn apply_live_terminal_output(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -5010,6 +5108,11 @@ impl TuiApp {
             route: hydration.route.clone(),
         });
         if !hydration.buffered_live_output.is_empty() {
+            self.trace_output(
+                &hydration.route,
+                "output_hydration_flush",
+                hydration.buffered_live_output.len(),
+            );
             self.apply_live_terminal_output(&hydration.buffered_live_output);
         }
         let size = hydration

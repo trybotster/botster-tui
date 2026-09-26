@@ -658,7 +658,18 @@ impl HubIo {
             IoMessage::InputEnded => Some(AppWake::Shutdown),
             IoMessage::Terminal { generation, frame } => {
                 self.budget.release_terminal(frame.frame.len());
-                self.current(generation).then_some(AppWake::Terminal(frame))
+                let current = self.current(generation);
+                crate::route_trace::count(
+                    frame.route.as_str(),
+                    frame.generation,
+                    if current {
+                        "delivered_to_app"
+                    } else {
+                        "drop_stale_connection"
+                    },
+                    frame.frame.len(),
+                );
+                current.then_some(AppWake::Terminal(frame))
             }
             IoMessage::Response {
                 generation,
@@ -935,19 +946,39 @@ fn run_reader_thread(
                 return;
             }
             DaemonUnixMuxFrame::Terminal(terminal) => {
+                let trace_key = crate::route_trace::enabled()
+                    .then(|| (terminal.route.clone(), terminal.generation));
+                let trace = |stage: &str, bytes: usize| {
+                    if let Some((route, route_generation)) = &trace_key {
+                        crate::route_trace::count(route, *route_generation, stage, bytes);
+                    }
+                };
+                if trace_key.is_some() {
+                    trace("wire", terminal.body.len());
+                    trace(&format!("wire conn={generation}"), terminal.body.len());
+                }
                 match admit_terminal_frame(terminal, budget) {
-                    Ok(Some(frame)) => IoMessage::Terminal { generation, frame },
-                    Ok(None) => continue,
+                    Ok(Some(frame)) => {
+                        trace("reader_admitted", frame.frame.len());
+                        IoMessage::Terminal { generation, frame }
+                    }
+                    Ok(None) => {
+                        trace("reader_drop_faulted_route", 0);
+                        continue;
+                    }
                     Err(TerminalAdmitError::Route {
                         route,
                         route_generation,
                         reason,
-                    }) => IoMessage::RouteFault {
-                        generation,
-                        route,
-                        route_generation,
-                        reason,
-                    },
+                    }) => {
+                        trace("reader_route_fault", 0);
+                        IoMessage::RouteFault {
+                            generation,
+                            route,
+                            route_generation,
+                            reason,
+                        }
+                    }
                     Err(TerminalAdmitError::Protocol(reason)) => {
                         let _ = sender.send(IoMessage::Disconnected {
                             generation,
