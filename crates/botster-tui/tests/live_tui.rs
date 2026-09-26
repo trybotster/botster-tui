@@ -241,6 +241,10 @@ struct TuiChild {
 
 impl TuiChild {
     fn spawn(hub: &IsolatedHub) -> Self {
+        Self::spawn_at(hub.endpoint(), hub.data_dir(), hub.working_directory())
+    }
+
+    fn spawn_at(endpoint: &DaemonEndpoint, data_dir: &Path, working_directory: &Path) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -250,17 +254,17 @@ impl TuiChild {
                 pixel_height: 0,
             })
             .expect("open a pty for the tui");
-        let socket = hub.endpoint().socket_path.display().to_string();
+        let socket = endpoint.socket_path.display().to_string();
         let connection = format!(
             "{{\"transport\":{{\"type\":\"unix_socket\",\"path\":{}}}}}",
             serde_json::to_string(&socket).expect("socket path json")
         );
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_botster-tui"));
         command.env("BOTSTER_HUB_CONNECTION", connection);
-        command.env("BOTSTER_HUB_DATA_DIR", hub.data_dir().display().to_string());
+        command.env("BOTSTER_HUB_DATA_DIR", data_dir.display().to_string());
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        command.cwd(hub.working_directory().display().to_string());
+        command.cwd(working_directory.display().to_string());
         let child = pair
             .slave
             .spawn_command(command)
@@ -576,6 +580,40 @@ impl Screen {
             .rev()
             .take(6)
             .collect()
+    }
+
+    /// Wait until one screen row contains every needle.
+    fn wait_for_row_with_all(
+        &mut self,
+        step: &'static str,
+        needles: &[&str],
+        deadline: Duration,
+        identity: &Identity,
+    ) {
+        let started = Instant::now();
+        let deadline = self.remaining(deadline);
+        let until = started + deadline;
+        loop {
+            if self
+                .rows()
+                .iter()
+                .any(|row| needles.iter().all(|needle| row.contains(needle)))
+            {
+                return;
+            }
+            if Instant::now() >= until {
+                let head_rows = self.head_rows();
+                let failure = self.failure(
+                    step,
+                    identity,
+                    deadline,
+                    started,
+                    format!("no row contains all of {needles:?}; first rows: {head_rows:?}"),
+                );
+                panic!("{failure}");
+            }
+            self.pump((Instant::now() + Duration::from_millis(100)).min(until));
+        }
     }
 
     fn head_rows(&mut self) -> Vec<String> {
@@ -1793,4 +1831,374 @@ fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
         );
     }
     drop(guard);
+}
+
+/// One candidate Hub whose data directory survives a stop, for restart recovery.
+///
+/// `IsolatedHub::restart` recreates the data directory, so it cannot show what
+/// happens to an existing session. This helper verifies the manifest hashes,
+/// runs `botster-hub start` under a short owned root, and stops the Hub either
+/// with `botster-hub shutdown` or with SIGKILL to the Hub process only, so the
+/// session workers can outlive a crash. On drop it stops the Hub and kills only
+/// processes whose command line contains its own root.
+struct PersistentHub {
+    candidate: Candidate,
+    root: ShortTempRoot,
+    endpoint: DaemonEndpoint,
+    child: Option<std::process::Child>,
+    starts: u32,
+    /// Process groups this test created: one per Hub start. Session workers
+    /// run in the group of the Hub start that spawned them.
+    owned_groups: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HubStop {
+    Graceful,
+    Kill,
+}
+
+impl PersistentHub {
+    fn start(candidate: Candidate) -> Self {
+        verify_candidate_hashes(&candidate);
+        let root = ShortTempRoot::create();
+        fs::create_dir_all(root.path.join("data")).expect("create hub data dir");
+        fs::create_dir_all(root.path.join("tmp")).expect("create hub tmp dir");
+        let endpoint = DaemonEndpoint::new(root.path.join("data").join("botster-hub.sock"));
+        let mut hub = Self {
+            candidate,
+            root,
+            endpoint,
+            child: None,
+            starts: 0,
+            owned_groups: Vec::new(),
+        };
+        hub.launch();
+        hub
+    }
+
+    fn endpoint(&self) -> &DaemonEndpoint {
+        &self.endpoint
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.root.path.join("data")
+    }
+
+    fn launch(&mut self) {
+        use std::os::unix::process::CommandExt;
+        self.starts += 1;
+        let log = fs::File::create(self.root.path.join(format!("hub-{}.log", self.starts)))
+            .expect("create hub log");
+        let worker_dir = Path::new(&self.candidate.worker_bin)
+            .parent()
+            .expect("worker bin has a parent directory");
+        let path = format!(
+            "{}:{}",
+            worker_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let child = std::process::Command::new(&self.candidate.hub_bin)
+            .args(["start", "--data-dir"])
+            .arg(self.data_dir())
+            .arg("--session-worker-bin")
+            .arg(&self.candidate.worker_bin)
+            .current_dir(&self.root.path)
+            .env("BOTSTER_ENV", "test")
+            .env("TMPDIR", self.root.path.join("tmp"))
+            .env("PATH", path)
+            .stdout(log.try_clone().expect("clone hub log"))
+            .stderr(log)
+            .process_group(0)
+            .spawn()
+            .expect("spawn candidate hub");
+        self.owned_groups.push(child.id());
+        self.child = Some(child);
+        let until = Instant::now() + SESSION_RUNNING_DEADLINE;
+        while request(&self.endpoint, DaemonRequest::Status).is_err() {
+            assert!(
+                Instant::now() < until,
+                "layer={LAYER} step=persistent_hub_ready cause=hub start {} never answered Status",
+                self.starts
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn stop(&mut self, how: HubStop) {
+        assert!(self.child.is_some(), "hub is running before stop");
+        match how {
+            HubStop::Graceful => {
+                let status = std::process::Command::new(&self.candidate.hub_bin)
+                    .args(["shutdown", "--data-dir"])
+                    .arg(self.data_dir())
+                    .env("BOTSTER_ENV", "test")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("run hub shutdown");
+                assert!(status.success(), "hub shutdown failed: {status:?}");
+            }
+            HubStop::Kill => self
+                .child
+                .as_mut()
+                .expect("hub child handle")
+                .kill()
+                .expect("SIGKILL the hub process"),
+        }
+        // Keep the handle until the process has exited, so Drop can still
+        // kill and reap it after a failed or slow stop.
+        let until = Instant::now() + EXIT_DEADLINE;
+        loop {
+            let child = self.child.as_mut().expect("hub child handle");
+            if child.try_wait().expect("poll hub exit").is_some() {
+                self.child = None;
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "layer={LAYER} step=persistent_hub_stop cause=hub did not exit after {how:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn restart_after(&mut self, how: HubStop) {
+        self.stop(how);
+        self.launch();
+    }
+}
+
+impl Drop for PersistentHub {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.stop(HubStop::Graceful);
+            }));
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Session workers that outlived a Hub stop remain in the process group
+        // of the Hub start that spawned them. Only groups this test created.
+        for group in &self.owned_groups {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", "--", &format!("-{group}")])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Fail closed unless both candidate binaries match the manifest sha256 values.
+fn verify_candidate_hashes(candidate: &Candidate) {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&candidate.manifest).expect("read candidate manifest"))
+            .expect("candidate manifest json");
+    for (name, path) in [
+        ("botster-hub", &candidate.hub_bin),
+        ("botster-session-worker", &candidate.worker_bin),
+    ] {
+        let expected = manifest["artifacts"]
+            .as_array()
+            .and_then(|artifacts| artifacts.iter().find(|artifact| artifact["name"] == name))
+            .and_then(|artifact| artifact["sha256"].as_str())
+            .unwrap_or_else(|| panic!("manifest has no sha256 for {name}"))
+            .to_string();
+        let output = std::process::Command::new("shasum")
+            .args(["-a", "256", path])
+            .output()
+            .expect("run shasum");
+        let actual = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            actual, expected,
+            "layer={LAYER} step=candidate_hash name={name}"
+        );
+    }
+}
+
+fn listed_lifecycle(endpoint: &DaemonEndpoint, identity: &Identity) -> Option<String> {
+    expect_ok(
+        "list_sessions_after_restart",
+        identity,
+        request(endpoint, DaemonRequest::ListSessions).expect("list sessions transport"),
+    )
+    .sessions
+    .into_iter()
+    .find(|session| session.session_id == identity.session_id)
+    .map(|session| session.lifecycle)
+}
+
+/// Counts input lines in the session process, so output after a Hub restart
+/// shows whether the same process survived (`seq:2`) or a new one runs (`seq:1`).
+const COUNTING_SHELL_COMMAND: &str = "printf 'live-ready\\n'; n=0; while IFS= read -r line; do n=$((n+1)); printf 'echo:%s\\nseq:%s\\n' \"$line\" \"$n\"; done";
+
+/// Spawn and attach one session, stop the Hub, start it on the same data
+/// directory, and record what the reconnected TUI shows for that session.
+///
+/// Client coherence is asserted: the TUI reconnects, its row agrees with the
+/// Hub's listing, and a session the Hub lists as running attaches on a fresh
+/// route and echoes. The outcome is printed, and the recovery gate then
+/// requires that the same session process survived.
+fn restart_recovery(how: HubStop, label: &str) {
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let mut hub = PersistentHub::start(Candidate::from_env());
+    let mut identity = Identity::default();
+    spawn_session(
+        hub.endpoint(),
+        &mut identity,
+        test_deadline,
+        COUNTING_SHELL_COMMAND,
+    );
+    {
+        let mut tui = TuiChild::spawn_at(hub.endpoint(), &hub.data_dir(), &hub.root.path);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let running_row = format!("{} · running", identity.session_id);
+        screen
+            .wait_for(
+                "session_row_visible",
+                &running_row,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let before = attach_and_echo(
+            hub.endpoint(),
+            &mut tui,
+            &mut screen,
+            &mut identity,
+            &running_row,
+            MARKER_ONE,
+            None,
+        );
+        screen
+            .wait_for("first_line_counted", "seq:1", SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        hub.restart_after(how);
+        // Before the stop the status row said "Attached: <session>". A row with
+        // both needles can only come from the new connection.
+        screen.wait_for_row_with_all(
+            "tui_reconnected",
+            &["connected (running)", "Attached: none"],
+            CONTROL_RECONNECT_DEADLINE,
+            &identity,
+        );
+        let settle = Instant::now() + screen.remaining(Duration::from_millis(1500));
+        screen.pump(settle);
+        let lifecycle = listed_lifecycle(hub.endpoint(), &identity);
+        let rows = screen.head_rows();
+
+        let outcome = match lifecycle.as_deref() {
+            Some("running") => {
+                let occupancy = attach_and_echo(
+                    hub.endpoint(),
+                    &mut tui,
+                    &mut screen,
+                    &mut identity,
+                    &running_row,
+                    MARKER_TWO,
+                    None,
+                );
+                assert!(
+                    occupancy.subscription_id != before.subscription_id
+                        || occupancy.generation != before.generation,
+                    "recovery must use a fresh terminal route"
+                );
+                // New output on the fresh route decides process continuity.
+                let started = Instant::now();
+                let continuity = loop {
+                    let text = read_session_screen(hub.endpoint(), &identity);
+                    if text.contains("seq:2") {
+                        break "same process (seq:2)";
+                    }
+                    if text.matches("seq:1").count() > 1
+                        || (text.contains(&format!("echo:{MARKER_TWO}"))
+                            && !text.contains(&format!("echo:{MARKER_ONE}")))
+                    {
+                        break "new process (seq restarted)";
+                    }
+                    assert!(
+                        started.elapsed() < SCREEN_DEADLINE,
+                        "layer={LAYER} step=post_recovery_output cause=no counted output after recovery: {text:?}"
+                    );
+                    screen.pump(Instant::now() + Duration::from_millis(100));
+                };
+                let history = screen.contains(&format!("echo:{MARKER_ONE}"));
+                detach_and_quit(&mut tui, &mut screen, &identity);
+                format!(
+                    "running_after_restart continuity={continuity} fresh_subscription={} generation={} history_visible={history}",
+                    occupancy.subscription_id, occupancy.generation
+                )
+            }
+            Some(other) => {
+                let row = format!("{} · {other}", identity.session_id);
+                screen
+                    .wait_for(
+                        "unresolved_row_matches_hub",
+                        &row,
+                        SCREEN_DEADLINE,
+                        &identity,
+                    )
+                    .unwrap_or_else(|failure| panic!("{failure}"));
+                quit_with_ctrl_p(&mut tui, &mut screen, &identity);
+                format!("reported lifecycle={other}")
+            }
+            None => {
+                let started = Instant::now();
+                while screen.contains(&identity.session_id) {
+                    assert!(
+                        started.elapsed() < SCREEN_DEADLINE,
+                        "layer={LAYER} step=gone_row_removed cause=TUI still shows {} after the Hub dropped it",
+                        identity.session_id
+                    );
+                    screen.pump(Instant::now() + Duration::from_millis(100));
+                }
+                quit_with_ctrl_p(&mut tui, &mut screen, &identity);
+                "gone (hub no longer lists the session)".to_string()
+            }
+        };
+        println!(
+            "{label}: stop={how:?} session={} outcome={outcome} rows_after_reconnect={rows:?}",
+            identity.session_id
+        );
+        // The recovery gate: the same session process survives the Hub stop.
+        assert!(
+            outcome.contains("continuity=same process"),
+            "layer={LAYER} step=recovery_gate cause={label} did not recover the existing session: {outcome}"
+        );
+    }
+    drop(hub);
+}
+
+/// Ctrl+P moves focus off the terminal, then q quits; the exit must succeed.
+fn quit_with_ctrl_p(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity) {
+    tui.write_all(b"\x10");
+    let settle = Instant::now() + screen.remaining(Duration::from_millis(300));
+    screen.pump(settle);
+    tui.write_all(b"q");
+    let started = Instant::now();
+    let deadline = screen.remaining(EXIT_DEADLINE);
+    let status = tui.wait_exit(started + deadline).unwrap_or_else(|cause| {
+        let failure = screen.failure("tui_exit_after_ctrl_p", identity, deadline, started, cause);
+        panic!("{failure}");
+    });
+    assert!(status.success(), "TUI exited unsuccessfully: {status:?}");
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s8a_graceful_hub_restart_reports_the_existing_session() {
+    restart_recovery(HubStop::Graceful, "t_s8a");
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s8b_hub_kill_restart_reports_the_existing_session() {
+    restart_recovery(HubStop::Kill, "t_s8b");
 }
