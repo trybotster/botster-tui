@@ -4,6 +4,7 @@ mod entity_options;
 mod hub_io;
 mod projection_paint;
 mod renderer;
+mod route_trace;
 mod terminal_input;
 
 fn main() -> std::io::Result<()> {
@@ -27,5 +28,6 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    route_trace::init_from_env();
     app::run(args)
 }
