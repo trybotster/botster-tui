@@ -39,12 +39,14 @@ use std::{
 
 use botster_core::contract::terminal_screen::TerminalScreenSize;
 use botster_hub_client::{
-    DaemonAttachOccupancy, DaemonEndpoint, DaemonModeFlags, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, request,
+    DaemonAttachOccupancy, DaemonEndpoint, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    request,
 };
 use botster_hub_test_support::{IsolatedHub, IsolatedHubBuilder};
 use botster_terminal_ghostty::GhosttyClientProjection;
-use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use portable_pty::{
+    ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
+};
 
 const LAYER: &str = "tui";
 const SCREEN_ROWS: u16 = 40;
@@ -59,6 +61,7 @@ const LAUNCH_SESSION_TYPE: &str = "shell";
 const LAUNCH_SESSION_TYPE_LABEL: &str = "TUI launch shell";
 const MARKER_ONE: &str = "tui-live-marker-one";
 const MARKER_TWO: &str = "tui-live-marker-two";
+const MARKER_THREE: &str = "tui-live-marker-three";
 const CONSENT_NORMAL_MARKER: &str = "tui-consent-normal-input";
 const CONSENT_OUTPUT_MARKER: &str = "tui-consent-output-while-dialog-open";
 const CONSENT_FIRST_ACCEPTED: &str = "tui-consent-first-line-accepted";
@@ -75,6 +78,7 @@ const TEST_DEADLINE: Duration = Duration::from_secs(120);
 const LAST_PANE_TITLES: usize = 16;
 const STREAM_EPOCH_UNAVAILABLE: &str = "unavailable";
 static SHORT_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// One bounded-failure record printed on one line.
 #[derive(Debug, Clone)]
@@ -234,7 +238,10 @@ impl Drop for HubGuard {
 /// The TUI child under its PTY. Dropped before the isolated Hub: kill and
 /// reap the child so no test-owned process outlives the run.
 struct TuiChild {
-    child: Box<dyn Child + Send + Sync>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// One message: the child's exit status, sent by a thread blocked in `wait`.
+    exited: Receiver<std::io::Result<ExitStatus>>,
+    exit: Option<ExitStatus>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
 }
@@ -265,14 +272,21 @@ impl TuiChild {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.cwd(working_directory.display().to_string());
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(command)
             .expect("spawn botster-tui under the pty");
         drop(pair.slave);
+        let killer = child.clone_killer();
+        let (exit_tx, exited) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = exit_tx.send(child.wait());
+        });
         let writer = pair.master.take_writer().expect("pty writer");
         Self {
-            child,
+            killer,
+            exited,
+            exit: None,
             master: pair.master,
             writer,
         }
@@ -319,14 +333,24 @@ impl TuiChild {
     }
 
     fn wait_exit(&mut self, deadline: Instant) -> Result<ExitStatus, String> {
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                Ok(None) => {
-                    return Err("deadline expired while the TUI was still running".to_string());
-                }
-                Err(error) => return Err(format!("failed to read the TUI exit status: {error}")),
+        if let Some(status) = &self.exit {
+            return Ok(status.clone());
+        }
+        match self
+            .exited
+            // timer: deadline — the TUI exits within the step budget; expiry fails the step
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Ok(status)) => {
+                self.exit = Some(status.clone());
+                Ok(status)
+            }
+            Ok(Err(error)) => Err(format!("failed to read the TUI exit status: {error}")),
+            Err(RecvTimeoutError::Timeout) => {
+                Err("deadline expired while the TUI was still running".to_string())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("the TUI exit waiter stopped without a status".to_string())
             }
         }
     }
@@ -334,9 +358,10 @@ impl TuiChild {
 
 impl Drop for TuiChild {
     fn drop(&mut self) {
-        if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.exit.is_none() {
+            let _ = self.killer.kill();
+            // timer: deadline — the killed TUI is reaped within the exit budget; expiry leaves the waiter thread
+            let _ = self.exited.recv_timeout(EXIT_DEADLINE);
         }
     }
 }
@@ -392,27 +417,50 @@ impl Screen {
         requested.min(self.test_deadline.saturating_duration_since(Instant::now()))
     }
 
-    /// Apply PTY bytes until `until`; returns true when anything arrived.
-    fn pump(&mut self, until: Instant) -> bool {
-        let mut received = false;
+    /// Block for the next TUI output until `until`, then apply everything
+    /// already queued. Returns false when the deadline passed (or the TUI
+    /// closed its output) with nothing new.
+    fn pump_next(&mut self, until: Instant) -> bool {
+        let timeout = until.saturating_duration_since(Instant::now());
+        // timer: deadline — bounded wait for TUI output; expiry fails the waiting step
+        let Ok(first) = self.bytes.recv_timeout(timeout) else {
+            return false;
+        };
+        self.projection.apply_terminal_output(&first);
+        while let Ok(chunk) = self.bytes.try_recv() {
+            self.projection.apply_terminal_output(&chunk);
+        }
+        self.note_title();
+        true
+    }
+
+    /// The single bounded wait of these tests: re-check `ready` after each
+    /// batch of TUI output until it yields a value or the deadline passes.
+    fn wait_until<T>(
+        &mut self,
+        step: &'static str,
+        deadline: Duration,
+        identity: &Identity,
+        mut ready: impl FnMut(&mut Self) -> Option<T>,
+        cause: impl FnOnce(&mut Self) -> String,
+    ) -> Result<T, Box<StepFailure>> {
+        let started = Instant::now();
+        let deadline = self.remaining(deadline);
+        let until = started + deadline;
         loop {
-            let timeout = until.saturating_duration_since(Instant::now());
-            match self.bytes.recv_timeout(timeout) {
-                Ok(chunk) => {
-                    self.projection.apply_terminal_output(&chunk);
-                    received = true;
-                    if timeout.is_zero() {
-                        break;
-                    }
+            if let Some(value) = ready(self) {
+                return Ok(value);
+            }
+            if !self.pump_next(until) {
+                if let Some(value) = ready(self) {
+                    return Ok(value);
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => break,
+                let cause = cause(self);
+                return Err(Box::new(
+                    self.failure(step, identity, deadline, started, cause),
+                ));
             }
         }
-        if received {
-            self.note_title();
-        }
-        received
     }
 
     fn screen_rows(&mut self) -> Vec<ScreenRow> {
@@ -510,27 +558,18 @@ impl Screen {
         previous: Option<(u16, u16)>,
         identity: &Identity,
     ) -> (u16, u16) {
-        let started = Instant::now();
-        let deadline = self.remaining(SCREEN_DEADLINE);
-        let until = started + deadline;
-        loop {
-            if let Some(size) = self.terminal_pane_inner_size()
-                && Some(size) != previous
-            {
-                return size;
-            }
-            if Instant::now() >= until {
-                let failure = self.failure(
-                    step,
-                    identity,
-                    deadline,
-                    started,
-                    format!("terminal pane not measurable or unchanged from {previous:?}"),
-                );
-                panic!("{failure}");
-            }
-            self.pump((Instant::now() + Duration::from_millis(100)).min(until));
-        }
+        self.wait_until(
+            step,
+            SCREEN_DEADLINE,
+            identity,
+            |screen| {
+                screen
+                    .terminal_pane_inner_size()
+                    .filter(|size| Some(*size) != previous)
+            },
+            |_| format!("terminal pane not measurable or unchanged from {previous:?}"),
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"))
     }
 
     fn contains(&mut self, needle: &str) -> bool {
@@ -551,25 +590,18 @@ impl Screen {
         deadline: Duration,
         identity: &Identity,
     ) -> Result<(u16, u16), Box<StepFailure>> {
-        let started = Instant::now();
-        let deadline = self.remaining(deadline);
-        let until = started + deadline;
-        loop {
-            if let Some(at) = self.locate(needle) {
-                return Ok(at);
-            }
-            if Instant::now() >= until {
-                let tail_rows = self.tail_rows();
-                return Err(Box::new(self.failure(
-                    step,
-                    identity,
-                    deadline,
-                    started,
-                    format!("{needle:?} not visible; last rows: {tail_rows:?}"),
-                )));
-            }
-            self.pump((Instant::now() + Duration::from_millis(100)).min(until));
-        }
+        self.wait_until(
+            step,
+            deadline,
+            identity,
+            |screen| screen.locate(needle),
+            |screen| {
+                format!(
+                    "{needle:?} not visible; last rows: {:?}",
+                    screen.tail_rows()
+                )
+            },
+        )
     }
 
     fn tail_rows(&mut self) -> Vec<String> {
@@ -590,30 +622,25 @@ impl Screen {
         deadline: Duration,
         identity: &Identity,
     ) {
-        let started = Instant::now();
-        let deadline = self.remaining(deadline);
-        let until = started + deadline;
-        loop {
-            if self
-                .rows()
-                .iter()
-                .any(|row| needles.iter().all(|needle| row.contains(needle)))
-            {
-                return;
-            }
-            if Instant::now() >= until {
-                let head_rows = self.head_rows();
-                let failure = self.failure(
-                    step,
-                    identity,
-                    deadline,
-                    started,
-                    format!("no row contains all of {needles:?}; first rows: {head_rows:?}"),
-                );
-                panic!("{failure}");
-            }
-            self.pump((Instant::now() + Duration::from_millis(100)).min(until));
-        }
+        self.wait_until(
+            step,
+            deadline,
+            identity,
+            |screen| {
+                screen
+                    .rows()
+                    .iter()
+                    .any(|row| needles.iter().all(|needle| row.contains(needle)))
+                    .then_some(())
+            },
+            |screen| {
+                format!(
+                    "no row contains all of {needles:?}; first rows: {:?}",
+                    screen.head_rows()
+                )
+            },
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
     fn head_rows(&mut self) -> Vec<String> {
@@ -683,19 +710,15 @@ fn expect_ok(step: &'static str, identity: &Identity, response: DaemonResponse) 
     response
 }
 
-/// Spawn the echo shell session through the Hub before the TUI starts.
-fn spawn_session(
-    endpoint: &DaemonEndpoint,
-    identity: &mut Identity,
-    test_deadline: Instant,
-    command: &str,
-) {
+/// Spawn one shell session through the Hub.
+///
+/// Callers wait for its "running" row on the TUI screen, which the TUI renders
+/// from the Hub's session entity events, so this does not poll the Hub.
+fn spawn_session(endpoint: &DaemonEndpoint, identity: &mut Identity, command: &str) {
     identity.session_id = format!(
-        "live-tui-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or_default()
+        "live-tui-{}-{}",
+        std::process::id(),
+        SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     let response = request(
         endpoint,
@@ -706,64 +729,27 @@ fn spawn_session(
     )
     .expect("spawn request transport");
     expect_ok("spawn", identity, response);
-    let started = Instant::now();
-    let deadline = SESSION_RUNNING_DEADLINE.min(test_deadline.saturating_duration_since(started));
-    let until = started + deadline;
-    loop {
-        let response = expect_ok(
-            "list_sessions",
-            identity,
-            request(endpoint, DaemonRequest::ListSessions).expect("list sessions transport"),
-        );
-        assert_eq!(response.kind, DaemonResponseKind::Sessions);
-        let running = response.sessions.iter().any(|session| {
-            session.session_id == identity.session_id && session.lifecycle == "running"
-        });
-        if running {
-            return;
-        }
-        if Instant::now() >= until {
-            let failure = StepFailure {
-                step: "session_running",
-                session_id: identity.session_id.clone(),
-                subscription_id: String::new(),
-                generation: String::new(),
-                stream_epoch: STREAM_EPOCH_UNAVAILABLE.to_string(),
-                deadline_ms: deadline.as_millis(),
-                elapsed_ms: started.elapsed().as_millis(),
-                last_pane_titles: Vec::new(),
-                cause: format!(
-                    "session never reached running: {:?}",
-                    response
-                        .sessions
-                        .iter()
-                        .map(|session| format!("{}={}", session.session_id, session.lifecycle))
-                        .collect::<Vec<_>>()
-                ),
-            };
-            panic!("{failure}");
-        }
-        thread::sleep(
-            Duration::from_millis(200).min(until.saturating_duration_since(Instant::now())),
-        );
-    }
 }
 
 /// Build the consent test shell with one test-owned output trigger.
 ///
 /// The shell emits neutral acceptance markers. It does not write the raw paste
 /// payload to the terminal. The client screen can therefore check for leaks.
-fn consent_shell_command(output_trigger: &Path) -> String {
+fn consent_shell_command(output_trigger: &Path, output_written: &Path) -> String {
     let trigger = output_trigger.display().to_string();
-    assert!(
-        trigger
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte)),
-        "consent output trigger must be safe for the fixed test shell: {trigger}"
-    );
+    let written = output_written.display().to_string();
+    for path in [&trigger, &written] {
+        assert!(
+            path.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte)),
+            "consent FIFO path must be safe for the fixed test shell: {path}"
+        );
+    }
+    // The background reader blocks on the trigger FIFO, prints the marker,
+    // then reports on the second FIFO that the marker was written.
     format!(
         "stty -echo; \
-         (while [ ! -f '{trigger}' ]; do sleep 0.05; done; printf '{CONSENT_OUTPUT_MARKER}\\n') & \
+         (read _ < '{trigger}'; printf '{CONSENT_OUTPUT_MARKER}\\n'; echo written > '{written}') & \
          printf '{SESSION_READY_MARKER}\\n'; \
          while IFS= read -r line; do \
            case \"$line\" in \
@@ -773,6 +759,34 @@ fn consent_shell_command(output_trigger: &Path) -> String {
            esac; \
          done"
     )
+}
+
+/// Create one FIFO for a test shell to block on or report through.
+fn make_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(
+        status.success(),
+        "mkfifo {} failed: {status:?}",
+        path.display()
+    );
+}
+
+/// Read one report that a test shell writes into `fifo`.
+fn wait_for_fifo_report(fifo: &Path, deadline: Duration) -> Result<String, String> {
+    let (report_tx, report_rx) = mpsc::channel();
+    let fifo = fifo.to_path_buf();
+    thread::spawn(move || {
+        let _ = report_tx.send(fs::read_to_string(&fifo));
+    });
+    // timer: deadline — the shell reports within the step budget; expiry fails the step
+    match report_rx.recv_timeout(deadline) {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(format!("fifo read failed: {error}")),
+        Err(_) => Err("the shell did not report before the deadline".to_string()),
+    }
 }
 
 fn read_session_screen(endpoint: &DaemonEndpoint, identity: &Identity) -> String {
@@ -800,91 +814,6 @@ fn read_session_screen(endpoint: &DaemonEndpoint, identity: &Identity) -> String
     readback.text
 }
 
-fn wait_for_session_screen(
-    endpoint: &DaemonEndpoint,
-    screen: &mut Screen,
-    identity: &Identity,
-    needle: &str,
-) -> String {
-    let started = Instant::now();
-    let deadline = screen.remaining(SCREEN_DEADLINE);
-    let until = started + deadline;
-    loop {
-        let readback = read_session_screen(endpoint, identity);
-        if readback.contains(needle) {
-            return readback;
-        }
-        if Instant::now() >= until {
-            let failure = screen.failure(
-                "read_screen_marker",
-                identity,
-                deadline,
-                started,
-                format!("{needle:?} not present in terminal readback: {readback:?}"),
-            );
-            panic!("{failure}");
-        }
-        screen.pump((Instant::now() + Duration::from_millis(100)).min(until));
-    }
-}
-
-fn read_mode_flags(endpoint: &DaemonEndpoint, identity: &Identity) -> DaemonModeFlags {
-    let response = expect_ok(
-        "read_mode_flags",
-        identity,
-        request(
-            endpoint,
-            DaemonRequest::ReadModeFlags {
-                session_id: identity.session_id.clone(),
-            },
-        )
-        .expect("read mode flags transport"),
-    );
-    assert_eq!(response.kind, DaemonResponseKind::ReadModeFlags);
-    let mode_flags = response
-        .mode_flags
-        .expect("read mode flags response includes its payload");
-    assert_eq!(mode_flags.session_id, identity.session_id);
-    assert!(
-        mode_flags.unavailable.is_none(),
-        "mode flags are available during the resize test: {:?}",
-        mode_flags.unavailable
-    );
-    mode_flags
-}
-
-/// Wait until the Hub reports exactly the drawn pane size for the session.
-fn wait_for_terminal_size(
-    endpoint: &DaemonEndpoint,
-    screen: &mut Screen,
-    identity: &Identity,
-    step: &'static str,
-    expected: (u16, u16),
-) {
-    let started = Instant::now();
-    let deadline = screen.remaining(SCREEN_DEADLINE);
-    let until = started + deadline;
-    loop {
-        let mode_flags = read_mode_flags(endpoint, identity);
-        let actual = (mode_flags.rows, mode_flags.cols);
-        if actual == expected {
-            return;
-        }
-        if Instant::now() >= until {
-            let failure = screen.failure(
-                step,
-                identity,
-                deadline,
-                started,
-                format!("hub terminal size {actual:?} never matched the drawn pane {expected:?}"),
-            );
-            panic!("{failure}");
-        }
-        screen.pump((Instant::now() + Duration::from_millis(100)).min(until));
-    }
-}
-
-/// Current Hub-side attach occupancy rows for the session.
 fn occupancies(endpoint: &DaemonEndpoint, identity: &Identity) -> Vec<DaemonAttachOccupancy> {
     let response = expect_ok(
         "status",
@@ -903,49 +832,31 @@ fn occupancies(endpoint: &DaemonEndpoint, identity: &Identity) -> Vec<DaemonAtta
         .unwrap_or_default()
 }
 
-fn wait_for_occupancy(
+/// The Hub occupancy of an attachment known to be complete.
+///
+/// Call only after output typed on that attachment is visible: typed input
+/// reaches a session only on a live attachment, and the Hub records the route
+/// before it answers the Attach, so one read is enough.
+fn attached_occupancy(
     endpoint: &DaemonEndpoint,
-    screen: &mut Screen,
     identity: &Identity,
     previous: Option<&DaemonAttachOccupancy>,
 ) -> DaemonAttachOccupancy {
-    let started = Instant::now();
-    let deadline = screen.remaining(SCREEN_DEADLINE);
-    let until = started + deadline;
-    let mut attached_control_seen = false;
-    loop {
-        let actual = occupancies(endpoint, identity);
-        if let Some(occupancy) = actual
-            .iter()
-            .find(|occupancy| {
-                previous.is_none_or(|previous| {
-                    occupancy.subscription_id != previous.subscription_id
-                        || occupancy.generation != previous.generation
-                })
+    let rows = occupancies(endpoint, identity);
+    rows.iter()
+        .find(|occupancy| {
+            previous.is_none_or(|previous| {
+                occupancy.subscription_id != previous.subscription_id
+                    || occupancy.generation != previous.generation
             })
-            .cloned()
-        {
-            return occupancy;
-        }
-        if Instant::now() >= until {
-            let head_rows = screen.head_rows();
-            let tail_rows = screen.tail_rows();
-            let failure = screen.failure(
-                "attach_occupancy",
-                identity,
-                deadline,
-                started,
-                format!(
-                    "hub did not publish new live attach occupancy; attached_control_seen={attached_control_seen} actual_occupancies={actual:?}; first_rows={head_rows:?}; last_rows={tail_rows:?}"
-                ),
-            );
-            panic!("{failure}");
-        }
-        let poll_until = (Instant::now() + Duration::from_millis(100)).min(until);
-        screen.pump(poll_until);
-        attached_control_seen |= screen.contains("[ Detach ]");
-        thread::sleep(poll_until.saturating_duration_since(Instant::now()));
-    }
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "layer={LAYER} step=attach_occupancy session_id={} cause=no new live attach occupancy after a completed attach: {rows:?}",
+                identity.session_id
+            )
+        })
 }
 
 fn start_hub(candidate: &Candidate) -> HubGuard {
@@ -992,9 +903,9 @@ fn attach_and_echo(
         )
         .unwrap_or_else(|failure| panic!("{failure}"));
     tui.click(col, row);
-    let (ready, occupancy) = if previous_occupancy.is_some() {
-        let occupancy = wait_for_occupancy(endpoint, screen, identity, previous_occupancy);
-        identity.adopt(&occupancy);
+    if previous_occupancy.is_some() {
+        // The detached projection stays readable, so wait until the new
+        // attachment owns the pane before clicking into it.
         screen
             .wait_for(
                 "reattach_control_visible",
@@ -1003,34 +914,18 @@ fn attach_and_echo(
                 identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let ready = screen
-            .wait_for(
-                "session_ready_visible",
-                SESSION_READY_MARKER,
-                SCREEN_DEADLINE,
-                identity,
-            )
-            .unwrap_or_else(|failure| panic!("{failure}"));
-        (ready, occupancy)
-    } else {
-        // The initial projection is empty, so this marker cannot be retained
-        // from an earlier attachment.
-        let ready = screen
-            .wait_for(
-                "session_ready_visible",
-                SESSION_READY_MARKER,
-                SCREEN_DEADLINE,
-                identity,
-            )
-            .unwrap_or_else(|failure| panic!("{failure}"));
-        let occupancy = wait_for_occupancy(endpoint, screen, identity, previous_occupancy);
-        identity.adopt(&occupancy);
-        (ready, occupancy)
-    };
-    // Focus the terminal pane by clicking a cell inside it, then type.
+    }
+    let ready = screen
+        .wait_for(
+            "session_ready_visible",
+            SESSION_READY_MARKER,
+            SCREEN_DEADLINE,
+            identity,
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    // Focus the pane, then type. The TUI reads its input in order, so the
+    // click is applied before the keys.
     tui.click(ready.0, ready.1);
-    let focus_until = Instant::now() + screen.remaining(Duration::from_millis(200));
-    screen.pump(focus_until);
     tui.type_line(marker);
     screen
         .wait_for(
@@ -1047,6 +942,8 @@ fn attach_and_echo(
             let reached = hub_screen.contains(&format!("echo:{marker}"));
             panic!("{failure} hub_screen_has_echo={reached} hub_screen={hub_screen:?}")
         });
+    let occupancy = attached_occupancy(endpoint, identity, previous_occupancy);
+    identity.adopt(&occupancy);
     occupancy
 }
 
@@ -1096,12 +993,13 @@ fn detach_and_quit(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity)
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s1_connect_select_session_and_see_echo() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity, test_deadline, SHELL_COMMAND);
+    spawn_session(hub.endpoint(), &mut identity, SHELL_COMMAND);
     {
         let mut tui = TuiChild::spawn(hub);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -1135,12 +1033,13 @@ fn t_s1_connect_select_session_and_see_echo() {
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity, test_deadline, SHELL_COMMAND);
+    spawn_session(hub.endpoint(), &mut identity, SHELL_COMMAND);
     {
         let mut tui = TuiChild::spawn(hub);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -1176,32 +1075,6 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
         screen
             .wait_for("detached_visible", "detached", SCREEN_DEADLINE, &identity)
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let detach_started = Instant::now();
-        let detach_deadline = screen.remaining(SCREEN_DEADLINE);
-        let detach_until = detach_started + detach_deadline;
-        while occupancies(hub.endpoint(), &identity)
-            .iter()
-            .any(|occupancy| {
-                occupancy.subscription_id == first.subscription_id
-                    && occupancy.generation == first.generation
-            })
-        {
-            if Instant::now() >= detach_until {
-                let failure = screen.failure(
-                    "detach_occupancy_released",
-                    &identity,
-                    detach_deadline,
-                    detach_started,
-                    "hub still reports the attachment after detach".to_string(),
-                );
-                panic!("{failure}");
-            }
-            thread::sleep(
-                Duration::from_millis(100)
-                    .min(detach_until.saturating_duration_since(Instant::now())),
-            );
-        }
-
         // Re-attach through the toolbar: the restored snapshot shows the first
         // echo, live input still works, and the Hub minted a new attachment.
         let second = attach_and_echo(
@@ -1221,6 +1094,14 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             second.generation, first.generation,
             "re-attach must carry a new attachment generation"
         );
+        // Barrier: the TUI sent Detach before this Attach on its one control
+        // connection, and the Attach has completed, so the first attachment's
+        // occupancy must already be gone.
+        assert_eq!(
+            occupancies(hub.endpoint(), &identity),
+            vec![second.clone()],
+            "only the re-attach may hold the session after detach"
+        );
         println!(
             "t_s2: reattached session={} first=({}, {}) second=({}, {})",
             first.session_id,
@@ -1237,14 +1118,18 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let output_trigger = hub.data_dir().join("consent-output.trigger");
-    let command = consent_shell_command(&output_trigger);
+    let output_written = hub.data_dir().join("consent-output.written");
+    make_fifo(&output_trigger);
+    make_fifo(&output_written);
+    let command = consent_shell_command(&output_trigger, &output_written);
     let mut identity = Identity::default();
-    spawn_session(hub.endpoint(), &mut identity, test_deadline, &command);
+    spawn_session(hub.endpoint(), &mut identity, &command);
     {
         let mut tui = TuiChild::spawn(hub);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -1282,19 +1167,14 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
         assert!(!screen.contains("Paste anyway"));
         assert!(!screen.contains(RAW_CONTROL_TOKEN));
         assert!(!screen.contains(RAW_SECOND_TOKEN));
-        let before_consent = read_session_screen(hub.endpoint(), &identity);
-        assert!(!before_consent.contains(CONSENT_FIRST_ACCEPTED));
-        assert!(!before_consent.contains(CONSENT_SECOND_ACCEPTED));
 
+        // The session writes output while the dialog is open; the report
+        // proves the write happened before the dialog was dismissed. The pane
+        // shows it after cancel (screen-applied evidence below).
         fs::write(&output_trigger, b"emit\n").expect("release output while consent is open");
-        let during_dialog = wait_for_session_screen(
-            hub.endpoint(),
-            &mut screen,
-            &identity,
-            CONSENT_OUTPUT_MARKER,
+        wait_for_fifo_report(&output_written, screen.remaining(SCREEN_DEADLINE)).unwrap_or_else(
+            |cause| panic!("layer={LAYER} step=dialog_output_written cause={cause}"),
         );
-        assert!(!during_dialog.contains(CONSENT_FIRST_ACCEPTED));
-        assert!(!during_dialog.contains(CONSENT_SECOND_ACCEPTED));
         assert!(screen.contains("Unsafe paste blocked"));
 
         tui.write_all(b"\r");
@@ -1306,9 +1186,6 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let armed = read_session_screen(hub.endpoint(), &identity);
-        assert!(!armed.contains(CONSENT_FIRST_ACCEPTED));
-        assert!(!armed.contains(CONSENT_SECOND_ACCEPTED));
         tui.write_all(b"\r");
         let terminal = screen
             .wait_for(
@@ -1318,9 +1195,6 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let cancelled = read_session_screen(hub.endpoint(), &identity);
-        assert!(!cancelled.contains(CONSENT_FIRST_ACCEPTED));
-        assert!(!cancelled.contains(CONSENT_SECOND_ACCEPTED));
         screen
             .wait_for(
                 "dialog_output_visible_after_cancel",
@@ -1342,6 +1216,10 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
+        // Ordered barrier: the shell handles lines in order, so a paste that
+        // leaked before consent would have printed before this echo.
+        assert!(!screen.contains(CONSENT_FIRST_ACCEPTED));
+        assert!(!screen.contains(CONSENT_SECOND_ACCEPTED));
         tui.paste(UNSAFE_PASTE);
         screen
             .wait_for(
@@ -1362,9 +1240,6 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let one_click = read_session_screen(hub.endpoint(), &identity);
-        assert!(!one_click.contains(CONSENT_FIRST_ACCEPTED));
-        assert!(!one_click.contains(CONSENT_SECOND_ACCEPTED));
         tui.write_all(b"\t");
         tui.write_all(b"\r");
         screen
@@ -1385,11 +1260,15 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert!(!screen.contains(RAW_CONTROL_TOKEN));
         assert!(!screen.contains(RAW_SECOND_TOKEN));
-        let accepted = read_session_screen(hub.endpoint(), &identity);
-        assert!(accepted.contains(CONSENT_FIRST_ACCEPTED));
-        assert!(accepted.contains(CONSENT_SECOND_ACCEPTED));
-        assert!(!accepted.contains(RAW_CONTROL_TOKEN));
-        assert!(!accepted.contains(RAW_SECOND_TOKEN));
+        // Arming alone never sends: the consented retry is the only delivery.
+        for accepted in [CONSENT_FIRST_ACCEPTED, CONSENT_SECOND_ACCEPTED] {
+            let count = screen
+                .rows()
+                .iter()
+                .filter(|row| row.contains(accepted))
+                .count();
+            assert_eq!(count, 1, "{accepted} must be delivered exactly once");
+        }
 
         println!(
             "t_s3: consent session={} subscription={} generation={} zero-before-consent cancel-safe output-preserved retry-accepted raw-payload-hidden",
@@ -1403,17 +1282,13 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s4_outer_pty_resize_reaches_the_attached_session() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut identity = Identity::default();
-    spawn_session(
-        hub.endpoint(),
-        &mut identity,
-        test_deadline,
-        RESIZE_SHELL_COMMAND,
-    );
+    spawn_session(hub.endpoint(), &mut identity, RESIZE_SHELL_COMMAND);
     {
         let mut tui = TuiChild::spawn(hub);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -1435,15 +1310,19 @@ fn t_s4_outer_pty_resize_reaches_the_attached_session() {
             MARKER_ONE,
             None,
         );
-        // Attach fits the session PTY to the drawn pane, not the spawn default.
+        // The session reports its own PTY size. The pane on screen was drawn
+        // before this input is read, and the TUI sends RESIZE right after each
+        // draw, so the report follows the fit on the same input stream.
         let initial_size = screen.wait_for_pane("attached_pane_measured", None, &identity);
-        wait_for_terminal_size(
-            hub.endpoint(),
-            &mut screen,
-            &identity,
-            "attach_fits_pane",
-            initial_size,
-        );
+        tui.type_line("tui-report-size");
+        screen
+            .wait_for(
+                "session_reports_attached_pty",
+                &format!("size:{}:{}", initial_size.0, initial_size.1),
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
 
         // One outer resize, with no follow-up event, must reach the session.
         const RESIZED_ROWS: u16 = 30;
@@ -1451,13 +1330,6 @@ fn t_s4_outer_pty_resize_reaches_the_attached_session() {
         tui.resize(RESIZED_ROWS, RESIZED_COLS);
         screen.resize(RESIZED_ROWS, RESIZED_COLS);
         let resized = screen.wait_for_pane("resized_pane_measured", Some(initial_size), &identity);
-        wait_for_terminal_size(
-            hub.endpoint(),
-            &mut screen,
-            &identity,
-            "resize_fits_pane",
-            resized,
-        );
 
         let terminal = screen
             .wait_for(
@@ -1494,16 +1366,12 @@ fn t_s4_outer_pty_resize_reaches_the_attached_session() {
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let mut guard = start_hub(&candidate);
     let mut stale_identity = Identity::default();
-    spawn_session(
-        guard.hub().endpoint(),
-        &mut stale_identity,
-        test_deadline,
-        SHELL_COMMAND,
-    );
+    spawn_session(guard.hub().endpoint(), &mut stale_identity, SHELL_COMMAND);
     {
         let mut tui = TuiChild::spawn(guard.hub());
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -1556,12 +1424,7 @@ fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session()
         );
 
         let mut fresh_identity = Identity::default();
-        spawn_session(
-            guard.hub().endpoint(),
-            &mut fresh_identity,
-            test_deadline,
-            SHELL_COMMAND,
-        );
+        spawn_session(guard.hub().endpoint(), &mut fresh_identity, SHELL_COMMAND);
         assert_ne!(fresh_identity.session_id, stale_identity.session_id);
         let fresh_session_row = format!("{} · running", fresh_identity.session_id);
         screen
@@ -1572,14 +1435,6 @@ fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session()
                 &fresh_identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let detached_hold = Instant::now() + screen.remaining(Duration::from_millis(500));
-        screen.pump(detached_hold);
-        assert!(!screen.contains(SESSION_READY_MARKER));
-        assert!(!screen.contains("[ Detach ]"));
-        assert!(
-            occupancies(guard.hub().endpoint(), &fresh_identity).is_empty(),
-            "a fresh session must stay detached until explicit activation"
-        );
         let fresh_occupancy = attach_and_echo(
             guard.hub().endpoint(),
             &mut tui,
@@ -1591,6 +1446,14 @@ fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session()
         );
         assert!(!screen.contains(&stale_session_row));
         assert!(!screen.contains(&format!("echo:{MARKER_ONE}")));
+        // The explicit attach has completed on the TUI's control connection,
+        // so any earlier automatic attach would also hold an occupancy. The
+        // request-boundary invariant is unit-tested in app.rs.
+        assert_eq!(
+            occupancies(guard.hub().endpoint(), &fresh_identity),
+            vec![fresh_occupancy.clone()],
+            "the fresh session is attached only by explicit activation"
+        );
         println!(
             "t_s5: reconnected stale_session={} stale_subscription={} fresh_session={} fresh_subscription={} input-output-visible",
             stale_identity.session_id,
@@ -1641,37 +1504,42 @@ fn admit_launch_target(endpoint: &DaemonEndpoint, root: &Path, identity: &Identi
     expect_ok("create_spawn_target", identity, response);
 }
 
-/// Wait until the Hub lists exactly one running session, and adopt its id.
-fn adopt_only_running_session(endpoint: &DaemonEndpoint, identity: &mut Identity) {
-    let started = Instant::now();
-    let until = started + SESSION_RUNNING_DEADLINE;
-    loop {
-        let response = expect_ok(
-            "list_sessions",
+/// Adopt the id of the one session the launch dialog started.
+///
+/// The TUI renders its running row from the Hub's session entity events, so
+/// once that row is visible one Hub listing names it.
+fn adopt_launched_session(endpoint: &DaemonEndpoint, screen: &mut Screen, identity: &mut Identity) {
+    screen
+        .wait_for(
+            "launched_session_running",
+            " · running",
+            SESSION_RUNNING_DEADLINE,
             identity,
-            request(endpoint, DaemonRequest::ListSessions).expect("list sessions transport"),
-        );
-        let running = response
-            .sessions
-            .iter()
-            .filter(|session| session.lifecycle == "running")
-            .map(|session| session.session_id.clone())
-            .collect::<Vec<_>>();
-        if let [session_id] = running.as_slice() {
-            identity.session_id = session_id.clone();
-            return;
-        }
-        assert!(
-            Instant::now() < until,
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    let response = expect_ok(
+        "list_sessions",
+        identity,
+        request(endpoint, DaemonRequest::ListSessions).expect("list sessions transport"),
+    );
+    let running = response
+        .sessions
+        .iter()
+        .filter(|session| session.lifecycle == "running")
+        .map(|session| session.session_id.clone())
+        .collect::<Vec<_>>();
+    let [session_id] = running.as_slice() else {
+        panic!(
             "layer={LAYER} step=launch_dialog_session_running cause=expected one running session, got {running:?}"
         );
-        thread::sleep(Duration::from_millis(200));
-    }
+    };
+    identity.session_id = session_id.clone();
 }
 
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s6_launch_dialog_spawns_a_session_type_at_an_admitted_target() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
@@ -1699,7 +1567,7 @@ fn t_s6_launch_dialog_spawns_a_session_type_at_an_admitted_target() {
             "launch_session_type_visible",
             &format!("[ {LAUNCH_SESSION_TYPE_LABEL} · "),
         );
-        adopt_only_running_session(hub.endpoint(), &mut identity);
+        adopt_launched_session(hub.endpoint(), &mut screen, &mut identity);
         let session_row = format!("{} · running", identity.session_id);
         screen
             .wait_for(
@@ -1734,15 +1602,15 @@ fn t_s6_launch_dialog_spawns_a_session_type_at_an_admitted_target() {
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
     let mut first = Identity::default();
-    spawn_session(hub.endpoint(), &mut first, test_deadline, SHELL_COMMAND);
-    thread::sleep(Duration::from_millis(5));
+    spawn_session(hub.endpoint(), &mut first, SHELL_COMMAND);
     let mut second = Identity::default();
-    spawn_session(hub.endpoint(), &mut second, test_deadline, SHELL_COMMAND);
+    spawn_session(hub.endpoint(), &mut second, SHELL_COMMAND);
     assert_ne!(first.session_id, second.session_id);
     {
         let mut tui = TuiChild::spawn(hub);
@@ -1768,14 +1636,11 @@ fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
             None,
         );
 
-        // Ctrl+J is 0x0A, a newline to a shell. It must select the other
-        // session instead; Enter on the focused row then attaches it.
+        // Ctrl+J (0x0A) would be a newline to the shell; it must select the
+        // other session instead, and Enter on the focused row attaches it.
+        // The TUI reads its input in order, so neither key needs a settle.
         tui.write_all(b"\x0a");
-        let settle = Instant::now() + screen.remaining(Duration::from_millis(300));
-        screen.pump(settle);
         tui.write_all(b"\r");
-        let occupancy = wait_for_occupancy(hub.endpoint(), &mut screen, &second, None);
-        second.adopt(&occupancy);
         screen
             .wait_for(
                 "second_session_attached",
@@ -1784,14 +1649,6 @@ fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
                 &second,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
-        let first_screen = read_session_screen(hub.endpoint(), &first);
-        assert_eq!(
-            first_screen.matches("echo:").count(),
-            1,
-            "Ctrl+J and Enter must not reach the first session: {first_screen:?}"
-        );
-
-        // Focus the second terminal and prove keys reach it.
         let ready = screen
             .wait_for(
                 "second_session_ready",
@@ -1801,8 +1658,6 @@ fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
         tui.click(ready.0, ready.1);
-        let focus_until = Instant::now() + screen.remaining(Duration::from_millis(200));
-        screen.pump(focus_until);
         tui.type_line(MARKER_TWO);
         screen
             .wait_for(
@@ -1812,26 +1667,63 @@ fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
                 &second,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
+        let occupancy = attached_occupancy(hub.endpoint(), &second, None);
+        second.adopt(&occupancy);
 
-        // Ctrl+P (0x10) moves focus to the toolbar, so q quits instead of
-        // reaching the shell.
+        // Ordered barrier for "Ctrl+J and Enter never reached the first
+        // session": return to it and type. Its shell handles input in order,
+        // so a stray newline would already show as an empty echo line.
+        tui.write_all(b"\x0b");
+        tui.write_all(b"\r");
+        screen
+            .wait_for(
+                "first_session_reattached",
+                &format!("Terminal · {}", first.session_id),
+                SCREEN_DEADLINE,
+                &first,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let ready = screen
+            .wait_for(
+                "first_session_history_visible",
+                &format!("echo:{MARKER_ONE}"),
+                SCREEN_DEADLINE,
+                &first,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(ready.0, ready.1);
+        tui.type_line(MARKER_THREE);
+        screen
+            .wait_for(
+                "first_barrier_echo_visible",
+                &format!("echo:{MARKER_THREE}"),
+                SCREEN_DEADLINE,
+                &first,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let echo_rows = screen
+            .rows()
+            .iter()
+            .filter(|row| row.contains("echo:"))
+            .count();
+        assert_eq!(
+            echo_rows,
+            2,
+            "only the two typed markers may echo in the first session: {:?}",
+            screen.rows()
+        );
+
+        // Ctrl+P (0x10) moves focus to the toolbar, so q quits the TUI; a q
+        // delivered to the shell would leave the TUI running instead.
         tui.write_all(b"\x10");
-        let settle = Instant::now() + screen.remaining(Duration::from_millis(300));
-        screen.pump(settle);
         tui.write_all(b"q");
         let started = Instant::now();
         let deadline = screen.remaining(EXIT_DEADLINE);
         let status = tui.wait_exit(started + deadline).unwrap_or_else(|cause| {
-            let failure =
-                screen.failure("tui_exit_after_ctrl_p", &second, deadline, started, cause);
+            let failure = screen.failure("tui_exit_after_ctrl_p", &first, deadline, started, cause);
             panic!("{failure}");
         });
         assert!(status.success(), "TUI exited unsuccessfully: {status:?}");
-        let second_screen = read_session_screen(hub.endpoint(), &second);
-        assert!(
-            !second_screen.lines().any(|line| line.trim() == "q"),
-            "q after Ctrl+P must not reach the session: {second_screen:?}"
-        );
         println!(
             "t_s7: ctrl+j switched {} -> {} without stray input; ctrl+p left the terminal; q quit",
             first.session_id, second.session_id
@@ -1854,11 +1746,18 @@ struct PersistentHub {
     candidate: Candidate,
     root: ShortTempRoot,
     endpoint: DaemonEndpoint,
-    child: Option<std::process::Child>,
+    running: Option<RunningHub>,
     starts: u32,
     /// Process groups this test created: one per Hub start. Session workers
     /// run in the group of the Hub start that spawned them.
     owned_groups: Vec<u32>,
+}
+
+/// One running Hub start: its pid and the exit status sent by a thread that
+/// owns the child and blocks in `wait`.
+struct RunningHub {
+    pid: u32,
+    exited: Receiver<std::io::Result<std::process::ExitStatus>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1878,7 +1777,7 @@ impl PersistentHub {
             candidate,
             root,
             endpoint,
-            child: None,
+            running: None,
             starts: 0,
             owned_groups: Vec::new(),
         };
@@ -1921,8 +1820,16 @@ impl PersistentHub {
             .process_group(0)
             .spawn()
             .expect("spawn candidate hub");
-        self.owned_groups.push(child.id());
-        self.child = Some(child);
+        let pid = child.id();
+        self.owned_groups.push(pid);
+        let (exit_tx, exited) = mpsc::channel();
+        thread::spawn(move || {
+            let mut child = child;
+            let _ = exit_tx.send(child.wait());
+        });
+        self.running = Some(RunningHub { pid, exited });
+        // DEFECT (pending in tests/timer_guard.rs): polls Status until
+        // `botster-hub start --ready-fd` provides a readiness signal.
         let until = Instant::now() + SESSION_RUNNING_DEADLINE;
         while request(&self.endpoint, DaemonRequest::Status).is_err() {
             assert!(
@@ -1935,7 +1842,7 @@ impl PersistentHub {
     }
 
     fn stop(&mut self, how: HubStop) {
-        assert!(self.child.is_some(), "hub is running before stop");
+        let running = self.running.as_ref().expect("hub is running before stop");
         match how {
             HubStop::Graceful => {
                 let status = std::process::Command::new(&self.candidate.hub_bin)
@@ -1948,50 +1855,34 @@ impl PersistentHub {
                     .expect("run hub shutdown");
                 assert!(status.success(), "hub shutdown failed: {status:?}");
             }
-            HubStop::Kill => self
-                .child
-                .as_mut()
-                .expect("hub child handle")
-                .kill()
-                .expect("SIGKILL the hub process"),
+            HubStop::Kill => kill_pid(running.pid),
         }
-        // Keep the handle until the process has exited, so Drop can still
-        // kill and reap it after a failed or slow stop.
-        let until = Instant::now() + EXIT_DEADLINE;
-        loop {
-            let child = self.child.as_mut().expect("hub child handle");
-            if child.try_wait().expect("poll hub exit").is_some() {
-                self.child = None;
-                return;
-            }
-            assert!(
-                Instant::now() < until,
-                "layer={LAYER} step=persistent_hub_stop cause=hub did not exit after {how:?}"
-            );
-            thread::sleep(Duration::from_millis(50));
+        // timer: deadline — the stopped Hub exits within the exit budget; expiry fails the stop
+        match running.exited.recv_timeout(EXIT_DEADLINE) {
+            Ok(_) => self.running = None,
+            Err(_) => panic!(
+                "layer={LAYER} step=persistent_hub_stop cause=hub pid {} did not exit after {how:?}",
+                running.pid
+            ),
         }
     }
 
     /// Stop the Hub, kill every group this test created, and assert that no
     /// member of those groups survives.
     fn finish(mut self) {
-        if self.child.is_some() {
+        if self.running.is_some() {
             self.stop(HubStop::Graceful);
         }
         kill_groups(&self.owned_groups);
-        let until = Instant::now() + EXIT_DEADLINE;
-        loop {
-            let survivors = group_members(&self.owned_groups);
-            if survivors.is_empty() {
-                println!("cleanup: owned_groups={:?} survivors=0", self.owned_groups);
-                return;
-            }
-            assert!(
-                Instant::now() < until,
-                "layer={LAYER} step=cleanup cause=processes survive in owned groups: {survivors:?}"
-            );
-            thread::sleep(Duration::from_millis(100));
-        }
+        let members = group_members(&self.owned_groups);
+        let pids = members.iter().map(|(pid, _, _)| *pid).collect::<Vec<_>>();
+        wait_for_exits(&pids, EXIT_DEADLINE);
+        let survivors = group_members(&self.owned_groups);
+        assert!(
+            survivors.is_empty(),
+            "layer={LAYER} step=cleanup cause=processes survive in owned groups: {survivors:?}"
+        );
+        println!("cleanup: owned_groups={:?} survivors=0", self.owned_groups);
     }
 
     fn restart_after(&mut self, how: HubStop) {
@@ -2002,16 +1893,62 @@ impl PersistentHub {
 
 impl Drop for PersistentHub {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.stop(HubStop::Graceful);
-            }));
-        }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(running) = self.running.take() {
+            kill_pid(running.pid);
+            // timer: deadline — the killed Hub is reaped within the exit budget; expiry leaves the waiter thread
+            let _ = running.exited.recv_timeout(EXIT_DEADLINE);
         }
         kill_groups(&self.owned_groups);
+    }
+}
+
+fn kill_pid(pid: u32) {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    // SAFETY: plain kill(2) on a pid this test started.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// Wait until every pid has exited (kqueue EVFILT_PROC NOTE_EXIT, which also
+/// reports processes that are not our children), bounded by `deadline`.
+fn wait_for_exits(pids: &[u32], deadline: Duration) {
+    // SAFETY: a private kqueue; each kevent struct is fully initialized.
+    unsafe {
+        let queue = libc::kqueue();
+        assert!(queue >= 0, "kqueue failed");
+        let mut pending = 0;
+        for pid in pids {
+            let change = libc::kevent {
+                ident: *pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // A pid that already exited fails with ESRCH and needs no wait.
+            if libc::kevent(queue, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 {
+                pending += 1;
+            }
+        }
+        // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
+        let until = Instant::now() + deadline;
+        while pending > 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            let timeout = libc::timespec {
+                tv_sec: left.as_secs() as libc::time_t,
+                tv_nsec: libc::c_long::from(left.subsec_nanos() as i32),
+            };
+            let mut event: libc::kevent = std::mem::zeroed();
+            // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
+            let ready = libc::kevent(queue, std::ptr::null(), 0, &mut event, 1, &timeout);
+            if ready <= 0 {
+                break;
+            }
+            pending -= 1;
+        }
+        libc::close(queue);
     }
 }
 
@@ -2068,7 +2005,7 @@ fn verify_candidate_hashes(candidate: &Candidate) {
 /// Live processes in the given process groups, as (pid, pgid, command).
 fn group_members(groups: &[u32]) -> Vec<(u32, u32, String)> {
     let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,pgid=,command="])
+        .args(["-axo", "pid=,pgid=,stat=,command="])
         .output()
         .expect("run ps");
     // An empty listing from a failed ps must not read as "no survivors".
@@ -2079,6 +2016,10 @@ fn group_members(groups: &[u32]) -> Vec<(u32, u32, String)> {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse().ok()?;
             let pgid = fields.next()?.parse().ok()?;
+            // An exited process awaiting its reaper is not a survivor.
+            if fields.next()?.starts_with('Z') {
+                return None;
+            }
             let command = fields.collect::<Vec<_>>().join(" ");
             groups.contains(&pgid).then_some((pid, pgid, command))
         })
@@ -2122,15 +2063,11 @@ const COUNTING_SHELL_COMMAND: &str = "printf 'live-ready\\n'; n=0; while IFS= re
 /// route and echoes. The outcome is printed, and the recovery gate then
 /// requires that the same session process survived.
 fn restart_recovery(how: HubStop, label: &str) {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;
     let mut hub = PersistentHub::start(Candidate::from_env());
     let mut identity = Identity::default();
-    spawn_session(
-        hub.endpoint(),
-        &mut identity,
-        test_deadline,
-        COUNTING_SHELL_COMMAND,
-    );
+    spawn_session(hub.endpoint(), &mut identity, COUNTING_SHELL_COMMAND);
     let workers = owned_session_workers(&hub.owned_groups);
     assert!(
         !workers.is_empty(),
@@ -2172,8 +2109,15 @@ fn restart_recovery(how: HubStop, label: &str) {
             CONTROL_RECONNECT_DEADLINE,
             &identity,
         );
-        let settle = Instant::now() + screen.remaining(Duration::from_millis(1500));
-        screen.pump(settle);
+        // The recovered session's row comes from the new connection's entity
+        // snapshot. A session that is not running shows another state and is
+        // classified from the Hub listing below.
+        let _ = screen.wait_for(
+            "recovered_row_running",
+            &running_row,
+            SCREEN_DEADLINE,
+            &identity,
+        );
         let lifecycle = listed_lifecycle(hub.endpoint(), &identity);
         println!(
             "{label}: owned_groups={:?} workers_after_restart={:?}",
@@ -2198,24 +2142,23 @@ fn restart_recovery(how: HubStop, label: &str) {
                         || occupancy.generation != before.generation,
                     "recovery must use a fresh terminal route"
                 );
-                // New output on the fresh route decides process continuity.
-                let started = Instant::now();
-                let continuity = loop {
-                    let text = read_session_screen(hub.endpoint(), &identity);
-                    if text.contains("seq:2") {
-                        break "same process (seq:2)";
-                    }
-                    if text.matches("seq:1").count() > 1
-                        || (text.contains(&format!("echo:{MARKER_TWO}"))
-                            && !text.contains(&format!("echo:{MARKER_ONE}")))
-                    {
-                        break "new process (seq restarted)";
-                    }
-                    assert!(
-                        started.elapsed() < SCREEN_DEADLINE,
-                        "layer={LAYER} step=post_recovery_output cause=no counted output after recovery: {text:?}"
-                    );
-                    screen.pump(Instant::now() + Duration::from_millis(100));
+                // New output on the fresh route decides process continuity:
+                // the counter line printed after the marker's echo.
+                let counted = screen
+                    .wait_until(
+                        "post_recovery_count",
+                        SCREEN_DEADLINE,
+                        &identity,
+                        |screen| counter_after_echo(&screen.rows(), MARKER_TWO),
+                        |screen| {
+                            format!("no count after the recovery echo: {:?}", screen.tail_rows())
+                        },
+                    )
+                    .unwrap_or_else(|failure| panic!("{failure}"));
+                let continuity = if counted == 2 {
+                    "same process (seq:2)"
+                } else {
+                    "new process (seq restarted)"
                 };
                 let history = screen.contains(&format!("echo:{MARKER_ONE}"));
                 detach_and_quit(&mut tui, &mut screen, &identity);
@@ -2238,15 +2181,20 @@ fn restart_recovery(how: HubStop, label: &str) {
                 format!("reported lifecycle={other}")
             }
             None => {
-                let started = Instant::now();
-                while screen.contains(&identity.session_id) {
-                    assert!(
-                        started.elapsed() < SCREEN_DEADLINE,
-                        "layer={LAYER} step=gone_row_removed cause=TUI still shows {} after the Hub dropped it",
-                        identity.session_id
-                    );
-                    screen.pump(Instant::now() + Duration::from_millis(100));
-                }
+                screen
+                    .wait_until(
+                        "gone_row_removed",
+                        SCREEN_DEADLINE,
+                        &identity,
+                        |screen| (!screen.contains(&identity.session_id)).then_some(()),
+                        |_| {
+                            format!(
+                                "TUI still shows {} after the Hub dropped it",
+                                identity.session_id
+                            )
+                        },
+                    )
+                    .unwrap_or_else(|failure| panic!("{failure}"));
                 quit_with_ctrl_p(&mut tui, &mut screen, &identity);
                 "gone (hub no longer lists the session)".to_string()
             }
@@ -2264,11 +2212,25 @@ fn restart_recovery(how: HubStop, label: &str) {
     hub.finish();
 }
 
+/// The `seq:<n>` count printed right after `echo:<marker>`, if visible.
+fn counter_after_echo(rows: &[String], marker: &str) -> Option<u64> {
+    let echo = format!("echo:{marker}");
+    let at = rows.iter().position(|row| row.contains(&echo))?;
+    rows[at + 1..].iter().find_map(|row| {
+        let (_, count) = row.split_once("seq:")?;
+        count
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok()
+    })
+}
+
 /// Ctrl+P moves focus off the terminal, then q quits; the exit must succeed.
 fn quit_with_ctrl_p(tui: &mut TuiChild, screen: &mut Screen, identity: &Identity) {
+    // The TUI reads its input in order: Ctrl+P is applied before q.
     tui.write_all(b"\x10");
-    let settle = Instant::now() + screen.remaining(Duration::from_millis(300));
-    screen.pump(settle);
     tui.write_all(b"q");
     let started = Instant::now();
     let deadline = screen.remaining(EXIT_DEADLINE);
