@@ -2462,12 +2462,13 @@ const FLOOD_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo mi
 
 /// Screen samples showing flood output that must all show the attachment
 /// before the stop key. Samples are screen observations, normally after a
-/// batch of PTY output (one more at the deadline), not rendered frames. 300 samples did not reproduce the Core route close; see README
-/// Known issues.
+/// batch of PTY output (one more at the deadline), not rendered frames.
+/// Before Core `ac35e32`, 300 samples did not reproduce the route close;
+/// 3000 reproduced it in most runs.
 const FLOOD_SAMPLES: usize = 3000;
 
 #[test]
-#[ignore = "pending Core write-budget fix (counts output-wake attempts, not reader liveness); run with the candidate env and --ignored --exact"]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
     // timer: deadline — whole-test budget shared by every wait; expiry fails the test
     let test_deadline = Instant::now() + TEST_DEADLINE;

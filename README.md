@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `8ff59ed395faa2f13abcc636f811337845721c9f` |
+| `botster-hub-client` / live hub | Hub `38f54ce8d905a1e64b4bbf2969aed3bf25850c1c` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `8ff59ed395faa2f13abcc636f811337845721c9f` (`@trybotster/hub-test-support@0.1.46`) |
+| `botster-hub-test-support` package | Hub git `38f54ce8d905a1e64b4bbf2969aed3bf25850c1c` (`@trybotster/hub-test-support@0.1.46`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `a499d5afa853df66629825538a1d51014884d50d` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `ac35e32d7d5703178c56aff95f6904c9b1ce3b53` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -188,7 +188,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`8ff59ed395faa2f13abcc636f811337845721c9f` (same Hub pin as Foundation above).
+`38f54ce8d905a1e64b4bbf2969aed3bf25850c1c` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -252,17 +252,23 @@ view, and that no Shift key reaches the session.
 T-S10 floods a session with `yes` and requires the route to stay attached for
 3000 screen samples of flood output (screen observations, normally after a
 batch of PTY output), the stop key to reach the session while `yes` still runs,
-and later input to echo. It is `#[ignore]`d and not in `script/test-live-tui`
-until the Core write-budget fix lands; see Known issues. Run it alone with
-`cargo test -p botster-tui --test live_tui
-t_s10_output_flood_keeps_the_route_attached_and_responsive -- --ignored --exact`
-and the candidate environment above.
+and later input to echo.
 
-Current pins, September 26, 2026: T-S1 to T-S9 passed against the Hub
-candidate built from Hub `8ff59ed3` (Core `a499d5a`) with Rust 1.97.0; the
-locked workspace run passed 177 unit tests and the integration tests. T-S8a,
-T-S8b, and T-S1 each passed 30 of 30 repeated runs (1-minute load at the
-start of each 30-run batch: 19.49, 23.77, and 16.77). T-S10 fails on this candidate; see Known issues.
+Before Core `ac35e32`, sustained output closed the route: the pane returned to
+`attaching` with `terminal subscription closed (core_adapter_closed)`. T-S10
+failed 5 of 7 runs on Core `891e220` (Hub candidate `f18179ec`), 1 of 1 on Hub
+`178512e1`, and 7 of 7 on Core `a499d5a` with Hub `8ff59ed3`. Core `ac35e32`
+stops counting session-output wakes toward the adapter write-attempt budget.
+
+Current pins, September 26, 2026: T-S1 to T-S10 passed against the Hub
+candidate built from Hub `38f54ce8` (Core `ac35e32`) with Rust 1.97.0, and
+T-S10 passed 10 of 10 repeated runs; the locked workspace run passed 177 unit
+tests and the integration tests.
+
+Hub `8ff59ed3` (Core `a499d5a`), September 26, 2026: T-S1 to T-S9 passed with
+Rust 1.97.0; the locked workspace run passed 177 unit tests and the
+integration tests. T-S8a, T-S8b, and T-S1 each passed 30 of 30 repeated runs
+(1-minute load at the start of each 30-run batch: 19.49, 23.77, and 16.77).
 
 Protocol 10 execution, September 25, 2026: T-S1 to T-S7 passed against the Hub
 candidate built from Hub `e3dacd99` (production code equal to the `a69b70cc`
@@ -311,28 +317,6 @@ Session types are authoritative Hub descriptors consumed through the
 
 ## Known issues
 
-### Sustained output closes the terminal route (pending Core write-budget fix)
-
-**Symptom.** While a session produces output continuously (for example
-`yes`), the TUI can lose the route: the pane returns to `attaching` and shows
-`terminal subscription closed (core_adapter_closed)`. In the Hub client
-contract that reason means Core closed the bound adapter while the connection
-stayed up. The TUI did not shed the route (a TUI shed reports a route fault and
-re-attaches).
-
-**Suspected cause (not proven).** Core `a499d5a` ends a bound route when its
-adapter refuses writes for a full `WRITE_ATTEMPT_BUDGET` (512 attempts) twice
-without a successful write; the first exhaustion resyncs. The budget counts
-write attempts on output wakes, not reader liveness, so a live reader behind a
-fast producer could exhaust it. Core also hard-stops a route on other paths
-(for example adapter close, epoch exhaustion, and the preserved-frame
-ceiling), and no trace yet shows which path closed these routes.
-
-**Observed (T-S10, 3000 flood screen samples).** Core `891e220`: 5 of 7 runs failed
-(Hub candidate `f18179ec`) and 1 of 1 (Hub `178512e1`); the five failures
-with a recorded count ended after 330 to 2104 samples. Core `a499d5a` with Hub
-`8ff59ed3`: 4 of 4 runs failed, after 36 to 1897 samples.
-
 ### Output can stop after a Hub restart (owner unresolved; fix after cutover)
 
 **Symptom.** After the Hub restarts (graceful `botster-hub shutdown` or a
@@ -355,7 +339,7 @@ shown that a second reattach restores output.
 | `23b0feaa` | none | about 18.5 at the failure | 1 of 4 (loop stopped at the failure) |
 | `23b0feaa` | TUI route counters (diagnostic branch) | 4.9 to 9.1 | 0 of 30 |
 | Hub diagnostic builds (v3 file trace: 14; ring trace: 41) | Hub trace; TUI counters on the 41 ring runs | 5 to 11 where recorded | 0 of 55 |
-| `8ff59ed3` (Core `a499d5a`, current pins) | none | 19.49 and 23.77 at batch start | 0 of 60 (30 graceful, 30 SIGKILL) |
+| `8ff59ed3` (Core `a499d5a`) | none | 19.49 and 23.77 at batch start | 0 of 60 (30 graceful, 30 SIGKILL) |
 
 The same symptom also appeared once without a restart: on Hub `178512e1` (Core
 `891e220`), T-S1 failed 1 of 6 runs. The first attach showed a blank pane while
