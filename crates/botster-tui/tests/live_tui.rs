@@ -1097,8 +1097,24 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             .unwrap_or_else(|failure| panic!("{failure}"));
         tui.click(col, row);
         screen
-            .wait_for("detached_visible", "detached", SCREEN_DEADLINE, &identity)
+            .wait_for(
+                "detach_confirmed",
+                &format!("{} · detached", identity.session_id),
+                SCREEN_DEADLINE,
+                &identity,
+            )
             .unwrap_or_else(|failure| panic!("{failure}"));
+        // The pane shows "detached" only after the Hub's successful Detach
+        // response, which the Hub sends after retiring the route and Core has
+        // detached that generation: the release barrier for a fresh Status.
+        let after_detach = occupancies(hub.endpoint(), &identity);
+        assert!(
+            !after_detach.iter().any(|occupancy| {
+                occupancy.subscription_id == first.subscription_id
+                    && occupancy.generation == first.generation
+            }),
+            "the confirmed Detach must release the first attachment: {after_detach:?}"
+        );
         // Re-attach through the toolbar: the restored snapshot shows the first
         // echo, live input still works, and the Hub minted a new attachment.
         let second = attach_and_echo(
@@ -1915,95 +1931,140 @@ impl Drop for PersistentHub {
 }
 
 fn kill_pid(pid: u32) {
-    let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
-    // SAFETY: plain kill(2) on a pid this test started.
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
+    if let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     }
 }
 
-/// Wait until every pid has exited (kqueue EVFILT_PROC NOTE_EXIT, which also
-/// reports processes that are not our children), bounded by `deadline`.
-///
-/// Supported platform: macOS, where the live candidates run. Other platforms
-/// fail loudly rather than carry an unexercised pidfd path.
+/// A `Timespec` for the time left until `until` (zero once it has passed).
+fn timespec_until(until: Instant) -> rustix::event::Timespec {
+    let left = until.saturating_duration_since(Instant::now());
+    rustix::event::Timespec {
+        tv_sec: left
+            .as_secs()
+            .try_into()
+            .unwrap_or(rustix::event::Secs::MAX),
+        tv_nsec: left.subsec_nanos().into(),
+    }
+}
+
+/// Wait until every pid has exited, bounded by `deadline`. Both platforms
+/// report exits of processes that are not our children: kqueue EVFILT_PROC
+/// NOTE_EXIT on macOS, pidfd on Linux (both through rustix).
 #[cfg(target_os = "macos")]
 fn wait_for_exits(pids: &[u32], deadline: Duration) {
-    // SAFETY: a private kqueue; each kevent struct is fully initialized.
-    unsafe {
-        let queue = libc::kqueue();
-        assert!(
-            queue >= 0,
-            "kqueue failed: {}",
-            std::io::Error::last_os_error()
+    use rustix::event::kqueue::{
+        Event, EventFilter, EventFlags, ProcessEvents, kevent_timespec, kqueue,
+    };
+    let queue = kqueue().expect("kqueue");
+    let mut pending = 0;
+    for pid in pids {
+        let Some(pid) = i32::try_from(*pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            continue;
+        };
+        let change = Event::new(
+            EventFilter::Proc {
+                pid,
+                flags: ProcessEvents::EXIT,
+            },
+            EventFlags::ADD | EventFlags::ONESHOT,
+            std::ptr::null_mut(),
         );
-        let mut pending = 0;
-        for pid in pids {
-            let change = libc::kevent {
-                ident: *pid as libc::uintptr_t,
-                filter: libc::EVFILT_PROC,
-                flags: libc::EV_ADD | libc::EV_ONESHOT,
-                fflags: libc::NOTE_EXIT,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            if libc::kevent(queue, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 {
-                pending += 1;
-                continue;
-            }
-            let error = std::io::Error::last_os_error();
+        let mut none: Vec<Event> = Vec::new();
+        // SAFETY: the change names a pid, not a file descriptor; udata is null.
+        match unsafe { kevent_timespec(&queue, &[change], &mut none, None) } {
+            Ok(_) => pending += 1,
             // ESRCH: the pid already exited, so there is nothing to wait for.
-            assert_eq!(
-                error.raw_os_error(),
-                Some(libc::ESRCH),
-                "kqueue registration for pid {pid} failed: {error}"
-            );
+            Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => panic!("kqueue registration for pid {pid:?} failed: {error}"),
         }
-        // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
-        let until = Instant::now() + deadline;
-        while pending > 0 {
-            let left = until.saturating_duration_since(Instant::now());
-            let timeout = libc::timespec {
-                tv_sec: left.as_secs() as libc::time_t,
-                tv_nsec: libc::c_long::from(left.subsec_nanos() as i32),
-            };
-            let mut event: libc::kevent = std::mem::zeroed();
-            // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
-            let ready = libc::kevent(queue, std::ptr::null(), 0, &mut event, 1, &timeout);
-            if ready == 0 {
-                break;
-            }
-            if ready < 0 {
-                let error = std::io::Error::last_os_error();
-                assert_eq!(
-                    error.raw_os_error(),
-                    Some(libc::EINTR),
-                    "kqueue wait failed: {error}"
-                );
-                continue;
-            }
-            pending -= 1;
+    }
+    // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
+    let until = Instant::now() + deadline;
+    let mut events: Vec<Event> = Vec::with_capacity(pending.max(1));
+    while pending > 0 {
+        events.clear();
+        let timeout = timespec_until(until);
+        // SAFETY: no changes; the kernel only fills `events`.
+        match unsafe { kevent_timespec(&queue, &[], &mut events, Some(&timeout)) } {
+            Ok(0) => break,
+            Ok(ready) => pending = pending.saturating_sub(ready),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("kqueue wait failed: {error}"),
         }
-        libc::close(queue);
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn wait_for_exits(_pids: &[u32], _deadline: Duration) {
-    panic!(
-        "layer={LAYER} step=cleanup cause=the live tests support macOS only (kqueue EVFILT_PROC)"
-    );
+#[cfg(target_os = "linux")]
+fn wait_for_exits(pids: &[u32], deadline: Duration) {
+    use rustix::event::{PollFd, PollFlags, poll};
+    use rustix::process::{PidfdFlags, pidfd_open};
+    let mut fds = Vec::new();
+    for pid in pids {
+        let Some(pid) = i32::try_from(*pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            continue;
+        };
+        match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(fd) => fds.push(fd),
+            // ESRCH: the pid already exited, so there is nothing to wait for.
+            Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => panic!("pidfd_open for pid {pid:?} failed: {error}"),
+        }
+    }
+    // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
+    let until = Instant::now() + deadline;
+    while !fds.is_empty() {
+        let timeout = timespec_until(until);
+        let mut polled = fds
+            .iter()
+            .map(|fd| PollFd::new(fd, PollFlags::IN))
+            .collect::<Vec<_>>();
+        let ready = match poll(&mut polled, Some(&timeout)) {
+            Ok(ready) => ready,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => panic!("pidfd poll failed: {error}"),
+        };
+        if ready == 0 {
+            break;
+        }
+        let exited = polled
+            .iter()
+            .map(|entry| !entry.revents().is_empty())
+            .collect::<Vec<_>>();
+        drop(polled);
+        let mut index = 0;
+        fds.retain(|_| {
+            let keep = !exited[index];
+            index += 1;
+            keep
+        });
+    }
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("the live tests wait for process exits with kqueue (macOS) or pidfd (Linux)");
 
 /// SIGKILL every process group in `groups`; each was created by this test.
 fn kill_groups(groups: &[u32]) {
     for group in groups {
-        let status = std::process::Command::new("kill")
-            .args(["-9", "--", &format!("-{group}")])
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Exit status 1 means the group is already empty.
-        println!("cleanup: kill -9 -{group} -> {status:?}");
+        let Some(pgid) = i32::try_from(*group)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            continue;
+        };
+        // ESRCH means the group is already empty.
+        let result = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+        println!("cleanup: kill -9 -{group} -> {result:?}");
     }
 }
 

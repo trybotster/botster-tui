@@ -275,9 +275,9 @@ dependencies = [
  "crossterm",
  "futures-lite",
  "jsonschema",
- "libc",
  "portable-pty",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
 ]
