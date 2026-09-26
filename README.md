@@ -246,13 +246,8 @@ Hub `0437cc4f` (production code equal to the `46fa2e65` pin), Core
 `891e220295427fd93991638d7c62ba40fa25d4ae`, and kit `6c46910`, with Rust
 1.97.0, two jobs, and incremental compilation disabled: T-S1 to T-S7 passed,
 and the locked workspace run passed 171 unit tests and two integration tests.
-T-S8 passed 12 of 14 runs. **Known open issue (owner unresolved):** in 2 of
-14 runs the session recovered and the TUI reattached on a fresh route, but new
-output never reached the pane. In one of them the Hub's ReadScreen showed the
-echo, so the input reached the session and the loss is on the output path to
-the TUI; the other failure predates that diagnostic and is unclassified. The
-Hub restart-route trace is attributing this. These results establish the
-tested client behavior, not performance acceptance.
+T-S8 passed 12 of 14 runs; see Known issues below. These results establish
+the tested client behavior, not performance acceptance.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
@@ -284,6 +279,49 @@ Session types are authoritative Hub descriptors consumed through the
   `session_type_entity_subscriptions`. A Hub without the feature fails the
   handshake with a compatibility diagnostic.
 - Pins: see the Foundation table above.
+
+## Known issues
+
+### Output can stop after a Hub restart (owner unresolved; fix after cutover)
+
+**Symptom.** After the Hub restarts (graceful `botster-hub shutdown` or a
+killed Hub process) and the TUI reattaches to a recovered session, the pane can
+show the recovered history but no new output. In the two failures with Hub
+`ReadScreen` evidence, the session and its process survived, typed input
+reached the session, and `ReadScreen` showed the new output, which did not
+reach the TUI pane on the new route. The earliest failure predates that check
+and is unclassified.
+
+**Workaround.** Detach and attach the session again. This is **unverified**:
+the failure has not reproduced since the check was designed, so no run has
+shown that a second reattach restores output.
+
+**Observed rates (T-S8, graceful and SIGKILL alternating):**
+
+| Hub candidate | Tracing | 1-minute load | Failures |
+| --- | --- | --- | --- |
+| `0437cc4f` (matched) | none | not recorded | 2 of 14 |
+| `23b0feaa` | none | about 18.5 at the failure | 1 of 4 (loop stopped at the failure) |
+| `23b0feaa` | TUI route counters (diagnostic branch) | 4.9 to 9.1 | 0 of 30 |
+| Hub diagnostic builds (v3 file trace: 14; ring trace: 41) | Hub trace; TUI counters on the 41 ring runs | 5 to 11 where recorded | 0 of 55 |
+
+All three failures occurred on untraced Hub builds. The `23b0feaa` failure ran
+at a recorded 1-minute load of 18.52; the two `0437cc4f` failures have no
+recorded load, so no load condition is established. Whether the Hub never sent
+the output or the TUI dropped it is not yet known.
+
+**Evidence** (under `~/botster-evidence/tui-cutover-20260925/`):
+`t_s8-repeats/` (0437cc4f runs and preserved Hub root), `t_s8-23b0feaa-n30/`
+(the 23b0feaa failure, `TRACE-EVIDENCE-INDEX.md`, preserved Hub root),
+`t_s8-23b0feaa-with-tui-trace/`, `t_s8-ring-with-tui-trace/`,
+`t_s8-ring-with-tui-trace-v2/`, and `t_s8-diagnostic-v3/`.
+
+**Next step.** No synthetic load is used. Keep running T-S8 under naturally
+occurring load with the TUI route counters (diagnostic commits `792e7b8` and
+`8045cab` on branch `delivery/hub-cutover-20260925`, not on main) and, where
+available, the Hub ring capture, and record the load for every run. If the
+failure recurs, the counters place the loss at the Hub, the TUI receive path,
+or the projection; verify the reattach workaround in that same run.
 
 ## Caller-owned Workspaces Spawn acceptance
 
