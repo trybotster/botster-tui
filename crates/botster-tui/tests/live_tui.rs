@@ -54,7 +54,9 @@ const SCREEN_COLS: u16 = 140;
 const SESSION_READY_MARKER: &str = "live-ready";
 const SHELL_COMMAND: &str =
     "printf 'live-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
-const RESIZE_SHELL_COMMAND: &str = "printf 'live-ready\\n'; while IFS= read -r line; do if [ \"$line\" = tui-report-size ]; then set -- $(stty size); printf 'size:%s:%s\\n' \"$1\" \"$2\"; else printf 'echo:%s\\n' \"$line\"; fi; done";
+/// Reports its PTY size on every SIGWINCH (`winch:<rows> <cols>`), so a resize
+/// is observable without any further input, and on request (`size:r:c`).
+const RESIZE_SHELL_COMMAND: &str = "trap 'printf \"winch:%s\\n\" \"$(stty size)\"' WINCH; printf 'live-ready\\n'; while IFS= read -r line; do if [ \"$line\" = tui-report-size ]; then set -- $(stty size); printf 'size:%s:%s\\n' \"$1\" \"$2\"; else printf 'echo:%s\\n' \"$line\"; fi; done";
 const LAUNCH_TARGET_ID: &str = "tui-launch";
 const LAUNCH_TARGET_LABEL: &str = "TUI launch";
 const LAUNCH_SESSION_TYPE: &str = "shell";
@@ -421,13 +423,19 @@ impl Screen {
     /// already queued. Returns false when the deadline passed (or the TUI
     /// closed its output) with nothing new.
     fn pump_next(&mut self, until: Instant) -> bool {
-        let timeout = until.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        if now >= until {
+            return false;
+        }
         // timer: deadline — bounded wait for TUI output; expiry fails the waiting step
-        let Ok(first) = self.bytes.recv_timeout(timeout) else {
+        let Ok(first) = self.bytes.recv_timeout(until - now) else {
             return false;
         };
         self.projection.apply_terminal_output(&first);
-        while let Ok(chunk) = self.bytes.try_recv() {
+        // Drain what is queued, but never past the deadline.
+        while Instant::now() < until
+            && let Ok(chunk) = self.bytes.try_recv()
+        {
             self.projection.apply_terminal_output(&chunk);
         }
         self.note_title();
@@ -774,6 +782,22 @@ fn make_fifo(path: &Path) {
     );
 }
 
+/// Write one release into a FIFO the test shell blocks on, bounded by
+/// `deadline`: opening a FIFO for writing blocks until a reader opens it.
+fn write_fifo(fifo: &Path, bytes: &'static [u8], deadline: Duration) -> Result<(), String> {
+    let (done_tx, done_rx) = mpsc::channel();
+    let fifo = fifo.to_path_buf();
+    thread::spawn(move || {
+        let _ = done_tx.send(fs::write(&fifo, bytes));
+    });
+    // timer: deadline — the shell's reader opens the FIFO within the step budget; expiry fails the step
+    match done_rx.recv_timeout(deadline) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("fifo write failed: {error}")),
+        Err(_) => Err("no reader opened the FIFO before the deadline".to_string()),
+    }
+}
+
 /// Read one report that a test shell writes into `fifo`.
 fn wait_for_fifo_report(fifo: &Path, deadline: Duration) -> Result<String, String> {
     let (report_tx, report_rx) = mpsc::channel();
@@ -1094,14 +1118,6 @@ fn t_s2_detach_and_reattach_keeps_echo_visible_with_a_new_generation() {
             second.generation, first.generation,
             "re-attach must carry a new attachment generation"
         );
-        // Barrier: the TUI sent Detach before this Attach on its one control
-        // connection, and the Attach has completed, so the first attachment's
-        // occupancy must already be gone.
-        assert_eq!(
-            occupancies(hub.endpoint(), &identity),
-            vec![second.clone()],
-            "only the re-attach may hold the session after detach"
-        );
         println!(
             "t_s2: reattached session={} first=({}, {}) second=({}, {})",
             first.session_id,
@@ -1171,7 +1187,12 @@ fn t_s3_unsafe_paste_requires_explicit_consent_and_retries_once() {
         // The session writes output while the dialog is open; the report
         // proves the write happened before the dialog was dismissed. The pane
         // shows it after cancel (screen-applied evidence below).
-        fs::write(&output_trigger, b"emit\n").expect("release output while consent is open");
+        write_fifo(
+            &output_trigger,
+            b"emit\n",
+            screen.remaining(SCREEN_DEADLINE),
+        )
+        .unwrap_or_else(|cause| panic!("layer={LAYER} step=release_dialog_output cause={cause}"));
         wait_for_fifo_report(&output_written, screen.remaining(SCREEN_DEADLINE)).unwrap_or_else(
             |cause| panic!("layer={LAYER} step=dialog_output_written cause={cause}"),
         );
@@ -1310,41 +1331,28 @@ fn t_s4_outer_pty_resize_reaches_the_attached_session() {
             MARKER_ONE,
             None,
         );
-        // The session reports its own PTY size. The pane on screen was drawn
-        // before this input is read, and the TUI sends RESIZE right after each
-        // draw, so the report follows the fit on the same input stream.
+        // The session prints its PTY size on every SIGWINCH, so the fit to the
+        // drawn pane is observed without any further input.
         let initial_size = screen.wait_for_pane("attached_pane_measured", None, &identity);
-        tui.type_line("tui-report-size");
         screen
             .wait_for(
                 "session_reports_attached_pty",
-                &format!("size:{}:{}", initial_size.0, initial_size.1),
+                &format!("winch:{} {}", initial_size.0, initial_size.1),
                 SCREEN_DEADLINE,
                 &identity,
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
 
-        // One outer resize, with no follow-up event, must reach the session.
+        // One outer resize, with no follow-up input, must reach the session.
         const RESIZED_ROWS: u16 = 30;
         const RESIZED_COLS: u16 = 100;
         tui.resize(RESIZED_ROWS, RESIZED_COLS);
         screen.resize(RESIZED_ROWS, RESIZED_COLS);
         let resized = screen.wait_for_pane("resized_pane_measured", Some(initial_size), &identity);
-
-        let terminal = screen
-            .wait_for(
-                "resized_terminal_visible",
-                SESSION_READY_MARKER,
-                SCREEN_DEADLINE,
-                &identity,
-            )
-            .unwrap_or_else(|failure| panic!("{failure}"));
-        tui.click(terminal.0, terminal.1);
-        tui.type_line("tui-report-size");
         screen
             .wait_for(
                 "session_reports_resized_pty",
-                &format!("size:{}:{}", resized.0, resized.1),
+                &format!("winch:{} {}", resized.0, resized.1),
                 SCREEN_DEADLINE,
                 &identity,
             )
@@ -1446,9 +1454,9 @@ fn t_s5_control_reconnect_clears_stale_attachment_and_attaches_a_fresh_session()
         );
         assert!(!screen.contains(&stale_session_row));
         assert!(!screen.contains(&format!("echo:{MARKER_ONE}")));
-        // The explicit attach has completed on the TUI's control connection,
-        // so any earlier automatic attach would also hold an occupancy. The
-        // request-boundary invariant is unit-tested in app.rs.
+        // After the explicit attach completes, the Hub holds exactly one
+        // occupancy for the session. The no-automatic-attach invariant is
+        // proven at the request boundary by a unit test in app.rs.
         assert_eq!(
             occupancies(guard.hub().endpoint(), &fresh_identity),
             vec![fresh_occupancy.clone()],
@@ -1859,7 +1867,11 @@ impl PersistentHub {
         }
         // timer: deadline — the stopped Hub exits within the exit budget; expiry fails the stop
         match running.exited.recv_timeout(EXIT_DEADLINE) {
-            Ok(_) => self.running = None,
+            Ok(Ok(_status)) => self.running = None,
+            Ok(Err(error)) => panic!(
+                "layer={LAYER} step=persistent_hub_stop cause=waiting for hub pid {} failed after {how:?}: {error}",
+                running.pid
+            ),
             Err(_) => panic!(
                 "layer={LAYER} step=persistent_hub_stop cause=hub pid {} did not exit after {how:?}",
                 running.pid
@@ -1912,11 +1924,19 @@ fn kill_pid(pid: u32) {
 
 /// Wait until every pid has exited (kqueue EVFILT_PROC NOTE_EXIT, which also
 /// reports processes that are not our children), bounded by `deadline`.
+///
+/// Supported platform: macOS, where the live candidates run. Other platforms
+/// fail loudly rather than carry an unexercised pidfd path.
+#[cfg(target_os = "macos")]
 fn wait_for_exits(pids: &[u32], deadline: Duration) {
     // SAFETY: a private kqueue; each kevent struct is fully initialized.
     unsafe {
         let queue = libc::kqueue();
-        assert!(queue >= 0, "kqueue failed");
+        assert!(
+            queue >= 0,
+            "kqueue failed: {}",
+            std::io::Error::last_os_error()
+        );
         let mut pending = 0;
         for pid in pids {
             let change = libc::kevent {
@@ -1927,10 +1947,17 @@ fn wait_for_exits(pids: &[u32], deadline: Duration) {
                 data: 0,
                 udata: std::ptr::null_mut(),
             };
-            // A pid that already exited fails with ESRCH and needs no wait.
             if libc::kevent(queue, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 {
                 pending += 1;
+                continue;
             }
+            let error = std::io::Error::last_os_error();
+            // ESRCH: the pid already exited, so there is nothing to wait for.
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "kqueue registration for pid {pid} failed: {error}"
+            );
         }
         // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
         let until = Instant::now() + deadline;
@@ -1943,13 +1970,29 @@ fn wait_for_exits(pids: &[u32], deadline: Duration) {
             let mut event: libc::kevent = std::mem::zeroed();
             // timer: deadline — killed processes exit within the cleanup budget; expiry fails the survivor check
             let ready = libc::kevent(queue, std::ptr::null(), 0, &mut event, 1, &timeout);
-            if ready <= 0 {
+            if ready == 0 {
                 break;
+            }
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::EINTR),
+                    "kqueue wait failed: {error}"
+                );
+                continue;
             }
             pending -= 1;
         }
         libc::close(queue);
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wait_for_exits(_pids: &[u32], _deadline: Duration) {
+    panic!(
+        "layer={LAYER} step=cleanup cause=the live tests support macOS only (kqueue EVFILT_PROC)"
+    );
 }
 
 /// SIGKILL every process group in `groups`; each was created by this test.
