@@ -249,11 +249,20 @@ reach a focused session as their exact escape sequences, that `Shift-Home`,
 `Shift-PageDown`, `Shift-PageUp`, and `Shift-End` each scroll the terminal
 view, and that no Shift key reaches the session.
 
+T-S10 floods a session with `yes` and requires the route to stay attached for
+3000 screen samples of flood output (screen observations, normally after a
+batch of PTY output), the stop key to reach the session while `yes` still runs,
+and later input to echo. It is `#[ignore]`d and not in `script/test-live-tui`
+until the Core write-budget fix lands; see Known issues. Run it alone with
+`cargo test -p botster-tui --test live_tui
+t_s10_output_flood_keeps_the_route_attached_and_responsive -- --ignored --exact`
+and the candidate environment above.
+
 Current pins, September 26, 2026: T-S1 to T-S9 passed against the Hub
 candidate built from Hub `8ff59ed3` (Core `a499d5a`) with Rust 1.97.0; the
 locked workspace run passed 177 unit tests and the integration tests. T-S8a,
 T-S8b, and T-S1 each passed 30 of 30 repeated runs (1-minute load at the
-start of each 30-run batch: 19.49, 23.77, and 16.77).
+start of each 30-run batch: 19.49, 23.77, and 16.77). T-S10 fails on this candidate; see Known issues.
 
 Protocol 10 execution, September 25, 2026: T-S1 to T-S7 passed against the Hub
 candidate built from Hub `e3dacd99` (production code equal to the `a69b70cc`
@@ -301,6 +310,28 @@ Session types are authoritative Hub descriptors consumed through the
 - Pins: see the Foundation table above.
 
 ## Known issues
+
+### Sustained output closes the terminal route (pending Core write-budget fix)
+
+**Symptom.** While a session produces output continuously (for example
+`yes`), the TUI can lose the route: the pane returns to `attaching` and shows
+`terminal subscription closed (core_adapter_closed)`. In the Hub client
+contract that reason means Core closed the bound adapter while the connection
+stayed up. The TUI did not shed the route (a TUI shed reports a route fault and
+re-attaches).
+
+**Suspected cause (not proven).** Core `a499d5a` ends a bound route when its
+adapter refuses writes for a full `WRITE_ATTEMPT_BUDGET` (512 attempts) twice
+without a successful write; the first exhaustion resyncs. The budget counts
+write attempts on output wakes, not reader liveness, so a live reader behind a
+fast producer could exhaust it. Core also hard-stops a route on other paths
+(for example adapter close, epoch exhaustion, and the preserved-frame
+ceiling), and no trace yet shows which path closed these routes.
+
+**Observed (T-S10, 3000 flood screen samples).** Core `891e220`: 5 of 7 runs failed
+(Hub candidate `f18179ec`) and 1 of 1 (Hub `178512e1`); the five failures
+with a recorded count ended after 330 to 2104 samples. Core `a499d5a` with Hub
+`8ff59ed3`: 4 of 4 runs failed, after 36 to 1897 samples.
 
 ### Output can stop after a Hub restart (owner unresolved; fix after cutover)
 
