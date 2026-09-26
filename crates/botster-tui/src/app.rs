@@ -4845,6 +4845,14 @@ impl TuiApp {
             self.send_bounded_detach(session_id.to_string(), route.to_string());
         }
         if self.attach_recovery_used {
+            route_trace::attach(|| {
+                json!({
+                    "event": "attach_recovery_exhausted",
+                    "session_id": session_id,
+                    "retired_route": route,
+                    "reason": reason,
+                })
+            });
             self.error = Some(format!(
                 "terminal attach failed closed after recovery: {reason}"
             ));
@@ -4854,6 +4862,16 @@ impl TuiApp {
         self.error = Some(format!("terminal attach recovering: {reason}"));
         let replacement = self.mint_subscription_id();
         self.begin_attach_hydration(session_id, &replacement);
+        route_trace::attach(|| {
+            json!({
+                "event": "attach_recovery_request",
+                "session_id": session_id,
+                "retired_route": route,
+                "replacement_route": replacement,
+                "reason": reason,
+                "submitted": self.is_connected(),
+            })
+        });
         if self.is_connected() {
             self.submit(
                 DaemonRequest::Attach {
