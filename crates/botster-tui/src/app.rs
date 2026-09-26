@@ -322,6 +322,10 @@ struct AttachHydration {
     /// True when this hydration restarts a route that was already live
     /// (ROUTE_RESYNC): the attachment and its input window survive.
     resync: bool,
+    /// Set when this hydration re-attaches after a route failure, with the
+    /// failure's short cause. Only its completion restores the campaign's one
+    /// recovery and counts toward the recovery notice.
+    recovery_cause: Option<String>,
 }
 
 impl AttachHydration {
@@ -339,8 +343,16 @@ impl AttachHydration {
             snapshot_finished: false,
             attached_seen: false,
             resync: false,
+            recovery_cause: None,
         }
     }
+}
+
+/// How often the current attachment recovered automatically, and why last.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoveryNotice {
+    count: u32,
+    cause: String,
 }
 
 /// Input captured while a route is still attaching. Operation ids are
@@ -1503,6 +1515,7 @@ fn draw_workspace_shell(
     let status = app.status_summary_node(width_class);
     let alert = app.connection_alert();
     let notice = app.transient_notice_band();
+    let recovery = app.recovery_notice_line();
     let toolbar = app.workspace_toolbar();
     let navigator = app.session_navigator();
     let focused_session = app.focused_session_panel();
@@ -1510,6 +1523,7 @@ fn draw_workspace_shell(
         Some(&status),
         alert.as_ref(),
         notice.as_ref(),
+        recovery.as_ref(),
         Some(&toolbar),
         Some(&navigator),
         Some(&focused_session),
@@ -1535,7 +1549,10 @@ fn draw_workspace_shell(
     );
 
     let mut next_y = area.y.saturating_add(1);
-    for band in [alert.as_ref(), notice.as_ref()].into_iter().flatten() {
+    for band in [alert.as_ref(), notice.as_ref(), recovery.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         let band_area = Rect::new(area.x, next_y, area.width, 1);
         renderer::render_node_with_presentation_state(
             frame,
@@ -1821,6 +1838,9 @@ struct TuiApp {
     attach_hydration: Option<AttachHydration>,
     /// One automatic recovery already used for the current attach campaign.
     attach_recovery_used: bool,
+    /// Completed automatic recoveries of the current attachment, shown as an
+    /// informational line until the next user attach or detach.
+    recovery_notice: Option<RecoveryNotice>,
     /// Retired route ids whose late frames and close events must be ignored.
     retired_subscription_ids: BTreeSet<String>,
     /// Close-event evidence from `TerminalSubscriptionClosed` (generation, reason).
@@ -1954,6 +1974,7 @@ impl TuiApp {
             projection_dirty: false,
             attach_hydration: None,
             attach_recovery_used: false,
+            recovery_notice: None,
             retired_subscription_ids: BTreeSet::new(),
             terminal_close_evidence: None,
             detaches: BTreeMap::new(),
@@ -2709,6 +2730,7 @@ impl TuiApp {
         self.clear_event_subscription_state();
         self.clear_route_state();
         self.attach_recovery_used = false;
+        self.recovery_notice = None;
         self.terminal_close_evidence = None;
         // Detach answers and spawn targets are per connection.
         self.detaches.clear();
@@ -3919,6 +3941,7 @@ impl TuiApp {
             return;
         };
         self.error = None;
+        self.recovery_notice = None;
         self.action_feedback = Some(format!("detach requested: {session_id}"));
         if cancelling_hydration && let Some(projection) = self.ghostty_projection.as_mut() {
             projection.abort_ghostsnp_history();
@@ -4000,6 +4023,7 @@ impl TuiApp {
 
     fn reset_attach_campaign(&mut self) {
         self.attach_recovery_used = false;
+        self.recovery_notice = None;
         self.retired_subscription_ids.clear();
         self.terminal_close_evidence = None;
     }
@@ -4428,6 +4452,16 @@ impl TuiApp {
         }
     }
 
+    /// Informational, not an error: the terminal re-attached on its own.
+    fn recovery_notice_line(&self) -> Option<UiNode> {
+        let notice = self.recovery_notice.as_ref()?;
+        Some(node(
+            UiNodeKind::Text,
+            "workspace-recovery-notice",
+            json!({ "text": format!("reconnected {}× after {}", notice.count, notice.cause) }),
+        ))
+    }
+
     fn transient_notice_band(&self) -> Option<UiNode> {
         let notice = self.transient_notice.as_ref()?;
         if Instant::now() >= notice.deadline {
@@ -4526,6 +4560,7 @@ impl TuiApp {
                 &session_id,
                 &route,
                 "frames before the attach response exceeded the pending budget",
+                "frames before the attach response exceeded the pending budget",
             );
             return;
         }
@@ -4588,6 +4623,8 @@ impl TuiApp {
             hydration.pending_input = previous.pending_input;
             hydration.pending_input_bytes = previous.pending_input_bytes;
             hydration.pending_resize = previous.pending_resize;
+            // A resync during a recovery's hydration is still that recovery.
+            hydration.recovery_cause = previous.recovery_cause;
         }
         hydration.attached_seen |= was_attached;
         hydration.resync |= was_attached;
@@ -4718,6 +4755,7 @@ impl TuiApp {
                             &session_id,
                             route,
                             "live output exceeded the attach buffer bound",
+                            "live output exceeded the attach buffer bound",
                         );
                         return;
                     }
@@ -4776,6 +4814,7 @@ impl TuiApp {
             &session_id,
             &subscription_id,
             &format!("terminal subscription closed ({reason})"),
+            &reason,
         );
     }
 
@@ -4798,7 +4837,7 @@ impl TuiApp {
         let Some((session_id, _)) = self.current_owner_pair() else {
             return;
         };
-        self.recover_current_subscription(&session_id, &route, reason);
+        self.recover_current_subscription(&session_id, &route, reason, reason);
     }
 
     fn recover_from_decode_or_phase_gap(&mut self, reason: &str) {
@@ -4806,12 +4845,23 @@ impl TuiApp {
             self.error = Some(reason.to_string());
             return;
         };
-        self.recover_current_subscription(&session_id, &route, reason);
+        self.recover_current_subscription(&session_id, &route, reason, reason);
     }
 
-    /// Retire the current route with a bounded Detach and, once per attach
-    /// campaign, re-attach with a fresh route.
-    fn recover_current_subscription(&mut self, session_id: &str, route: &str, reason: &str) {
+    /// Retire the current route with a bounded Detach and re-attach with a
+    /// fresh route. A campaign has one recovery at a time: a failure during
+    /// the recovery's own hydration fails closed, and a completed recovery
+    /// restores it, so each later independent failure recovers once.
+    ///
+    /// `reason` is the error line while the recovery runs; `cause` is the
+    /// short cause the recovery notice names once it completes.
+    fn recover_current_subscription(
+        &mut self,
+        session_id: &str,
+        route: &str,
+        reason: &str,
+        cause: &str,
+    ) {
         if let Some(projection) = self.ghostty_projection.as_mut() {
             projection.abort_ghostsnp_history();
         }
@@ -4830,6 +4880,9 @@ impl TuiApp {
         self.error = Some(format!("terminal attach recovering: {reason}"));
         let replacement = self.mint_subscription_id();
         self.begin_attach_hydration(session_id, &replacement);
+        if let Some(hydration) = self.attach_hydration.as_mut() {
+            hydration.recovery_cause = Some(cause.to_string());
+        }
         if self.is_connected() {
             self.submit(
                 DaemonRequest::Attach {
@@ -4897,6 +4950,7 @@ impl TuiApp {
                 self.recover_current_subscription(
                     &session_id,
                     &route,
+                    "attach failed before READY",
                     "attach failed before READY",
                 );
             }
@@ -5069,6 +5123,15 @@ impl TuiApp {
             session_id: session_id.to_string(),
             route: hydration.route.clone(),
         });
+        if let Some(cause) = hydration.recovery_cause.clone() {
+            self.attach_recovery_used = false;
+            let count = self
+                .recovery_notice
+                .as_ref()
+                .map_or(0, |notice| notice.count)
+                + 1;
+            self.recovery_notice = Some(RecoveryNotice { count, cause });
+        }
         if !hydration.buffered_live_output.is_empty() {
             self.apply_live_terminal_output(&hydration.buffered_live_output);
         }
@@ -5817,6 +5880,9 @@ impl TuiApp {
             root.children.push(child(alert));
         }
         if let Some(notice) = self.transient_notice_band() {
+            root.children.push(child(notice));
+        }
+        if let Some(notice) = self.recovery_notice_line() {
             root.children.push(child(notice));
         }
         root.children.push(child(self.workspace_toolbar()));
@@ -15945,6 +16011,178 @@ mod tests {
             attach_state_frame(AttachStateCode::Failed),
         ));
         assert!(app.attach_hydration.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed closed after recovery"))
+        );
+    }
+
+    /// Attach `route` fully: the response, `attached`, and a whole snapshot.
+    fn hydrate_fully(app: &mut TuiApp, route: &str, generation: u64) {
+        complete_attach(app, "session-alpha", route, generation);
+        app.apply_wake(routed(
+            route,
+            generation,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        for frame in ghostsnp_snapshot_frames("SCREEN\r\n") {
+            app.apply_wake(routed(route, generation, frame));
+        }
+    }
+
+    /// Close `route` the way the Hub reports a Core reader-deadline close.
+    fn close_route(app: &mut TuiApp, route: &str, generation: u64) {
+        app.handle_terminal_subscription_closed(
+            "session-alpha".to_string(),
+            route.to_string(),
+            generation,
+            "core_adapter_closed".to_string(),
+        );
+    }
+
+    fn replacement_route(app: &TuiApp) -> String {
+        app.attach_hydration
+            .as_ref()
+            .map(|hydration| hydration.route.clone())
+            .expect("a recovery attach is hydrating")
+    }
+
+    #[test]
+    fn a_completed_recovery_restores_one_recovery_for_the_next_close() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        hydrate_fully(&mut app, "route-1", 1);
+        assert!(app.attached_matches_route("route-1"));
+
+        close_route(&mut app, "route-1", 1);
+        assert!(app.attach_recovery_used);
+        let second = replacement_route(&app);
+        hydrate_fully(&mut app, &second, 2);
+        assert!(app.attached_matches_route(&second));
+        assert!(
+            !app.attach_recovery_used,
+            "a completed recovery restores the allowance"
+        );
+        assert_eq!(
+            app.recovery_notice,
+            Some(RecoveryNotice {
+                count: 1,
+                cause: "core_adapter_closed".to_string()
+            })
+        );
+        // Sends set or clear the error line; they never touch the notice.
+        app.send_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.recovery_notice.is_some());
+
+        // An independent later close recovers again instead of failing closed.
+        close_route(&mut app, &second, 2);
+        let third = replacement_route(&app);
+        assert_ne!(third, second);
+        assert!(app.attach_recovery_used);
+        assert!(
+            !app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed closed after recovery"))
+        );
+        hydrate_fully(&mut app, &third, 3);
+        let rendered = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+        assert!(
+            rendered.contains("reconnected 2× after core_adapter_closed"),
+            "{rendered}"
+        );
+
+        // A user detach ends the attachment and its notice.
+        app.detach_attached();
+        assert_eq!(app.recovery_notice, None);
+    }
+
+    #[test]
+    fn a_resync_during_a_recovery_keeps_it_a_recovery() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        hydrate_fully(&mut app, "route-1", 1);
+        close_route(&mut app, "route-1", 1);
+        let second = replacement_route(&app);
+        complete_attach(&mut app, "session-alpha", &second, 2);
+        app.apply_wake(routed(
+            &second,
+            2,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        let ready = ghostsnp_snapshot_frames("SCREEN\r\n")
+            .into_iter()
+            .next()
+            .expect("READY frame");
+        app.apply_wake(routed(&second, 2, ready));
+
+        // The recovery's route resyncs before its snapshot finishes.
+        app.apply_wake(routed_at_epoch(&second, 2, 1, resync_frame(0, 1)));
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|hydration| hydration.recovery_cause.is_some()),
+            "the resync hydration keeps the recovery cause"
+        );
+        for frame in ghostsnp_snapshot_frames("SCREEN\r\n") {
+            app.apply_wake(routed_at_epoch(&second, 2, 1, frame));
+        }
+        assert!(app.attached_matches_route(&second));
+        assert!(
+            !app.attach_recovery_used,
+            "the completed recovery restores it"
+        );
+        assert_eq!(
+            app.recovery_notice,
+            Some(RecoveryNotice {
+                count: 1,
+                cause: "core_adapter_closed".to_string()
+            }),
+            "counted once"
+        );
+
+        // A later independent close recovers.
+        close_route(&mut app, &second, 2);
+        assert_ne!(replacement_route(&app), second);
+        assert!(
+            !app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed closed after recovery"))
+        );
+    }
+
+    #[test]
+    fn a_recovery_that_reaches_only_ready_keeps_the_allowance_spent() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        hydrate_fully(&mut app, "route-1", 1);
+        close_route(&mut app, "route-1", 1);
+        let second = replacement_route(&app);
+        complete_attach(&mut app, "session-alpha", &second, 2);
+        app.apply_wake(routed(
+            &second,
+            2,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        // READY only: the snapshot never finishes, so the attach never opens.
+        let ready = ghostsnp_snapshot_frames("SCREEN\r\n")
+            .into_iter()
+            .next()
+            .expect("READY frame");
+        app.apply_wake(routed(&second, 2, ready));
+        assert!(
+            app.attach_hydration
+                .as_ref()
+                .is_some_and(|h| h.snapshot_ready)
+        );
+        assert!(app.attached.is_none());
+        assert!(app.attach_recovery_used, "READY alone restores nothing");
+        assert_eq!(app.recovery_notice, None, "READY alone is no recovery");
+
+        close_route(&mut app, &second, 2);
+        assert!(app.attach_hydration.is_none(), "no second recovery");
         assert!(
             app.error
                 .as_deref()

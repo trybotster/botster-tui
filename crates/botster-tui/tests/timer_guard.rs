@@ -27,6 +27,20 @@ use std::{
 /// match, so fixing a site forces its entry out of this list. None today.
 const PENDING_DEFECTS: &[(&str, &str, &str)] = &[];
 
+/// Marked waits that stand in for an event another repository has not
+/// shipped yet: (file, name). Each is marked
+/// `// timer: deadline — <name>: <why>; remove when it lands`, and the marked
+/// lines must match this list exactly, so adding one or removing one forces
+/// this list to change.
+const NAMED_EXCEPTIONS: &[(&str, &str)] = &[
+    // T-S11 waits out the Core reader deadline until the Hub status entity
+    // (attach occupancy) lets it wait for the route close as an event.
+    ("crates/botster-tui/tests/live_tui.rs", "hub-status-entity"),
+];
+
+/// Marker suffix that names a stand-in wait.
+const NAMED_EXCEPTION_SUFFIX: &str = "remove when it lands";
+
 const CATEGORIES: [&str; 6] = [
     "deadline",
     "backoff",
@@ -165,6 +179,44 @@ fn every_timer_in_the_repository_is_marked() {
     );
 }
 
+/// The name of a stand-in wait marked on `line`, if any.
+fn named_exception(line: &str) -> Option<&str> {
+    let (_, marker) = line.split_once("// timer: deadline — ")?;
+    if !marker.trim_end().ends_with(NAMED_EXCEPTION_SUFFIX) {
+        return None;
+    }
+    marker.split_once(':').map(|(name, _)| name.trim())
+}
+
+#[test]
+fn named_exceptions_match_the_marked_stand_in_waits_exactly() {
+    let root = repository_root();
+    let mut found = Vec::new();
+    for path in scanned_files(&root) {
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for line in source.lines() {
+            if let Some(name) = named_exception(line) {
+                found.push((relative.clone(), name.to_string()));
+            }
+        }
+    }
+    let expected = NAMED_EXCEPTIONS
+        .iter()
+        .map(|(file, name)| (file.to_string(), name.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found, expected,
+        "stand-in waits and NAMED_EXCEPTIONS differ"
+    );
+}
+
 #[test]
 fn guard_flags_unmarked_timers_and_accepts_marked_ones() {
     let unmarked = "fn f() {\n    std::thread::sleep(d);\n}\n";
@@ -191,6 +243,16 @@ fn guard_flags_unmarked_timers_and_accepts_marked_ones() {
     assert!(
         violations(comment).is_empty(),
         "comment-only lines are prose"
+    );
+    assert_eq!(
+        named_exception(
+            "// timer: deadline — hub-status-entity: waits for it; remove when it lands"
+        ),
+        Some("hub-status-entity")
+    );
+    assert_eq!(
+        named_exception("// timer: deadline — reply bound; expiry fails"),
+        None
     );
     let identifier = "let sleeper = asleep_count;\n";
     assert!(
