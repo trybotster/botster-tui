@@ -1039,7 +1039,13 @@ fn attach_and_echo(
             SCREEN_DEADLINE,
             identity,
         )
-        .unwrap_or_else(|failure| panic!("{failure}"));
+        .unwrap_or_else(|failure| {
+            // The Hub's screen says whether the input reached the session
+            // (output route lost) or never arrived (input route lost).
+            let hub_screen = read_session_screen(endpoint, identity);
+            let reached = hub_screen.contains(&format!("echo:{marker}"));
+            panic!("{failure} hub_screen_has_echo={reached} hub_screen={hub_screen:?}")
+        });
     occupancy
 }
 
@@ -1839,8 +1845,10 @@ fn t_s7_host_keys_switch_sessions_and_leave_the_terminal() {
 /// happens to an existing session. This helper verifies the manifest hashes,
 /// runs `botster-hub start` under a short owned root, and stops the Hub either
 /// with `botster-hub shutdown` or with SIGKILL to the Hub process only, so the
-/// session workers can outlive a crash. On drop it stops the Hub and kills only
-/// processes whose command line contains its own root.
+/// session workers can outlive a crash. Each Hub start runs in a new process
+/// group that the test records; `finish` stops the Hub, kills those groups,
+/// and asserts that no member survives. Drop repeats the group kill as a
+/// fallback after a failure.
 struct PersistentHub {
     candidate: Candidate,
     root: ShortTempRoot,
@@ -1963,6 +1971,28 @@ impl PersistentHub {
         }
     }
 
+    /// Stop the Hub, kill every group this test created, and assert that no
+    /// member of those groups survives.
+    fn finish(mut self) {
+        if self.child.is_some() {
+            self.stop(HubStop::Graceful);
+        }
+        kill_groups(&self.owned_groups);
+        let until = Instant::now() + EXIT_DEADLINE;
+        loop {
+            let survivors = group_members(&self.owned_groups);
+            if survivors.is_empty() {
+                println!("cleanup: owned_groups={:?} survivors=0", self.owned_groups);
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "layer={LAYER} step=cleanup cause=processes survive in owned groups: {survivors:?}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn restart_after(&mut self, how: HubStop) {
         self.stop(how);
         self.launch();
@@ -1980,14 +2010,19 @@ impl Drop for PersistentHub {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // Session workers that outlived a Hub stop remain in the process group
-        // of the Hub start that spawned them. Only groups this test created.
-        for group in &self.owned_groups {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", "--", &format!("-{group}")])
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        kill_groups(&self.owned_groups);
+    }
+}
+
+/// SIGKILL every process group in `groups`; each was created by this test.
+fn kill_groups(groups: &[u32]) {
+    for group in groups {
+        let status = std::process::Command::new("kill")
+            .args(["-9", "--", &format!("-{group}")])
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Exit status 1 means the group is already empty.
+        println!("cleanup: kill -9 -{group} -> {status:?}");
     }
 }
 
@@ -2019,7 +2054,45 @@ fn verify_candidate_hashes(candidate: &Candidate) {
             actual, expected,
             "layer={LAYER} step=candidate_hash name={name}"
         );
+        println!("provenance: {name}={path} sha256={actual} (manifest match)");
     }
+    println!(
+        "provenance: manifest={} tui_bin={} tui_version={}",
+        candidate.manifest,
+        env!("CARGO_BIN_EXE_botster-tui"),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Live processes in the given process groups, as (pid, pgid, command).
+fn group_members(groups: &[u32]) -> Vec<(u32, u32, String)> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid=,command="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            groups.contains(&pgid).then_some((pid, pgid, command))
+        })
+        .collect()
+}
+
+/// The session workers this test's Hub starts spawned, by process group.
+fn owned_session_workers(groups: &[u32]) -> Vec<(u32, u32, String)> {
+    group_members(groups)
+        .into_iter()
+        .filter(|(_, _, command)| {
+            command
+                .split_whitespace()
+                .next()
+                .is_some_and(|program| program.ends_with("/botster-session-worker"))
+        })
+        .collect()
 }
 
 fn listed_lifecycle(endpoint: &DaemonEndpoint, identity: &Identity) -> Option<String> {
@@ -2055,6 +2128,13 @@ fn restart_recovery(how: HubStop, label: &str) {
         test_deadline,
         COUNTING_SHELL_COMMAND,
     );
+    let workers = owned_session_workers(&hub.owned_groups);
+    assert!(
+        !workers.is_empty(),
+        "layer={LAYER} step=worker_group cause=no session worker in owned groups {:?}",
+        hub.owned_groups
+    );
+    println!("{label}: workers_before_stop={workers:?}");
     {
         let mut tui = TuiChild::spawn_at(hub.endpoint(), &hub.data_dir(), &hub.root.path);
         let mut screen = Screen::attach(&tui, test_deadline);
@@ -2092,6 +2172,11 @@ fn restart_recovery(how: HubStop, label: &str) {
         let settle = Instant::now() + screen.remaining(Duration::from_millis(1500));
         screen.pump(settle);
         let lifecycle = listed_lifecycle(hub.endpoint(), &identity);
+        println!(
+            "{label}: owned_groups={:?} workers_after_restart={:?}",
+            hub.owned_groups,
+            owned_session_workers(&hub.owned_groups)
+        );
         let rows = screen.head_rows();
 
         let outcome = match lifecycle.as_deref() {
@@ -2173,7 +2258,7 @@ fn restart_recovery(how: HubStop, label: &str) {
             "layer={LAYER} step=recovery_gate cause={label} did not recover the existing session: {outcome}"
         );
     }
-    drop(hub);
+    hub.finish();
 }
 
 /// Ctrl+P moves focus off the terminal, then q quits; the exit must succeed.
