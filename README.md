@@ -329,15 +329,6 @@ available, the Hub ring capture, and record the load for every run. If the
 failure recurs, the counters place the loss at the Hub, the TUI receive path,
 or the projection; verify the reattach workaround in that same run.
 
-### Test timer exception: T-S8 Hub readiness (known DEFECT; waits for Hub --ready-fd)
-
-The live tests wait on events, and `crates/botster-tui/tests/timer_guard.rs`
-fails on any sleep or timer without a `// timer:` marker. One exception is
-listed explicitly in the guard: T-S8's `PersistentHub::launch` polls `Status`
-until the restarted Hub answers, because `botster-hub start` has no readiness
-signal yet. When the Hub's `--ready-fd` lands, the launcher switches to it and
-the exception is removed; the guard fails if the stale entry remains.
-
 ## Caller-owned Workspaces Spawn acceptance
 
 The installed TUI exposes one deterministic file-based acceptance mode for a
