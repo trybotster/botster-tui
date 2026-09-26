@@ -2493,6 +2493,11 @@ fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
         tui.click(ready.0, ready.1);
+        // The ready marker can paint during hydration, before the attach
+        // completes; the flood checks start from a completed attachment.
+        screen
+            .wait_for("attach_complete", "[ Detach ]", SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
 
         // Start the flood. Every sampled screen must keep the attachment
         // ("[ Detach ]"); a closed route clears it. A ROUTE_RESYNC keeps the
