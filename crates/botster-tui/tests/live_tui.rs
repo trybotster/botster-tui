@@ -1040,8 +1040,9 @@ fn attach_and_echo(
             identity,
         )
         .unwrap_or_else(|failure| {
-            // The Hub's screen says whether the input reached the session
-            // (output route lost) or never arrived (input route lost).
+            // An echo on the Hub's screen proves the input reached the session
+            // and the loss is on the output path to this client. No echo
+            // there does not by itself prove an input-route failure.
             let hub_screen = read_session_screen(endpoint, identity);
             let reached = hub_screen.contains(&format!("echo:{marker}"));
             panic!("{failure} hub_screen_has_echo={reached} hub_screen={hub_screen:?}")
@@ -2070,6 +2071,8 @@ fn group_members(groups: &[u32]) -> Vec<(u32, u32, String)> {
         .args(["-axo", "pid=,pgid=,command="])
         .output()
         .expect("run ps");
+    // An empty listing from a failed ps must not read as "no survivors".
+    assert!(output.status.success(), "ps failed: {:?}", output.status);
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {

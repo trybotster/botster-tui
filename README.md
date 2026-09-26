@@ -248,8 +248,10 @@ Hub `0437cc4f` (production code equal to the `46fa2e65` pin), Core
 and the locked workspace run passed 171 unit tests and two integration tests.
 T-S8 passed 12 of 14 runs. **Known open issue (suspected Hub side):** in 2 of
 14 runs the session recovered and the TUI reattached on a fresh route, but new
-output never reached the pane, although the Hub's ReadScreen showed the echo.
-The Hub restart-route trace is attributing this. These results establish the
+output never reached the pane. In one of them the Hub's ReadScreen showed the
+echo, so the input reached the session and the loss is on the output path to
+the TUI; the other failure predates that diagnostic and is unclassified. The
+Hub restart-route trace is attributing this. These results establish the
 tested client behavior, not performance acceptance.
 
 The visible System details diagnostics are intentionally local-client
