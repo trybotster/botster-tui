@@ -31,9 +31,9 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `46fa2e65a2b81ff3218239b7c8051a40ef53f262` |
+| `botster-hub-client` / live hub | Hub `a69b70ccf5516489579647e21926b3aac7ea8b66` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `46fa2e65a2b81ff3218239b7c8051a40ef53f262` (`@trybotster/hub-test-support@0.1.45`) |
+| `botster-hub-test-support` package | Hub git `a69b70ccf5516489579647e21926b3aac7ea8b66` (`@trybotster/hub-test-support@0.1.46`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
 | `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `891e220295427fd93991638d7c62ba40fa25d4ae` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
@@ -185,7 +185,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`46fa2e65a2b81ff3218239b7c8051a40ef53f262` (same Hub pin as Foundation above).
+`a69b70ccf5516489579647e21926b3aac7ea8b66` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -241,7 +241,13 @@ manifest-verified Hub launcher, because `IsolatedHub::restart` recreates the
 data directory. It kills only the process groups it created and asserts that
 none of their members survive.
 
-Matched execution, September 25, 2026, against the Hub candidate built from
+Protocol 10 execution, September 25, 2026: T-S1 to T-S7 passed against the Hub
+candidate built from Hub `e3dacd99` (production code equal to the `a69b70cc`
+pin), Core `891e220`, and kit `6c46910`, with Rust 1.97.0; the locked workspace
+run passed 172 unit tests and two integration tests. T-S8 was not rerun on
+this candidate.
+
+Earlier matched execution, September 25, 2026, against the Hub candidate built from
 Hub `0437cc4f` (production code equal to the `46fa2e65` pin), Core
 `891e220295427fd93991638d7c62ba40fa25d4ae`, and kit `6c46910`, with Rust
 1.97.0, two jobs, and incremental compilation disabled: T-S1 to T-S7 passed,
@@ -275,7 +281,7 @@ Session types are authoritative Hub descriptors consumed through the
   the Hub effective `session_type_id` with `request.target_id = T`. Freeform
   `DaemonRequest::Spawn { command }` is not a product affordance.
   Workspaces acceptance setup may still use raw Spawn.
-- Client handshake requires `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 49` and
+- Client handshake requires `MINIMUM_CONFORMANCE_FIXTURE_REVISION = 50` and
   `session_type_entity_subscriptions`. A Hub without the feature fails the
   handshake with a compatibility diagnostic.
 - Pins: see the Foundation table above.
