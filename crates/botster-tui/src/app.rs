@@ -436,6 +436,17 @@ impl PendingUnsafePaste {
     }
 }
 
+/// The Hub's answer to one Detach, as far as this connection knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DetachState {
+    /// Sent; no correlated response yet.
+    Pending,
+    /// A correlated Events response with no operator error arrived.
+    Confirmed,
+    /// An operator error, an unexpected response, or request failure/expiry.
+    Failed(String),
+}
+
 /// What the application does with one host-control completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingReply {
@@ -456,8 +467,9 @@ enum PendingReply {
     SessionTypeForm,
     /// Attach for the campaign on `route`.
     Attach { session_id: String, route: String },
-    /// Detach for a retired route; the response only updates diagnostics.
-    Detach,
+    /// Detach for a retired route. Its correlated response is the only proof
+    /// that the Hub released the route.
+    Detach { session_id: String, route: String },
     /// SubscribeEvents candidate for one notice descriptor.
     SubscribeEvents {
         key: NoticeSubscriptionKey,
@@ -1815,6 +1827,9 @@ struct TuiApp {
     retired_subscription_ids: BTreeSet<String>,
     /// Close-event evidence from `TerminalSubscriptionClosed` (generation, reason).
     terminal_close_evidence: Option<(u64, String)>,
+    /// The newest Detach per session on this connection: its route and
+    /// whether the Hub confirmed it. The pane title shows the outcome.
+    detaches: BTreeMap<String, (String, DetachState)>,
     /// Last MODES frame for the current route.
     terminal_modes: Option<TerminalModeState>,
     /// Client-side input window for the current route generation.
@@ -1943,6 +1958,7 @@ impl TuiApp {
             attach_recovery_used: false,
             retired_subscription_ids: BTreeSet::new(),
             terminal_close_evidence: None,
+            detaches: BTreeMap::new(),
             terminal_modes: None,
             input_window: InputWindow::new(),
             pending_unsafe_paste: None,
@@ -2728,7 +2744,8 @@ impl TuiApp {
         self.clear_route_state();
         self.attach_recovery_used = false;
         self.terminal_close_evidence = None;
-        // Spawn targets are read per connection.
+        // Detach answers and spawn targets are per connection.
+        self.detaches.clear();
         self.spawn_targets.clear();
         self.spawn_targets_loaded = false;
         self.spawn_targets_failure = None;
@@ -2879,7 +2896,20 @@ impl TuiApp {
 
     fn apply_completion(&mut self, reply: PendingReply, response: DaemonResponse) {
         match reply {
-            PendingReply::Apply | PendingReply::Detach | PendingReply::Unsubscribe => {
+            PendingReply::Apply | PendingReply::Unsubscribe => {
+                self.apply_response(response);
+            }
+            PendingReply::Detach { session_id, route } => {
+                // Success is a correlated Events response with no operator
+                // error; anything else is a failed detach, never a release.
+                let state = match &response.error {
+                    None if response.kind == DaemonResponseKind::Events => DetachState::Confirmed,
+                    Some(error) => {
+                        DetachState::Failed(format!("{} (code={})", error.message, error.code))
+                    }
+                    None => DetachState::Failed(format!("unexpected {:?} response", response.kind)),
+                };
+                self.finish_detach(&session_id, &route, state);
                 self.apply_response(response);
             }
             PendingReply::SpawnTargets => {
@@ -2967,7 +2997,10 @@ impl TuiApp {
         match reply {
             PendingReply::Apply => self.error = Some(format!("request failed: {message}")),
             PendingReply::SpawnTargets => self.spawn_targets_failure = Some(message),
-            PendingReply::Detach | PendingReply::Unsubscribe => {}
+            PendingReply::Unsubscribe => {}
+            PendingReply::Detach { session_id, route } => {
+                self.finish_detach(&session_id, &route, DetachState::Failed(message));
+            }
             PendingReply::ListForTarget { target_label, .. } => {
                 self.error = Some(format!("session types failed to load: {message}"));
                 self.action_feedback = Some(format!(
@@ -3936,14 +3969,31 @@ impl TuiApp {
     }
 
     fn send_bounded_detach(&mut self, session_id: String, route: String) {
+        self.detaches
+            .insert(session_id.clone(), (route.clone(), DetachState::Pending));
         self.submit(
             DaemonRequest::Detach {
-                session_id,
-                subscription_id: route,
+                session_id: session_id.clone(),
+                subscription_id: route.clone(),
             },
-            PendingReply::Detach,
+            PendingReply::Detach { session_id, route },
             DETACH_ON_DISCONNECT_BOUND,
         );
+    }
+
+    /// Record the Hub's answer to one Detach. A stale answer for a route the
+    /// session no longer owns changes nothing.
+    fn finish_detach(&mut self, session_id: &str, route: &str, state: DetachState) {
+        let Some((current, slot)) = self.detaches.get_mut(session_id) else {
+            return;
+        };
+        if current != route {
+            return;
+        }
+        if let DetachState::Failed(reason) = &state {
+            self.error = Some(format!("detach of {session_id} failed: {reason}"));
+        }
+        *slot = state;
     }
 
     /// Retire the current route and send a bounded Detach when connected.
@@ -7279,7 +7329,15 @@ impl TuiApp {
                 format!("Terminal · {} · attaching", hydration.session_id)
             }
             (Some(attached), _, _) => format!("Terminal · {attached}"),
-            (None, None, Some(selected)) => format!("Terminal · {selected} · detached"),
+            (None, None, Some(selected)) => match self.detaches.get(selected) {
+                Some((_, DetachState::Pending)) => format!("Terminal · {selected} · detaching"),
+                Some((_, DetachState::Failed(_))) => {
+                    format!("Terminal · {selected} · detach failed")
+                }
+                Some((_, DetachState::Confirmed)) | None => {
+                    format!("Terminal · {selected} · detached")
+                }
+            },
             (None, None, None) => "Terminal".to_string(),
         }
     }
@@ -13592,6 +13650,48 @@ mod tests {
         assert!(
             fixture.contains(concat!("\"", "session", "_type_id\"")),
             "checked-in spawn-driver evidence example must use the session type field key"
+        );
+    }
+
+    #[test]
+    fn detached_title_appears_only_after_a_confirmed_detach_response() {
+        let reply = |route: &str| PendingReply::Detach {
+            session_id: "session-alpha".to_string(),
+            route: route.to_string(),
+        };
+        let mut app = workspace_fixture();
+        app.attached = None;
+        app.selected_session = Some("session-alpha".to_string());
+
+        app.send_bounded_detach("session-alpha".to_string(), "route-1".to_string());
+        assert_eq!(app.terminal_title(), "Terminal · session-alpha · detaching");
+
+        // A stale answer for an older route changes nothing.
+        app.apply_completion(reply("route-0"), base_response(DaemonResponseKind::Events));
+        assert_eq!(app.terminal_title(), "Terminal · session-alpha · detaching");
+
+        app.apply_completion(reply("route-1"), base_response(DaemonResponseKind::Events));
+        assert_eq!(app.terminal_title(), "Terminal · session-alpha · detached");
+
+        // An operator error is a failed detach, never a release.
+        app.send_bounded_detach("session-alpha".to_string(), "route-2".to_string());
+        app.apply_completion(reply("route-2"), operator_error_response("detach refused"));
+        assert_eq!(
+            app.terminal_title(),
+            "Terminal · session-alpha · detach failed"
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("detach refused"))
+        );
+
+        // So is expiry.
+        app.send_bounded_detach("session-alpha".to_string(), "route-3".to_string());
+        app.apply_request_failure(reply("route-3"), DaemonRequestError::DeadlineExpired);
+        assert_eq!(
+            app.terminal_title(),
+            "Terminal · session-alpha · detach failed"
         );
     }
 
