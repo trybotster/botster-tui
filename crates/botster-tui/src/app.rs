@@ -2695,6 +2695,7 @@ impl TuiApp {
             return;
         }
         self.reconnect_failures = self.reconnect_failures.saturating_add(1);
+        // timer: backoff — failed Hub connect or lost link; capped exponential reconnect delay
         self.reconnect_at = Some(Instant::now() + reconnect_backoff_delay(self.reconnect_failures));
     }
 
@@ -2847,6 +2848,7 @@ impl TuiApp {
         }
         #[cfg(test)]
         self.record_request(&request);
+        // timer: deadline — host-control request expiry; expiry completes the request with DeadlineExpired
         let request_id = self.hub_io.submit(&request, Instant::now() + deadline);
         self.pending_requests.insert(request_id, reply);
         request_id
@@ -3323,6 +3325,7 @@ impl TuiApp {
             family.to_string(),
             EntityOptionsRetryState {
                 consecutive_failures,
+                // timer: backoff — entity-options subscribe admission failure; capped exponential retry delay
                 next_attempt_at: Instant::now() + delay,
             },
         );
@@ -4313,6 +4316,7 @@ impl TuiApp {
             Ok(text) => {
                 self.transient_notice = Some(TransientNotice {
                     text: text.to_string(),
+                    // timer: ui-lifetime — transient notice, server-supplied ttl_ms; one wake at expiry via next_deadline
                     deadline: Instant::now() + Duration::from_millis(u64::from(ttl_ms)),
                 });
             }
@@ -4637,6 +4641,7 @@ impl TuiApp {
                     route,
                     generation,
                     payload,
+                    // timer: deadline — unsafe-paste consent expires; expiry cancels the retry
                     deadline: Instant::now() + UNSAFE_PASTE_CONSENT_TIMEOUT,
                     stage: UnsafePasteConsentStage::Review,
                 });
@@ -7686,6 +7691,7 @@ fn drive_workspaces_acceptance(
 
     let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true, HubIo::new());
     app.connect();
+    // timer: deadline — acceptance step budget; expiry fails the acceptance run
     let connect_deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     app.pump_until(connect_deadline, |app| {
         app.is_connected() || app.connection_error.is_some()
@@ -8125,6 +8131,7 @@ fn wait_for_acceptance_state(
     expectation: &str,
     mut ready: impl FnMut(&mut TuiApp, &mut AcceptanceDiagnostics) -> bool,
 ) -> io::Result<()> {
+    // timer: deadline — acceptance step budget; expiry fails the acceptance run
     let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     let observed = app.pump_until(deadline, |app| {
         diagnostics.observe_app(app);
@@ -8203,6 +8210,7 @@ fn drive_workspaces_claim_acceptance(
     );
     let mut app = TuiApp::new_with_runtime_context(Some(endpoint), None, true, HubIo::new());
     app.connect();
+    // timer: deadline — acceptance step budget; expiry fails the acceptance run
     let connect_deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     app.pump_until(connect_deadline, |app| {
         app.is_connected() || app.connection_error.is_some()
@@ -8761,6 +8769,7 @@ fn ensure_claim_option_exclusion(
 ) -> io::Result<bool> {
     let target = Value::String(session_uuid.to_string());
     let mut reopened = false;
+    // timer: deadline — acceptance step budget; expiry fails the acceptance run
     let deadline = Instant::now() + ACCEPTANCE_TIMEOUT;
     while Instant::now() < deadline {
         let (_, hit_map) = acceptance_frame(app, router, diagnostics)?;
@@ -9061,6 +9070,7 @@ fn activate_acceptance_action(
         serde_json::to_value(&request).map_err(io::Error::other)?,
     )?;
     app.handle_dispatch(dispatch);
+    // timer: deadline — acceptance step budget; expiry fails the acceptance run
     if !app.settle(Instant::now() + ACCEPTANCE_TIMEOUT) {
         return invalid_acceptance(format!(
             "action {action_id} request did not complete within the acceptance timeout"
@@ -15343,6 +15353,7 @@ mod tests {
         activate_notice(&mut app, "old-sub", 5_000, "session-alpha");
         app.transient_notice = Some(TransientNotice {
             text: "old".to_string(),
+            // timer: ui-lifetime — test notice lifetime
             deadline: Instant::now() + Duration::from_secs(5),
         });
         app.force_reconnect();
