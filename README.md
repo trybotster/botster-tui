@@ -121,7 +121,8 @@ Expanded (`>=120` columns) terminals use a fixed 40-column session navigator;
 regular (`80..119`) terminals use a 40/60 split. Compact terminals (`<80`)
 stack a content-sized navigator above the terminal.
 Tab and Shift-Tab move focus; arrows navigate focused controls; Enter or Space
-activates; PageUp/PageDown and the mouse wheel scroll; `Esc` cancels an open
+activates; outside the terminal pane, PageUp/PageDown and the mouse wheel
+scroll the focused area; `Esc` cancels an open
 confirmation, returns from plugin-owned content to the System shell, or exits
 from the base shell. `q` and `Ctrl-C` also exit.
 
@@ -139,7 +140,9 @@ reserved host keys, which work whatever has focus:
 - `Shift-PageUp` / `Shift-PageDown` / `Shift-Home` / `Shift-End` scroll the
   terminal view.
 
-`Shift-Tab` is not reserved; it reaches the session.
+Plain `PageUp` / `PageDown`, `Ctrl-Home` / `Ctrl-End`, and `Shift-Tab` are not
+reserved; they reach the session, so pagers and editors such as `less` and
+`vim` receive them.
 
 Activating a running session row attaches that session. Moving selection with
 the keyboard does not attach until Enter or Space activates the row. Clicking

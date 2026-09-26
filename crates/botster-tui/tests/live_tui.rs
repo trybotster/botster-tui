@@ -2454,3 +2454,153 @@ fn t_s8a_graceful_hub_restart_reports_the_existing_session() {
 fn t_s8b_hub_kill_restart_reports_the_existing_session() {
     restart_recovery(HubStop::Kill, "t_s8b");
 }
+
+/// Prints 60 filler lines, then every received byte as `key:<hex>`.
+const KEY_SHELL_COMMAND: &str = "i=0; while [ $i -lt 60 ]; do printf 'fill:%02d\\n' $i; i=$((i+1)); done; printf 'live-ready\\n'; stty -icanon -echo min 1; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); printf 'key:%s\\n' \"$b\"; done";
+
+/// The `key:<hex>` bytes visible in the pane, in screen order.
+fn visible_key_bytes(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|row| {
+            let (_, rest) = row.split_once("key:")?;
+            let hex = rest
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect::<String>();
+            (!hex.is_empty()).then_some(hex)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s9_page_keys_reach_the_session_and_shift_variants_scroll() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let mut identity = Identity::default();
+    spawn_session(hub.endpoint(), &mut identity, KEY_SHELL_COMMAND);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let row = format!("{} · running", identity.session_id);
+        let (col, line) = screen
+            .wait_for("session_row_visible", &row, SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(col, line);
+        let ready = screen
+            .wait_for(
+                "session_ready_visible",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(ready.0, ready.1);
+
+        // Plain PageUp/PageDown and Ctrl+Home/End reach the session (less and
+        // vim receive them) instead of scrolling the TUI.
+        // A trailing `z` is an ordered barrier: once it arrives, every byte
+        // sent before it has arrived too.
+        tui.write_all(b"\x1b[5~\x1b[6~\x1b[1;5H\x1b[1;5Fz");
+        let received = screen
+            .wait_until(
+                "page_keys_reach_session",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| {
+                    let bytes = visible_key_bytes(&screen.rows());
+                    (bytes.last().map(String::as_str) == Some("7a")).then_some(bytes)
+                },
+                |screen| format!("key bytes so far: {:?}", visible_key_bytes(&screen.rows())),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let expected = [
+            "1b", "5b", "35", "7e", // PageUp: ESC [ 5 ~
+            "1b", "5b", "36", "7e", // PageDown: ESC [ 6 ~
+            "1b", "5b", "31", "3b", "35", "48", // Ctrl+Home: ESC [ 1 ; 5 H
+            "1b", "5b", "31", "3b", "35", "46", // Ctrl+End: ESC [ 1 ; 5 F
+            "7a", // barrier z
+        ];
+        assert_eq!(
+            received, expected,
+            "the session receives exactly the four key sequences, then z"
+        );
+
+        // Each Shift key scrolls the view and never reaches the session. The
+        // history (60 fill lines, then the key lines) is longer than two
+        // pages, so the top, one page down, and the bottom are distinct views.
+        let bottom = |screen: &mut Screen| {
+            visible_key_bytes(&screen.rows()).last().map(String::as_str) == Some("7a")
+        };
+        tui.write_all(b"\x1b[1;2H");
+        screen
+            .wait_until(
+                "shift_home_scrolls_to_top",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| (screen.contains("fill:00") && !bottom(screen)).then_some(()),
+                |screen| format!("view: {:?}", screen.head_rows()),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.write_all(b"\x1b[6;2~");
+        screen
+            .wait_until(
+                "shift_page_down_scrolls_one_page",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| (!screen.contains("fill:00") && !bottom(screen)).then_some(()),
+                |screen| format!("view: {:?}", screen.head_rows()),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.write_all(b"\x1b[5;2~");
+        screen
+            .wait_until(
+                "shift_page_up_scrolls_back_to_top",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| (screen.contains("fill:00") && !bottom(screen)).then_some(()),
+                |screen| format!("view: {:?}", screen.head_rows()),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.write_all(b"\x1b[1;2F");
+        screen
+            .wait_until(
+                "shift_end_scrolls_to_bottom",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| (!screen.contains("fill:00") && bottom(screen)).then_some(()),
+                |screen| format!("view: {:?}", screen.head_rows()),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        // Ordered barrier: the session reads bytes in order, so once `x`
+        // arrives, any Shift key byte sent before it would be on screen too.
+        tui.write_all(b"x");
+        let after = screen
+            .wait_until(
+                "barrier_byte_reaches_session",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| {
+                    let bytes = visible_key_bytes(&screen.rows());
+                    (bytes.last().map(String::as_str) == Some("78")).then_some(bytes)
+                },
+                |screen| format!("key bytes: {:?}", visible_key_bytes(&screen.rows())),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let mut expected_after = received.clone();
+        expected_after.push("78".to_owned());
+        assert_eq!(
+            after, expected_after,
+            "only the barrier byte arrives after the Shift keys"
+        );
+        println!(
+            "t_s9: page keys reached the session ({} exact bytes); Shift+Home, PageDown, PageUp, End each scrolled; no Shift key reached the session",
+            received.len()
+        );
+        detach_and_quit(&mut tui, &mut screen, &identity);
+    }
+    drop(guard);
+}

@@ -1447,9 +1447,7 @@ fn route_input_event(
                 apply_host_key(app, router, hit_map, host_key);
             }
         }
-        Event::Key(key)
-            if key.kind == KeyEventKind::Press
-                && app.handle_tui_owned_key(key, router.focused_node_id()) => {}
+        Event::Key(key) if key.kind == KeyEventKind::Press && app.handle_tui_owned_key(key) => {}
         Event::Key(key) if app.handle_focused_terminal_key(key, router.focused_node_id()) => {}
         Event::Paste(ref text)
             if app.handle_focused_terminal_paste(text, router.focused_node_id()) => {}
@@ -2329,42 +2327,10 @@ impl TuiApp {
         true
     }
 
-    fn handle_tui_owned_key(&mut self, key: KeyEvent, focused_node_id: Option<&str>) -> bool {
-        // Terminal scroll shortcuts only when the production terminal owns focus.
-        let terminal_focused = focused_node_id == Some("tui-terminal")
-            || focused_node_id == Some("tui-terminal-output");
-        if terminal_focused && self.ghostty_projection.is_some() && self.attached.is_some() {
-            if key.modifiers == KeyModifiers::NONE {
-                match key.code {
-                    KeyCode::PageUp => {
-                        self.scroll_projection(ScrollOp::Delta(
-                            -(i32::from(self.terminal_viewport_size.rows)),
-                        ));
-                        return true;
-                    }
-                    KeyCode::PageDown => {
-                        self.scroll_projection(ScrollOp::Delta(i32::from(
-                            self.terminal_viewport_size.rows,
-                        )));
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Home => {
-                        self.scroll_projection(ScrollOp::Top);
-                        return true;
-                    }
-                    KeyCode::End => {
-                        self.scroll_projection(ScrollOp::Bottom);
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-        }
+    /// Keys the TUI handles before terminal forwarding: Esc for dialogs and
+    /// plugin content. PageUp/PageDown and Ctrl+Home/End reach a focused
+    /// session; the Shift variants scroll as reserved host keys.
+    fn handle_tui_owned_key(&mut self, key: KeyEvent) -> bool {
         if key.code != KeyCode::Esc || key.modifiers != KeyModifiers::NONE {
             return false;
         }
@@ -7870,7 +7836,7 @@ fn drive_workspaces_acceptance(
                 "initial session subscription has no id",
             )
         })?;
-    if !app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None) {
+    if !app.handle_tui_owned_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)) {
         return invalid_acceptance(
             "Esc did not return the active plugin surface to System details",
         );
@@ -16684,6 +16650,29 @@ mod tests {
             "selection never attaches"
         );
         assert!(app.observed_terminal_inputs.is_empty());
+    }
+
+    #[test]
+    fn unshifted_page_and_ctrl_home_end_keys_reach_the_focused_session() {
+        let (mut app, mut router, map) = attached_workspace_with_focused_terminal();
+        // With a projection installed these keys used to scroll it instead.
+        app.ensure_ghostty_projection("session-alpha");
+        assert!(app.ghostty_projection.is_some());
+        for (code, modifiers) in [
+            (KeyCode::PageUp, KeyModifiers::NONE),
+            (KeyCode::PageDown, KeyModifiers::NONE),
+            (KeyCode::Home, KeyModifiers::CONTROL),
+            (KeyCode::End, KeyModifiers::CONTROL),
+        ] {
+            let event = Event::Key(KeyEvent::new(code, modifiers));
+            assert!(route_input_event(&mut app, &mut router, &map, event));
+        }
+        assert_eq!(
+            app.observed_terminal_inputs.len(),
+            4,
+            "each key is forwarded to the session as input"
+        );
+        assert_eq!(router.focused_node_id(), Some("tui-terminal"));
     }
 
     #[test]
