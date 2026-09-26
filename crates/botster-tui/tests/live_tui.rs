@@ -1830,20 +1830,37 @@ impl PersistentHub {
             worker_dir.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let child = std::process::Command::new(&self.candidate.hub_bin)
+        // The Hub writes one readiness line on this pipe once its socket is
+        // bound and its owner loop accepts requests, then closes it.
+        let (ready_reader, ready_writer) = std::io::pipe().expect("readiness pipe");
+        let ready_fd = std::os::fd::AsRawFd::as_raw_fd(&ready_writer);
+        let mut command = std::process::Command::new(&self.candidate.hub_bin);
+        command
             .args(["start", "--data-dir"])
             .arg(self.data_dir())
             .arg("--session-worker-bin")
             .arg(&self.candidate.worker_bin)
+            .arg("--ready-fd")
+            .arg(ready_fd.to_string())
             .current_dir(&self.root.path)
             .env("BOTSTER_ENV", "test")
             .env("TMPDIR", self.root.path.join("tmp"))
             .env("PATH", path)
             .stdout(log.try_clone().expect("clone hub log"))
             .stderr(log)
-            .process_group(0)
-            .spawn()
-            .expect("spawn candidate hub");
+            .process_group(0);
+        // SAFETY: fcntl(F_SETFD) is async-signal-safe. It clears close-on-exec
+        // on the write end in the child only, so the Hub inherits exactly it.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = std::os::fd::BorrowedFd::borrow_raw(ready_fd);
+                rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())
+                    .map_err(std::io::Error::from)
+            });
+        }
+        let child = command.spawn().expect("spawn candidate hub");
+        // Only the child may hold the write end, or EOF never arrives.
+        drop(ready_writer);
         let pid = child.id();
         self.owned_groups.push(pid);
         let (exit_tx, exited) = mpsc::channel();
@@ -1852,17 +1869,48 @@ impl PersistentHub {
             let _ = exit_tx.send(child.wait());
         });
         self.running = Some(RunningHub { pid, exited });
-        // DEFECT (pending in tests/timer_guard.rs): polls Status until
-        // `botster-hub start --ready-fd` provides a readiness signal.
-        let until = Instant::now() + SESSION_RUNNING_DEADLINE;
-        while request(&self.endpoint, DaemonRequest::Status).is_err() {
-            assert!(
-                Instant::now() < until,
-                "layer={LAYER} step=persistent_hub_ready cause=hub start {} never answered Status",
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let read =
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(ready_reader), &mut line);
+            let _ = line_tx.send(read.map(|_| line));
+        });
+        // timer: deadline — the Hub reports readiness within the start budget; expiry fails the start
+        let line = match line_rx.recv_timeout(SESSION_RUNNING_DEADLINE) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => panic!(
+                "layer={LAYER} step=persistent_hub_ready cause=hub start {} readiness read failed: {error}",
                 self.starts
+            ),
+            Err(_) => {
+                kill_groups(&[pid]);
+                panic!(
+                    "layer={LAYER} step=persistent_hub_ready cause=hub start {} reported no readiness before the deadline",
+                    self.starts
+                );
+            }
+        };
+        let Some((protocol_version, build_revision)) = parse_ready_line(&line) else {
+            // EOF (an empty read) or a malformed line: the start failed.
+            panic!(
+                "layer={LAYER} step=persistent_hub_ready cause=hub start {} failed before readiness: line={line:?}; see {}",
+                self.starts,
+                self.root
+                    .path
+                    .join(format!("hub-{}.log", self.starts))
+                    .display()
             );
-            thread::sleep(Duration::from_millis(100));
-        }
+        };
+        assert_eq!(
+            protocol_version,
+            botster_hub_client::PROTOCOL_VERSION,
+            "the candidate Hub must speak the pinned protocol"
+        );
+        println!(
+            "hub start {}: ready protocol_version={protocol_version} build_revision={build_revision}",
+            self.starts
+        );
     }
 
     fn stop(&mut self, how: HubStop) {
@@ -1927,6 +1975,46 @@ impl Drop for PersistentHub {
             let _ = running.exited.recv_timeout(EXIT_DEADLINE);
         }
         kill_groups(&self.owned_groups);
+    }
+}
+
+/// Parse the Hub's readiness line: exactly `ready <protocol_version> <build_revision>\n`,
+/// where the revision is printable ASCII without spaces.
+fn parse_ready_line(line: &str) -> Option<(u16, String)> {
+    let body = line.strip_suffix('\n')?;
+    let mut fields = body.split(' ');
+    let (Some("ready"), Some(protocol), Some(revision), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    let protocol = protocol.parse().ok()?;
+    let printable = !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_graphic());
+    printable.then(|| (protocol, revision.to_string()))
+}
+
+#[test]
+fn ready_line_parser_accepts_only_the_exact_contract() {
+    assert_eq!(
+        parse_ready_line("ready 10 e3dacd99\n"),
+        Some((10, "e3dacd99".to_string()))
+    );
+    assert_eq!(
+        parse_ready_line("ready 10 unknown\n"),
+        Some((10, "unknown".to_string()))
+    );
+    for bad in [
+        "",
+        "ready 10 abc",
+        "ready 10\n",
+        "ready x abc\n",
+        "ready 10 a b\n",
+        "ready 10  abc\n",
+        "ready 70000 abc\n",
+        "readyx 10 abc\n",
+        "ready 10 ab\tc\n",
+    ] {
+        assert_eq!(parse_ready_line(bad), None, "{bad:?} must be rejected");
     }
 }
 

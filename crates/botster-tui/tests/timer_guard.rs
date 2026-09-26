@@ -24,19 +24,8 @@ use std::{
 
 /// Known DEFECT sites that wait for an event source owned by another
 /// repository: (file, exact trimmed line, reason). Every entry must still
-/// match, so fixing a site forces its entry out of this list.
-const PENDING_DEFECTS: &[(&str, &str, &str)] = &[
-    (
-        "crates/botster-tui/tests/live_tui.rs",
-        "let until = Instant::now() + SESSION_RUNNING_DEADLINE;",
-        "PersistentHub readiness polls Status until `botster-hub start --ready-fd` lands (Hub pair)",
-    ),
-    (
-        "crates/botster-tui/tests/live_tui.rs",
-        "thread::sleep(Duration::from_millis(100));",
-        "PersistentHub readiness polls Status until `botster-hub start --ready-fd` lands (Hub pair)",
-    ),
-];
+/// match, so fixing a site forces its entry out of this list. None today.
+const PENDING_DEFECTS: &[(&str, &str, &str)] = &[];
 
 const CATEGORIES: [&str; 6] = [
     "deadline",
