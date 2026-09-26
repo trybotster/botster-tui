@@ -15476,6 +15476,92 @@ mod tests {
         assert!(app.terminal_modes.is_some());
     }
 
+    /// Encode one real GHOSTSNP export the way the Hub sends it: READY, one
+    /// SNAPSHOT_HISTORY per History or Finish page, then SNAPSHOT_FINISH.
+    fn ghostsnp_snapshot_frames(
+        text: &str,
+    ) -> Vec<botster_terminal_protocol_client::TerminalFrame> {
+        use botster_terminal_ghostty::{GhosttySnapshotFrameKind, GhosttyTerminal};
+        use botster_terminal_protocol_client::{
+            encode_snapshot_finish, encode_snapshot_history, encode_snapshot_ready,
+        };
+        let mut source =
+            GhosttyTerminal::new(TerminalScreenSize::new(24, 80)).expect("producer terminal");
+        source.write_output_bytes(text.as_bytes());
+        let mut frames = Vec::new();
+        source
+            .export_snapshot_frames(|frame| {
+                let encoded = match frame.kind {
+                    GhosttySnapshotFrameKind::Ready => encode_snapshot_ready(&frame.bytes),
+                    GhosttySnapshotFrameKind::History | GhosttySnapshotFrameKind::Finish => {
+                        encode_snapshot_history(&frame.bytes)
+                    }
+                };
+                frames.push(encoded.expect("snapshot frame"));
+                true
+            })
+            .expect("export GHOSTSNP frames");
+        frames.push(encode_snapshot_finish().expect("snapshot finish"));
+        frames
+    }
+
+    fn projection_text(app: &mut TuiApp) -> String {
+        let projection = app
+            .ghostty_projection
+            .as_mut()
+            .expect("projection installed")
+            .project_viewport()
+            .expect("project viewport");
+        projection
+            .cells
+            .iter()
+            .map(|cell| cell.grapheme.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn route_resync_snapshot_replaces_the_screen_and_reopens_the_live_path() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        complete_attach(&mut app, "session-alpha", "route-1", 1);
+        app.apply_wake(routed(
+            "route-1",
+            1,
+            attach_state_frame(AttachStateCode::Attached),
+        ));
+        for frame in ghostsnp_snapshot_frames("OLD-SCREEN-MARKER\r\n") {
+            app.apply_wake(routed("route-1", 1, frame));
+        }
+        assert_eq!(app.attached_session_id(), Some("session-alpha"));
+        assert!(projection_text(&mut app).contains("OLD-SCREEN-MARKER"));
+
+        // A stalled bound route resyncs: the old screen is dropped at once.
+        app.apply_wake(routed_at_epoch("route-1", 1, 1, resync_frame(0, 1)));
+        assert!(app.ghostty_projection.is_none());
+        assert!(app.attached.is_none());
+
+        for frame in ghostsnp_snapshot_frames("NEW-SCREEN-MARKER\r\n") {
+            app.apply_wake(routed_at_epoch("route-1", 1, 1, frame));
+        }
+        assert_eq!(
+            app.attached_session_id(),
+            Some("session-alpha"),
+            "the live path reopens after the replacement snapshot"
+        );
+        let screen = projection_text(&mut app);
+        assert!(screen.contains("NEW-SCREEN-MARKER"), "{screen}");
+        assert!(!screen.contains("OLD-SCREEN-MARKER"), "{screen}");
+
+        app.apply_wake(routed_at_epoch(
+            "route-1",
+            1,
+            1,
+            botster_terminal_protocol_client::encode_output(b"LIVE-AFTER-RESYNC")
+                .expect("output frame"),
+        ));
+        assert!(projection_text(&mut app).contains("LIVE-AFTER-RESYNC"));
+    }
+
     #[test]
     fn input_results_are_correlated_by_operation_on_every_epoch() {
         let mut app = workspace_fixture();
