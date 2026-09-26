@@ -2455,6 +2455,117 @@ fn t_s8b_hub_kill_restart_reports_the_existing_session() {
     restart_recovery(HubStop::Kill, "t_s8b");
 }
 
+/// Waits for one byte to start `yes flood`, stops the flood on the next byte
+/// and prints `stopped:<hex>:<running|exited>`, then prints every received
+/// byte as `key:<hex>`.
+const FLOOD_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo min 1; dd bs=1 count=1 2>/dev/null >/dev/null; yes flood & p=$!; b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); if kill $p 2>/dev/null; then s=running; else s=exited; fi; wait $p 2>/dev/null; printf 'stopped:%s:%s\\n' \"$b\" \"$s\"; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); printf 'key:%s\\n' \"$b\"; done";
+
+/// Screen samples showing flood output that must all show the attachment
+/// before the stop key. Samples are screen observations, normally after a
+/// batch of PTY output (one more at the deadline), not rendered frames. 300 samples did not reproduce the Core route close; see README
+/// Known issues.
+const FLOOD_SAMPLES: usize = 3000;
+
+#[test]
+#[ignore = "pending Core write-budget fix (counts output-wake attempts, not reader liveness); run with the candidate env and --ignored --exact"]
+fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let mut identity = Identity::default();
+    spawn_session(hub.endpoint(), &mut identity, FLOOD_SHELL_COMMAND);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let row = format!("{} · running", identity.session_id);
+        let (col, line) = screen
+            .wait_for("session_row_visible", &row, SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(col, line);
+        let ready = screen
+            .wait_for(
+                "session_ready_visible",
+                SESSION_READY_MARKER,
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(ready.0, ready.1);
+
+        // Start the flood. Every sampled screen must keep the attachment
+        // ("[ Detach ]"); a closed route clears it. A ROUTE_RESYNC keeps the
+        // attachment and replaces the screen with a snapshot.
+        tui.write_all(b"f");
+        let flood_samples = std::cell::Cell::new(0_usize);
+        let mut detached_sample = None;
+        screen
+            .wait_until(
+                "flood_samples_show_attachment",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| {
+                    if !screen.contains("[ Detach ]") {
+                        detached_sample = Some((flood_samples.get(), screen.head_rows()));
+                        return Some(());
+                    }
+                    if screen.contains("flood") {
+                        flood_samples.set(flood_samples.get() + 1);
+                    }
+                    (flood_samples.get() >= FLOOD_SAMPLES).then_some(())
+                },
+                |screen| {
+                    format!(
+                        "{} flood samples; view: {:?}",
+                        flood_samples.get(),
+                        screen.head_rows()
+                    )
+                },
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert_eq!(
+            detached_sample, None,
+            "the route stays attached during the flood (flood samples, view)"
+        );
+
+        // Responsive: the stop key reaches the session while `yes` still runs,
+        // and the output after the flood renders.
+        tui.write_all(b"q");
+        screen
+            .wait_for(
+                "stop_key_reaches_flooding_session",
+                "stopped:71:running",
+                SCREEN_DEADLINE,
+                &identity,
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.write_all(b"z");
+        screen
+            .wait_until(
+                "key_after_flood_reaches_session",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| {
+                    (visible_key_bytes(&screen.rows()).last().map(String::as_str) == Some("7a"))
+                        .then_some(())
+                },
+                |screen| format!("view: {:?}", screen.head_rows()),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(
+            screen.contains("[ Detach ]"),
+            "the route is still attached after the flood"
+        );
+        println!(
+            "t_s10: {} flood screen samples showed the attachment; stop key reached the running flood; input after the flood echoed",
+            flood_samples.get()
+        );
+        detach_and_quit(&mut tui, &mut screen, &identity);
+    }
+    drop(guard);
+}
+
 /// Prints 60 filler lines, then every received byte as `key:<hex>`.
 const KEY_SHELL_COMMAND: &str = "i=0; while [ $i -lt 60 ]; do printf 'fill:%02d\\n' $i; i=$((i+1)); done; printf 'live-ready\\n'; stty -icanon -echo min 1; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); printf 'key:%s\\n' \"$b\"; done";
 
