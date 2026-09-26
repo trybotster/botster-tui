@@ -232,12 +232,25 @@ T-S7 attaches one of two sessions, then proves that `Ctrl-J` selects the other
 without sending input to the attached session, that `Enter` attaches it, and
 that `Ctrl-P` moves focus off the terminal so `q` quits.
 
-Matched execution, September 25, 2026: all six cases passed with Rust 1.97.0
-against the Hub candidate built from Hub `0437cc4f` (production code equal to
-the `46fa2e65` pin) and Core `891e220295427fd93991638d7c62ba40fa25d4ae`. The
-locked workspace run passed 164 unit tests and two integration tests. The live
-run used two jobs with incremental compilation disabled. These results
-establish the tested client behavior, not performance acceptance.
+T-S8a and T-S8b prove recovery of an existing session across a Hub stop:
+graceful `botster-hub shutdown` (T-S8a) and SIGKILL of the Hub process only
+(T-S8b), then a new Hub on the same data directory. The session shell counts
+input lines, and the gate requires the same process after the restart
+(`seq:2`), a fresh terminal route, and new output. The test uses its own
+manifest-verified Hub launcher, because `IsolatedHub::restart` recreates the
+data directory. It kills only the process groups it created and asserts that
+none of their members survive.
+
+Matched execution, September 25, 2026, against the Hub candidate built from
+Hub `0437cc4f` (production code equal to the `46fa2e65` pin), Core
+`891e220295427fd93991638d7c62ba40fa25d4ae`, and kit `6c46910`, with Rust
+1.97.0, two jobs, and incremental compilation disabled: T-S1 to T-S7 passed,
+and the locked workspace run passed 171 unit tests and two integration tests.
+T-S8 passed 12 of 14 runs. **Known open issue (suspected Hub side):** in 2 of
+14 runs the session recovered and the TUI reattached on a fresh route, but new
+output never reached the pane, although the Hub's ReadScreen showed the echo.
+The Hub restart-route trace is attributing this. These results establish the
+tested client behavior, not performance acceptance.
 
 The visible System details diagnostics are intentionally local-client
 diagnostics, not private hub probes.
