@@ -1314,7 +1314,11 @@ fn run_loop(
             applied += 1;
         }
     }
-    app.shutdown();
+    if !app.shutdown() {
+        return Err(io::Error::other(
+            "the Hub link or input thread did not stop within the shutdown bound",
+        ));
+    }
     Ok(())
 }
 
@@ -2102,11 +2106,12 @@ impl TuiApp {
         }
     }
 
-    /// Stop the I/O owner within the shutdown bound.
-    fn shutdown(self) {
+    /// Stop the I/O owner within the shutdown bound. Returns whether every
+    /// I/O thread confirmed its stop.
+    fn shutdown(self) -> bool {
         let mut app = self;
         app.detach_owner_if_writable();
-        app.hub_io.shutdown(SHUTDOWN_BOUND);
+        app.hub_io.shutdown(SHUTDOWN_BOUND)
     }
 
     fn set_drafts(&mut self, drafts: BTreeMap<String, Value>) {
@@ -2703,7 +2708,10 @@ impl TuiApp {
 
     /// Forget every connection-scoped state.
     fn drop_connection_state(&mut self) {
-        self.hub_io.disconnect(DETACH_ON_DISCONNECT_BOUND);
+        if !self.hub_io.disconnect(DETACH_ON_DISCONNECT_BOUND) {
+            self.error =
+                Some("the previous Hub link did not close within the detach bound".to_string());
+        }
         self.connected_generation = None;
         self.pending_requests.clear();
         self.reset_active_plugin_surface();
@@ -2746,7 +2754,7 @@ impl TuiApp {
             return;
         }
         if let Err(error) = admit_terminal_hello(&ack) {
-            self.hub_io.disconnect(Duration::ZERO);
+            self.hub_io.disconnect_now();
             self.apply_link_failure(error);
             return;
         }

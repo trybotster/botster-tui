@@ -161,18 +161,28 @@ struct HubLink {
 }
 
 impl HubLink {
+    /// Close without waiting: stop the writer and shut the socket so the
+    /// reader unblocks. Used once the connection has already failed.
+    fn close_now(self) {
+        let _ = self.writer.send(WriteCommand::Stop);
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
     /// Close within `bound`: let the writer drain queued frames (for example a
     /// final Detach) first, then shut the socket so the reader unblocks.
-    fn close(self, bound: Duration) {
+    /// Returns whether both threads confirmed their stop within the bound.
+    fn close_within(self, bound: Duration) -> bool {
+        // timer: deadline — link threads confirm their stop within the close bound; expiry returns an incomplete close
         let deadline = Instant::now() + bound;
         let _ = self.writer.send(WriteCommand::Stop);
-        let _ = self
-            .writer_stopped
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let left = deadline.saturating_duration_since(Instant::now());
+        // timer: deadline — the writer drains and confirms within the close bound; expiry returns an incomplete close
+        let writer_stopped = self.writer_stopped.recv_timeout(left).is_ok();
         let _ = self.stream.shutdown(Shutdown::Both);
-        let _ = self
-            .reader_stopped
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let left = deadline.saturating_duration_since(Instant::now());
+        // timer: deadline — the reader confirms after the socket shutdown within the close bound; expiry returns an incomplete close
+        let reader_stopped = self.reader_stopped.recv_timeout(left).is_ok();
+        writer_stopped && reader_stopped
     }
 }
 
@@ -384,7 +394,7 @@ impl HubIo {
         host_requirement: DaemonCompatibilityRequirement,
         terminal_requirement: TerminalCompatibilityRequirement,
     ) -> u64 {
-        self.disconnect(Duration::ZERO);
+        self.disconnect_now();
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         let sender = self.wake_tx.clone();
@@ -423,9 +433,18 @@ impl HubIo {
     /// Close the current connection, if any, and fail every pending request.
     ///
     /// Waits at most `bound` for the reader and writer threads to stop.
-    pub fn disconnect(&mut self, bound: Duration) {
+    /// Close the link within `bound` and fail its pending requests. Returns
+    /// whether the link threads confirmed their stop; true when no link.
+    pub fn disconnect(&mut self, bound: Duration) -> bool {
+        let closed = self.link.take().is_none_or(|link| link.close_within(bound));
+        self.fail_pending();
+        closed
+    }
+
+    /// Close the link without waiting and fail its pending requests.
+    pub fn disconnect_now(&mut self) {
         if let Some(link) = self.link.take() {
-            link.close(bound);
+            link.close_now();
         }
         self.fail_pending();
     }
@@ -444,7 +463,7 @@ impl HubIo {
     fn end_link(&mut self, error: DaemonTransportError) {
         let generation = self.generation;
         if let Some(link) = self.link.take() {
-            link.close(Duration::ZERO);
+            link.close_now();
         }
         self.fail_pending();
         self.ready
@@ -711,7 +730,7 @@ impl HubIo {
                     return None;
                 }
                 if let Some(link) = self.link.take() {
-                    link.close(Duration::ZERO);
+                    link.close_now();
                 }
                 self.fail_pending();
                 Some(AppWake::Disconnected { generation, error })
@@ -741,20 +760,24 @@ impl HubIo {
     /// `EventStream` inside that thread wakes Crossterm's internal wait thread
     /// (verified against crossterm 0.29.0 `event/stream.rs`: `Drop` sets the
     /// shutdown flag and wakes the mio poller).
-    pub fn shutdown(mut self, bound: Duration) {
+    ///
+    /// Returns whether every thread confirmed its stop; false is an
+    /// incomplete shutdown that the caller reports.
+    pub fn shutdown(mut self, bound: Duration) -> bool {
+        // timer: deadline — link and input threads stop within the shutdown bound; expiry returns an incomplete shutdown
         let deadline = Instant::now() + bound;
-        self.disconnect(deadline.saturating_duration_since(Instant::now()));
+        let link_closed = self.disconnect(deadline.saturating_duration_since(Instant::now()));
         let Some(mut input) = self.input.take() else {
-            return;
+            return link_closed;
         };
         input.stop.stop();
-        let stopped = input
-            .stopped
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .is_ok();
-        if stopped && let Some(handle) = input.handle.take() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // timer: deadline — the input thread confirms its stop within the shutdown bound; expiry returns an incomplete shutdown
+        let input_stopped = input.stopped.recv_timeout(left).is_ok();
+        if input_stopped && let Some(handle) = input.handle.take() {
             let _ = handle.join();
         }
+        link_closed && input_stopped
     }
 }
 
