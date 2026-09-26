@@ -246,7 +246,7 @@ Hub `0437cc4f` (production code equal to the `46fa2e65` pin), Core
 `891e220295427fd93991638d7c62ba40fa25d4ae`, and kit `6c46910`, with Rust
 1.97.0, two jobs, and incremental compilation disabled: T-S1 to T-S7 passed,
 and the locked workspace run passed 171 unit tests and two integration tests.
-T-S8 passed 12 of 14 runs. **Known open issue (suspected Hub side):** in 2 of
+T-S8 passed 12 of 14 runs. **Known open issue (owner unresolved):** in 2 of
 14 runs the session recovered and the TUI reattached on a fresh route, but new
 output never reached the pane. In one of them the Hub's ReadScreen showed the
 echo, so the input reached the session and the loss is on the output path to
