@@ -441,6 +441,8 @@ impl PendingUnsafePaste {
 enum PendingReply {
     /// Apply the response to read models and diagnostics.
     Apply,
+    /// The connection's spawn-target list; a failure is kept for the dialog.
+    SpawnTargets,
     /// Session types for the target-first spawn picker (flow-local only).
     ListForTarget {
         target_id: String,
@@ -1775,9 +1777,11 @@ struct TuiApp {
     notice_overflow_dropped: usize,
     transient_notice: Option<TransientNotice>,
     spawn_targets: Vec<DaemonSpawnTarget>,
-    /// Whether a ListSpawnTargets reply has arrived; before it, an empty list
-    /// means "not loaded yet", not "no targets".
+    /// Whether this connection's ListSpawnTargets reply has arrived; before
+    /// it, an empty list means "not loaded yet", not "no targets".
     spawn_targets_loaded: bool,
+    /// Why this connection's ListSpawnTargets request failed, if it did.
+    spawn_targets_failure: Option<String>,
     selected_session_type_id: Option<String>,
     session_type_form: Option<SessionTypeFormDraft>,
     target_first_spawn: Option<TargetFirstSpawnFlow>,
@@ -1919,6 +1923,7 @@ impl TuiApp {
             transient_notice: None,
             spawn_targets: Vec::new(),
             spawn_targets_loaded: false,
+            spawn_targets_failure: None,
             selected_session_type_id: None,
             session_type_form: None,
             target_first_spawn: None,
@@ -2723,6 +2728,10 @@ impl TuiApp {
         self.clear_route_state();
         self.attach_recovery_used = false;
         self.terminal_close_evidence = None;
+        // Spawn targets are read per connection.
+        self.spawn_targets.clear();
+        self.spawn_targets_loaded = false;
+        self.spawn_targets_failure = None;
     }
 
     /// Forget the current route: attachment, hydration, projection, modes, input window.
@@ -2873,6 +2882,13 @@ impl TuiApp {
             PendingReply::Apply | PendingReply::Detach | PendingReply::Unsubscribe => {
                 self.apply_response(response);
             }
+            PendingReply::SpawnTargets => {
+                self.spawn_targets_failure = response
+                    .error
+                    .as_ref()
+                    .map(|error| format!("{} (code={})", error.message, error.code));
+                self.apply_response(response);
+            }
             PendingReply::ListForTarget {
                 target_id,
                 target_label,
@@ -2950,6 +2966,7 @@ impl TuiApp {
         let message = error.to_string();
         match reply {
             PendingReply::Apply => self.error = Some(format!("request failed: {message}")),
+            PendingReply::SpawnTargets => self.spawn_targets_failure = Some(message),
             PendingReply::Detach | PendingReply::Unsubscribe => {}
             PendingReply::ListForTarget { target_label, .. } => {
                 self.error = Some(format!("session types failed to load: {message}"));
@@ -2998,7 +3015,11 @@ impl TuiApp {
     }
 
     fn refresh_spawn_targets(&mut self) {
-        self.submit_apply(DaemonRequest::ListSpawnTargets);
+        self.submit(
+            DaemonRequest::ListSpawnTargets,
+            PendingReply::SpawnTargets,
+            REQUEST_DEADLINE,
+        );
     }
 
     fn refresh_status(&mut self) {
@@ -3417,6 +3438,10 @@ impl TuiApp {
     fn begin_target_first_spawn(&mut self) {
         self.error = None;
         self.session_type_form = None;
+        if let Some(failure) = &self.spawn_targets_failure {
+            self.error = Some(format!("launch targets failed to load: {failure}"));
+            return;
+        }
         // Before the target list loads, the dialog opens and fills in when the
         // ListSpawnTargets reply arrives.
         if self.spawn_targets_loaded && self.launch_target_options().is_empty() {
@@ -7088,11 +7113,13 @@ impl TuiApp {
             TargetFirstSpawnStep::PickTarget => {
                 let options = self.launch_target_options();
                 let help = if !options.is_empty() {
-                    "Select a launch target first"
+                    "Select a launch target first".to_string()
+                } else if let Some(failure) = &self.spawn_targets_failure {
+                    format!("Launch targets failed to load: {failure}")
                 } else if self.spawn_targets_loaded {
-                    "No launch targets available"
+                    "No launch targets available".to_string()
                 } else {
-                    "Loading launch targets…"
+                    "Loading launch targets…".to_string()
                 };
                 nodes.push(node(
                     UiNodeKind::Text,
@@ -11697,6 +11724,38 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("Repo A (repo-a)"), "{rendered}");
         assert!(!rendered.contains("Loading launch targets"));
+    }
+
+    #[test]
+    fn spawn_target_state_is_per_connection_and_failures_leave_loading() {
+        let mut app = TuiApp::new(None);
+        app.spawn_targets_loaded = true;
+        app.drop_connection_state();
+        app.begin_target_first_spawn();
+        assert_eq!(app.error, None, "a reconnect is loading, not empty");
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        assert!(lines.join("\n").contains("Loading launch targets"));
+
+        app.apply_request_failure(
+            PendingReply::SpawnTargets,
+            DaemonRequestError::DeadlineExpired,
+        );
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Launch targets failed to load"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Loading launch targets"));
+
+        app.target_first_spawn = None;
+        app.begin_target_first_spawn();
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("launch targets failed to load"))
+        );
+        assert!(app.target_first_spawn.is_none());
     }
 
     #[test]
