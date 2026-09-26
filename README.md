@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `38f54ce8d905a1e64b4bbf2969aed3bf25850c1c` |
+| `botster-hub-client` / live hub | Hub `e9cd8445cb70894955cef38f1466bed3526f3a13` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `38f54ce8d905a1e64b4bbf2969aed3bf25850c1c` (`@trybotster/hub-test-support@0.1.46`) |
+| `botster-hub-test-support` package | Hub git `e9cd8445cb70894955cef38f1466bed3526f3a13` (`@trybotster/hub-test-support@0.1.46`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `ac35e32d7d5703178c56aff95f6904c9b1ce3b53` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `6a8fc2245449b04e859fc4c1c4a71fb06b860e80` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -188,7 +188,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`38f54ce8d905a1e64b4bbf2969aed3bf25850c1c` (same Hub pin as Foundation above).
+`e9cd8445cb70894955cef38f1466bed3526f3a13` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -261,9 +261,21 @@ failed 5 of 7 runs on Core `891e220` (Hub candidate `f18179ec`), 1 of 1 on Hub
 stops counting session-output wakes toward the adapter write-attempt budget.
 
 Current pins, September 26, 2026: T-S1 to T-S10 passed against the Hub
-candidate built from Hub `38f54ce8` (Core `ac35e32`) with Rust 1.97.0, and
-T-S10 passed 10 of 10 repeated runs; the locked workspace run passed 177 unit
-tests and the integration tests.
+candidate built from Hub `fe51ce50` (Core `6a8fc22`; Hub `e9cd8445` adds only
+a docs plan file) with Rust 1.97.0; T-S10 passed 3 of 3 runs. The 1-minute
+load was 53.68 at the start of the T-S1 to T-S9 sequence and 41.99 at the
+start of the T-S10 runs. The locked workspace run passed 177 unit tests and
+the integration tests.
+
+Core `6a8fc22` closes a route (`core_adapter_closed`) when the route has output
+pending and its client completes no write for 10 s. On a route close or another
+route failure (for example a decode or phase gap), the TUI re-attaches
+automatically only if the current attach campaign has not used its one
+recovery; otherwise it fails closed with `terminal attach failed closed after
+recovery`. A user attach or a Hub connection teardown starts a new campaign.
+
+Hub `38f54ce8` (Core `ac35e32`), September 26, 2026: T-S1 to T-S10 passed,
+and T-S10 passed 10 of 10 repeated runs.
 
 Hub `8ff59ed3` (Core `a499d5a`), September 26, 2026: T-S1 to T-S9 passed with
 Rust 1.97.0; the locked workspace run passed 177 unit tests and the
