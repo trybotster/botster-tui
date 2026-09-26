@@ -1771,6 +1771,9 @@ struct TuiApp {
     notice_overflow_dropped: usize,
     transient_notice: Option<TransientNotice>,
     spawn_targets: Vec<DaemonSpawnTarget>,
+    /// Whether a ListSpawnTargets reply has arrived; before it, an empty list
+    /// means "not loaded yet", not "no targets".
+    spawn_targets_loaded: bool,
     selected_session_type_id: Option<String>,
     session_type_form: Option<SessionTypeFormDraft>,
     target_first_spawn: Option<TargetFirstSpawnFlow>,
@@ -1911,6 +1914,7 @@ impl TuiApp {
             notice_overflow_dropped: 0,
             transient_notice: None,
             spawn_targets: Vec::new(),
+            spawn_targets_loaded: false,
             selected_session_type_id: None,
             session_type_form: None,
             target_first_spawn: None,
@@ -3402,7 +3406,9 @@ impl TuiApp {
     fn begin_target_first_spawn(&mut self) {
         self.error = None;
         self.session_type_form = None;
-        if self.launch_target_options().is_empty() {
+        // Before the target list loads, the dialog opens and fills in when the
+        // ListSpawnTargets reply arrives.
+        if self.spawn_targets_loaded && self.launch_target_options().is_empty() {
             self.error =
                 Some("no launch targets available (no enabled admitted spawn targets)".to_string());
             return;
@@ -5584,6 +5590,7 @@ impl TuiApp {
         }
         if matches!(response.kind, DaemonResponseKind::SpawnTargets) {
             self.spawn_targets = response.spawn_targets;
+            self.spawn_targets_loaded = true;
         }
         if matches!(response.kind, DaemonResponseKind::AvailablePackages) {
             self.available_packages = response.available_packages;
@@ -7066,12 +7073,20 @@ impl TuiApp {
         )];
         match &flow.step {
             TargetFirstSpawnStep::PickTarget => {
+                let options = self.launch_target_options();
+                let help = if !options.is_empty() {
+                    "Select a launch target first"
+                } else if self.spawn_targets_loaded {
+                    "No launch targets available"
+                } else {
+                    "Loading launch targets…"
+                };
                 nodes.push(node(
                     UiNodeKind::Text,
                     "tui-target-first-spawn-help",
-                    json!({ "text": "Select a launch target first" }),
+                    json!({ "text": help }),
                 ));
-                for target in self.launch_target_options() {
+                for target in options {
                     nodes.push(button(
                         &format!("tui-spawn-target-{}", target.target_id),
                         &format!("{} ({})", target.label, target.target_id),
@@ -11641,8 +11656,35 @@ mod tests {
     }
 
     #[test]
+    fn spawn_before_targets_load_opens_the_dialog_and_fills_it_on_arrival() {
+        let mut app = TuiApp::new(None);
+        app.begin_target_first_spawn();
+        assert_eq!(app.error, None, "an unloaded list is not an empty list");
+        assert!(app.target_first_spawn.is_some());
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        assert!(lines.join("\n").contains("Loading launch targets"));
+
+        let mut response = base_response(DaemonResponseKind::SpawnTargets);
+        response.spawn_targets = vec![DaemonSpawnTarget {
+            target_id: "repo-a".to_string(),
+            label: "Repo A".to_string(),
+            root: std::path::PathBuf::from("/tmp/repo-a"),
+            enabled: true,
+            kind: "git".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        }];
+        app.apply_response(response);
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 48);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Repo A (repo-a)"), "{rendered}");
+        assert!(!rendered.contains("Loading launch targets"));
+    }
+
+    #[test]
     fn blank_target_first_spawn_validation_renders_visible_error_state() {
         let mut app = TuiApp::new(None);
+        app.spawn_targets_loaded = true;
         app.begin_target_first_spawn();
 
         assert_eq!(
@@ -12991,6 +13033,7 @@ mod tests {
     fn corrected_user_action_clears_stale_validation_error() {
         let mut app = TuiApp::new(None);
         app.system_details_visible = true;
+        app.spawn_targets_loaded = true;
         app.begin_target_first_spawn();
         assert_eq!(
             app.error.as_deref(),
