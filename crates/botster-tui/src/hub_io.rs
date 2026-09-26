@@ -1134,14 +1134,23 @@ mod tests {
     fn stop_signal_resolves_the_input_wait_from_another_thread() {
         let stop = Arc::new(StopSignal::new());
         let remote = Arc::clone(&stop);
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
+            // Stop only after the waiter registered its waker and went Pending.
+            registered_rx.recv().expect("the waiter registers first");
             remote.stop();
         });
-        let resolved = future::block_on(future::or(
-            future::pending::<Option<io::Result<Event>>>(),
-            StopWait(&stop),
-        ));
+        let mut wait = StopWait(&stop);
+        let mut registered = Some(registered_tx);
+        let resolved = future::block_on(future::poll_fn(|cx| {
+            let poll = Pin::new(&mut wait).poll(cx);
+            if poll.is_pending()
+                && let Some(registered) = registered.take()
+            {
+                let _ = registered.send(());
+            }
+            poll
+        }));
         assert!(resolved.is_none());
         handle.join().expect("stop thread");
     }
