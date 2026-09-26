@@ -77,7 +77,7 @@ use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
 const PACKAGE_CONFIG_FIELD_PREFIX: &str = "package-config";
 const SMOKE_MESSAGE: &str = "botster-tui smoke ok";
-const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 49;
+const MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 50;
 /// Absolute deadline for an ordinary host-control request.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// Absolute deadline for Detach and for connection teardown.
@@ -13171,6 +13171,7 @@ mod tests {
             },
             terminal_compatibility: Some(compatibility),
             diagnostics: Vec::new(),
+            terminal_generation: None,
         };
         let error = admit_terminal_hello(&ack)
             .expect_err("missing terminal snapshot_delivery must fail before Attach");
@@ -13191,6 +13192,7 @@ mod tests {
             compatibility: DaemonCompatibility::current(),
             terminal_compatibility: None,
             diagnostics: Vec::new(),
+            terminal_generation: None,
         };
         admit_terminal_hello(&ack)
             .expect_err("omitted terminal_compatibility must fail before Attach");
@@ -14657,8 +14659,8 @@ mod tests {
     fn pinned_session_plugin_binding_fixture_is_conformance_40() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 49,
-            "hub-test-support pin must publish fixture revision 49"
+            scenario.conformance_fixture_revision, 50,
+            "hub-test-support pin must publish fixture revision 50"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -15227,9 +15229,9 @@ mod tests {
     }
 
     #[test]
-    fn tui_requires_package_event_subscriptions_at_floor_49() {
+    fn tui_requires_package_event_subscriptions_at_floor_50() {
         let requirement = tui_compatibility_requirement();
-        assert_eq!(requirement.minimum_conformance_fixture_revision, 49);
+        assert_eq!(requirement.minimum_conformance_fixture_revision, 50);
         assert!(
             requirement
                 .required_features
