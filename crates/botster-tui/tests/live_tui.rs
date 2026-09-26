@@ -2036,9 +2036,19 @@ fn wait_for_exits(pids: &[u32], deadline: Duration) {
         if ready == 0 {
             break;
         }
+        // IN or HUP on a pidfd means the process exited; ERR, NVAL, or any
+        // other flag is a failed wait, not exit evidence.
+        let exit_flags = PollFlags::IN | PollFlags::HUP;
         let exited = polled
             .iter()
-            .map(|entry| !entry.revents().is_empty())
+            .map(|entry| {
+                let flags = entry.revents();
+                assert!(
+                    exit_flags.contains(flags),
+                    "pidfd poll reported non-exit flags {flags:?}"
+                );
+                !flags.is_empty()
+            })
             .collect::<Vec<_>>();
         drop(polled);
         let mut index = 0;
