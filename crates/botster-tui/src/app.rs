@@ -13527,6 +13527,45 @@ mod tests {
     }
 
     #[test]
+    fn a_new_running_session_is_never_attached_without_activation() {
+        let mut app = workspace_fixture();
+        app.attached = None;
+        app.session_entities
+            .begin_generation("sessions".to_string());
+        let entity = |id: &str| {
+            serde_json::to_value(session_entity(id, Some("running"))).expect("session json")
+        };
+        app.apply_entity_frame(DaemonEntityFrame::Snapshot {
+            subscription_id: "sessions".to_string(),
+            entity_type: "session".to_string(),
+            snapshot_seq: 1,
+            items: vec![entity("session-stale")],
+            resync_reason: None,
+        });
+        app.apply_entity_frame(DaemonEntityFrame::Upsert {
+            subscription_id: "sessions".to_string(),
+            entity_type: "session".to_string(),
+            snapshot_seq: 2,
+            id: "session-fresh".to_string(),
+            entity: entity("session-fresh"),
+        });
+        assert!(
+            app.sessions
+                .iter()
+                .any(|session| session.session_id == "session-fresh"),
+            "the fresh session is listed"
+        );
+        assert!(
+            !app.observed_requests
+                .iter()
+                .any(|request| matches!(request, ObservedRequest::Attach { .. })),
+            "listing a session must not submit an Attach: {:?}",
+            app.observed_requests
+        );
+        assert!(app.attach_hydration.is_none());
+    }
+
+    #[test]
     fn claim_session_baseline_requires_lifecycle_class_current() {
         let mut app = TuiApp::new(None);
         app.session_entities.has_snapshot = true;
