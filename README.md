@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `a69b70ccf5516489579647e21926b3aac7ea8b66` |
+| `botster-hub-client` / live hub | Hub `8ff59ed395faa2f13abcc636f811337845721c9f` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `a69b70ccf5516489579647e21926b3aac7ea8b66` (`@trybotster/hub-test-support@0.1.46`) |
+| `botster-hub-test-support` package | Hub git `8ff59ed395faa2f13abcc636f811337845721c9f` (`@trybotster/hub-test-support@0.1.46`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `891e220295427fd93991638d7c62ba40fa25d4ae` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `a499d5afa853df66629825538a1d51014884d50d` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -188,7 +188,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`a69b70ccf5516489579647e21926b3aac7ea8b66` (same Hub pin as Foundation above).
+`8ff59ed395faa2f13abcc636f811337845721c9f` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -243,6 +243,17 @@ input lines, and the gate requires the same process after the restart
 manifest-verified Hub launcher, because `IsolatedHub::restart` recreates the
 data directory. It kills only the process groups it created and asserts that
 none of their members survive.
+
+T-S9 proves that plain `PageUp` / `PageDown` and `Ctrl-Home` / `Ctrl-End`
+reach a focused session as their exact escape sequences, that `Shift-Home`,
+`Shift-PageDown`, `Shift-PageUp`, and `Shift-End` each scroll the terminal
+view, and that no Shift key reaches the session.
+
+Current pins, September 26, 2026: T-S1 to T-S9 passed against the Hub
+candidate built from Hub `8ff59ed3` (Core `a499d5a`) with Rust 1.97.0; the
+locked workspace run passed 177 unit tests and the integration tests. T-S8a,
+T-S8b, and T-S1 each passed 30 of 30 repeated runs (1-minute load at the
+start of each 30-run batch: 19.49, 23.77, and 16.77).
 
 Protocol 10 execution, September 25, 2026: T-S1 to T-S7 passed against the Hub
 candidate built from Hub `e3dacd99` (production code equal to the `a69b70cc`
@@ -313,10 +324,17 @@ shown that a second reattach restores output.
 | `23b0feaa` | none | about 18.5 at the failure | 1 of 4 (loop stopped at the failure) |
 | `23b0feaa` | TUI route counters (diagnostic branch) | 4.9 to 9.1 | 0 of 30 |
 | Hub diagnostic builds (v3 file trace: 14; ring trace: 41) | Hub trace; TUI counters on the 41 ring runs | 5 to 11 where recorded | 0 of 55 |
+| `8ff59ed3` (Core `a499d5a`, current pins) | none | 19.49 and 23.77 at batch start | 0 of 60 (30 graceful, 30 SIGKILL) |
 
-All three failures occurred on untraced Hub builds. The `23b0feaa` failure ran
-at a recorded 1-minute load of 18.52; the two `0437cc4f` failures have no
-recorded load, so no load condition is established. Whether the Hub never sent
+The same symptom also appeared once without a restart: on Hub `178512e1` (Core
+`891e220`), T-S1 failed 1 of 6 runs. The first attach showed a blank pane while
+Hub `ReadScreen` showed the echo. On `8ff59ed3` (Core `a499d5a`, which carries
+attach fixes), T-S1 passed 30 of 30. No run has shown that Core `a499d5a`
+removes the cause; these runs only did not reproduce it.
+
+The three restart failures in the table occurred on untraced Hub builds. The
+`23b0feaa` failure ran at a recorded 1-minute load of 18.52; the two
+`0437cc4f` failures have no recorded load, so no load condition is established. Whether the Hub never sent
 the output or the TUI dropped it is not yet known.
 
 **Evidence** (under `~/botster-evidence/tui-cutover-20260925/`):
