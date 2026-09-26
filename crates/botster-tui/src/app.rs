@@ -8802,7 +8802,7 @@ fn ensure_claim_option_exclusion(
                 return Ok(reopened);
             }
         }
-        app.pump_once(Instant::now() + Duration::from_millis(50));
+        app.pump_once(deadline);
     }
     invalid_acceptance(format!(
         "timed out waiting for Available sessions to exclude {session_uuid}"
