@@ -18,9 +18,10 @@ use botster_core::{
 use botster_hub_client::{
     DaemonApp, DaemonAvailablePackage, DaemonCompatibility, DaemonCompatibilityError,
     DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonDiagnosticKind, DaemonEndpoint,
-    DaemonEntityFrame, DaemonEvent, DaemonHelloAck, DaemonPackage, DaemonPackageAvailabilityReason,
-    DaemonPackageAvailabilityState, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
-    DaemonPackagePin, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus, DaemonPluginSurface,
+    DaemonEntityFrame, DaemonEvent, DaemonHelloAck, DaemonObservabilityCounters, DaemonPackage,
+    DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
+    DaemonPackageNavigationEntry, DaemonPackagePin, DaemonPackageRouteDescriptor,
+    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonQuarantine, DaemonQuarantineTarget,
     DaemonRequest, DaemonRequestError, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
     DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
     DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
@@ -464,6 +465,9 @@ enum DetachState {
 enum PendingReply {
     /// Apply the response to read models and diagnostics.
     Apply,
+    /// ResolveQuarantine. Only a package resolution replies with the package
+    /// list; a repository root's reply carries none.
+    ResolveQuarantine { target: DaemonQuarantineTarget },
     /// The connection's spawn-target list; a failure is kept for the dialog.
     SpawnTargets,
     /// Session types for the target-first spawn picker (flow-local only).
@@ -1516,6 +1520,7 @@ fn draw_workspace_shell(
     let alert = app.connection_alert();
     let notice = app.transient_notice_band();
     let recovery = app.recovery_notice_line();
+    let quarantine = app.quarantine_band();
     let toolbar = app.workspace_toolbar();
     let navigator = app.session_navigator();
     let focused_session = app.focused_session_panel();
@@ -1524,6 +1529,7 @@ fn draw_workspace_shell(
         alert.as_ref(),
         notice.as_ref(),
         recovery.as_ref(),
+        quarantine.as_ref(),
         Some(&toolbar),
         Some(&navigator),
         Some(&focused_session),
@@ -1549,9 +1555,14 @@ fn draw_workspace_shell(
     );
 
     let mut next_y = area.y.saturating_add(1);
-    for band in [alert.as_ref(), notice.as_ref(), recovery.as_ref()]
-        .into_iter()
-        .flatten()
+    for band in [
+        alert.as_ref(),
+        notice.as_ref(),
+        recovery.as_ref(),
+        quarantine.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         let band_area = Rect::new(area.x, next_y, area.width, 1);
         renderer::render_node_with_presentation_state(
@@ -1774,6 +1785,10 @@ struct TuiApp {
     diagnostics: Vec<DaemonDiagnostic>,
     package_count: usize,
     enabled_package_count: usize,
+    /// Hub quarantines awaiting operator resolution, from the latest Status.
+    quarantines: Vec<DaemonQuarantine>,
+    /// Hub observability counters from the latest Status.
+    hub_counters: DaemonObservabilityCounters,
     apps: Vec<DaemonApp>,
     package_navigation: Vec<DaemonPackageNavigationEntry>,
     packages: Vec<DaemonPackage>,
@@ -1930,6 +1945,8 @@ impl TuiApp {
             diagnostics: Vec::new(),
             package_count: 0,
             enabled_package_count: 0,
+            quarantines: Vec::new(),
+            hub_counters: DaemonObservabilityCounters::default(),
             apps: Vec::new(),
             package_navigation: Vec::new(),
             packages: Vec::new(),
@@ -2520,6 +2537,24 @@ impl TuiApp {
                     self.submit_apply(DaemonRequest::ShowPackage { package_name });
                 }
             }
+            "botster.tui.quarantine.resolve" => {
+                match payload.map(serde_json::from_value::<DaemonQuarantineTarget>) {
+                    Some(Ok(target)) => {
+                        self.action_feedback = Some(format!(
+                            "resolve requested: {}",
+                            quarantine_target_text(&target)
+                        ));
+                        self.submit(
+                            DaemonRequest::ResolveQuarantine {
+                                target: target.clone(),
+                            },
+                            PendingReply::ResolveQuarantine { target },
+                            REQUEST_DEADLINE,
+                        );
+                    }
+                    _ => self.error = Some("resolve: invalid quarantine target".to_string()),
+                }
+            }
             "botster.tui.package.enable" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("enable requested: {package_name}"));
@@ -2731,6 +2766,10 @@ impl TuiApp {
         self.clear_route_state();
         self.attach_recovery_used = false;
         self.recovery_notice = None;
+        // Quarantines and counters describe the Hub of the dropped
+        // connection; the next Status fills them again.
+        self.quarantines.clear();
+        self.hub_counters = DaemonObservabilityCounters::default();
         self.terminal_close_evidence = None;
         // Detach answers and spawn targets are per connection.
         self.detaches.clear();
@@ -2887,6 +2926,15 @@ impl TuiApp {
             PendingReply::Apply | PendingReply::Unsubscribe => {
                 self.apply_response(response);
             }
+            PendingReply::ResolveQuarantine { target } => {
+                let resolved = response.error.is_none()
+                    && matches!(response.kind, DaemonResponseKind::QuarantineResolved);
+                if resolved && matches!(target, DaemonQuarantineTarget::Package { .. }) {
+                    self.packages = response.packages.clone();
+                    self.sync_notice_subscriptions();
+                }
+                self.apply_response(response);
+            }
             PendingReply::Detach { session_id, route } => {
                 // Success is a correlated Events response with no operator
                 // error; anything else is a failed detach, never a release.
@@ -2983,7 +3031,9 @@ impl TuiApp {
     fn apply_request_failure(&mut self, reply: PendingReply, error: DaemonRequestError) {
         let message = error.to_string();
         match reply {
-            PendingReply::Apply => self.error = Some(format!("request failed: {message}")),
+            PendingReply::Apply | PendingReply::ResolveQuarantine { .. } => {
+                self.error = Some(format!("request failed: {message}"));
+            }
             PendingReply::SpawnTargets => self.spawn_targets_failure = Some(message),
             PendingReply::Unsubscribe => {}
             PendingReply::Detach { session_id, route } => {
@@ -5465,6 +5515,9 @@ impl TuiApp {
     fn record_request(&mut self, request: &DaemonRequest) {
         match request {
             DaemonRequest::Status => self.observed_requests.push(ObservedRequest::Status),
+            DaemonRequest::ResolveQuarantine { target } => self
+                .observed_requests
+                .push(ObservedRequest::ResolveQuarantine(target.clone())),
             DaemonRequest::ListApps => self.observed_requests.push(ObservedRequest::ListApps),
             DaemonRequest::ListPackageNavigation => self
                 .observed_requests
@@ -5672,11 +5725,16 @@ impl TuiApp {
         self.record_diagnostics(response.diagnostics);
 
         if let Some(error) = response.error {
+            let quarantine_changed = error_may_create_quarantine(&error.code, &error.operation);
             self.record_diagnostics(error.diagnostics);
             self.error = Some(format!(
                 "{} (code={} operation={})",
                 error.message, error.code, error.operation
             ));
+            if quarantine_changed {
+                // Only Status lists quarantines; show the new one now.
+                self.refresh_status();
+            }
             return;
         }
 
@@ -5690,8 +5748,16 @@ impl TuiApp {
             self.status = format!("connected ({})", status.lifecycle_state);
             self.package_count = status.package_count;
             self.enabled_package_count = status.enabled_package_count;
+            self.quarantines = status.quarantines;
+            self.hub_counters = status.observability;
         }
 
+        if matches!(response.kind, DaemonResponseKind::QuarantineResolved) {
+            // The quarantine list lives only in Status, so read it again. A
+            // package resolution's package list is applied by its reply.
+            self.action_feedback = Some("quarantine resolved".to_string());
+            self.refresh_status();
+        }
         if matches!(
             response.kind,
             DaemonResponseKind::Packages | DaemonResponseKind::PackageDecision
@@ -5883,6 +5949,9 @@ impl TuiApp {
             root.children.push(child(notice));
         }
         if let Some(notice) = self.recovery_notice_line() {
+            root.children.push(child(notice));
+        }
+        if let Some(notice) = self.quarantine_band() {
             root.children.push(child(notice));
         }
         root.children.push(child(self.workspace_toolbar()));
@@ -6363,6 +6432,44 @@ impl TuiApp {
         dialog
     }
 
+    /// One line and one Resolve action per Hub quarantine.
+    fn quarantine_nodes(&self) -> Vec<UiNode> {
+        let mut nodes = Vec::new();
+        for (index, quarantine) in self.quarantines.iter().enumerate() {
+            nodes.push(node(
+                UiNodeKind::Text,
+                &format!("tui-quarantine-{index}"),
+                json!({ "text": format!("quarantine: {}", quarantine_text(quarantine)) }),
+            ));
+            let target = quarantine_target(quarantine);
+            nodes.push(button(
+                &format!("tui-quarantine-{index}-resolve"),
+                "Resolve",
+                "botster.tui.quarantine.resolve",
+                serde_json::to_value(&target).unwrap_or(Value::Null),
+            ));
+        }
+        nodes
+    }
+
+    /// Informational band while the Hub holds quarantines.
+    fn quarantine_band(&self) -> Option<UiNode> {
+        let count = self.quarantines.len();
+        if count == 0 {
+            return None;
+        }
+        let noun = if count == 1 {
+            "quarantine"
+        } else {
+            "quarantines"
+        };
+        Some(node(
+            UiNodeKind::Text,
+            "workspace-quarantine-notice",
+            json!({ "text": format!("{count} {noun} awaiting resolution (System details)") }),
+        ))
+    }
+
     fn system_details_panel(&self) -> UiNode {
         let mut panel = node(
             UiNodeKind::Panel,
@@ -6418,6 +6525,14 @@ impl TuiApp {
                 UiNodeKind::Text,
                 "tui-connection-error",
                 json!({ "text": format!("connection: {error}") }),
+            )));
+        }
+        children.extend(self.quarantine_nodes().into_iter().map(child));
+        if let Some(counters) = hub_counters_text(&self.hub_counters) {
+            children.push(child(node(
+                UiNodeKind::Text,
+                "tui-hub-counters",
+                json!({ "text": counters }),
             )));
         }
         children.push(child(node(
@@ -7419,6 +7534,7 @@ impl TuiApp {
 #[derive(Debug, PartialEq, Eq)]
 enum ObservedRequest {
     Status,
+    ResolveQuarantine(DaemonQuarantineTarget),
     ListApps,
     ListPackageNavigation,
     ListPackages,
@@ -9569,6 +9685,103 @@ fn workspace_button(
             .insert("tone".to_string(), Value::String(tone.to_string()));
     }
     control
+}
+
+/// Operator errors whose failure the Hub records as a quarantine: a package
+/// mutation whose rollback failed, and a repository session-types write whose
+/// outcome is unknown.
+fn error_may_create_quarantine(code: &str, operation: &str) -> bool {
+    code == "package_compensation_failed" || operation == "repo_session_type"
+}
+
+/// The resolution target for a listed quarantine.
+fn quarantine_target(quarantine: &DaemonQuarantine) -> DaemonQuarantineTarget {
+    match quarantine {
+        DaemonQuarantine::Package { package_name, .. } => DaemonQuarantineTarget::Package {
+            package_name: package_name.clone(),
+        },
+        DaemonQuarantine::RepositorySessionTypes { root, .. } => {
+            DaemonQuarantineTarget::RepositorySessionTypes { root: root.clone() }
+        }
+    }
+}
+
+fn quarantine_target_text(target: &DaemonQuarantineTarget) -> String {
+    match target {
+        DaemonQuarantineTarget::Package { package_name } => format!("package {package_name}"),
+        DaemonQuarantineTarget::RepositorySessionTypes { root } => {
+            format!("session types at {}", root.display())
+        }
+    }
+}
+
+fn quarantine_text(quarantine: &DaemonQuarantine) -> String {
+    match quarantine {
+        DaemonQuarantine::Package {
+            package_name,
+            original,
+            compensation,
+            durable,
+            loaded,
+            quarantined_at_ms,
+        } => {
+            let mut text = format!("package {package_name}");
+            if *quarantined_at_ms == 0 {
+                text.push_str(": no failure record");
+            } else {
+                text.push_str(&format!(
+                    ": {original}; compensation failed: {compensation}"
+                ));
+            }
+            if *loaded {
+                text.push_str(" · loaded but inert");
+            }
+            if !*durable {
+                text.push_str(" · not durable: lasts until the Hub restarts");
+            }
+            text
+        }
+        DaemonQuarantine::RepositorySessionTypes {
+            root,
+            cause,
+            detail,
+            ..
+        } => format!("session types at {}: {cause}: {detail}", root.display()),
+    }
+}
+
+/// The protocol 11 event and quarantine counters that are not zero.
+fn hub_counters_text(counters: &DaemonObservabilityCounters) -> Option<String> {
+    let values = [
+        (
+            "event_replacements_stranded",
+            counters.event_replacements_stranded,
+        ),
+        (
+            "event_deliveries_generation_unloaded",
+            counters.event_deliveries_generation_unloaded,
+        ),
+        (
+            "event_deliveries_package_unloaded",
+            counters.event_deliveries_package_unloaded,
+        ),
+        (
+            "event_deliveries_handler_absent",
+            counters.event_deliveries_handler_absent,
+        ),
+        ("event_stage_overlaps", counters.event_stage_overlaps),
+        ("events_stranded", counters.events_stranded),
+        (
+            "package_quarantines_not_durable",
+            counters.package_quarantines_not_durable,
+        ),
+    ];
+    let shown = values
+        .iter()
+        .filter(|(_, value)| *value != 0)
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    (!shown.is_empty()).then(|| format!("hub counters: {}", shown.join(" ")))
 }
 
 fn unique_suffix() -> u128 {
@@ -11730,6 +11943,209 @@ mod tests {
             parse(&["--smoke"]),
             Ok(ParsedCommand::Run(AppArgs { smoke: true, .. }))
         ));
+    }
+
+    fn quarantined_status() -> DaemonResponse {
+        let mut response = status_response("running", 1);
+        response.status.as_mut().expect("status").quarantines = vec![
+            DaemonQuarantine::Package {
+                package_name: "workflow.plugin".to_string(),
+                original: "enable failed".to_string(),
+                compensation: "rollback failed".to_string(),
+                durable: false,
+                loaded: true,
+                quarantined_at_ms: 1_790_000_000_000,
+            },
+            DaemonQuarantine::RepositorySessionTypes {
+                root: std::path::PathBuf::from("/repo/one"),
+                cause: "write_outcome_unknown".to_string(),
+                detail: "rename interrupted".to_string(),
+                quarantined_at_ms: 1_790_000_000_001,
+            },
+        ];
+        response
+            .status
+            .as_mut()
+            .expect("status")
+            .observability
+            .events_stranded = 3;
+        response
+    }
+
+    #[test]
+    fn status_quarantines_render_with_resolve_actions_and_a_workspace_band() {
+        let mut app = workspace_fixture();
+        app.apply_completion(PendingReply::Apply, quarantined_status());
+        assert_eq!(app.quarantines.len(), 2);
+
+        let workspace = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+        assert!(
+            workspace.contains("2 quarantines awaiting resolution (System details)"),
+            "{workspace}"
+        );
+
+        app.system_details_visible = true;
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 80);
+        let details = lines.join("\n");
+        assert!(
+            details.contains(
+                "quarantine: package workflow.plugin: enable failed; compensation failed: rollback failed · loaded but inert · not durable: lasts until the Hub restarts"
+            ),
+            "{details}"
+        );
+        assert!(
+            details.contains(
+                "quarantine: session types at /repo/one: write_outcome_unknown: rename interrupted"
+            ),
+            "{details}"
+        );
+        assert_eq!(details.matches("Resolve").count(), 2, "{details}");
+        assert!(
+            details.contains("hub counters: events_stranded=3"),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn resolve_sends_the_listed_target_and_a_resolution_rereads_status() {
+        let mut app = workspace_fixture();
+        app.apply_completion(PendingReply::Apply, quarantined_status());
+        let nodes = app.quarantine_nodes();
+        let payload = nodes
+            .iter()
+            .filter_map(|node| node.props.get("action"))
+            .filter_map(|action| action.get("payload"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(payload.len(), 2, "one Resolve payload per quarantine");
+        for payload in payload {
+            app.handle_action(
+                "botster.tui.quarantine.resolve".to_string(),
+                None,
+                Some(payload),
+            );
+        }
+        app.handle_action(
+            "botster.tui.quarantine.resolve".to_string(),
+            None,
+            Some(json!({ "kind": "unknown" })),
+        );
+        assert_eq!(
+            app.observed_requests,
+            vec![
+                ObservedRequest::ResolveQuarantine(DaemonQuarantineTarget::Package {
+                    package_name: "workflow.plugin".to_string()
+                }),
+                ObservedRequest::ResolveQuarantine(
+                    DaemonQuarantineTarget::RepositorySessionTypes {
+                        root: std::path::PathBuf::from("/repo/one")
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("resolve: invalid quarantine target")
+        );
+
+        // A repository root's resolution replies without a package list:
+        // the package model stays.
+        app.packages = vec![package_with_configuration()];
+        app.observed_requests.clear();
+        app.apply_completion(
+            PendingReply::ResolveQuarantine {
+                target: DaemonQuarantineTarget::RepositorySessionTypes {
+                    root: std::path::PathBuf::from("/repo/one"),
+                },
+            },
+            base_response(DaemonResponseKind::QuarantineResolved),
+        );
+        assert_eq!(app.packages.len(), 1, "the package model survives");
+        assert_eq!(app.observed_requests, vec![ObservedRequest::Status]);
+        assert_eq!(app.action_feedback.as_deref(), Some("quarantine resolved"));
+
+        // A package resolution replies with the package list, which replaces
+        // the model.
+        app.observed_requests.clear();
+        app.apply_completion(
+            PendingReply::ResolveQuarantine {
+                target: DaemonQuarantineTarget::Package {
+                    package_name: "workflow.plugin".to_string(),
+                },
+            },
+            base_response(DaemonResponseKind::QuarantineResolved),
+        );
+        assert!(app.packages.is_empty(), "the reply's package list applies");
+        assert_eq!(app.observed_requests, vec![ObservedRequest::Status]);
+
+        // The re-read Status without quarantines clears the list and band.
+        app.apply_completion(PendingReply::Apply, status_response("running", 1));
+        assert!(app.quarantines.is_empty());
+        assert!(app.quarantine_band().is_none());
+    }
+
+    #[test]
+    fn quarantine_creating_errors_reread_status_and_others_do_not() {
+        let mut app = workspace_fixture();
+        for (code, operation, rereads) in [
+            (
+                "package_compensation_failed",
+                "package_mutation_compensation",
+                true,
+            ),
+            (
+                "repo_session_type_publication_uncertain",
+                "repo_session_type",
+                true,
+            ),
+            ("package_not_found", "package_mutation", false),
+        ] {
+            app.observed_requests.clear();
+            let mut response = base_response(DaemonResponseKind::OperatorError);
+            response.error = Some(botster_hub_client::DaemonOperatorError {
+                code: code.to_string(),
+                request_id: "request".to_string(),
+                operation: operation.to_string(),
+                message: "failed".to_string(),
+                diagnostics: Vec::new(),
+            });
+            app.apply_completion(PendingReply::Apply, response);
+            assert_eq!(
+                app.observed_requests.contains(&ObservedRequest::Status),
+                rereads,
+                "{code} / {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_forgets_its_quarantines_and_counters() {
+        let mut app = workspace_fixture();
+        app.apply_completion(PendingReply::Apply, quarantined_status());
+        assert!(app.quarantine_band().is_some());
+        assert!(hub_counters_text(&app.hub_counters).is_some());
+        app.drop_connection_state();
+        assert!(app.quarantines.is_empty());
+        assert!(app.quarantine_band().is_none());
+        assert!(app.quarantine_nodes().is_empty());
+        assert_eq!(hub_counters_text(&app.hub_counters), None);
+    }
+
+    #[test]
+    fn hub_counters_show_only_nonzero_protocol_11_counters() {
+        assert_eq!(
+            hub_counters_text(&DaemonObservabilityCounters::default()),
+            None
+        );
+        let mut counters = DaemonObservabilityCounters::default();
+        counters.event_stage_overlaps = 1;
+        counters.package_quarantines_not_durable = 2;
+        assert_eq!(
+            hub_counters_text(&counters).as_deref(),
+            Some("hub counters: event_stage_overlaps=1 package_quarantines_not_durable=2")
+        );
     }
 
     #[test]
@@ -13908,6 +14324,7 @@ mod tests {
             lifecycle_counters: botster_hub_client::DaemonLifecycleCounters::default(),
             live_attach_occupancy: Vec::new(),
             observability: botster_hub_client::DaemonObservabilityCounters::default(),
+            quarantines: Vec::new(),
             local_webrtc_terminal_records: Vec::new(),
             diagnostics: Vec::new(),
         });
@@ -14947,11 +15364,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_40() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_51() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 50,
-            "hub-test-support pin must publish fixture revision 50"
+            scenario.conformance_fixture_revision, 51,
+            "hub-test-support pin must publish fixture revision 51"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
