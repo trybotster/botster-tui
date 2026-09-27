@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `e9cd8445cb70894955cef38f1466bed3526f3a13` |
+| `botster-hub-client` / live hub | Hub `1ec61b94c76f62b0b2942c21c7c03630da709221` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `e9cd8445cb70894955cef38f1466bed3526f3a13` (`@trybotster/hub-test-support@0.1.46`) |
+| `botster-hub-test-support` package | Hub git `1ec61b94c76f62b0b2942c21c7c03630da709221` (`@trybotster/hub-test-support@0.1.46`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `6a8fc2245449b04e859fc4c1c4a71fb06b860e80` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `549b3f62dabacf45cce4b4dfd19e1a6800bf8c7a` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -188,7 +188,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`e9cd8445cb70894955cef38f1466bed3526f3a13` (same Hub pin as Foundation above).
+`1ec61b94c76f62b0b2942c21c7c03630da709221` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -267,9 +267,14 @@ cycle, re-attach on a new route (Hub `Status` occupancy), and echo input. The se
 recovery restores the recovery for the next independent close. The wait while
 the TUI is stopped is fixed; see Known issues.
 
-Current pins, September 26, 2026: T-S1 to T-S10 passed against the Hub
-candidate built from Hub `fe51ce50` (Core `6a8fc22`; Hub `e9cd8445` adds only
-a docs plan file) with Rust 1.97.0; T-S10 passed 3 of 3 runs. The 1-minute
+Current pins (protocol 11), September 27, 2026: T-S1 to T-S11 passed against
+the Hub candidate built from Hub `1ec61b94` (Core `549b3f6`) with Rust 1.97.0.
+The locked workspace run passed 191 tests (unit, timer guard, and integration);
+the 1-minute load was 12.77 at the start of the T-S1 to T-S11 sequence.
+
+Hub `e9cd8445` (Core `6a8fc22`), September 26, 2026: T-S1 to T-S10 passed
+against the Hub candidate built from Hub `fe51ce50` (`e9cd8445` adds only a
+docs plan file) with Rust 1.97.0; T-S10 passed 3 of 3 runs. The 1-minute
 load was 53.68 at the start of the T-S1 to T-S9 sequence and 41.99 at the
 start of the T-S10 runs. The locked workspace run passed 177 unit tests and
 the integration tests.
@@ -339,12 +344,43 @@ Session types are authoritative Hub descriptors consumed through the
   handshake with a compatibility diagnostic.
 - Pins: see the Foundation table above.
 
+### Quarantines (System details)
+
+Protocol 11 Status lists quarantines the operator must resolve. System details
+shows one line per quarantine and a Resolve action:
+
+- `package <name>: <original>; compensation failed: <compensation>`, with
+  `loaded but inert` while its runtime is still loaded and `not durable: lasts
+  until the Hub restarts` when the Hub could not persist it;
+- `session types at <root>: <cause>: <detail>` for a repository root whose
+  session-types write outcome is unknown.
+
+Resolve sends `ResolveQuarantine` with that quarantine's target. A package
+resolution's reply (`QuarantineResolved`) carries the package list, which the
+TUI applies; a repository resolution's reply carries none, and the package list
+stays. Both make the TUI read Status again, because only Status lists
+quarantines. While any quarantine exists the
+workspace shows `N quarantine(s) awaiting resolution (System details)`. The
+protocol 11 event and quarantine counters appear in System details as `hub
+counters: name=value`, only when they are not zero.
+
+A reply that can create a quarantine (`package_compensation_failed`, or an
+error from a `repo_session_type` write) also makes the TUI read Status again,
+so the new quarantine appears at once. A Hub reconnect clears the quarantine
+list and counters until the new connection's Status arrives.
+
+Live tests do not create a quarantine. The one bounded attempt, an unreadable
+local package directory during a reload, ended in a plain load refusal, and no
+deterministic live trigger was found (evidence
+`quarantine-live-no-production-path.md`). Unit tests cover the rendering, the
+Resolve request, the Status re-reads, and the reconnect.
+
 ## Known issues
 
 ### T-S11 waits a fixed time for the reader-deadline close (hub-status-entity)
 
 While the TUI is stopped, only the Hub can observe the route close, and Hub
-`e9cd8445` publishes no event for it to a sibling client (attach occupancy is
+`1ec61b94` publishes no event for it to a sibling client (attach occupancy is
 only in the `Status` response). T-S11 therefore waits a fixed
 `CORE_READER_PROGRESS_DEADLINE` (10 s, from Core `6a8fc22`) plus a 5 s margin
 before it resumes the TUI, and then proves the close through the TUI's own
