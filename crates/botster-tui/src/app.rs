@@ -11460,7 +11460,7 @@ fn capability_text(capabilities: &[botster_hub_client::DaemonCapability]) -> Str
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     use super::*;
     use botster_hub_client::{DaemonUiTreeSnapshot, TerminalCompatibility};
@@ -16193,7 +16193,7 @@ mod tests {
         assert!(!rendered_workspace(&app).contains("old"));
     }
 
-    fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
+    pub(crate) fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
         DaemonResponse {
             kind,
             status: None,
@@ -16277,7 +16277,7 @@ mod tests {
     fn complete_attach(app: &mut TuiApp, session_id: &str, route: &str, generation: u64) {
         let mut response = base_response(DaemonResponseKind::TerminalAttached);
         response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach::new(
-            session_id, route, generation,
+            session_id, route, generation, 64,
         ));
         app.apply_completion(
             PendingReply::Attach {
@@ -16583,6 +16583,7 @@ mod tests {
             "session-alpha",
             "route-1",
             6,
+            64,
         ));
         app.apply_completion(
             PendingReply::Attach {
