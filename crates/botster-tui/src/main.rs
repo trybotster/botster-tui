@@ -1,5 +1,6 @@
 mod acceptance;
 mod app;
+mod credit;
 mod entity_options;
 mod hub_io;
 mod projection_paint;

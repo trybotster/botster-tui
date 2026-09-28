@@ -17,18 +17,20 @@
 //!
 //! - 32 outstanding host-control requests per connection; a 33rd `submit`
 //!   completes immediately with `DaemonRequestError::TooManyOutstandingRequests`.
-//! - 256 items / 8 MiB of pending wakes. When a terminal frame would exceed
-//!   the bound, the reader waits for the application to release space before
-//!   it reads the socket again (backpressure): the Hub and Core then hold the
-//!   session's output, and the PTY blocks the program. Link close and shutdown
-//!   end the wait. A terminal frame (at most `MAX_ROUTE_EGRESS_BYTES`) always
-//!   fits once the queue drains. Only a frame that does not decode faults its
-//!   route (`RouteFault`); the application detaches
-//!   and re-attaches that route only. Control frames are never shed because
-//!   their producers are already bounded (32 responses, Hub-shed events with
-//!   `EventGap`, entity snapshots per subscription). A later per-route credit
-//!   window on the Unix mux replaces this blocking read, so control frames need
-//!   not wait behind a flooding route.
+//! - 256 items / 8 MiB of pending wakes, shared by every route and by
+//!   retained frames. Terminal output is credited per route (S13): the Hub
+//!   sends a frame only against credit this client granted for it, after the
+//!   Hub demanded that whole frame, so the reader never waits and never sheds
+//!   a slow route, and control frames never wait behind a flooding route.
+//!   Grants are carved from this budget first come first served; a route's
+//!   pool stays charged until its frames are dequeued, returned, or its
+//!   generation closes (`credit.rs`). Only a frame that does not decode faults
+//!   its route (`RouteFault`); the application detaches and re-attaches that
+//!   route only. A frame no grant covered, a second unserved demand, or an
+//!   over-return is a protocol violation that closes the connection. Control
+//!   frames are never shed because their producers are already bounded (32
+//!   responses, Hub-shed events with `EventGap`, entity snapshots per
+//!   subscription).
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -38,7 +40,7 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -49,15 +51,18 @@ use std::{
 
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEntityFrame, DaemonEvent,
-    DaemonHelloAck, DaemonRequest, DaemonRequestError, DaemonResponse, DaemonTransportError,
-    DaemonUnixFrameReader, DaemonUnixMuxFrame, DaemonUnixTerminalFrame, MAX_OUTSTANDING_REQUESTS,
-    RequestIdSequence, ServerFrame, TerminalCompatibilityRequirement,
-    connect_and_hello_with_terminal_requirement, encode_client_frame, encode_request_id,
-    encode_unix_terminal_frame, parse_request_id,
+    DaemonHelloAck, DaemonRequest, DaemonRequestError, DaemonResponse, DaemonResponseKind,
+    DaemonTransportError, DaemonUnixCreditFrame, DaemonUnixFrameReader, DaemonUnixMuxFrame,
+    DaemonUnixTerminalFrame, MAX_OUTSTANDING_REQUESTS, RequestIdSequence, ServerFrame,
+    TerminalCompatibilityRequirement, connect_and_hello_with_terminal_requirement,
+    encode_client_frame, encode_request_id, encode_unix_credit_frame, encode_unix_terminal_frame,
+    parse_request_id,
 };
 use botster_terminal_protocol_client::{RouteId, RoutedTerminalFrame, TerminalFrame};
 use crossterm::event::{Event, EventStream};
 use futures_lite::{StreamExt, future};
+
+use crate::credit::{CreditLedger, CreditViolation, Release};
 
 /// Pending wake items before a terminal route is shed.
 pub const MAX_PENDING_WAKE_ITEMS: usize = 256;
@@ -149,6 +154,10 @@ enum IoMessage {
         route_generation: u64,
         reason: String,
     },
+    Credit {
+        generation: u64,
+        frame: DaemonUnixCreditFrame,
+    },
 }
 
 /// Handles the connect thread hands to the owner once Hello succeeded.
@@ -208,14 +217,6 @@ struct WakeBudget {
     bytes: AtomicUsize,
     /// Routes (with route generation) already reported as faulted.
     faulted_routes: Mutex<BTreeSet<(String, u64)>>,
-    /// The connection generation whose reader may wait for terminal space;
-    /// `None` after a close or shutdown.
-    open_reader: Mutex<Option<u64>>,
-    /// Signalled when pending space is released or the open reader changes.
-    space: Condvar,
-    /// Test seam: told each time a reader starts waiting for space.
-    #[cfg(test)]
-    waiting: Mutex<Option<Sender<()>>>,
 }
 
 impl WakeBudget {
@@ -224,67 +225,6 @@ impl WakeBudget {
             items: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
             faulted_routes: Mutex::new(BTreeSet::new()),
-            open_reader: Mutex::new(None),
-            space: Condvar::new(),
-            #[cfg(test)]
-            waiting: Mutex::new(None),
-        }
-    }
-
-    /// Let `generation`'s reader wait for space; any other reader stops.
-    fn open_reader(&self, generation: u64) {
-        let mut open = self
-            .open_reader
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *open = Some(generation);
-        self.space.notify_all();
-    }
-
-    /// Stop `generation`'s reader if it is waiting for space.
-    fn close_reader(&self, generation: u64) {
-        let mut open = self
-            .open_reader
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if *open == Some(generation) {
-            *open = None;
-        }
-        self.space.notify_all();
-    }
-
-    fn notify_space(&self) {
-        let _open = self
-            .open_reader
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        self.space.notify_all();
-    }
-
-    /// Reserve one terminal item of `bytes` for `generation`'s reader,
-    /// waiting while the budget is full. This is the TUI's backpressure: the
-    /// reader stops reading the socket, so the Hub and Core hold the
-    /// session's output. Returns false when the reader was closed first.
-    fn reserve_terminal_waiting(&self, generation: u64, bytes: usize) -> bool {
-        let mut open = self
-            .open_reader
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        loop {
-            if *open != Some(generation) {
-                return false;
-            }
-            if self.try_reserve_terminal(bytes) {
-                return true;
-            }
-            #[cfg(test)]
-            if let Some(waiting) = self.waiting.lock().ok().and_then(|seam| seam.clone()) {
-                let _ = waiting.send(());
-            }
-            open = self
-                .space
-                .wait(open)
-                .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 
@@ -329,13 +269,19 @@ impl WakeBudget {
 
     fn release_control(&self) {
         self.items.fetch_sub(1, Ordering::AcqRel);
-        self.notify_space();
     }
 
     fn release_terminal(&self, bytes: usize) {
         self.items.fetch_sub(1, Ordering::AcqRel);
         self.bytes.fetch_sub(bytes, Ordering::AcqRel);
-        self.notify_space();
+    }
+
+    /// Give back credit that left a route's pool.
+    fn release(&self, release: Release) {
+        let items = usize::try_from(release.items).unwrap_or(usize::MAX);
+        let bytes = usize::try_from(release.bytes).unwrap_or(usize::MAX);
+        self.items.fetch_sub(items, Ordering::AcqRel);
+        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
 
@@ -401,10 +347,15 @@ pub struct HubIo {
     request_ids: RequestIdSequence,
     pending: BTreeMap<u64, PendingRequest>,
     budget: Arc<WakeBudget>,
+    /// Output credit per route of the current connection (S13).
+    credit: CreditLedger,
     /// Test seam: when set, terminal input frames are recorded instead of
     /// written, so a test without a Hub can observe the write path.
     #[cfg(test)]
     captured_terminal: Option<Vec<(String, u64, Vec<u8>)>>,
+    /// Test seam: when set, credit frames are recorded instead of written.
+    #[cfg(test)]
+    captured_credit: Option<Vec<DaemonUnixCreditFrame>>,
 }
 
 impl HubIo {
@@ -422,8 +373,11 @@ impl HubIo {
             request_ids: RequestIdSequence::new(),
             pending: BTreeMap::new(),
             budget: Arc::new(WakeBudget::new()),
+            credit: CreditLedger::default(),
             #[cfg(test)]
             captured_terminal: None,
+            #[cfg(test)]
+            captured_credit: None,
         }
     }
 
@@ -480,7 +434,6 @@ impl HubIo {
         self.disconnect_now();
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        self.budget.open_reader(generation);
         let sender = self.wake_tx.clone();
         let budget = Arc::clone(&self.budget);
         let spawned = thread::Builder::new()
@@ -520,21 +473,66 @@ impl HubIo {
     /// Close the link within `bound` and fail its pending requests. Returns
     /// whether the link threads confirmed their stop; true when no link.
     pub fn disconnect(&mut self, bound: Duration) -> bool {
-        // A reader waiting for space cannot see the socket shut: end its wait.
-        // The generation is open from connect(), before its link is installed.
-        self.budget.close_reader(self.generation);
         let closed = self.link.take().is_none_or(|link| link.close_within(bound));
+        self.reset_credit();
         self.fail_pending();
         closed
     }
 
     /// Close the link without waiting and fail its pending requests.
     pub fn disconnect_now(&mut self) {
-        self.budget.close_reader(self.generation);
         if let Some(link) = self.link.take() {
             link.close_now();
         }
+        self.reset_credit();
         self.fail_pending();
+    }
+
+    /// The connection ended: every route's credit returns to the budget.
+    /// Frames of that connection still queued were in those pools, so they
+    /// release nothing when they are dequeued and discarded.
+    fn reset_credit(&mut self) {
+        let release = self.credit.reset();
+        self.budget.release(release);
+    }
+
+    /// Grant queued demands while the budget covers each whole frame.
+    fn serve_credit(&mut self) {
+        let budget = &self.budget;
+        let grants = self.credit.serve(|bytes| {
+            budget.try_reserve_terminal(usize::try_from(bytes).unwrap_or(usize::MAX))
+        });
+        for grant in grants {
+            let frame = DaemonUnixCreditFrame::Grant {
+                route: grant.route,
+                generation: grant.generation,
+                items: grant.items,
+                bytes: grant.bytes,
+            };
+            #[cfg(test)]
+            if let Some(captured) = self.captured_credit.as_mut() {
+                captured.push(frame);
+                continue;
+            }
+            let Some(bytes) = encode_unix_credit_frame(&frame) else {
+                continue;
+            };
+            if let Some(link) = self.link.as_ref() {
+                let _ = link.writer.send(WriteCommand::Bytes(bytes));
+            }
+        }
+    }
+
+    /// A credit rule was broken: the connection ends typed.
+    fn credit_violation(&mut self, violation: &CreditViolation) {
+        let reason = match violation {
+            CreditViolation::SecondDemand(_) => {
+                "a second credit demand before the first was served"
+            }
+            CreditViolation::UncoveredFrame(_) => "a terminal frame without credit",
+            CreditViolation::ReturnExceedsPool(_) => "a credit return larger than the route's pool",
+        };
+        self.end_link(DaemonTransportError::Protocol(reason));
     }
 
     fn fail_pending(&mut self) {
@@ -550,10 +548,10 @@ impl HubIo {
     /// Close the current link from the owner side and queue `Disconnected`.
     fn end_link(&mut self, error: DaemonTransportError) {
         let generation = self.generation;
-        self.budget.close_reader(generation);
         if let Some(link) = self.link.take() {
             link.close_now();
         }
+        self.reset_credit();
         self.fail_pending();
         self.ready
             .push_back(AppWake::Disconnected { generation, error });
@@ -631,15 +629,31 @@ impl HubIo {
             captured.push((route.to_string(), generation, body.to_vec()));
             return true;
         }
-        let Some(link) = self.link.as_ref() else {
+        if self.link.is_none() {
             return false;
-        };
+        }
         let Some(bytes) =
             encode_unix_terminal_frame(route, generation, INPUT_CONTAINER_EPOCH, body)
         else {
             return false;
         };
-        link.writer.send(WriteCommand::Bytes(bytes)).is_ok()
+        // Input is credited per route: a frame beyond the route's credit waits
+        // in order until the Hub returns credit. A route with no attachment
+        // (closed or never attached) takes no input.
+        let Some(ready) = self.credit.send_input(route, generation, bytes) else {
+            return false;
+        };
+        self.write_input(ready)
+    }
+
+    /// Write input frames that input credit released, in order.
+    fn write_input(&mut self, frames: Vec<Vec<u8>>) -> bool {
+        let Some(link) = self.link.as_ref() else {
+            return false;
+        };
+        frames
+            .into_iter()
+            .all(|bytes| link.writer.send(WriteCommand::Bytes(bytes)).is_ok())
     }
 
     /// Forget fault state for a retired route so a re-attach with the same
@@ -657,8 +671,9 @@ impl HubIo {
     }
 
     /// Release one retained frame charged with `try_retain`.
-    pub fn release_retained(&self, bytes: usize) {
+    pub fn release_retained(&mut self, bytes: usize) {
         self.budget.release_terminal(bytes);
+        self.serve_credit();
     }
 
     /// Earliest absolute deadline among outstanding requests.
@@ -761,13 +776,84 @@ impl HubIo {
         }
     }
 
+    /// Apply one credit frame from the Hub to the ledger.
+    fn apply_credit(&mut self, frame: DaemonUnixCreditFrame) {
+        let outcome = match frame {
+            DaemonUnixCreditFrame::Demand {
+                route,
+                generation,
+                bytes,
+            } => self.credit.demand(&route, generation, bytes),
+            DaemonUnixCreditFrame::Return {
+                route,
+                generation,
+                items,
+                bytes,
+            } => self
+                .credit
+                .returned(&route, generation, u64::from(items), bytes)
+                .map(|release| self.budget.release(release)),
+            DaemonUnixCreditFrame::Closed {
+                route, generation, ..
+            } => {
+                let release = self.credit.closed(&route, generation);
+                self.budget.release(release);
+                Ok(())
+            }
+            DaemonUnixCreditFrame::InputCredit {
+                route,
+                generation,
+                items,
+            } => {
+                let ready = self.credit.input_returned(&route, generation, items);
+                self.write_input(ready);
+                Ok(())
+            }
+            DaemonUnixCreditFrame::Grant { .. } => {
+                self.end_link(DaemonTransportError::Protocol(
+                    "the Hub sent a client-only credit grant",
+                ));
+                Ok(())
+            }
+        };
+        if let Err(violation) = outcome {
+            self.credit_violation(&violation);
+        }
+    }
+
     fn map_message(&mut self, message: IoMessage) -> Option<AppWake> {
         match message {
             IoMessage::Input(event) => Some(AppWake::Input(event)),
             IoMessage::InputEnded => Some(AppWake::Shutdown),
             IoMessage::Terminal { generation, frame } => {
-                self.budget.release_terminal(frame.frame.len());
-                self.current(generation).then_some(AppWake::Terminal(frame))
+                if !self.current(generation) {
+                    // Settled when that connection's credit was reset.
+                    return None;
+                }
+                let bytes = u64::try_from(frame.frame.len()).unwrap_or(u64::MAX);
+                match self
+                    .credit
+                    .dequeued(frame.route.as_str(), frame.generation, bytes)
+                {
+                    Ok(release) => {
+                        self.budget.release(release);
+                        self.serve_credit();
+                        Some(AppWake::Terminal(frame))
+                    }
+                    Err(violation) => {
+                        self.credit_violation(&violation);
+                        None
+                    }
+                }
+            }
+            IoMessage::Credit { generation, frame } => {
+                self.budget.release_control();
+                if !self.current(generation) {
+                    return None;
+                }
+                self.apply_credit(frame);
+                self.serve_credit();
+                None
             }
             IoMessage::Response {
                 generation,
@@ -775,8 +861,20 @@ impl HubIo {
                 response,
             } => {
                 self.budget.release_control();
+                self.serve_credit();
                 if !self.current(generation) {
                     return None;
+                }
+                // The Hub demands credit for a route only after its Attach
+                // response, so the route is known before its first demand.
+                if response.kind == DaemonResponseKind::TerminalAttached
+                    && let Some(attach) = response.terminal_attach.as_ref()
+                {
+                    self.credit.attach(
+                        &attach.subscription_id,
+                        attach.generation,
+                        attach.input_credit_items,
+                    );
                 }
                 // A response for an unknown, cancelled, or expired id is discarded
                 // for that key only.
@@ -788,10 +886,12 @@ impl HubIo {
             }
             IoMessage::Event { generation, event } => {
                 self.budget.release_control();
+                self.serve_credit();
                 self.current(generation).then_some(AppWake::Event(event))
             }
             IoMessage::Entity { generation, frame } => {
                 self.budget.release_control();
+                self.serve_credit();
                 self.current(generation).then_some(AppWake::Entity(frame))
             }
             IoMessage::Connected {
@@ -800,7 +900,6 @@ impl HubIo {
                 link,
             } => {
                 if generation != self.generation {
-                    self.budget.close_reader(generation);
                     let _ = link.stream.shutdown(Shutdown::Both);
                     let _ = link.writer.send(WriteCommand::Stop);
                     return None;
@@ -820,10 +919,10 @@ impl HubIo {
                 if generation != self.generation {
                     return None;
                 }
-                self.budget.close_reader(generation);
                 if let Some(link) = self.link.take() {
                     link.close_now();
                 }
+                self.reset_credit();
                 self.fail_pending();
                 Some(AppWake::Disconnected { generation, error })
             }
@@ -1049,11 +1148,14 @@ fn run_reader_thread(
                 });
                 return;
             }
+            DaemonUnixMuxFrame::Credit(frame) => {
+                budget.reserve_control();
+                IoMessage::Credit { generation, frame }
+            }
             DaemonUnixMuxFrame::Terminal(terminal) => {
-                match admit_terminal_frame(generation, terminal, budget) {
+                match admit_terminal_frame(terminal, budget) {
                     Ok(Some(frame)) => IoMessage::Terminal { generation, frame },
                     Ok(None) => continue,
-                    Err(TerminalAdmitError::Stopped) => return,
                     Err(TerminalAdmitError::Route {
                         route,
                         route_generation,
@@ -1087,19 +1189,18 @@ enum TerminalAdmitError {
         reason: String,
     },
     Protocol(&'static str),
-    /// The link closed while the reader waited for space.
-    Stopped,
 }
 
-/// Decode one Hub terminal container into a routed frame under the wake budget.
+/// Decode one Hub terminal container into a routed frame.
 ///
-/// A full budget makes the reader wait (backpressure) instead of shedding.
-/// `Ok(None)` means the frame was dropped for a route already reported faulted.
-/// `Err(Route)` carries the first fault for a route (a decode failure);
-/// `Err(Protocol)` means the connection itself violated the contract;
-/// `Err(Stopped)` means the link closed while waiting.
+/// The frame's budget was reserved when this client granted its credit, so
+/// the reader never waits; the owner debits the route's pool on dequeue. A
+/// frame dropped here (decode failure or a faulted route) stays charged to its
+/// pool until the generation closes. `Ok(None)` means the frame was dropped
+/// for a route already reported faulted. `Err(Route)` carries the first fault
+/// for a route (a decode failure); `Err(Protocol)` means the connection itself
+/// violated the contract.
 fn admit_terminal_frame(
-    link_generation: u64,
     terminal: DaemonUnixTerminalFrame,
     budget: &WakeBudget,
 ) -> Result<Option<RoutedTerminalFrame>, TerminalAdmitError> {
@@ -1125,9 +1226,6 @@ fn admit_terminal_frame(
             });
         }
     };
-    if !budget.reserve_terminal_waiting(link_generation, frame.len()) {
-        return Err(TerminalAdmitError::Stopped);
-    }
     Ok(Some(RoutedTerminalFrame {
         route: route_id,
         generation,
@@ -1153,159 +1251,223 @@ mod tests {
         }
     }
 
-    /// A budget whose reader for generation 1 may wait, filled to its
-    /// item bound.
-    fn full_budget() -> Arc<WakeBudget> {
-        let budget = Arc::new(WakeBudget::new());
-        budget.open_reader(1);
-        for _ in 0..MAX_PENDING_WAKE_ITEMS {
-            assert!(budget.try_reserve_terminal(0));
-        }
-        budget
-    }
-
-    /// Admit one frame on another thread. The first receiver fires once the
-    /// reader waits for space; the second carries the admission result.
-    fn admit_on_thread(
-        budget: &Arc<WakeBudget>,
-    ) -> (
-        Receiver<()>,
-        Receiver<Result<Option<RoutedTerminalFrame>, TerminalAdmitError>>,
-    ) {
-        // `waiting` fires once the reader is inside the wait for space.
-        let (waiting_tx, waiting) = mpsc::channel();
-        *budget.waiting.lock().expect("seam") = Some(waiting_tx);
-        let (result_tx, result) = mpsc::channel();
-        let budget = Arc::clone(budget);
-        thread::spawn(move || {
-            let _ = result_tx.send(admit_terminal_frame(
-                1,
-                terminal_container("r", 1, b"hi"),
-                &budget,
-            ));
-        });
-        (waiting, result)
-    }
-
-    /// Receive one message the test is waiting for.
-    fn recv_within<T>(receiver: &Receiver<T>, what: &str) -> T {
-        let bound = Duration::from_secs(10);
-        // timer: deadline — the awaited thread event arrives within the bound; expiry fails the test
-        let received = receiver.recv_timeout(bound);
-        received.unwrap_or_else(|error| panic!("{what}: {error}"))
-    }
-
-    #[test]
-    fn a_full_budget_makes_the_reader_wait_until_space_is_released() {
-        let budget = full_budget();
-        let (waiting, result) = admit_on_thread(&budget);
-        recv_within(&waiting, "the reader waits for space");
-        // The budget is full, so the frame cannot be admitted before a release.
-        assert!(
-            result.try_recv().is_err(),
-            "no frame is admitted while full"
-        );
-        assert_eq!(budget.items.load(Ordering::Acquire), MAX_PENDING_WAKE_ITEMS);
-        budget.release_terminal(0);
-        let admitted = recv_within(&result, "the release wakes the reader")
-            .ok()
-            .flatten()
-            .expect("the frame is admitted, not shed");
-        assert_eq!(admitted.route.as_str(), "r");
-        assert_eq!(admitted.frame.body(), b"hi");
-        assert!(
-            !budget.is_faulted("r", 1),
-            "backpressure never faults the route"
-        );
-        assert_eq!(budget.items.load(Ordering::Acquire), MAX_PENDING_WAKE_ITEMS);
-    }
-
-    #[test]
-    fn a_full_byte_budget_makes_the_reader_wait_until_bytes_are_released() {
-        let budget = Arc::new(WakeBudget::new());
-        budget.open_reader(1);
-        // One pending frame holds the whole byte bound; the item bound is free.
-        assert!(budget.try_reserve_terminal(MAX_PENDING_WAKE_BYTES));
-        let (waiting, result) = admit_on_thread(&budget);
-        recv_within(&waiting, "the reader waits for bytes");
-        assert!(
-            result.try_recv().is_err(),
-            "no frame is admitted while full"
-        );
-        budget.release_terminal(MAX_PENDING_WAKE_BYTES);
-        let admitted = recv_within(&result, "the byte release wakes the reader")
-            .ok()
-            .flatten()
-            .expect("the frame is admitted, not shed");
-        assert_eq!(admitted.frame.body(), b"hi");
-        assert_eq!(budget.items.load(Ordering::Acquire), 1);
-    }
-
-    /// A HubIo whose current generation 1 is open, with a full budget and a
-    /// reader waiting for space.
-    fn owner_with_waiting_reader() -> (
-        HubIo,
-        Receiver<Result<Option<RoutedTerminalFrame>, TerminalAdmitError>>,
-    ) {
+    /// A HubIo with a current connection (generation 1) whose credit grants
+    /// are captured instead of written.
+    fn linked_io() -> HubIo {
         let mut io = HubIo::new();
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let (writer, _writes) = mpsc::channel();
+        let (_reader_stop, reader_stopped) = mpsc::channel();
+        let (_writer_stop, writer_stopped) = mpsc::channel();
         io.generation = 1;
-        io.budget.open_reader(1);
-        for _ in 0..MAX_PENDING_WAKE_ITEMS {
-            assert!(io.budget.try_reserve_terminal(0));
+        io.link = Some(HubLink {
+            generation: 1,
+            stream,
+            writer,
+            reader_stopped,
+            writer_stopped,
+        });
+        io.captured_credit = Some(Vec::new());
+        io
+    }
+
+    fn attach_response(route: &str, generation: u64) -> Box<DaemonResponse> {
+        let mut response = crate::app::tests::base_response(DaemonResponseKind::TerminalAttached);
+        response.terminal_attach = Some(botster_hub_client::DaemonTerminalAttach::new(
+            "s", route, generation, 64,
+        ));
+        Box::new(response)
+    }
+
+    fn credit(io: &mut HubIo, frame: DaemonUnixCreditFrame) -> Option<AppWake> {
+        io.budget.reserve_control();
+        io.map_message(IoMessage::Credit {
+            generation: 1,
+            frame,
+        })
+    }
+
+    fn demand(route: &str, bytes: u64) -> DaemonUnixCreditFrame {
+        DaemonUnixCreditFrame::Demand {
+            route: route.to_string(),
+            generation: 7,
+            bytes,
         }
-        let (waiting, result) = admit_on_thread(&io.budget);
-        recv_within(&waiting, "the reader waits for space");
-        (io, result)
+    }
+
+    fn granted(io: &mut HubIo) -> Vec<(String, u64)> {
+        io.captured_credit
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|frame| match frame {
+                DaemonUnixCreditFrame::Grant {
+                    route,
+                    items: 1,
+                    bytes,
+                    ..
+                } => (route, bytes),
+                other => panic!("expected a one-frame grant, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Dequeue one terminal frame of the route through the owner.
+    fn dequeue(io: &mut HubIo, route: &str) -> Option<AppWake> {
+        let frame = admit_terminal_frame(terminal_container(route, 7, b"hi"), &io.budget)
+            .ok()
+            .flatten()
+            .expect("frame decodes");
+        io.map_message(IoMessage::Terminal {
+            generation: 1,
+            frame,
+        })
+    }
+
+    fn frame_len() -> u64 {
+        u64::try_from(
+            encode_output(b"hi")
+                .expect("encode output")
+                .as_bytes()
+                .len(),
+        )
+        .expect("small")
+    }
+
+    fn pending(io: &HubIo) -> (usize, usize) {
+        (
+            io.budget.items.load(Ordering::Acquire),
+            io.budget.bytes.load(Ordering::Acquire),
+        )
     }
 
     #[test]
-    fn every_owner_close_path_ends_a_waiting_reader() {
-        // No link is installed yet: connect() opened the generation, and the
-        // Connected wake has not been applied.
-        let (mut io, result) = owner_with_waiting_reader();
+    fn demands_are_granted_only_for_attached_routes() {
+        let mut io = linked_io();
+        credit(&mut io, demand("r", frame_len()));
+        assert!(granted(&mut io).is_empty(), "stale before the attach");
+        io.pending.insert(
+            1,
+            PendingRequest {
+                // timer: deadline — test request expiry bound
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        io.budget.reserve_control();
+        io.map_message(IoMessage::Response {
+            generation: 1,
+            request_id: 1,
+            response: attach_response("r", 7),
+        });
+        credit(&mut io, demand("r", frame_len()));
+        assert_eq!(granted(&mut io), vec![("r".to_string(), frame_len())]);
+        assert_eq!(
+            pending(&io),
+            (1, usize::try_from(frame_len()).expect("small"))
+        );
+        // The covered frame dequeues and its charge leaves the budget.
+        assert!(matches!(dequeue(&mut io, "r"), Some(AppWake::Terminal(_))));
+        assert_eq!(pending(&io), (0, 0));
+    }
+
+    #[test]
+    fn a_frame_without_credit_closes_the_connection() {
+        let mut io = linked_io();
+        io.credit.attach("r", 7, 64);
+        assert!(dequeue(&mut io, "r").is_none());
+        assert!(io.link.is_none(), "the violation ends the link");
+        assert!(matches!(
+            io.ready.pop_front(),
+            Some(AppWake::Disconnected {
+                error: DaemonTransportError::Protocol("a terminal frame without credit"),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_waiting_head_demand_is_granted_when_budget_returns() {
+        let mut io = linked_io();
+        io.credit.attach("a", 7, 64);
+        io.credit.attach("b", 7, 64);
+        let half = u64::try_from(MAX_PENDING_WAKE_BYTES / 2).expect("fits");
+        credit(&mut io, demand("a", half));
+        credit(&mut io, demand("b", half));
+        assert_eq!(granted(&mut io).len(), 2, "both halves fit");
+        io.credit.attach("c", 7, 64);
+        credit(&mut io, demand("c", 1));
+        assert!(granted(&mut io).is_empty(), "the budget is full");
+        // RETURN of a's credit frees room; the waiting demand is granted.
+        credit(
+            &mut io,
+            DaemonUnixCreditFrame::Return {
+                route: "a".to_string(),
+                generation: 7,
+                items: 1,
+                bytes: half,
+            },
+        );
+        assert_eq!(granted(&mut io), vec![("c".to_string(), 1)]);
+    }
+
+    #[test]
+    fn closed_and_disconnect_release_the_pools() {
+        let mut io = linked_io();
+        io.credit.attach("a", 7, 64);
+        io.credit.attach("b", 7, 64);
+        credit(&mut io, demand("a", 100));
+        credit(&mut io, demand("b", 200));
+        assert_eq!(pending(&io), (2, 300));
+        credit(
+            &mut io,
+            DaemonUnixCreditFrame::Closed {
+                route: "a".to_string(),
+                generation: 7,
+                spent_items: 0,
+                spent_bytes: 0,
+            },
+        );
+        assert_eq!(pending(&io), (1, 200));
+        // A demand for the closed generation is stale.
+        credit(&mut io, demand("a", 10));
+        granted(&mut io);
+        assert_eq!(pending(&io), (1, 200));
         io.disconnect_now();
-        assert!(matches!(
-            recv_within(&result, "disconnect_now ends the wait"),
-            Err(TerminalAdmitError::Stopped)
-        ));
-
-        let (mut io, result) = owner_with_waiting_reader();
-        assert!(io.disconnect(Duration::from_secs(1)));
-        assert!(matches!(
-            recv_within(&result, "disconnect ends the wait"),
-            Err(TerminalAdmitError::Stopped)
-        ));
-
-        let (mut io, result) = owner_with_waiting_reader();
-        io.end_link(DaemonTransportError::Protocol("test link failure"));
-        assert!(matches!(
-            recv_within(&result, "end_link ends the wait"),
-            Err(TerminalAdmitError::Stopped)
-        ));
-
-        let (io, result) = owner_with_waiting_reader();
-        assert!(io.shutdown(Duration::from_secs(1)));
-        assert!(matches!(
-            recv_within(&result, "shutdown ends the wait"),
-            Err(TerminalAdmitError::Stopped)
-        ));
+        assert_eq!(
+            pending(&io),
+            (0, 0),
+            "a closed connection releases every pool"
+        );
     }
 
     #[test]
-    fn closing_the_link_ends_a_waiting_reader() {
-        let budget = full_budget();
-        let (waiting, result) = admit_on_thread(&budget);
-        recv_within(&waiting, "the reader waits for space");
-        budget.close_reader(1);
-        let outcome = recv_within(&result, "the close wakes the reader");
-        assert!(matches!(outcome, Err(TerminalAdmitError::Stopped)));
-        // A newer connection also ends an older reader's wait.
-        budget.open_reader(1);
-        let (waiting, result) = admit_on_thread(&budget);
-        recv_within(&waiting, "the reader waits for space");
-        budget.open_reader(2);
-        let outcome = recv_within(&result, "the newer connection wakes the reader");
-        assert!(matches!(outcome, Err(TerminalAdmitError::Stopped)));
+    fn a_second_unserved_demand_or_an_over_return_closes_the_connection() {
+        let mut io = linked_io();
+        io.credit.attach("a", 7, 64);
+        // One byte already pending, so the whole-budget demand stays unserved.
+        assert!(io.budget.try_reserve_terminal(1));
+        let full = u64::try_from(MAX_PENDING_WAKE_BYTES).expect("fits");
+        credit(&mut io, demand("a", full));
+        assert!(granted(&mut io).is_empty());
+        credit(&mut io, demand("a", 1));
+        assert!(
+            io.link.is_none(),
+            "a second demand while the first is unserved"
+        );
+
+        let mut io = linked_io();
+        io.credit.attach("a", 7, 64);
+        credit(
+            &mut io,
+            DaemonUnixCreditFrame::Return {
+                route: "a".to_string(),
+                generation: 7,
+                items: 1,
+                bytes: 1,
+            },
+        );
+        assert!(io.link.is_none(), "a return larger than the pool");
     }
 
     #[test]
@@ -1317,7 +1479,7 @@ mod tests {
             stream_epoch: 0,
             body: vec![9, 9, 9],
         };
-        match admit_terminal_frame(2, malformed, &budget) {
+        match admit_terminal_frame(malformed, &budget) {
             Err(TerminalAdmitError::Route { reason, .. }) => {
                 assert!(reason.contains("decode failed"));
             }
