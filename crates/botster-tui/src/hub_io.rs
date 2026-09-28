@@ -17,11 +17,18 @@
 //!
 //! - 32 outstanding host-control requests per connection; a 33rd `submit`
 //!   completes immediately with `DaemonRequestError::TooManyOutstandingRequests`.
-//! - 256 items / 8 MiB of pending wakes. A terminal frame that would exceed
-//!   the bound is dropped and its route is reported once as `RouteFault`; the
-//!   application detaches and re-attaches that route only. Control frames are
-//!   never shed here because their producers are already bounded (32 responses,
-//!   Hub-shed events with `EventGap`, entity snapshots per subscription).
+//! - 256 items / 8 MiB of pending wakes. When a terminal frame would exceed
+//!   the bound, the reader waits for the application to release space before
+//!   it reads the socket again (backpressure): the Hub and Core then hold the
+//!   session's output, and the PTY blocks the program. Link close and shutdown
+//!   end the wait. A terminal frame (at most `MAX_ROUTE_EGRESS_BYTES`) always
+//!   fits once the queue drains. Only a frame that does not decode faults its
+//!   route (`RouteFault`); the application detaches
+//!   and re-attaches that route only. Control frames are never shed because
+//!   their producers are already bounded (32 responses, Hub-shed events with
+//!   `EventGap`, entity snapshots per subscription). A later per-route credit
+//!   window on the Unix mux replaces this blocking read, so control frames need
+//!   not wait behind a flooding route.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -31,7 +38,7 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -56,6 +63,11 @@ use futures_lite::{StreamExt, future};
 pub const MAX_PENDING_WAKE_ITEMS: usize = 256;
 /// Pending wake bytes before a terminal route is shed.
 pub const MAX_PENDING_WAKE_BYTES: usize = 8 * 1024 * 1024;
+
+// Every terminal frame fits the byte bound once the queue drains, so a
+// waiting reader always makes progress.
+const _: () =
+    assert!(botster_terminal_protocol_client::MAX_ROUTE_EGRESS_BYTES < MAX_PENDING_WAKE_BYTES);
 /// Client-to-Hub input containers carry a reserved epoch of 0; Hub validates
 /// only the route and the fixed attachment generation.
 const INPUT_CONTAINER_EPOCH: u32 = 0;
@@ -196,6 +208,14 @@ struct WakeBudget {
     bytes: AtomicUsize,
     /// Routes (with route generation) already reported as faulted.
     faulted_routes: Mutex<BTreeSet<(String, u64)>>,
+    /// The connection generation whose reader may wait for terminal space;
+    /// `None` after a close or shutdown.
+    open_reader: Mutex<Option<u64>>,
+    /// Signalled when pending space is released or the open reader changes.
+    space: Condvar,
+    /// Test seam: told each time a reader starts waiting for space.
+    #[cfg(test)]
+    waiting: Mutex<Option<Sender<()>>>,
 }
 
 impl WakeBudget {
@@ -204,6 +224,67 @@ impl WakeBudget {
             items: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
             faulted_routes: Mutex::new(BTreeSet::new()),
+            open_reader: Mutex::new(None),
+            space: Condvar::new(),
+            #[cfg(test)]
+            waiting: Mutex::new(None),
+        }
+    }
+
+    /// Let `generation`'s reader wait for space; any other reader stops.
+    fn open_reader(&self, generation: u64) {
+        let mut open = self
+            .open_reader
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *open = Some(generation);
+        self.space.notify_all();
+    }
+
+    /// Stop `generation`'s reader if it is waiting for space.
+    fn close_reader(&self, generation: u64) {
+        let mut open = self
+            .open_reader
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *open == Some(generation) {
+            *open = None;
+        }
+        self.space.notify_all();
+    }
+
+    fn notify_space(&self) {
+        let _open = self
+            .open_reader
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.space.notify_all();
+    }
+
+    /// Reserve one terminal item of `bytes` for `generation`'s reader,
+    /// waiting while the budget is full. This is the TUI's backpressure: the
+    /// reader stops reading the socket, so the Hub and Core hold the
+    /// session's output. Returns false when the reader was closed first.
+    fn reserve_terminal_waiting(&self, generation: u64, bytes: usize) -> bool {
+        let mut open = self
+            .open_reader
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if *open != Some(generation) {
+                return false;
+            }
+            if self.try_reserve_terminal(bytes) {
+                return true;
+            }
+            #[cfg(test)]
+            if let Some(waiting) = self.waiting.lock().ok().and_then(|seam| seam.clone()) {
+                let _ = waiting.send(());
+            }
+            open = self
+                .space
+                .wait(open)
+                .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 
@@ -248,11 +329,13 @@ impl WakeBudget {
 
     fn release_control(&self) {
         self.items.fetch_sub(1, Ordering::AcqRel);
+        self.notify_space();
     }
 
     fn release_terminal(&self, bytes: usize) {
         self.items.fetch_sub(1, Ordering::AcqRel);
         self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.notify_space();
     }
 }
 
@@ -397,6 +480,7 @@ impl HubIo {
         self.disconnect_now();
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
+        self.budget.open_reader(generation);
         let sender = self.wake_tx.clone();
         let budget = Arc::clone(&self.budget);
         let spawned = thread::Builder::new()
@@ -436,6 +520,9 @@ impl HubIo {
     /// Close the link within `bound` and fail its pending requests. Returns
     /// whether the link threads confirmed their stop; true when no link.
     pub fn disconnect(&mut self, bound: Duration) -> bool {
+        // A reader waiting for space cannot see the socket shut: end its wait.
+        // The generation is open from connect(), before its link is installed.
+        self.budget.close_reader(self.generation);
         let closed = self.link.take().is_none_or(|link| link.close_within(bound));
         self.fail_pending();
         closed
@@ -443,6 +530,7 @@ impl HubIo {
 
     /// Close the link without waiting and fail its pending requests.
     pub fn disconnect_now(&mut self) {
+        self.budget.close_reader(self.generation);
         if let Some(link) = self.link.take() {
             link.close_now();
         }
@@ -462,6 +550,7 @@ impl HubIo {
     /// Close the current link from the owner side and queue `Disconnected`.
     fn end_link(&mut self, error: DaemonTransportError) {
         let generation = self.generation;
+        self.budget.close_reader(generation);
         if let Some(link) = self.link.take() {
             link.close_now();
         }
@@ -711,6 +800,7 @@ impl HubIo {
                 link,
             } => {
                 if generation != self.generation {
+                    self.budget.close_reader(generation);
                     let _ = link.stream.shutdown(Shutdown::Both);
                     let _ = link.writer.send(WriteCommand::Stop);
                     return None;
@@ -730,6 +820,7 @@ impl HubIo {
                 if generation != self.generation {
                     return None;
                 }
+                self.budget.close_reader(generation);
                 if let Some(link) = self.link.take() {
                     link.close_now();
                 }
@@ -959,9 +1050,10 @@ fn run_reader_thread(
                 return;
             }
             DaemonUnixMuxFrame::Terminal(terminal) => {
-                match admit_terminal_frame(terminal, budget) {
+                match admit_terminal_frame(generation, terminal, budget) {
                     Ok(Some(frame)) => IoMessage::Terminal { generation, frame },
                     Ok(None) => continue,
+                    Err(TerminalAdmitError::Stopped) => return,
                     Err(TerminalAdmitError::Route {
                         route,
                         route_generation,
@@ -995,14 +1087,19 @@ enum TerminalAdmitError {
         reason: String,
     },
     Protocol(&'static str),
+    /// The link closed while the reader waited for space.
+    Stopped,
 }
 
 /// Decode one Hub terminal container into a routed frame under the wake budget.
 ///
+/// A full budget makes the reader wait (backpressure) instead of shedding.
 /// `Ok(None)` means the frame was dropped for a route already reported faulted.
-/// `Err(Route)` carries the first fault for a route; `Err(Protocol)` means the
-/// connection itself violated the contract.
+/// `Err(Route)` carries the first fault for a route (a decode failure);
+/// `Err(Protocol)` means the connection itself violated the contract;
+/// `Err(Stopped)` means the link closed while waiting.
 fn admit_terminal_frame(
+    link_generation: u64,
     terminal: DaemonUnixTerminalFrame,
     budget: &WakeBudget,
 ) -> Result<Option<RoutedTerminalFrame>, TerminalAdmitError> {
@@ -1028,17 +1125,8 @@ fn admit_terminal_frame(
             });
         }
     };
-    if !budget.try_reserve_terminal(frame.len()) {
-        if budget.mark_faulted(&route, generation) {
-            return Err(TerminalAdmitError::Route {
-                route: route_id,
-                route_generation: generation,
-                reason: format!(
-                    "client pending wake bound exceeded ({MAX_PENDING_WAKE_ITEMS} items / {MAX_PENDING_WAKE_BYTES} bytes)"
-                ),
-            });
-        }
-        return Ok(None);
+    if !budget.reserve_terminal_waiting(link_generation, frame.len()) {
+        return Err(TerminalAdmitError::Stopped);
     }
     Ok(Some(RoutedTerminalFrame {
         route: route_id,
@@ -1065,39 +1153,159 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admit_reserves_budget_and_faults_a_route_once() {
-        let budget = WakeBudget::new();
-        let admitted = admit_terminal_frame(terminal_container("r", 1, b"hi"), &budget)
-            .ok()
-            .flatten()
-            .expect("first frame is admitted");
-        assert_eq!(admitted.route.as_str(), "r");
-        assert_eq!(admitted.generation, 1);
-        assert_eq!(admitted.stream_epoch, 0);
-        assert_eq!(admitted.frame.body(), b"hi");
-        assert_eq!(budget.items.load(Ordering::Acquire), 1);
-        for _ in 1..MAX_PENDING_WAKE_ITEMS {
+    /// A budget whose reader for generation 1 may wait, filled to its
+    /// item bound.
+    fn full_budget() -> Arc<WakeBudget> {
+        let budget = Arc::new(WakeBudget::new());
+        budget.open_reader(1);
+        for _ in 0..MAX_PENDING_WAKE_ITEMS {
             assert!(budget.try_reserve_terminal(0));
         }
-        match admit_terminal_frame(terminal_container("r", 1, b"x"), &budget) {
-            Err(TerminalAdmitError::Route {
-                route,
-                route_generation,
-                reason,
-            }) => {
-                assert_eq!(route.as_str(), "r");
-                assert_eq!(route_generation, 1);
-                assert!(reason.contains("pending wake bound"));
-            }
-            other => panic!("expected a route fault, got {:?}", other.is_ok()),
+        budget
+    }
+
+    /// Admit one frame on another thread. The first receiver fires once the
+    /// reader waits for space; the second carries the admission result.
+    fn admit_on_thread(
+        budget: &Arc<WakeBudget>,
+    ) -> (
+        Receiver<()>,
+        Receiver<Result<Option<RoutedTerminalFrame>, TerminalAdmitError>>,
+    ) {
+        // `waiting` fires once the reader is inside the wait for space.
+        let (waiting_tx, waiting) = mpsc::channel();
+        *budget.waiting.lock().expect("seam") = Some(waiting_tx);
+        let (result_tx, result) = mpsc::channel();
+        let budget = Arc::clone(budget);
+        thread::spawn(move || {
+            let _ = result_tx.send(admit_terminal_frame(
+                1,
+                terminal_container("r", 1, b"hi"),
+                &budget,
+            ));
+        });
+        (waiting, result)
+    }
+
+    /// Receive one message the test is waiting for.
+    fn recv_within<T>(receiver: &Receiver<T>, what: &str) -> T {
+        let bound = Duration::from_secs(10);
+        // timer: deadline — the awaited thread event arrives within the bound; expiry fails the test
+        let received = receiver.recv_timeout(bound);
+        received.unwrap_or_else(|error| panic!("{what}: {error}"))
+    }
+
+    #[test]
+    fn a_full_budget_makes_the_reader_wait_until_space_is_released() {
+        let budget = full_budget();
+        let (waiting, result) = admit_on_thread(&budget);
+        recv_within(&waiting, "the reader waits for space");
+        // The budget is full, so the frame cannot be admitted before a release.
+        assert!(
+            result.try_recv().is_err(),
+            "no frame is admitted while full"
+        );
+        assert_eq!(budget.items.load(Ordering::Acquire), MAX_PENDING_WAKE_ITEMS);
+        budget.release_terminal(0);
+        let admitted = recv_within(&result, "the release wakes the reader")
+            .ok()
+            .flatten()
+            .expect("the frame is admitted, not shed");
+        assert_eq!(admitted.route.as_str(), "r");
+        assert_eq!(admitted.frame.body(), b"hi");
+        assert!(
+            !budget.is_faulted("r", 1),
+            "backpressure never faults the route"
+        );
+        assert_eq!(budget.items.load(Ordering::Acquire), MAX_PENDING_WAKE_ITEMS);
+    }
+
+    #[test]
+    fn a_full_byte_budget_makes_the_reader_wait_until_bytes_are_released() {
+        let budget = Arc::new(WakeBudget::new());
+        budget.open_reader(1);
+        // One pending frame holds the whole byte bound; the item bound is free.
+        assert!(budget.try_reserve_terminal(MAX_PENDING_WAKE_BYTES));
+        let (waiting, result) = admit_on_thread(&budget);
+        recv_within(&waiting, "the reader waits for bytes");
+        assert!(
+            result.try_recv().is_err(),
+            "no frame is admitted while full"
+        );
+        budget.release_terminal(MAX_PENDING_WAKE_BYTES);
+        let admitted = recv_within(&result, "the byte release wakes the reader")
+            .ok()
+            .flatten()
+            .expect("the frame is admitted, not shed");
+        assert_eq!(admitted.frame.body(), b"hi");
+        assert_eq!(budget.items.load(Ordering::Acquire), 1);
+    }
+
+    /// A HubIo whose current generation 1 is open, with a full budget and a
+    /// reader waiting for space.
+    fn owner_with_waiting_reader() -> (
+        HubIo,
+        Receiver<Result<Option<RoutedTerminalFrame>, TerminalAdmitError>>,
+    ) {
+        let mut io = HubIo::new();
+        io.generation = 1;
+        io.budget.open_reader(1);
+        for _ in 0..MAX_PENDING_WAKE_ITEMS {
+            assert!(io.budget.try_reserve_terminal(0));
         }
+        let (waiting, result) = admit_on_thread(&io.budget);
+        recv_within(&waiting, "the reader waits for space");
+        (io, result)
+    }
+
+    #[test]
+    fn every_owner_close_path_ends_a_waiting_reader() {
+        // No link is installed yet: connect() opened the generation, and the
+        // Connected wake has not been applied.
+        let (mut io, result) = owner_with_waiting_reader();
+        io.disconnect_now();
         assert!(matches!(
-            admit_terminal_frame(terminal_container("r", 1, b"y"), &budget),
-            Ok(None)
+            recv_within(&result, "disconnect_now ends the wait"),
+            Err(TerminalAdmitError::Stopped)
         ));
-        budget.forget_route("r");
-        assert!(!budget.is_faulted("r", 1));
+
+        let (mut io, result) = owner_with_waiting_reader();
+        assert!(io.disconnect(Duration::from_secs(1)));
+        assert!(matches!(
+            recv_within(&result, "disconnect ends the wait"),
+            Err(TerminalAdmitError::Stopped)
+        ));
+
+        let (mut io, result) = owner_with_waiting_reader();
+        io.end_link(DaemonTransportError::Protocol("test link failure"));
+        assert!(matches!(
+            recv_within(&result, "end_link ends the wait"),
+            Err(TerminalAdmitError::Stopped)
+        ));
+
+        let (io, result) = owner_with_waiting_reader();
+        assert!(io.shutdown(Duration::from_secs(1)));
+        assert!(matches!(
+            recv_within(&result, "shutdown ends the wait"),
+            Err(TerminalAdmitError::Stopped)
+        ));
+    }
+
+    #[test]
+    fn closing_the_link_ends_a_waiting_reader() {
+        let budget = full_budget();
+        let (waiting, result) = admit_on_thread(&budget);
+        recv_within(&waiting, "the reader waits for space");
+        budget.close_reader(1);
+        let outcome = recv_within(&result, "the close wakes the reader");
+        assert!(matches!(outcome, Err(TerminalAdmitError::Stopped)));
+        // A newer connection also ends an older reader's wait.
+        budget.open_reader(1);
+        let (waiting, result) = admit_on_thread(&budget);
+        recv_within(&waiting, "the reader waits for space");
+        budget.open_reader(2);
+        let outcome = recv_within(&result, "the newer connection wakes the reader");
+        assert!(matches!(outcome, Err(TerminalAdmitError::Stopped)));
     }
 
     #[test]
@@ -1109,7 +1317,7 @@ mod tests {
             stream_epoch: 0,
             body: vec![9, 9, 9],
         };
-        match admit_terminal_frame(malformed, &budget) {
+        match admit_terminal_frame(2, malformed, &budget) {
             Err(TerminalAdmitError::Route { reason, .. }) => {
                 assert!(reason.contains("decode failed"));
             }

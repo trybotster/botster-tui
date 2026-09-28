@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `1ec61b94c76f62b0b2942c21c7c03630da709221` |
+| `botster-hub-client` / live hub | Hub `90d4e7378f0405f966dc99cfa203400fd09d6064` |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `1ec61b94c76f62b0b2942c21c7c03630da709221` (`@trybotster/hub-test-support@0.1.46`) |
+| `botster-hub-test-support` package | Hub git `90d4e7378f0405f966dc99cfa203400fd09d6064` (`@trybotster/hub-test-support@0.1.49`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `549b3f62dabacf45cce4b4dfd19e1a6800bf8c7a` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `d855f96c63bf582d475350cd95cb8ab316798ad2` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -188,7 +188,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`1ec61b94c76f62b0b2942c21c7c03630da709221` (same Hub pin as Foundation above).
+`90d4e7378f0405f966dc99cfa203400fd09d6064` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -249,10 +249,33 @@ reach a focused session as their exact escape sequences, that `Shift-Home`,
 `Shift-PageDown`, `Shift-PageUp`, and `Shift-End` each scroll the terminal
 view, and that no Shift key reaches the session.
 
-T-S10 floods a session with `yes` and requires the route to stay attached for
-3000 screen samples of flood output (screen observations, normally after a
-batch of PTY output), the stop key to reach the session while `yes` still runs,
-and later input to echo.
+T-S10 floods a session with `yes` for 3000 screen samples of flood output
+(screen observations, normally after a batch of PTY output). No sample may show
+a route close (the recovery error or the `reconnected` notice); after the flood,
+Hub `Status` must list the same route (subscription and generation) as before
+it; the stop key must reach the session while `yes` still runs, and later input
+must echo. The test also counts samples in ROUTE_RESYNC hydration (Detach
+hidden, no error).
+
+The TUI applies backpressure end to end. When 256 terminal wakes or 8 MiB are
+pending, its socket reader waits for the application to catch up instead of
+reading on, so the Hub and Core hold the session's output and the PTY blocks the
+program. The reader does not drop a received terminal frame, or shed its
+route, because the application is slow. One exception remains: a frame the TUI
+parks until its Attach response is charged to the same budget without waiting,
+and a full budget faults that route. Link close, shutdown, and a newer
+connection end the wait.
+
+Observed with Core's backpressure (a test candidate: Hub `4a34386f` with Core
+`6327177`): 12 T-S10 runs passed with 0 samples in resync hydration and the same
+route before and after the flood, taking 27 to 81 s (1-minute load 20 to 83 at
+the start of each batch). One further run failed (1-minute load 152 at the start
+of its batch): after the flood phase passed, `stopped:71:running`
+did not appear within the then 20 s step deadline, and the last pane was
+`attaching`. That is consistent with a slow drain, a resync or a close; the
+cause was not determined. T-S10 now records the whole screen when this step
+fails. On Core `85b3507`, before Core's backpressure, about 80% of flood samples
+were in resync hydration.
 
 Before Core `ac35e32`, sustained output closed the route: the pane returned to
 `attaching` with `terminal subscription closed (core_adapter_closed)`. T-S10
@@ -267,8 +290,36 @@ cycle, re-attach on a new route (Hub `Status` occupancy), and echo input. The se
 recovery restores the recovery for the next independent close. The wait while
 the TUI is stopped is fixed; see Known issues.
 
-Current pins (protocol 11), September 27, 2026: T-S1 to T-S11 passed against
-the Hub candidate built from Hub `1ec61b94` (Core `549b3f6`) with Rust 1.97.0.
+T-S12 kills the attached session's worker (SIGKILL on the one worker in the
+test Hub's process group). The route closes with `worker_lost` and the session
+entity turns `failed` / `worker_lost`. The TUI must show the session as
+`crashed` (row and pane title) with `crashed: its worker was lost
+(worker_lost)`, offer Remove, and not re-attach: Hub `Status` then lists no
+attach occupancy for the session.
+
+A `worker_lost` close ends the route without the automatic recovery, because
+a re-attach to a session whose worker is gone can only fail. A `failed` session
+with any other failure reason keeps its plain `failed` state. A reply with the
+operator code `not_attached` (Core refused input, resize or a guarded write
+from a client without an attachment) reads `not attached: <message>; nothing
+reached the session`. The TUI sends input and resize only on its bound route,
+so it does not expect this reply.
+
+Current pins (protocol 12), September 27, 2026: against the Hub candidate built
+from Hub `90d4e737` (Core `d855f96`) with Rust 1.97.0, T-S1 to T-S12 passed and
+T-S10 passed 3 more runs (1-minute load 22.06 and 79.90 at the start of those
+batches). T-S11 failed once in that sequence (1-minute load 133.48 at the start
+of its batch): after its second SIGCONT the route was still attached and no
+second recovery appeared. Its second cycle had waited for `flood` output that
+the first cycle left on screen, so the likely cause is that the TUI was stopped
+before the session began to flood, and nothing was pending for the Core
+deadline; this was not proven. T-S11 now waits for each cycle's own `flood-<n>`
+output, and it then passed 3 of 3 (1-minute load 39.76 at the start). The locked
+workspace run passed 198 tests.
+
+Hub `1ec61b94` (Core `549b3f6`, protocol 11), September 27, 2026: T-S1 to
+T-S11 passed against the Hub candidate built from Hub `1ec61b94` with Rust
+1.97.0.
 The locked workspace run passed 191 tests (unit, timer guard, and integration);
 the 1-minute load was 12.77 at the start of the T-S1 to T-S11 sequence.
 
@@ -369,6 +420,12 @@ error from a `repo_session_type` write) also makes the TUI read Status again,
 so the new quarantine appears at once. A Hub reconnect clears the quarantine
 list and counters until the new connection's Status arrives.
 
+Protocol 12 adds plugin logs. Each package in System details has a Logs action:
+it reads the package's log records from the start (`ReadPluginLogs`,
+`after_seq` 0) and shows a summary (records read, `next_seq`,
+`first_available_seq`) and the last 10 records, with any records the Hub
+dropped before one. A Hub reconnect clears the shown logs.
+
 Live tests do not create a quarantine. The one bounded attempt, an unreadable
 local package directory during a reload, ended in a plain load refusal, and no
 deterministic live trigger was found (evidence
@@ -380,7 +437,7 @@ Resolve request, the Status re-reads, and the reconnect.
 ### T-S11 waits a fixed time for the reader-deadline close (hub-status-entity)
 
 While the TUI is stopped, only the Hub can observe the route close, and Hub
-`1ec61b94` publishes no event for it to a sibling client (attach occupancy is
+`90d4e737` publishes no event for it to a sibling client (attach occupancy is
 only in the `Status` response). T-S11 therefore waits a fixed
 `CORE_READER_PROGRESS_DEADLINE` (10 s, from Core `6a8fc22`) plus a 5 s margin
 before it resumes the TUI, and then proves the close through the TUI's own

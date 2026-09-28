@@ -2479,11 +2479,17 @@ const FLOOD_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo mi
 /// 3000 reproduced it in most runs.
 const FLOOD_SAMPLES: usize = 3000;
 
+/// Bound for the flood phase and for draining it after the stop key. With
+/// end-to-end backpressure the TUI processes every byte `yes` writes, so a
+/// sample, and the drain of output queued before the stop, take longer than
+/// when Core dropped output; expiry fails the test.
+const FLOOD_DEADLINE: Duration = Duration::from_secs(120);
+
 #[test]
 #[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
 fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
-    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
-    let test_deadline = Instant::now() + TEST_DEADLINE;
+    // timer: deadline — whole-test budget shared by every wait, plus the flood phase; expiry fails the test
+    let test_deadline = Instant::now() + TEST_DEADLINE + FLOOD_DEADLINE;
     let candidate = Candidate::from_env();
     let guard = start_hub(&candidate);
     let hub = guard.hub();
@@ -2512,21 +2518,33 @@ fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
             .wait_for("attach_complete", "[ Detach ]", SCREEN_DEADLINE, &identity)
             .unwrap_or_else(|failure| panic!("{failure}"));
 
-        // Start the flood. Every sampled screen must keep the attachment
-        // ("[ Detach ]"); a closed route clears it. A ROUTE_RESYNC keeps the
-        // attachment and replaces the screen with a snapshot.
+        // The route before the flood; it must still own the session after it.
+        let before = attached_occupancy(hub.endpoint(), &identity, None);
+
+        // Start the flood. A ROUTE_RESYNC keeps the route: its snapshot
+        // hydration hides the Detach control and titles the pane
+        // `attaching`, and no error is shown. A closed route shows the
+        // recovery error, then the `reconnected` notice. No sample may show
+        // either.
         tui.write_all(b"f");
         let flood_samples = std::cell::Cell::new(0_usize);
-        let mut detached_sample = None;
+        let resync_samples = std::cell::Cell::new(0_usize);
+        let mut closed_sample = None;
         screen
             .wait_until(
-                "flood_samples_show_attachment",
-                SCREEN_DEADLINE,
+                "flood_samples_keep_the_route",
+                FLOOD_DEADLINE,
                 &identity,
                 |screen| {
-                    if !screen.contains("[ Detach ]") {
-                        detached_sample = Some((flood_samples.get(), screen.head_rows()));
+                    if screen.contains("recovering:")
+                        || screen.contains("reconnected")
+                        || screen.contains("failed closed after recovery")
+                    {
+                        closed_sample = Some((flood_samples.get(), visible_rows(screen)));
                         return Some(());
+                    }
+                    if !screen.contains("[ Detach ]") {
+                        resync_samples.set(resync_samples.get() + 1);
                     }
                     if screen.contains("flood") {
                         flood_samples.set(flood_samples.get() + 1);
@@ -2543,50 +2561,63 @@ fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert_eq!(
-            detached_sample, None,
-            "the route stays attached during the flood (flood samples, view)"
+            closed_sample, None,
+            "the route is never closed during the flood (flood samples, view)"
         );
 
         // Responsive: the stop key reaches the session while `yes` still runs,
-        // and the output after the flood renders.
+        // and the output after the flood renders. Nothing is dropped, so the
+        // flood output queued before the stop renders first: these steps share
+        // the flood bound.
         tui.write_all(b"q");
         screen
-            .wait_for(
+            .wait_until(
                 "stop_key_reaches_flooding_session",
-                "stopped:71:running",
-                SCREEN_DEADLINE,
+                FLOOD_DEADLINE,
                 &identity,
+                |screen| screen.contains("stopped:71:running").then_some(()),
+                // The whole screen, error line included, classifies a failure:
+                // a slow drain, a resync (attaching, no error) or a close.
+                |screen| format!("full view: {:?}", visible_rows(screen)),
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
         tui.write_all(b"z");
         screen
             .wait_until(
                 "key_after_flood_reaches_session",
-                SCREEN_DEADLINE,
+                FLOOD_DEADLINE,
                 &identity,
                 |screen| {
                     (visible_key_bytes(&screen.rows()).last().map(String::as_str) == Some("7a"))
                         .then_some(())
                 },
-                |screen| format!("view: {:?}", screen.head_rows()),
+                |screen| format!("full view: {:?}", visible_rows(screen)),
             )
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert!(
             screen.contains("[ Detach ]"),
             "the route is still attached after the flood"
         );
+        // The same route owns the session: the flood never replaced it.
+        let after = occupancies(hub.endpoint(), &identity);
+        assert_eq!(
+            after,
+            vec![before],
+            "the pre-flood route still owns the session"
+        );
         println!(
-            "t_s10: {} flood screen samples showed the attachment; stop key reached the running flood; input after the flood echoed",
-            flood_samples.get()
+            "t_s10: {} flood screen samples, {} in resync hydration; the route was never replaced; stop key reached the running flood; input after the flood echoed",
+            flood_samples.get(),
+            resync_samples.get()
         );
         detach_and_quit(&mut tui, &mut screen, &identity);
     }
     drop(guard);
 }
 
-/// Starts `yes flood` on `f`; any other byte stops the flood and is echoed as
-/// `key:<hex>`.
-const STALL_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo min 1; p=; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); if [ \"$b\" = 66 ]; then yes flood & p=$!; else if [ -n \"$p\" ]; then kill $p 2>/dev/null; wait $p 2>/dev/null; p=; fi; printf 'key:%s\\n' \"$b\"; fi; done";
+/// Starts `yes flood-<n>` on the n-th `f`, so each flood's output names its
+/// own start; any other byte stops the flood and is echoed as `key:<hex>`.
+const STALL_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo min 1; p=; n=0; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); if [ \"$b\" = 66 ]; then n=$((n+1)); yes \"flood-$n\" & p=$!; else if [ -n \"$p\" ]; then kill $p 2>/dev/null; wait $p 2>/dev/null; p=; fi; printf 'key:%s\\n' \"$b\"; fi; done";
 
 /// Core `READER_PROGRESS_DEADLINE` (Core 6a8fc22): a route with output
 /// pending whose client completes no write for this long is closed.
@@ -2630,9 +2661,16 @@ fn t_s11_stopped_tui_recovers_from_each_reader_deadline_close() {
         for cycle in 1..=2 {
             // The Core deadline runs only while output is pending, so the
             // session floods while the TUI is stopped.
+            // This cycle's own flood output: an earlier cycle's lines stay on
+            // screen, so only `flood-<cycle>` proves the session floods now.
             tui.write_all(b"f");
             screen
-                .wait_for("flood_visible", "flood", SCREEN_DEADLINE, &identity)
+                .wait_for(
+                    "flood_visible",
+                    &format!("flood-{cycle}"),
+                    SCREEN_DEADLINE,
+                    &identity,
+                )
                 .unwrap_or_else(|failure| panic!("cycle {cycle}: {failure}"));
             tui.signal(rustix::process::Signal::STOP);
             // timer: deadline — hub-status-entity: waits for Hub status entity (attach occupancy); remove when it lands
@@ -2698,8 +2736,96 @@ fn t_s11_stopped_tui_recovers_from_each_reader_deadline_close() {
     drop(guard);
 }
 
+#[test]
+#[ignore = "candidate smoke: needs BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, BOTSTER_CANDIDATE_MANIFEST; run with --ignored --exact"]
+fn t_s12_a_lost_worker_shows_a_crashed_session_without_a_reattach() {
+    // timer: deadline — whole-test budget shared by every wait; expiry fails the test
+    let test_deadline = Instant::now() + TEST_DEADLINE;
+    let candidate = Candidate::from_env();
+    let guard = start_hub(&candidate);
+    let hub = guard.hub();
+    let mut identity = Identity::default();
+    spawn_session(hub.endpoint(), &mut identity, KEY_SHELL_COMMAND);
+    {
+        let mut tui = TuiChild::spawn(hub);
+        let mut screen = Screen::attach(&tui, test_deadline);
+        let row = format!("{} · running", identity.session_id);
+        let (col, line) = screen
+            .wait_for("session_row_visible", &row, SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        tui.click(col, line);
+        screen
+            .wait_for("attach_complete", "[ Detach ]", SCREEN_DEADLINE, &identity)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        // The session's worker dies without an exit report. This test's own
+        // Hub started it: it is the one live worker in the Hub's group.
+        let workers = hub.owned_session_worker_pids();
+        assert_eq!(workers.len(), 1, "one session, one worker: {workers:?}");
+        let pid = i32::try_from(workers[0])
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("worker pid");
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL)
+            .expect("kill the session worker");
+
+        // The route closes with worker_lost and the entity turns failed /
+        // worker_lost: the TUI shows a crash, not an exit, and no re-attach.
+        let crashed_row = format!("{} · crashed", identity.session_id);
+        let crashed_title = format!("Terminal · {} · crashed", identity.session_id);
+        screen
+            .wait_until(
+                "worker_lost_shows_a_crash",
+                SCREEN_DEADLINE,
+                &identity,
+                |screen| {
+                    (screen.contains(&crashed_row)
+                        && screen.contains(&crashed_title)
+                        && screen.contains("crashed: its worker was lost (worker_lost)"))
+                    .then_some(())
+                },
+                |screen| format!("view: {:?}", screen.head_rows()),
+            )
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(!screen.contains("recovering"), "no automatic re-attach");
+        assert!(!screen.contains("[ Detach ]"), "no attachment remains");
+        assert!(
+            screen.contains("[ Remove ]"),
+            "the crashed session can be removed"
+        );
+        // The Hub holds no attachment for the session: nothing re-attached.
+        let rows = occupancies(hub.endpoint(), &identity);
+        assert!(rows.is_empty(), "no live attach occupancy: {rows:?}");
+        println!(
+            "t_s12: worker {} killed; session {} shows crashed; no re-attach",
+            workers[0], identity.session_id
+        );
+        // Ctrl+P (0x10) focuses the toolbar so q quits the TUI.
+        tui.write_all(b"\x10");
+        tui.write_all(b"q");
+        let started = Instant::now();
+        let deadline = screen.remaining(EXIT_DEADLINE);
+        let status = tui.wait_exit(started + deadline).unwrap_or_else(|cause| {
+            let failure =
+                screen.failure("tui_exit_after_crash", &identity, deadline, started, cause);
+            panic!("{failure}");
+        });
+        assert!(status.success(), "TUI exited unsuccessfully: {status:?}");
+    }
+    drop(guard);
+}
+
 /// Prints 60 filler lines, then every received byte as `key:<hex>`.
 const KEY_SHELL_COMMAND: &str = "i=0; while [ $i -lt 60 ]; do printf 'fill:%02d\\n' $i; i=$((i+1)); done; printf 'live-ready\\n'; stty -icanon -echo min 1; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); printf 'key:%s\\n' \"$b\"; done";
+
+/// The screen rows that carry text, for a failure's full view.
+fn visible_rows(screen: &mut Screen) -> Vec<String> {
+    screen
+        .rows()
+        .into_iter()
+        .filter(|row| !row.trim_matches(|c: char| c == '│' || c == ' ').is_empty())
+        .collect()
+}
 
 /// The `key:<hex>` bytes visible in the pane, in screen order.
 fn visible_key_bytes(rows: &[String]) -> Vec<String> {
