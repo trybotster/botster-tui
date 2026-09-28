@@ -21,16 +21,17 @@ use botster_hub_client::{
     DaemonEntityFrame, DaemonEvent, DaemonHelloAck, DaemonObservabilityCounters, DaemonPackage,
     DaemonPackageAvailabilityReason, DaemonPackageAvailabilityState, DaemonPackageInstallPlan,
     DaemonPackageNavigationEntry, DaemonPackagePin, DaemonPackageRouteDescriptor,
-    DaemonPackageUpdateStatus, DaemonPluginSurface, DaemonQuarantine, DaemonQuarantineTarget,
-    DaemonRequest, DaemonRequestError, DaemonResponse, DaemonResponseKind, DaemonSessionEntity,
-    DaemonSessionType, DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
-    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
-    DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
-    DaemonTransportError, DaemonTransportResult, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
-    FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION, FEATURE_PLUGIN_SURFACE_RENDER,
-    FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
-    FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK, FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
-    FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL, TerminalCompatibilityRequirement,
+    DaemonPackageUpdateStatus, DaemonPluginLogs, DaemonPluginSurface, DaemonQuarantine,
+    DaemonQuarantineTarget, DaemonRequest, DaemonRequestError, DaemonResponse, DaemonResponseKind,
+    DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeDefinition,
+    DaemonSessionTypeEditableDefinition, DaemonSessionTypeExecution,
+    DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
+    DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
+    FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
+    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
+    FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL,
+    TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST, TerminalCompatibilityRequirement,
     ensure_terminal_compatible,
 };
 use botster_terminal_ghostty::{
@@ -559,6 +560,13 @@ impl SessionRow {
 
     fn is_attachable(&self) -> bool {
         !self.pending && self.lifecycle == "running"
+    }
+
+    /// The session's worker died without an exit report: a crash, not an
+    /// exit.
+    fn crashed(&self) -> bool {
+        self.lifecycle == "failed"
+            && self.failure_reason.as_deref() == Some(TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST)
     }
 }
 
@@ -1789,6 +1797,8 @@ struct TuiApp {
     quarantines: Vec<DaemonQuarantine>,
     /// Hub observability counters from the latest Status.
     hub_counters: DaemonObservabilityCounters,
+    /// The latest plugin log page read per package (protocol 12).
+    plugin_logs: BTreeMap<String, DaemonPluginLogs>,
     apps: Vec<DaemonApp>,
     package_navigation: Vec<DaemonPackageNavigationEntry>,
     packages: Vec<DaemonPackage>,
@@ -1947,6 +1957,7 @@ impl TuiApp {
             enabled_package_count: 0,
             quarantines: Vec::new(),
             hub_counters: DaemonObservabilityCounters::default(),
+            plugin_logs: BTreeMap::new(),
             apps: Vec::new(),
             package_navigation: Vec::new(),
             packages: Vec::new(),
@@ -2555,6 +2566,15 @@ impl TuiApp {
                     _ => self.error = Some("resolve: invalid quarantine target".to_string()),
                 }
             }
+            "botster.tui.package.logs" => {
+                if let Some(package_name) = package_name_from_payload(&payload) {
+                    self.action_feedback = Some(format!("logs requested: {package_name}"));
+                    self.submit_apply(DaemonRequest::ReadPluginLogs {
+                        package_name,
+                        after_seq: 0,
+                    });
+                }
+            }
             "botster.tui.package.enable" => {
                 if let Some(package_name) = package_name_from_payload(&payload) {
                     self.action_feedback = Some(format!("enable requested: {package_name}"));
@@ -2770,6 +2790,7 @@ impl TuiApp {
         // connection; the next Status fills them again.
         self.quarantines.clear();
         self.hub_counters = DaemonObservabilityCounters::default();
+        self.plugin_logs.clear();
         self.terminal_close_evidence = None;
         // Detach answers and spawn targets are per connection.
         self.detaches.clear();
@@ -4860,6 +4881,12 @@ impl TuiApp {
         self.action_feedback = Some(format!(
             "terminal subscription closed generation={generation} reason={reason}: {session_id}"
         ));
+        if reason == TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST {
+            // The worker is gone: a re-attach can only fail. End the route
+            // and report the crash instead of recovering.
+            self.end_route_after_worker_lost(&session_id, &subscription_id);
+            return;
+        }
         self.recover_current_subscription(
             &session_id,
             &subscription_id,
@@ -4888,6 +4915,23 @@ impl TuiApp {
             return;
         };
         self.recover_current_subscription(&session_id, &route, reason, reason);
+    }
+
+    /// The session's worker died: retire the route with a bounded Detach and
+    /// leave the session to its failed entity row.
+    fn end_route_after_worker_lost(&mut self, session_id: &str, route: &str) {
+        if let Some(projection) = self.ghostty_projection.as_mut() {
+            projection.abort_ghostsnp_history();
+        }
+        self.clear_route_state();
+        self.retire_subscription(route);
+        if self.is_connected() {
+            self.send_bounded_detach(session_id.to_string(), route.to_string());
+        }
+        self.recovery_notice = None;
+        self.error = Some(format!(
+            "session {session_id} crashed: its worker was lost (worker_lost)"
+        ));
     }
 
     fn recover_from_decode_or_phase_gap(&mut self, reason: &str) {
@@ -5515,6 +5559,15 @@ impl TuiApp {
     fn record_request(&mut self, request: &DaemonRequest) {
         match request {
             DaemonRequest::Status => self.observed_requests.push(ObservedRequest::Status),
+            DaemonRequest::ReadPluginLogs {
+                package_name,
+                after_seq,
+            } => self
+                .observed_requests
+                .push(ObservedRequest::ReadPluginLogs {
+                    package_name: package_name.clone(),
+                    after_seq: *after_seq,
+                }),
             DaemonRequest::ResolveQuarantine { target } => self
                 .observed_requests
                 .push(ObservedRequest::ResolveQuarantine(target.clone())),
@@ -5727,10 +5780,19 @@ impl TuiApp {
         if let Some(error) = response.error {
             let quarantine_changed = error_may_create_quarantine(&error.code, &error.operation);
             self.record_diagnostics(error.diagnostics);
-            self.error = Some(format!(
-                "{} (code={} operation={})",
-                error.message, error.code, error.operation
-            ));
+            self.error = Some(if error.code == "not_attached" {
+                // Core refused input, resize or a guarded write from a client
+                // with no attachment; nothing reached the session.
+                format!(
+                    "not attached: {} (operation={}); nothing reached the session",
+                    error.message, error.operation
+                )
+            } else {
+                format!(
+                    "{} (code={} operation={})",
+                    error.message, error.code, error.operation
+                )
+            });
             if quarantine_changed {
                 // Only Status lists quarantines; show the new one now.
                 self.refresh_status();
@@ -5752,6 +5814,11 @@ impl TuiApp {
             self.hub_counters = status.observability;
         }
 
+        if matches!(response.kind, DaemonResponseKind::PluginLogs)
+            && let Some(logs) = response.plugin_logs.clone()
+        {
+            self.plugin_logs.insert(logs.package_name.clone(), logs);
+        }
         if matches!(response.kind, DaemonResponseKind::QuarantineResolved) {
             // The quarantine list lives only in Status, so read it again. A
             // package resolution's package list is applied by its reply.
@@ -6250,6 +6317,10 @@ impl TuiApp {
         let attached = self.attached_session_id() == Some(session.session_id.as_str());
         let state = if session.pending {
             "pending spawn"
+        } else if session.crashed() {
+            // The pane names the lost worker; the row stays short enough for
+            // the navigator.
+            "crashed"
         } else if attached && session.is_attachable() {
             "attached"
         } else {
@@ -6274,7 +6345,11 @@ impl TuiApp {
         if let Some(lifecycle) = &session.session_type_lifecycle {
             label.push_str(&format!(" · type_lifecycle={lifecycle}"));
         }
-        if let Some(reason) = &session.failure_reason {
+        if let Some(reason) = session
+            .failure_reason
+            .as_ref()
+            .filter(|_| !session.crashed())
+        {
             label.push_str(&format!(" · {reason}"));
         }
         let mut item = node(
@@ -6562,6 +6637,9 @@ impl TuiApp {
                         .map(child),
                 );
                 children.extend(package_action_nodes(package, index).into_iter().map(child));
+                if let Some(logs) = self.plugin_logs.get(&package.package_name) {
+                    children.extend(plugin_log_nodes(logs, index).into_iter().map(child));
+                }
                 for (entrypoint_index, entrypoint) in
                     package.runnable_entrypoints.iter().enumerate()
                 {
@@ -7476,6 +7554,11 @@ impl TuiApp {
                 format!("Terminal · {} · attaching", hydration.session_id)
             }
             (Some(attached), _, _) => format!("Terminal · {attached}"),
+            (None, None, Some(selected))
+                if self.selected_session_row().is_some_and(SessionRow::crashed) =>
+            {
+                format!("Terminal · {selected} · crashed")
+            }
             (None, None, Some(selected)) => match self.detaches.get(selected) {
                 Some((_, DetachState::Pending)) => format!("Terminal · {selected} · detaching"),
                 Some((_, DetachState::Failed(_))) => {
@@ -7513,6 +7596,10 @@ impl TuiApp {
             Some(session) if session.is_attachable() => {
                 "Activate this session to open its terminal.".to_string()
             }
+            Some(session) if session.crashed() => {
+                "This session crashed: its worker was lost. Remove it, or Spawn a new session."
+                    .to_string()
+            }
             Some(session) => format!(
                 "This session is {}; attachment is unavailable{}.",
                 session.lifecycle,
@@ -7534,6 +7621,10 @@ impl TuiApp {
 #[derive(Debug, PartialEq, Eq)]
 enum ObservedRequest {
     Status,
+    ReadPluginLogs {
+        package_name: String,
+        after_seq: u64,
+    },
     ResolveQuarantine(DaemonQuarantineTarget),
     ListApps,
     ListPackageNavigation,
@@ -10086,7 +10177,48 @@ fn package_action_nodes(package: &DaemonPackage, index: usize) -> Vec<UiNode> {
             "botster.tui.package.update_status",
             json!({ "package_name": package.package_name }),
         ),
+        button(
+            &format!("tui-package-{index}-logs"),
+            "Logs",
+            "botster.tui.package.logs",
+            json!({ "package_name": package.package_name }),
+        ),
     ]
+}
+
+/// Records of a plugin log page shown under its package, newest last.
+const SHOWN_PLUGIN_LOG_RECORDS: usize = 10;
+
+fn plugin_log_nodes(logs: &DaemonPluginLogs, index: usize) -> Vec<UiNode> {
+    let shown = logs.records.len().min(SHOWN_PLUGIN_LOG_RECORDS);
+    let mut nodes = vec![node(
+        UiNodeKind::Text,
+        &format!("tui-package-{index}-logs-summary"),
+        json!({
+            "text": format!(
+                "logs: {} · {} records read · showing the last {shown} · next_seq={} first_available_seq={}",
+                logs.package_name,
+                logs.records.len(),
+                logs.next_seq,
+                logs.first_available_seq
+            )
+        }),
+    )];
+    for record in &logs.records[logs.records.len() - shown..] {
+        let dropped = if record.dropped_before > 0 {
+            format!(" ({} dropped before)", record.dropped_before)
+        } else {
+            String::new()
+        };
+        nodes.push(node(
+            UiNodeKind::Text,
+            &format!("tui-package-{index}-log-{}", record.seq),
+            json!({
+                "text": format!("log #{} {}: {}{dropped}", record.seq, record.level, record.message)
+            }),
+        ));
+    }
+    nodes
 }
 
 fn entrypoint_action_nodes(
@@ -12131,6 +12263,96 @@ mod tests {
         assert!(app.quarantine_band().is_none());
         assert!(app.quarantine_nodes().is_empty());
         assert_eq!(hub_counters_text(&app.hub_counters), None);
+    }
+
+    fn plugin_log_page(count: u64) -> DaemonPluginLogs {
+        DaemonPluginLogs {
+            package_name: "workflow.plugin".to_string(),
+            records: (1..=count)
+                .map(|seq| botster_hub_client::DaemonPluginLogRecord {
+                    seq,
+                    generation: 1,
+                    at_ms: 1_790_000_000_000 + seq,
+                    level: "info".to_string(),
+                    message: format!("message {seq}"),
+                    fields_json: None,
+                    dropped_before: if seq == 12 { 4 } else { 0 },
+                })
+                .collect(),
+            next_seq: count + 1,
+            first_available_seq: 1,
+        }
+    }
+
+    #[test]
+    fn plugin_logs_are_read_from_the_start_and_show_the_last_records() {
+        let mut app = workspace_fixture();
+        app.packages = vec![package_with_configuration()];
+        let package_name = app.packages[0].package_name.clone();
+        app.observed_requests.clear();
+        app.handle_action(
+            "botster.tui.package.logs".to_string(),
+            None,
+            Some(json!({ "package_name": package_name })),
+        );
+        assert_eq!(
+            app.observed_requests,
+            vec![ObservedRequest::ReadPluginLogs {
+                package_name: package_name.clone(),
+                after_seq: 0,
+            }]
+        );
+
+        let mut page = plugin_log_page(12);
+        page.package_name = package_name.clone();
+        let mut response = base_response(DaemonResponseKind::PluginLogs);
+        response.plugin_logs = Some(page);
+        app.apply_completion(PendingReply::Apply, response);
+
+        app.system_details_visible = true;
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 200, 120);
+        let details = lines.join("\n");
+        assert!(details.contains("[ Logs ]"), "{details}");
+        assert!(
+            details.contains(&format!(
+                "logs: {package_name} · 12 records read · showing the last 10 · next_seq=13 first_available_seq=1"
+            )),
+            "{details}"
+        );
+        assert!(
+            !details.contains("log #2 info"),
+            "only the last 10: {details}"
+        );
+        assert!(details.contains("log #3 info: message 3"), "{details}");
+        assert!(
+            details.contains("log #12 info: message 12 (4 dropped before)"),
+            "{details}"
+        );
+
+        app.drop_connection_state();
+        assert!(app.plugin_logs.is_empty(), "a reconnect forgets the logs");
+    }
+
+    #[test]
+    fn plugin_logs_fit_the_live_terminal_size() {
+        // The live tests drive a 140x40 terminal.
+        let mut app = workspace_fixture();
+        app.packages = vec![package_with_configuration()];
+        let mut page = plugin_log_page(12);
+        page.package_name = app.packages[0].package_name.clone();
+        let mut response = base_response(DaemonResponseKind::PluginLogs);
+        response.plugin_logs = Some(page);
+        app.apply_completion(PendingReply::Apply, response);
+        app.system_details_visible = true;
+        let (lines, _) = renderer::render_to_lines(&app.surface(), 140, 40);
+        let details = lines.join("\n");
+        assert!(details.contains("[ Logs ]"), "{details}");
+        assert!(details.contains("showing the last 10"), "{details}");
+        assert!(details.contains("log #3 info: message 3"), "{details}");
+        assert!(
+            details.contains("log #12 info: message 12 (4 dropped before)"),
+            "{details}"
+        );
     }
 
     #[test]
@@ -15364,11 +15586,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_51() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_52() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 51,
-            "hub-test-support pin must publish fixture revision 51"
+            scenario.conformance_fixture_revision, 52,
+            "hub-test-support pin must publish fixture revision 52"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
@@ -16004,6 +16226,7 @@ mod tests {
             lifecycle: Vec::new(),
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
+            plugin_logs: None,
             plugin_surface: None,
             plugin_action_result: None,
             local_webrtc_bootstrap: None,
@@ -16567,6 +16790,93 @@ mod tests {
             !app.error
                 .as_deref()
                 .is_some_and(|error| error.contains("failed closed after recovery"))
+        );
+    }
+
+    #[test]
+    fn a_worker_lost_close_ends_the_route_without_a_recovery() {
+        let mut app = workspace_fixture();
+        app.begin_attach_hydration("session-alpha", "route-1");
+        hydrate_fully(&mut app, "route-1", 1);
+        app.handle_terminal_subscription_closed(
+            "session-alpha".to_string(),
+            "route-1".to_string(),
+            1,
+            "worker_lost".to_string(),
+        );
+        assert!(app.attached.is_none());
+        assert!(app.attach_hydration.is_none(), "no re-attach is attempted");
+        assert!(!app.attach_recovery_used, "the recovery is not spent");
+        assert!(app.recovery_notice.is_none());
+        assert!(app.retired_subscription_ids.contains("route-1"));
+        assert_eq!(
+            app.error.as_deref(),
+            Some("session session-alpha crashed: its worker was lost (worker_lost)")
+        );
+    }
+
+    #[test]
+    fn a_crashed_session_renders_distinctly_from_an_exited_one() {
+        let mut app = workspace_fixture();
+        let alpha = app
+            .sessions
+            .iter_mut()
+            .find(|row| row.session_id == "session-alpha")
+            .expect("alpha row");
+        alpha.lifecycle = "failed".to_string();
+        alpha.failure_reason = Some("worker_lost".to_string());
+        assert!(!alpha.is_attachable());
+
+        let rendered = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+        assert!(rendered.contains("session-alpha · crashed"), "{rendered}");
+        assert!(!rendered.contains("· worker_lost"), "{rendered}");
+        assert!(rendered.contains("session-beta · exited"), "{rendered}");
+        assert!(
+            rendered.contains("Terminal · session-alpha · crashed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("This session crashed: its worker was lost."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("[ Remove ]"),
+            "the crashed session can be removed"
+        );
+
+        // Another failure reason is not a crash.
+        let alpha = app
+            .sessions
+            .iter_mut()
+            .find(|row| row.session_id == "session-alpha")
+            .expect("alpha row");
+        alpha.failure_reason = Some("spawn_failed".to_string());
+        let rendered = render_app_to_lines(&app, 140, 42, &RenderState::default())
+            .0
+            .join("\n");
+        assert!(rendered.contains("session-alpha · failed"), "{rendered}");
+        assert!(!rendered.contains("crashed"), "{rendered}");
+    }
+
+    #[test]
+    fn a_not_attached_refusal_says_nothing_reached_the_session() {
+        let mut app = workspace_fixture();
+        let mut response = base_response(DaemonResponseKind::OperatorError);
+        response.error = Some(botster_hub_client::DaemonOperatorError {
+            code: "not_attached".to_string(),
+            request_id: "request".to_string(),
+            operation: "resize".to_string(),
+            message: "client c is not subscribed to session session-alpha".to_string(),
+            diagnostics: Vec::new(),
+        });
+        app.apply_completion(PendingReply::Apply, response);
+        assert_eq!(
+            app.error.as_deref(),
+            Some(
+                "not attached: client c is not subscribed to session session-alpha (operation=resize); nothing reached the session"
+            )
         );
     }
 
