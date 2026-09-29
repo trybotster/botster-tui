@@ -2832,11 +2832,14 @@ fn visible_key_bytes(rows: &[String]) -> Vec<String> {
     rows.iter()
         .filter_map(|row| {
             let (_, rest) = row.split_once("key:")?;
+            // The fixture emits exactly two hex digits per byte; screen cells
+            // after them are outside that token.
             let hex = rest
                 .chars()
+                .take(2)
                 .take_while(char::is_ascii_hexdigit)
                 .collect::<String>();
-            (!hex.is_empty()).then_some(hex)
+            (hex.len() == 2).then_some(hex)
         })
         .collect()
 }
