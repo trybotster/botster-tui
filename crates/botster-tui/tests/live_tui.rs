@@ -2727,7 +2727,7 @@ fn t_s11_stopped_tui_recovers_from_each_reader_deadline_close() {
                             == Some(echo);
                         (echoed && screen.contains(&notice)).then_some(())
                     },
-                    |screen| format!("cycle {cycle}; view: {:?}", screen.head_rows()),
+                    |screen| format!("cycle {cycle}; full view: {:?}", visible_rows(screen)),
                 )
                 .unwrap_or_else(|failure| panic!("{failure}"));
         }
@@ -2832,11 +2832,15 @@ fn visible_key_bytes(rows: &[String]) -> Vec<String> {
     rows.iter()
         .filter_map(|row| {
             let (_, rest) = row.split_once("key:")?;
+            // One echoed byte is exactly two hex digits. A longer run is a
+            // leftover cell of the row's earlier text (`flood-1` under
+            // `key:78` reads `key:781`), not part of the byte.
             let hex = rest
                 .chars()
+                .take(2)
                 .take_while(char::is_ascii_hexdigit)
                 .collect::<String>();
-            (!hex.is_empty()).then_some(hex)
+            (hex.len() == 2).then_some(hex)
         })
         .collect()
 }

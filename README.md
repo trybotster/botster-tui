@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `90d4e7378f0405f966dc99cfa203400fd09d6064` |
+| `botster-hub-client` / live hub | Hub `4cbf35918a99224b6af0de52b502fe69289f55dd` (protocol 13, unpublished branch pin; see S13) |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `90d4e7378f0405f966dc99cfa203400fd09d6064` (`@trybotster/hub-test-support@0.1.49`) |
+| `botster-hub-test-support` package | Hub git `4cbf35918a99224b6af0de52b502fe69289f55dd` (`@trybotster/hub-test-support@0.1.50`) |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `d855f96c63bf582d475350cd95cb8ab316798ad2` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -257,14 +257,21 @@ it; the stop key must reach the session while `yes` still runs, and later input
 must echo. The test also counts samples in ROUTE_RESYNC hydration (Detach
 hidden, no error).
 
-The TUI applies backpressure end to end. When 256 terminal wakes or 8 MiB are
-pending, its socket reader waits for the application to catch up instead of
-reading on, so the Hub and Core hold the session's output and the PTY blocks the
-program. The reader does not drop a received terminal frame, or shed its
-route, because the application is slow. One exception remains: a frame the TUI
-parks until its Attach response is charged to the same budget without waiting,
-and a full budget faults that route. Link close, shutdown, and a newer
-connection end the wait.
+The TUI applies per-route credit on the Unix connection (S13, protocol 13).
+The Hub sends a route's terminal frame only against credit the TUI granted, so
+a flooding route can never hold up control frames or another route. A route has
+no credit until the Hub demands it for its head frame, and the first demand
+comes only after that route's Attach response. The TUI grants whole frames,
+first come first served across routes, from one pending budget (256 wakes or
+8 MiB). Each frame costs one item plus its full encoded length. A frame stays
+charged until the application consumes it. `RETURN` gives credit back for a
+dropped frame, and `CLOSED` (exactly once per generation) releases whatever the
+generation still held. A demand for an unknown or retired generation is
+ignored. A lost connection resets the whole budget. Input is credited the other
+way: the Attach response opens a window of 64 frames, `INPUT_CREDIT` returns
+units, and the TUI queues input in order rather than send beyond credit. The
+TUI applies credit frames on every read path. A frame without credit, a second
+outstanding demand or an over-large return closes the connection.
 
 Observed with Core's backpressure (a test candidate: Hub `4a34386f` with Core
 `6327177`): 12 T-S10 runs passed with 0 samples in resync hydration and the same
@@ -305,7 +312,27 @@ from a client without an attachment) reads `not attached: <message>; nothing
 reached the session`. The TUI sends input and resize only on its bound route,
 so it does not expect this reply.
 
-Current pins (protocol 12), September 27, 2026: against the Hub candidate built
+Current pins (protocol 13, S13 per-route credit), September 28, 2026: against
+the Hub candidate built from Hub `87a1db94` (Core `5b13fb1`, conformance
+fixture 53, an unpublished branch commit) with Rust 1.97.0, T-S1 to T-S12 passed
+in one suite run (1-minute load 5.44 at its start), and T-S10 and T-S12 passed 3
+of 3 runs each (1-minute load 8.01 to 10.01 at the start of each run). The
+locked workspace run passed 204 tests. The suite log header names the tree
+hash of the full working diff at that time, which excluded the results in this
+paragraph; the diff without README.md hashes to `81c76c7d5aa2b205`.
+
+T-S11 failed at `input_after_recovery_echoes` in 5 of 8 runs and, in an earlier
+batch, 2 of 4 runs on that candidate (1-minute load 8 to 22). The pre-S13 pair
+(this TUI at `aaaac16` with Hub `90d4e737`) failed the same step in 3 of 8 runs
+(load 9 to 10), so the failure predates S13. In every failing run the pane showed
+`key:781` or `key:792` where `key:78` or `key:79` was expected: the test read the
+hex digits after `key:` and took a leftover digit of the row's earlier
+`flood-N` text as part of the byte. The TUI applied every terminal frame it
+received in those runs (a temporary log recorded no dropped frame). Why the row
+keeps the leftover digit was not determined. The test now reads exactly two hex
+digits, and T-S11 then passed 8 of 8 on the S13 candidate.
+
+Earlier, current pins (protocol 12), September 27, 2026: against the Hub candidate built
 from Hub `90d4e737` (Core `d855f96`) with Rust 1.97.0, T-S1 to T-S12 passed and
 T-S10 passed 3 more runs (1-minute load 22.06 and 79.90 at the start of those
 batches). T-S11 failed once in that sequence (1-minute load 133.48 at the start

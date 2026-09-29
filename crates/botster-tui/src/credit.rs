@@ -405,6 +405,102 @@ mod tests {
         );
     }
 
+    /// Two flooding routes share one budget: whatever the interleaving of
+    /// demands, dequeues, returns and a close, granted bytes never exceed the
+    /// budget and every byte comes back once both routes are gone.
+    #[test]
+    fn two_route_flood_conserves_the_budget() {
+        const TOTAL: u64 = 100;
+        let mut ledger = CreditLedger::default();
+        let mut free = TOTAL;
+        ledger.attach("a", 1, 64);
+        ledger.attach("b", 1, 64);
+        let serve = |ledger: &mut CreditLedger, free: &mut u64| {
+            let grants = ledger.serve(|need| {
+                if need <= *free {
+                    *free -= need;
+                    true
+                } else {
+                    false
+                }
+            });
+            assert!(*free <= TOTAL);
+            grants
+        };
+        for round in 0..20u64 {
+            let route = if round % 2 == 0 { "a" } else { "b" };
+            let _ = ledger.demand(route, 1, 30);
+            serve(&mut ledger, &mut free);
+            // The application consumes route a's frames only; b's pool holds.
+            if let Some((items, _)) = ledger.pool("a", 1)
+                && items > 0
+            {
+                let release = ledger.dequeued("a", 1, 30).expect("covered");
+                free += release.bytes;
+            }
+            assert!(free <= TOTAL);
+        }
+        // Route b was starved of nothing it demanded, yet holds credit.
+        let (_, b_bytes) = ledger.pool("b", 1).expect("b attached");
+        assert!(b_bytes > 0 && b_bytes <= TOTAL);
+        free += ledger.closed("a", 1).bytes;
+        free += ledger.closed("b", 1).bytes;
+        assert_eq!(free, TOTAL);
+    }
+
+    /// A grant sent for a generation that closed, then a new generation on the
+    /// same route: the old CLOSED settles only the old pool, and a late return
+    /// or demand for the old generation is ignored.
+    #[test]
+    fn a_new_generation_is_independent_of_the_closed_one() {
+        let mut ledger = CreditLedger::default();
+        ledger.attach("a", 1, 64);
+        ledger.demand("a", 1, 10).expect("demand");
+        ledger.serve(budget(10));
+        ledger.attach("a", 2, 64);
+        ledger.demand("a", 2, 20).expect("demand");
+        ledger.serve(budget(20));
+        assert_eq!(
+            ledger.closed("a", 1),
+            Release {
+                items: 1,
+                bytes: 10
+            }
+        );
+        assert_eq!(ledger.demand("a", 1, 5), Ok(()), "stale demand");
+        assert_eq!(ledger.returned("a", 1, 1, 10), Ok(Release::default()));
+        assert_eq!(ledger.pool("a", 2), Some((1, 20)));
+    }
+
+    /// The Hub returns an unneeded grant at once, or the unused remainder of
+    /// a write, as a RETURN with no items and only bytes.
+    #[test]
+    fn a_bytes_only_return_releases_bytes_and_keeps_the_item() {
+        let mut ledger = CreditLedger::default();
+        ledger.attach("a", 1, 64);
+        ledger.demand("a", 1, 100).expect("demand");
+        ledger.serve(budget(100));
+        assert_eq!(
+            ledger.returned("a", 1, 0, 40),
+            Ok(Release {
+                items: 0,
+                bytes: 40
+            })
+        );
+        assert_eq!(ledger.pool("a", 1), Some((1, 60)));
+        assert_eq!(
+            ledger.returned("a", 1, 0, 61),
+            Err(CreditViolation::ReturnExceedsPool(("a".to_string(), 1)))
+        );
+        assert_eq!(
+            ledger.closed("a", 1),
+            Release {
+                items: 1,
+                bytes: 60
+            }
+        );
+    }
+
     #[test]
     fn reset_releases_every_pool() {
         let mut ledger = CreditLedger::default();
