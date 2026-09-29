@@ -7,6 +7,7 @@ mod session_types_spawn;
 mod status_quarantine_logs;
 mod workspace_layout;
 
+use super::args::{parse_hub_connection, parse_shared_session_id};
 use super::*;
 use botster_hub_client::{DaemonUiTreeSnapshot, TerminalCompatibility};
 use botster_terminal_protocol_client::mode_bits;
@@ -307,11 +308,23 @@ fn plugin_log_page(count: u64) -> DaemonPluginLogs {
 }
 
 fn source_without_line_comments() -> String {
-    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    std::fs::read_dir(src_dir)
-        .expect("botster-tui src directory is readable")
-        .map(|entry| entry.expect("source entry is readable").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+    fn rust_files(directory: &std::path::Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("botster-tui src directory is readable") {
+            let path = entry.expect("source entry is readable").path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    rust_files(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    files
+        .into_iter()
         .map(|path| {
             std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
