@@ -1,13 +1,19 @@
 use super::*;
 
-pub fn run(args: AppArgs) -> io::Result<()> {
+/// The acceptance driver's entry: the scenario and evidence files come from
+/// the environment, and a run without them is an error.
+pub fn run_acceptance(args: AppArgs) -> io::Result<()> {
     match AcceptanceMode::from_environment()? {
-        Some(AcceptanceMode::Spawn(config)) => return run_workspaces_acceptance(args, config),
-        Some(AcceptanceMode::Claim(config)) => {
-            return run_workspaces_claim_acceptance(args, config);
-        }
-        None => {}
+        Some(AcceptanceMode::Spawn(config)) => run_workspaces_acceptance(args, config),
+        Some(AcceptanceMode::Claim(config)) => run_workspaces_claim_acceptance(args, config),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "acceptance mode needs its scenario and evidence files in the environment",
+        )),
     }
+}
+
+pub fn run(args: AppArgs) -> io::Result<()> {
     let hub_io = HubIo::with_terminal_input()?;
     let mut terminal = setup_terminal()?;
     let run_result = run_loop(&mut terminal, args, hub_io);

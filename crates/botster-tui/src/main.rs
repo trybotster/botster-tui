@@ -1,10 +1,4 @@
-mod acceptance;
-mod app;
-mod entity_options;
-mod hub_io;
-mod projection_paint;
-mod renderer;
-mod terminal_input;
+use botster_tui::app;
 
 fn main() -> std::io::Result<()> {
     let args = match app::AppArgs::parse(std::env::args().skip(1)) {

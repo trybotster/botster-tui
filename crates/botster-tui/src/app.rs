@@ -95,8 +95,8 @@ pub use args::{AppArgs, ParsedCommand, smoke_message, usage};
 mod state;
 use state::*;
 mod shell;
-pub use shell::run;
 use shell::*;
+pub use shell::{run, run_acceptance};
 
 mod actions;
 mod attach;

@@ -1181,12 +1181,19 @@ pub(super) fn membership_entity_row(
         return None;
     }
     for (id, fields) in &family.records {
-        let row_session = fields
-            .get("session_uuid")
-            .and_then(Value::as_str)
-            .or_else(|| fields.get("id").and_then(Value::as_str));
+        // A membership row names its session as {hub_id, session_id}; its id
+        // is "<hub_id>/<session_id>".
+        let row_session = fields.get("session_id").and_then(Value::as_str);
+        let row_hub = fields.get("hub_id").and_then(Value::as_str);
         let row_workspace = fields.get("workspace_id").and_then(Value::as_str);
-        if row_session == Some(session_uuid) && row_workspace == Some(workspace_id) {
+        let row_names_itself = matches!(
+            (row_hub, row_session),
+            (Some(hub), Some(session)) if *id == format!("{hub}/{session}")
+        );
+        if row_names_itself
+            && row_session == Some(session_uuid)
+            && row_workspace == Some(workspace_id)
+        {
             return Some((id.clone(), family.snapshot_seq));
         }
     }

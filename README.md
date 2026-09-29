@@ -496,14 +496,17 @@ or the projection; verify the reattach workaround in that same run.
 
 ## Caller-owned Workspaces Spawn acceptance
 
-The installed TUI exposes one deterministic file-based acceptance mode for a
-caller that already owns a shared Hub, package setup, Git fixtures, sequencing,
-and cleanup. Set both paths when launching the installed package:
+The `botster-tui-acceptance` binary (built by every `cargo build`, separate from
+the product `botster-tui`) is one deterministic file-based acceptance driver for
+a caller that already owns a shared Hub, package setup, Git fixtures,
+sequencing, and cleanup. The product binary has no acceptance mode. Run the
+driver directly, with the Hub connection the caller owns and both paths set:
 
 ```sh
+BOTSTER_HUB_CONNECTION='<typed connection JSON>' \
 BOTSTER_TUI_ACCEPTANCE_SCENARIO=/path/to/scenario.json \
 BOTSTER_TUI_ACCEPTANCE_EVIDENCE=/path/to/new-evidence.jsonl \
-  botster-hub apps open --data-dir /path/to/shared-hub botster-tui
+  botster-tui-acceptance
 ```
 
 The v1 schema and consumer fixtures live under
@@ -517,11 +520,9 @@ The JSON Schema pins the structural scenario matrix and every event payload;
 the binary additionally rejects duplicate case ids, surrounding whitespace,
 and expected target/branch values that do not equal their requested values,
 because standard JSON Schema cannot express those cross-field equalities.
-The two acceptance paths reach the installed child through the current
-`botster-hub apps open` caller-environment inheritance behavior; the package
-manifest declares only its normal Hub connection and data-directory injections.
-If Hub launch policy later replaces inherited caller environment with declared
-passthrough inputs, this contract must be routed to the Hub owner and migrated.
+The caller supplies the Hub connection and both paths in the environment; the
+package manifest declares only the product binary's normal Hub connection and
+data-directory injections and has no acceptance entrypoint.
 
 This mode uses the same presentation-aware production UiNode tree and realized
 `HitMap` as interactive drawing at a fixed production-sized viewport. It finds
@@ -618,15 +619,17 @@ Paths may instead come from `BOTSTER_HUB_SOURCE_PATH` /
 `BOTSTER_WORKSPACES_PACKAGE_PATH`. Explicit `hub_rev` / `workspaces_rev` /
 `tui_rev` / `session_worker_rev` are optional when a git path can resolve HEAD.
 
-5. Launch the installed TUI with a **new** evidence path (export the binary
-   variables so the pin ledger can bind them):
+5. Run `botster-tui-acceptance` (the acceptance binary, not the product
+   `botster-tui`) with a **new** evidence path, the caller-owned Hub
+   connection, and the binary variables exported so the pin ledger can bind them:
 
 ```sh
 export BOTSTER_HUB_BIN BOTSTER_SESSION_WORKER_BIN BOTSTER_HUB_BUILD_TARGET_DIR
 export BOTSTER_HUB_SOURCE_PATH BOTSTER_WORKSPACES_PACKAGE_PATH
+BOTSTER_HUB_CONNECTION='<typed connection JSON>' \
 BOTSTER_TUI_ACCEPTANCE_SCENARIO=/path/to/claim.scenario.json \
 BOTSTER_TUI_ACCEPTANCE_EVIDENCE=/path/to/new-claim.evidence.jsonl \
-  "$BOTSTER_HUB_BIN" apps open --data-dir "$BOTSTER_HUB_DATA_DIR" botster-tui
+  botster-tui-acceptance
 ```
 
 ### Production path (what the driver exercises)
