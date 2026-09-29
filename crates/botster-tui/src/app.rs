@@ -15586,11 +15586,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pinned_session_plugin_binding_fixture_is_conformance_52() {
+    fn pinned_session_plugin_binding_fixture_is_conformance_53() {
         let scenario = botster_hub_test_support::session_plugin_binding_conformance_scenario();
         assert_eq!(
-            scenario.conformance_fixture_revision, 52,
-            "hub-test-support pin must publish fixture revision 52"
+            scenario.conformance_fixture_revision, 53,
+            "hub-test-support pin must publish fixture revision 53"
         );
         assert!(scenario.conformance_fixture_revision >= MINIMUM_CONFORMANCE_FIXTURE_REVISION);
     }
