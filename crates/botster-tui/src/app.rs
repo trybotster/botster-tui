@@ -70,15 +70,9 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 
-use crate::acceptance::{
-    AcceptanceMode, CLAIM_SCHEMA, ClaimConfig, EvidenceWriter, FailureContext, SCHEMA,
-    ScenarioCase, SpawnConfig, verify_claim_pins,
-};
 use crate::projection_paint::tui_terminal_region;
 use crate::renderer::{self, HitMap, InputDispatch, InputRouter, RenderState};
 
-mod acceptance_drive;
-use acceptance_drive::*;
 mod package_config;
 use package_config::*;
 mod ui_nodes;
@@ -257,7 +251,6 @@ struct TuiApp {
     confirmation: Option<DestructiveAction>,
     #[cfg(test)]
     workspace_test_mode: bool,
-    acceptance_audit: Option<AcceptanceRequestAudit>,
     #[cfg(test)]
     observed_requests: Vec<ObservedRequest>,
     #[cfg(test)]

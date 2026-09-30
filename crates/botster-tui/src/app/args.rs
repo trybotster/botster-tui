@@ -27,10 +27,7 @@ pub const fn usage() -> &'static str {
 
 impl AppArgs {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
-        // Parent claim-stack prose uses BOTSTER_LIVE_DATA_DIR; prefer the established
-        // BOTSTER_HUB_DATA_DIR injector when both are present.
-        let hub_data_dir = std::env::var_os("BOTSTER_HUB_DATA_DIR")
-            .or_else(|| std::env::var_os(crate::acceptance::LIVE_DATA_DIR_ENV));
+        let hub_data_dir = std::env::var_os("BOTSTER_HUB_DATA_DIR");
         Self::parse_with_environment(
             args,
             std::env::var_os("BOTSTER_HUB_CONNECTION"),

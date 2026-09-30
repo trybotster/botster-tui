@@ -119,7 +119,6 @@ impl TuiApp {
             confirmation: None,
             #[cfg(test)]
             workspace_test_mode: false,
-            acceptance_audit: None,
             #[cfg(test)]
             observed_requests: Vec::new(),
             #[cfg(test)]
@@ -143,55 +142,6 @@ impl TuiApp {
         self.attached
             .as_ref()
             .map(|attached| attached.session_id.as_str())
-    }
-
-    /// Harness helper: apply wakes until `ready` holds or `deadline` passes.
-    ///
-    /// Input events are ignored here; harness drivers dispatch their own
-    /// synthetic events. Returns whether `ready` held.
-    pub(super) fn pump_until(
-        &mut self,
-        deadline: Instant,
-        mut ready: impl FnMut(&mut Self) -> bool,
-    ) -> bool {
-        loop {
-            if ready(self) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            let until = self
-                .next_deadline()
-                .map_or(deadline, |candidate| candidate.min(deadline));
-            match self.hub_io.next_wake(Some(until)) {
-                AppWake::Input(_) => {}
-                AppWake::Shutdown => return ready(self),
-                other => self.apply_wake(other),
-            }
-        }
-    }
-
-    /// Harness helper: wait at most until `until` for one wake and apply it.
-    pub(super) fn pump_once(&mut self, until: Instant) {
-        let until = self
-            .next_deadline()
-            .map_or(until, |candidate| candidate.min(until));
-        match self.hub_io.next_wake(Some(until)) {
-            AppWake::Input(_) | AppWake::Shutdown => {}
-            other => self.apply_wake(other),
-        }
-        while let Some(wake) = self.hub_io.try_next_wake() {
-            match wake {
-                AppWake::Input(_) | AppWake::Shutdown => {}
-                other => self.apply_wake(other),
-            }
-        }
-    }
-
-    /// Harness helper: apply wakes until no host-control request is outstanding.
-    pub(super) fn settle(&mut self, deadline: Instant) -> bool {
-        self.pump_until(deadline, |app| app.pending_requests.is_empty())
     }
 
     /// Earliest absolute deadline the loop must wake for.
