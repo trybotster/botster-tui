@@ -304,6 +304,7 @@ fn plugin_log_page(count: u64) -> DaemonPluginLogs {
             .collect(),
         next_seq: count + 1,
         first_available_seq: 1,
+        log_id: None,
     }
 }
 
@@ -989,7 +990,7 @@ fn rendered_workspace(app: &TuiApp) -> String {
         .join("\n")
 }
 
-fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
+pub(crate) fn base_response(kind: DaemonResponseKind) -> DaemonResponse {
     DaemonResponse {
         kind,
         status: None,
