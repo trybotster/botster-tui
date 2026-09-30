@@ -2617,7 +2617,7 @@ fn t_s10_output_flood_keeps_the_route_attached_and_responsive() {
 
 /// Starts `yes flood-<n>` on the n-th `f`, so each flood's output names its
 /// own start; any other byte stops the flood and is echoed as `key:<hex>`.
-const STALL_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo min 1; p=; n=0; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); if [ \"$b\" = 66 ]; then n=$((n+1)); yes \"flood-$n\" & p=$!; else if [ -n \"$p\" ]; then kill $p 2>/dev/null; wait $p 2>/dev/null; p=; fi; printf 'key:%s\\n' \"$b\"; fi; done";
+const STALL_SHELL_COMMAND: &str = "printf 'live-ready\\n'; stty -icanon -echo min 1; p=; n=0; while true; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); if [ \"$b\" = 66 ]; then n=$((n+1)); yes \"flood-$n\" & p=$!; else if [ -n \"$p\" ]; then kill $p 2>/dev/null; wait $p 2>/dev/null; p=; fi; printf '\\nkey:%s\\n' \"$b\"; fi; done";
 
 /// Core `READER_PROGRESS_DEADLINE` (Core 6a8fc22): a route with output
 /// pending whose client completes no write for this long is closed.
@@ -2723,7 +2723,9 @@ fn t_s11_stopped_tui_recovers_from_each_reader_deadline_close() {
                     SCREEN_DEADLINE,
                     &identity,
                     |screen| {
-                        let echoed = visible_key_bytes(&screen.rows()).last().map(String::as_str)
+                        let echoed = visible_key_tokens(&screen.rows())
+                            .last()
+                            .map(String::as_str)
                             == Some(echo);
                         (echoed && screen.contains(&notice)).then_some(())
                     },
@@ -2827,6 +2829,22 @@ fn visible_rows(screen: &mut Screen) -> Vec<String> {
         .collect()
 }
 
+/// The `key:<hex>` tokens visible in the pane, in screen order: the whole
+/// whitespace-delimited token after `key:`, so a stray cell next to the two
+/// digits makes a different token instead of being ignored.
+fn visible_key_tokens(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|row| {
+            let (_, rest) = row.split_once("key:")?;
+            let token = rest.split_whitespace().next()?;
+            token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+                .then(|| token.to_string())
+        })
+        .collect()
+}
+
 /// The `key:<hex>` bytes visible in the pane, in screen order.
 fn visible_key_bytes(rows: &[String]) -> Vec<String> {
     rows.iter()
@@ -2842,6 +2860,16 @@ fn visible_key_bytes(rows: &[String]) -> Vec<String> {
             (hex.len() == 2).then_some(hex)
         })
         .collect()
+}
+
+#[test]
+fn key_tokens_keep_a_stray_cell_that_key_bytes_ignore() {
+    let rows = vec![
+        "│ a ││key:78        │".to_string(),
+        "│ a ││key:781       │".to_string(),
+    ];
+    assert_eq!(visible_key_bytes(&rows), ["78", "78"]);
+    assert_eq!(visible_key_tokens(&rows), ["78", "781"]);
 }
 
 #[test]
