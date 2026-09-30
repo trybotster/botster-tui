@@ -46,6 +46,8 @@ impl TuiApp {
                 Some("the previous Hub link did not close within the detach bound".to_string());
         }
         self.connected_generation = None;
+        self.hub_offers_restart = false;
+        self.restarting_sessions.clear();
         self.pending_requests.clear();
         self.reset_active_plugin_surface();
         self.invalidate_session_generation();
@@ -103,6 +105,7 @@ impl TuiApp {
             return;
         }
         self.connected_generation = Some(generation);
+        self.hub_offers_restart = host_offers_restart(&ack.compatibility);
         self.reconnect_failures = 0;
         self.reconnect_at = None;
         self.status = "connected".to_string();

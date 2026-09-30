@@ -71,6 +71,8 @@ impl TuiApp {
             pending_plugin_request: None,
             session_entities: SessionEntityState::default(),
             pending_sessions: BTreeMap::new(),
+            restarting_sessions: BTreeSet::new(),
+            hub_offers_restart: false,
             session_type_entities: SessionTypeEntityState::default(),
             session_type_subscription_error: None,
             entity_options: EntityOptionsStore::default(),

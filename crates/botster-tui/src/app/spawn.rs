@@ -355,3 +355,54 @@ impl TuiApp {
         }
     }
 }
+
+impl TuiApp {
+    /// Ask the Hub to start an ended session again under the same session id.
+    /// Offered only when the Hub advertised `session_restart` at Hello.
+    pub(super) fn restart_session(&mut self, session_id: &str) {
+        if !self.hub_offers_restart {
+            self.error = Some("restart unavailable: this Hub does not offer it".to_string());
+            return;
+        }
+        if !self.restarting_sessions.insert(session_id.to_string()) {
+            return;
+        }
+        self.error = None;
+        self.action_feedback = Some(format!("restarting: {session_id}"));
+        self.submit(
+            DaemonRequest::RestartSession {
+                session_id: session_id.to_string(),
+            },
+            PendingReply::Restart {
+                session_id: session_id.to_string(),
+            },
+            REQUEST_DEADLINE,
+        );
+    }
+}
+
+/// Whether the Hub's Hello offers `session_restart`.
+pub(super) fn host_offers_restart(compatibility: &DaemonCompatibility) -> bool {
+    compatibility
+        .features
+        .iter()
+        .any(|feature| feature == FEATURE_SESSION_RESTART)
+}
+
+/// What the Hub's refusal of a restart means for the operator.
+pub(super) fn restart_refusal_text(
+    session_id: &str,
+    error: &botster_hub_client::DaemonOperatorError,
+) -> String {
+    let advice = match error.code.as_str() {
+        "restart_not_ready" => "; the Hub cannot release the session yet, retry shortly",
+        "restart_not_ended" => "; the session is still running",
+        "restart_record_unavailable" => "; the Hub holds no restart record for it",
+        "restart_environment_not_retained" => "; its environment was not kept",
+        _ => "",
+    };
+    format!(
+        "restart refused for {session_id}: {} (code={}){advice}",
+        error.message, error.code
+    )
+}

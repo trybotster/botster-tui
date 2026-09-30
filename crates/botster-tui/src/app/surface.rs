@@ -252,6 +252,12 @@ impl TuiApp {
         let selected_is_removable = selected.is_some_and(|session| {
             !session.pending && !matches!(session.lifecycle.as_str(), "running" | "pending")
         });
+        let selected_is_restartable = self.hub_offers_restart
+            && selected.is_some_and(|session| {
+                session.restartable
+                    && !session.pending
+                    && !self.restarting_sessions.contains(&session.session_id)
+            });
         let attach_is_primary = selected_is_attachable && !selected_is_attached;
         let detach_is_primary = self.attached.is_some() && !attach_is_primary;
         let spawn_is_primary = !attach_is_primary && !detach_is_primary;
@@ -317,6 +323,16 @@ impl TuiApp {
                 Some("danger"),
             )));
         }
+        if selected_is_restartable {
+            actions.push(child(workspace_button(
+                "workspace-restart",
+                "Restart",
+                "botster.tui.session.restart",
+                payload.clone(),
+                "auto",
+                None,
+            )));
+        }
         if selected_is_removable {
             actions.push(child(workspace_button(
                 "workspace-remove",
@@ -369,6 +385,8 @@ impl TuiApp {
         let attached = self.attached_session_id() == Some(session.session_id.as_str());
         let state = if session.pending {
             "pending spawn"
+        } else if self.restarting_sessions.contains(&session.session_id) {
+            "restarting"
         } else if session.crashed() {
             // The pane names the lost worker; the row stays short enough for
             // the navigator.

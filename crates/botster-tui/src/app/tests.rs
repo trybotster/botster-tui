@@ -2,6 +2,7 @@ mod attach_route;
 mod connection_args;
 mod package_ui;
 mod paste_and_keys;
+mod restart;
 mod session_selection;
 mod session_types_spawn;
 mod status_quarantine_logs;
@@ -380,6 +381,7 @@ fn session_entity(session_id: &str, lifecycle: Option<&str>) -> DaemonSessionEnt
         traits: Vec::new(),
         interaction: None,
         session_type_lifecycle: None,
+        restartable: false,
     }
 }
 
