@@ -1,4 +1,3 @@
-mod acceptance;
 mod app;
 mod entity_options;
 mod hub_io;

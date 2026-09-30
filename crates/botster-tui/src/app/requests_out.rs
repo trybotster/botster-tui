@@ -24,9 +24,6 @@ impl TuiApp {
         reply: PendingReply,
         deadline: Duration,
     ) -> u64 {
-        if let Some(audit) = &mut self.acceptance_audit {
-            audit.record(&request);
-        }
         #[cfg(test)]
         self.record_request(&request);
         // timer: deadline — host-control request expiry; expiry completes the request with DeadlineExpired

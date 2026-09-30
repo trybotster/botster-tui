@@ -259,52 +259,6 @@ fn refresh_read_models_does_not_list_sessions() {
 }
 
 #[test]
-fn acceptance_request_audit_detects_legacy_list_sessions() {
-    let mut audit = AcceptanceRequestAudit::default();
-
-    audit.record(&DaemonRequest::ListSessions);
-
-    assert_eq!(audit.list_sessions, 1);
-}
-
-/// Default-gate cold-cut invariant: the installed Workspaces spawn-form driver
-/// must key the form field as session_type_id, never the retired template
-/// field name. Live lanes prove the field works end-to-end; this scan keeps a
-/// silent revert from surviving `script/test`.
-#[test]
-fn workspaces_spawn_acceptance_uses_session_type_id_field_key() {
-    let source = source_without_line_comments();
-    let call_site = concat!(
-        "select_only_acceptance_value(\n",
-        "        app,\n",
-        "        router,\n",
-        "        \"",
-        "session",
-        "_type_id\",\n"
-    );
-    assert!(
-        source.contains(call_site),
-        "acceptance spawn-form selector must pass the session type field name"
-    );
-
-    let forbidden_field = concat!("template", "_id");
-    assert!(
-        !source.contains(forbidden_field),
-        "acceptance source must not retain the retired spawn form field key"
-    );
-
-    let fixture = include_str!("../../../fixtures/workspaces-spawn-driver-v1.evidence.jsonl");
-    assert!(
-        !fixture.contains(forbidden_field),
-        "checked-in spawn-driver evidence example must not teach the retired field key"
-    );
-    assert!(
-        fixture.contains(concat!("\"", "session", "_type_id\"")),
-        "checked-in spawn-driver evidence example must use the session type field key"
-    );
-}
-
-#[test]
 fn detached_title_appears_only_after_a_confirmed_detach_response() {
     let reply = |route: &str| PendingReply::Detach {
         session_id: "session-alpha".to_string(),
@@ -382,30 +336,6 @@ fn a_new_running_session_is_never_attached_without_activation() {
         app.observed_requests
     );
     assert!(app.attach_hydration.is_none());
-}
-
-#[test]
-fn claim_session_baseline_requires_lifecycle_class_current() {
-    let mut app = TuiApp::new(None);
-    app.session_entities.has_snapshot = true;
-    let session_uuid = "00000000-0000-4000-8000-0000000000ee";
-    let mut ended = session_entity(session_uuid, Some("exited"));
-    ended.lifecycle_class = "ended".to_string();
-    app.session_entities
-        .entities
-        .insert(session_uuid.to_string(), ended);
-    assert!(
-        !claim_session_is_current(&app, session_uuid),
-        "ended lifecycle_class must not satisfy claim baseline"
-    );
-    app.session_entities.entities.insert(
-        session_uuid.to_string(),
-        session_entity(session_uuid, Some("running")),
-    );
-    assert!(
-        claim_session_is_current(&app, session_uuid),
-        "current lifecycle_class must satisfy claim baseline"
-    );
 }
 
 #[test]

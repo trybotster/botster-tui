@@ -1,13 +1,6 @@
 use super::*;
 
 pub fn run(args: AppArgs) -> io::Result<()> {
-    match AcceptanceMode::from_environment()? {
-        Some(AcceptanceMode::Spawn(config)) => return run_workspaces_acceptance(args, config),
-        Some(AcceptanceMode::Claim(config)) => {
-            return run_workspaces_claim_acceptance(args, config);
-        }
-        None => {}
-    }
     let hub_io = HubIo::with_terminal_input()?;
     let mut terminal = setup_terminal()?;
     let run_result = run_loop(&mut terminal, args, hub_io);
