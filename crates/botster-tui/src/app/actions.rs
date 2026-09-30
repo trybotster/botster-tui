@@ -322,6 +322,13 @@ impl TuiApp {
                     self.confirmation = Some(DestructiveAction::Remove(session_id));
                 }
             }
+            "botster.tui.session.restart" => {
+                if let Some(session_id) =
+                    session_id_from_payload(&payload).or_else(|| self.selected_session.clone())
+                {
+                    self.restart_session(&session_id);
+                }
+            }
             "botster.tui.confirm.cancel" => {
                 self.confirmation = None;
             }

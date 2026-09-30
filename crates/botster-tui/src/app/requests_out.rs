@@ -84,6 +84,21 @@ impl TuiApp {
                 target_id,
                 target_label,
             } => self.apply_list_for_target(&target_id, &target_label, response),
+            PendingReply::Restart { session_id } => {
+                self.restarting_sessions.remove(&session_id);
+                match response.error.clone() {
+                    Some(error) => {
+                        self.apply_response(response);
+                        self.error = Some(restart_refusal_text(&session_id, &error));
+                    }
+                    None => {
+                        self.apply_response(response);
+                        self.action_feedback = Some(format!(
+                            "restart accepted: {session_id}; waiting for the running session"
+                        ));
+                    }
+                }
+            }
             PendingReply::Spawn { session_id } => {
                 let failed = response.error.is_some();
                 self.apply_response(response);
@@ -168,6 +183,10 @@ impl TuiApp {
                 self.action_feedback = Some(format!(
                     "session types for {target_label} failed to load; pick another target or cancel"
                 ));
+            }
+            PendingReply::Restart { session_id } => {
+                self.restarting_sessions.remove(&session_id);
+                self.error = Some(format!("restart failed for {session_id}: {message}"));
             }
             PendingReply::Spawn { session_id } => {
                 self.pending_sessions.remove(&session_id);

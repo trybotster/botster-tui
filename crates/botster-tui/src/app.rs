@@ -28,7 +28,7 @@ use botster_hub_client::{
     DaemonSessionTypeMutationSource, DaemonSessionTypeRequest, DaemonSessionTypeWorkingDirectory,
     DaemonSoftwareIdentity, DaemonSpawnTarget, DaemonTransportError, DaemonTransportResult,
     FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS, FEATURE_PACKAGE_NAVIGATION, FEATURE_PLUGIN_SURFACE_ACTION,
-    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    FEATURE_PLUGIN_SURFACE_RENDER, FEATURE_SESSION_ENTITY_SUBSCRIPTIONS, FEATURE_SESSION_RESTART,
     FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS, FEATURE_SESSIONS, FEATURE_TERMINAL_READBACK,
     FEATURE_TERMINAL_SUBSCRIPTION_CLOSED, FEATURE_UNIX_TERMINAL_ADAPTER, PROTOCOL,
     TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST, TerminalCompatibilityRequirement,
@@ -177,6 +177,10 @@ struct TuiApp {
     pending_plugin_request: Option<UiActionRequest>,
     session_entities: SessionEntityState,
     pending_sessions: BTreeMap<String, SessionRow>,
+    /// Sessions with a RestartSession request outstanding; the row says so.
+    restarting_sessions: BTreeSet<String>,
+    /// The Hub's Hello offered `session_restart` on this connection.
+    hub_offers_restart: bool,
     session_type_entities: SessionTypeEntityState,
     session_type_subscription_error: Option<String>,
     /// Multi-family entity-options store (non-process-wide families + generation).
@@ -268,6 +272,7 @@ struct TuiApp {
 #[derive(Debug, PartialEq, Eq)]
 enum ObservedRequest {
     Status,
+    RestartSession(String),
     ReadPluginLogs {
         package_name: String,
         after_seq: u64,

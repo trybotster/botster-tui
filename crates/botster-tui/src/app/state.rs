@@ -66,6 +66,8 @@ pub(super) struct SessionRow {
     pub(super) traits: Vec<String>,
     pub(super) interaction: Option<String>,
     pub(super) session_type_lifecycle: Option<String>,
+    /// The Hub holds a durable record to restart this ended session from.
+    pub(super) restartable: bool,
 }
 
 /// One attach campaign between the Attach request and the open live path.
@@ -231,6 +233,9 @@ pub(super) enum DetachState {
 pub(super) enum PendingReply {
     /// Apply the response to read models and diagnostics.
     Apply,
+    /// RestartSession for an ended session; it answers `spawned` once the new
+    /// process runs, or an operator error that names why it could not.
+    Restart { session_id: String },
     /// ResolveQuarantine. Only a package resolution replies with the package
     /// list; a repository root's reply carries none.
     ResolveQuarantine { target: DaemonQuarantineTarget },
@@ -287,6 +292,7 @@ impl SessionRow {
             traits: Vec::new(),
             interaction: None,
             session_type_lifecycle: None,
+            restartable: false,
         }
     }
 
@@ -302,6 +308,7 @@ impl SessionRow {
             traits: Vec::new(),
             interaction: None,
             session_type_lifecycle: None,
+            restartable: false,
         }
     }
 
@@ -320,6 +327,7 @@ impl SessionRow {
             traits: entity.traits.clone(),
             interaction: entity.interaction.clone(),
             session_type_lifecycle: entity.session_type_lifecycle.clone(),
+            restartable: entity.restartable,
         }
     }
 
@@ -1002,6 +1010,7 @@ pub(super) fn session_binding_reference_row() -> serde_json::Map<String, Value> 
         traits: vec!["reference-trait".to_string()],
         interaction: Some("reference-interaction".to_string()),
         session_type_lifecycle: Some("reference-lifecycle".to_string()),
+        restartable: false,
     })
     .expect("exhaustive session binding reference row must serialize")
     .as_object()

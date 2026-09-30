@@ -5,6 +5,9 @@ impl TuiApp {
     pub(super) fn record_request(&mut self, request: &DaemonRequest) {
         match request {
             DaemonRequest::Status => self.observed_requests.push(ObservedRequest::Status),
+            DaemonRequest::RestartSession { session_id } => self
+                .observed_requests
+                .push(ObservedRequest::RestartSession(session_id.clone())),
             DaemonRequest::ReadPluginLogs {
                 package_name,
                 after_seq,
