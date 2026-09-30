@@ -128,11 +128,10 @@ impl TuiApp {
                     return;
                 }
                 // The Attach response is the only source of the attachment
-                // generation. Frames parked before it replay now.
+                // generation.
                 match attached {
                     Some(attach) if attach.subscription_id == route => {
                         self.route_generation = Some(attach.generation);
-                        self.replay_pre_attach_frames();
                     }
                     _ => self.fail_attach_campaign(
                         &session_id,

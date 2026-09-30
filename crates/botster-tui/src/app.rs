@@ -373,4 +373,4 @@ pub(crate) fn short_suffix() -> u64 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

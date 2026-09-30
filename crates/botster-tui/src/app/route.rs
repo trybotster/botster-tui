@@ -36,10 +36,10 @@ impl TuiApp {
             }
         };
         // The attachment generation comes only from the trusted Attach
-        // response. Frames that arrive first wait, bounded, and replay once the
-        // response lands; a frame is never allowed to set the reservation.
+        // response. A route's socket opens after that response, so a frame
+        // that arrives before it belongs to no attachment and is dropped; a
+        // frame is never allowed to set the reservation.
         let Some(generation) = self.route_generation else {
-            self.park_pre_attach_frame(routed);
             return;
         };
         if routed.generation != generation {
@@ -71,59 +71,8 @@ impl TuiApp {
         self.apply_terminal_event(&route, event);
     }
 
-    /// Retain one frame until the Attach response fixes the generation.
-    ///
-    /// The frame is charged against the connection's aggregate pending budget,
-    /// not a separate per-route buffer. At the bound only this route fails.
-    pub(super) fn park_pre_attach_frame(&mut self, routed: RoutedTerminalFrame) {
-        let Some(hydration) = self.attach_hydration.as_ref() else {
-            return;
-        };
-        let bytes = routed.frame.len();
-        if !self.hub_io.try_retain(bytes) {
-            let session_id = hydration.session_id.clone();
-            let route = hydration.route.clone();
-            self.recover_current_subscription(
-                &session_id,
-                &route,
-                "frames before the attach response exceeded the pending budget",
-                "frames before the attach response exceeded the pending budget",
-            );
-            return;
-        }
-        if let Some(hydration) = self.attach_hydration.as_mut() {
-            hydration.pending_frame_bytes += bytes;
-            hydration.pending_frames.push_back(routed);
-        }
-    }
-
-    /// Take the parked frames out of the campaign and release their budget.
-    pub(super) fn take_parked_frames(&mut self) -> VecDeque<RoutedTerminalFrame> {
-        let Some(hydration) = self.attach_hydration.as_mut() else {
-            return VecDeque::new();
-        };
-        let parked = std::mem::take(&mut hydration.pending_frames);
-        hydration.pending_frame_bytes = 0;
-        for routed in &parked {
-            self.hub_io.release_retained(routed.frame.len());
-        }
-        parked
-    }
-
-    /// Replay frames parked before the Attach response, in arrival order.
-    /// Output only: queued user input is never replayed here.
-    pub(super) fn replay_pre_attach_frames(&mut self) {
-        for routed in self.take_parked_frames() {
-            if self.attach_hydration.is_none() && self.attached.is_none() {
-                return;
-            }
-            self.apply_routed_terminal_frame(routed);
-        }
-    }
-
-    /// Drop the attach campaign and release every frame it retained.
+    /// Drop the attach campaign.
     pub(super) fn drop_attach_hydration(&mut self) {
-        let _ = self.take_parked_frames();
         self.attach_hydration = None;
     }
 
@@ -142,7 +91,6 @@ impl TuiApp {
         }
         self.clear_ghostty_projection();
         let was_attached = self.attached.take().is_some();
-        let _ = self.take_parked_frames();
         let mut hydration = AttachHydration::new(&session_id, &route);
         if let Some(previous) = self.attach_hydration.take() {
             hydration.attached_seen = previous.attached_seen;

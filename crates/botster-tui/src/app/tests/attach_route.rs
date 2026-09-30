@@ -1,34 +1,29 @@
 use super::*;
 
 #[test]
-fn generation_comes_only_from_the_attach_response_and_parked_frames_replay() {
+fn generation_comes_only_from_the_attach_response() {
     let mut app = workspace_fixture();
     app.begin_attach_hydration("session-alpha", "route-1");
-    // Frames before the response never set the reservation; they wait.
+    // A frame before the response never sets the reservation, and is dropped:
+    // the route's socket opens after the response.
     app.apply_wake(routed(
         "route-1",
         9,
         attach_state_frame(AttachStateCode::Attached),
     ));
+    assert_eq!(app.route_generation, None);
+    assert_eq!(app.route_epoch, None);
+    complete_attach(&mut app, "session-alpha", "route-1", 4);
+    assert_eq!(app.route_generation, Some(4));
     app.apply_wake(routed(
         "route-1",
         4,
         attach_state_frame(AttachStateCode::Attached),
     ));
     app.apply_wake(routed("route-1", 4, modes_frame(mode_bits::MOUSE_NORMAL)));
-    assert_eq!(app.route_generation, None);
-    assert_eq!(
-        app.attach_hydration
-            .as_ref()
-            .map(|hydration| hydration.pending_frames.len()),
-        Some(3)
-    );
-    complete_attach(&mut app, "session-alpha", "route-1", 4);
-    assert_eq!(app.route_generation, Some(4));
     assert_eq!(app.route_epoch, Some(0));
     let hydration = app.attach_hydration.as_ref().expect("campaign continues");
     assert!(hydration.attached_seen);
-    assert!(hydration.pending_frames.is_empty());
     assert_eq!(
         app.terminal_modes
             .as_ref()
@@ -59,23 +54,6 @@ fn generation_comes_only_from_the_attach_response_and_parked_frames_replay() {
         attach_state_frame(AttachStateCode::Detached),
     ));
     assert!(app.attach_hydration.is_some());
-}
-
-#[test]
-fn frames_before_the_attach_response_share_the_pending_budget() {
-    let mut app = workspace_fixture();
-    app.begin_attach_hydration("session-alpha", "route-1");
-    for _ in 0..crate::hub_io::MAX_PENDING_WAKE_ITEMS {
-        app.apply_wake(routed("route-1", 1, modes_frame(0)));
-    }
-    assert!(app.attach_hydration.is_some());
-    assert!(!app.hub_io.try_retain(0));
-    app.apply_wake(routed("route-1", 1, modes_frame(0)));
-    assert!(app.retired_subscription_ids.contains("route-1"));
-    assert!(app.attach_recovery_used);
-    // The failed campaign released every parked frame from the budget.
-    assert!(app.hub_io.try_retain(0));
-    app.hub_io.release_retained(0);
 }
 
 #[test]

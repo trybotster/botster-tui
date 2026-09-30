@@ -78,12 +78,6 @@ pub(super) struct SessionRow {
 pub(super) struct AttachHydration {
     pub(super) session_id: String,
     pub(super) route: String,
-    /// Frames that arrived before the trusted Attach response fixed the
-    /// attachment generation. Charged against the connection's aggregate
-    /// pending budget through `HubIo::try_retain`; replayed once the response
-    /// lands, released when the campaign ends.
-    pub(super) pending_frames: VecDeque<RoutedTerminalFrame>,
-    pub(super) pending_frame_bytes: usize,
     pub(super) buffered_live_output: Vec<u8>,
     pub(super) pending_input: Vec<PendingTerminalInput>,
     pub(super) pending_input_bytes: usize,
@@ -108,8 +102,6 @@ impl AttachHydration {
         Self {
             session_id: session_id.to_string(),
             route: route.to_string(),
-            pending_frames: VecDeque::new(),
-            pending_frame_bytes: 0,
             buffered_live_output: Vec::new(),
             pending_input: Vec::new(),
             pending_input_bytes: 0,

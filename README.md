@@ -31,11 +31,11 @@ The workspace pins the Ghostty terminal client stack as one multipath set:
 
 | Crate | Pin |
 | --- | --- |
-| `botster-hub-client` / live hub | Hub `90d4e7378f0405f966dc99cfa203400fd09d6064` |
+| `botster-hub-client` / live hub | Hub `87beb0d3dc87b943e39847169589853e84a896b8` (protocol 14) |
 | `botster-ui-contract` | tag `botster-ui-contract-v0.3.3` |
-| `botster-hub-test-support` package | Hub git `90d4e7378f0405f966dc99cfa203400fd09d6064` (`@trybotster/hub-test-support@0.1.49`) |
+| `botster-hub-test-support` package | Hub git `87beb0d3dc87b943e39847169589853e84a896b8` |
 | `botster-tui-kit` | `6c4691036f68c870d8003b2927d4c22ac052c081` |
-| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `d855f96c63bf582d475350cd95cb8ab316798ad2` with `libghostty-vt` |
+| `botster-core` / `botster-terminal-ghostty` / `botster-core-test-support` / `botster-terminal-protocol-client` | Core `8f69957d6a71aa865f1936de248ee7bfed552120` with `libghostty-vt` |
 | Vendored Ghostty source | Ghostty `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` |
 
 `botster-terminal-ghostty` owns incremental GHOSTSNP decode, live VT apply,
@@ -188,7 +188,7 @@ workspace shortcuts documented above.
 
 The session workspace uses the authoritative external hub client protocol
 from `botster-hub-client`, pinned to botster-hub revision
-`90d4e7378f0405f966dc99cfa203400fd09d6064` (same Hub pin as Foundation above).
+`87beb0d3dc87b943e39847169589853e84a896b8` (same Hub pin as Foundation above).
 The protocol source is `crates/botster-hub-client/src/lib.rs` in that
 repository; it owns the daemon handshake, request/response frames, session
 spawn/attach, opaque Unix terminal envelopes, and mux Event/Terminal planes.
@@ -257,14 +257,21 @@ it; the stop key must reach the session while `yes` still runs, and later input
 must echo. The test also counts samples in ROUTE_RESYNC hydration (Detach
 hidden, no error).
 
-The TUI applies backpressure end to end. When 256 terminal wakes or 8 MiB are
-pending, its socket reader waits for the application to catch up instead of
-reading on, so the Hub and Core hold the session's output and the PTY blocks the
-program. The reader does not drop a received terminal frame, or shed its
-route, because the application is slow. One exception remains: a frame the TUI
-parks until its Attach response is charged to the same budget without waiting,
-and a full budget faults that route. Link close, shutdown, and a newer
-connection end the wait.
+Each attached route has its own socket. The Attach response names it
+(`route_socket`); the TUI connects once, at that response, and starts one reader
+and one writer thread for the route. Terminal frames travel only there, in both
+directions; the control connection carries none, and a terminal frame on it ends
+the connection. The Hub closes a route's socket at the end of its generation,
+and the TUI holds the `TerminalSubscriptionClosed` event until that socket
+reaches end of stream, so the route's last frame is applied before its close.
+
+The TUI applies backpressure per route. When 256 terminal wakes or 8 MiB are
+pending, that route's reader waits for the application to catch up instead of
+reading on, so the kernel buffer fills, the Hub holds that route's output and
+the PTY blocks the program. The control reader never waits for terminal space,
+so control frames are not delayed behind a flooding route. The reader does not
+drop a received terminal frame, or shed its route, because the application is
+slow. Link close, shutdown, and a newer connection end the wait.
 
 Observed with Core's backpressure (a test candidate: Hub `4a34386f` with Core
 `6327177`): 12 T-S10 runs passed with 0 samples in resync hydration and the same

@@ -4,31 +4,37 @@
 //!
 //! - the Crossterm `EventStream` input thread,
 //! - one socket reader thread and one socket writer thread per Hub connection,
+//! - one reader thread and one writer thread per attached terminal route,
 //! - the absolute-deadline table for outstanding host-control requests.
 //!
 //! The application thread never blocks on a socket, the filesystem, or a timer
 //! that is not an absolute deadline. It waits on exactly one channel with
 //! `recv_timeout` to the earliest deadline and applies the `AppWake` it gets.
 //!
-//! Every frame of one connection rides that connection: correlated responses,
-//! unsolicited events, entity subscription frames, and routed terminal frames.
+//! The control connection carries correlated responses, unsolicited events and
+//! entity subscription frames. Each attached route has its own socket, named by
+//! the Attach response, and terminal frames travel only there, in both
+//! directions. A client that stops reading one route stalls only that route.
 //!
 //! Bounds (section 6 of the implementation contract):
 //!
 //! - 32 outstanding host-control requests per connection; a 33rd `submit`
 //!   completes immediately with `DaemonRequestError::TooManyOutstandingRequests`.
 //! - 256 items / 8 MiB of pending wakes. When a terminal frame would exceed
-//!   the bound, the reader waits for the application to release space before
-//!   it reads the socket again (backpressure): the Hub and Core then hold the
-//!   session's output, and the PTY blocks the program. Link close and shutdown
-//!   end the wait. A terminal frame (at most `MAX_ROUTE_EGRESS_BYTES`) always
-//!   fits once the queue drains. Only a frame that does not decode faults its
-//!   route (`RouteFault`); the application detaches
-//!   and re-attaches that route only. Control frames are never shed because
-//!   their producers are already bounded (32 responses, Hub-shed events with
-//!   `EventGap`, entity snapshots per subscription). A later per-route credit
-//!   window on the Unix mux replaces this blocking read, so control frames need
-//!   not wait behind a flooding route.
+//!   the bound, that route's reader waits for the application to release space
+//!   before it reads its socket again (backpressure): the kernel buffer fills,
+//!   the Hub holds that route's output, and the PTY blocks the program. The
+//!   control reader never waits for terminal space, so control frames are not
+//!   delayed by a flooding route. Link close and shutdown end the wait. A
+//!   terminal frame (at most `MAX_ROUTE_EGRESS_BYTES`) always fits once the
+//!   queue drains. Only a frame that does not decode faults its route
+//!   (`RouteFault`); the application detaches and re-attaches that route only.
+//!   Control frames are never shed because their producers are already bounded
+//!   (32 responses, Hub-shed events with `EventGap`, entity snapshots per
+//!   subscription).
+//! - The Hub closes a route's socket at the end of its generation. The
+//!   `TerminalSubscriptionClosed` event is held until that socket reaches end
+//!   of stream, so the route's last frame is applied before its close.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -49,11 +55,11 @@ use std::{
 
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEntityFrame, DaemonEvent,
-    DaemonHelloAck, DaemonRequest, DaemonRequestError, DaemonResponse, DaemonTransportError,
-    DaemonUnixFrameReader, DaemonUnixMuxFrame, DaemonUnixTerminalFrame, MAX_OUTSTANDING_REQUESTS,
-    RequestIdSequence, ServerFrame, TerminalCompatibilityRequirement,
-    connect_and_hello_with_terminal_requirement, encode_client_frame, encode_request_id,
-    encode_unix_terminal_frame, parse_request_id,
+    DaemonHelloAck, DaemonRequest, DaemonRequestError, DaemonResponse, DaemonResponseKind,
+    DaemonRouteStream, DaemonTerminalAttach, DaemonTransportError, DaemonUnixFrameReader,
+    DaemonUnixTerminalFrame, MAX_OUTSTANDING_REQUESTS, RequestIdSequence, ServerFrame,
+    TerminalCompatibilityRequirement, connect_and_hello_with_terminal_requirement,
+    encode_client_frame, encode_request_id, encode_unix_terminal_frame, parse_request_id,
 };
 use botster_terminal_protocol_client::{RouteId, RoutedTerminalFrame, TerminalFrame};
 use crossterm::event::{Event, EventStream};
@@ -149,6 +155,26 @@ enum IoMessage {
         route_generation: u64,
         reason: String,
     },
+    /// A route's socket reached end of stream or failed: the route's end.
+    /// It follows every frame that route delivered.
+    RouteEnded {
+        generation: u64,
+        route: String,
+    },
+}
+
+/// One attached route's socket, as the owner holds it.
+struct RouteLink {
+    /// The owner's handle, to shut the socket and unblock the reader.
+    stream: UnixStream,
+    writer: Sender<WriteCommand>,
+}
+
+impl RouteLink {
+    fn close(self) {
+        let _ = self.writer.send(WriteCommand::Stop);
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
 }
 
 /// Handles the connect thread hands to the owner once Hello succeeded.
@@ -401,6 +427,10 @@ pub struct HubIo {
     request_ids: RequestIdSequence,
     pending: BTreeMap<u64, PendingRequest>,
     budget: Arc<WakeBudget>,
+    /// Attached routes with a live socket, by route id.
+    routes: BTreeMap<String, RouteLink>,
+    /// A `TerminalSubscriptionClosed` event held until its route socket ends.
+    held_closed: BTreeMap<String, DaemonEvent>,
     /// Test seam: when set, terminal input frames are recorded instead of
     /// written, so a test without a Hub can observe the write path.
     #[cfg(test)]
@@ -422,6 +452,8 @@ impl HubIo {
             request_ids: RequestIdSequence::new(),
             pending: BTreeMap::new(),
             budget: Arc::new(WakeBudget::new()),
+            routes: BTreeMap::new(),
+            held_closed: BTreeMap::new(),
             #[cfg(test)]
             captured_terminal: None,
         }
@@ -523,6 +555,7 @@ impl HubIo {
         // A reader waiting for space cannot see the socket shut: end its wait.
         // The generation is open from connect(), before its link is installed.
         self.budget.close_reader(self.generation);
+        self.close_routes();
         let closed = self.link.take().is_none_or(|link| link.close_within(bound));
         self.fail_pending();
         closed
@@ -531,10 +564,117 @@ impl HubIo {
     /// Close the link without waiting and fail its pending requests.
     pub fn disconnect_now(&mut self) {
         self.budget.close_reader(self.generation);
+        self.close_routes();
         if let Some(link) = self.link.take() {
             link.close_now();
         }
         self.fail_pending();
+    }
+
+    /// Close every route socket and forget every held close event.
+    fn close_routes(&mut self) {
+        self.held_closed.clear();
+        for link in std::mem::take(&mut self.routes).into_values() {
+            link.close();
+        }
+    }
+
+    /// Connect the route socket an Attach response named, once, and start its
+    /// reader and writer. A response without a socket names a route that had
+    /// already ended: nothing to read, and its close event is not held.
+    fn open_route(&mut self, generation: u64, attach: &DaemonTerminalAttach) {
+        if attach.route_socket.is_none() {
+            return;
+        }
+        let Ok(route_id) = RouteId::new(&attach.subscription_id) else {
+            return;
+        };
+        let route = attach.subscription_id.clone();
+        let route_generation = attach.generation;
+        let fail = |ready: &mut VecDeque<AppWake>, reason: String| {
+            ready.push_back(AppWake::RouteFault {
+                route: route_id.clone(),
+                generation: route_generation,
+                reason,
+            });
+        };
+        let stream = match DaemonRouteStream::connect(attach) {
+            Ok(stream) => stream,
+            Err(error) => {
+                fail(
+                    &mut self.ready,
+                    format!("route socket connect failed: {error}"),
+                );
+                return;
+            }
+        };
+        let (shutdown_handle, writer_stream) =
+            match (stream.try_clone_stream(), stream.try_clone_stream()) {
+                (Ok(shutdown_handle), Ok(writer_stream)) => (shutdown_handle, writer_stream),
+                (Err(error), _) | (_, Err(error)) => {
+                    fail(
+                        &mut self.ready,
+                        format!("route socket setup failed: {error}"),
+                    );
+                    return;
+                }
+            };
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer_sender = self.wake_tx.clone();
+        let writer_route = route.clone();
+        let writer_route_id = route_id.clone();
+        let writer_spawn = thread::Builder::new()
+            .name(format!("botster-tui-route-writer-{generation}"))
+            .spawn(move || {
+                run_route_writer(
+                    generation,
+                    writer_route,
+                    writer_route_id,
+                    route_generation,
+                    writer_stream,
+                    &writer_rx,
+                    &writer_sender,
+                );
+            });
+        if let Err(error) = writer_spawn {
+            fail(
+                &mut self.ready,
+                format!("route writer thread failed: {error}"),
+            );
+            return;
+        }
+        let sender = self.wake_tx.clone();
+        let budget = Arc::clone(&self.budget);
+        let reader_route = route.clone();
+        let reader_route_id = route_id.clone();
+        let reader_spawn = thread::Builder::new()
+            .name(format!("botster-tui-route-reader-{generation}"))
+            .spawn(move || {
+                run_route_reader(
+                    generation,
+                    reader_route,
+                    reader_route_id,
+                    route_generation,
+                    stream,
+                    &sender,
+                    &budget,
+                );
+            });
+        if let Err(error) = reader_spawn {
+            let _ = writer_tx.send(WriteCommand::Stop);
+            fail(
+                &mut self.ready,
+                format!("route reader thread failed: {error}"),
+            );
+            return;
+        }
+        self.routes.insert(
+            route,
+            RouteLink {
+                stream: shutdown_handle,
+                writer: writer_tx,
+            },
+        );
     }
 
     fn fail_pending(&mut self) {
@@ -551,6 +691,7 @@ impl HubIo {
     fn end_link(&mut self, error: DaemonTransportError) {
         let generation = self.generation;
         self.budget.close_reader(generation);
+        self.close_routes();
         if let Some(link) = self.link.take() {
             link.close_now();
         }
@@ -621,9 +762,9 @@ impl HubIo {
         self.pending.len()
     }
 
-    /// Send one encoded terminal input frame on the terminal plane.
+    /// Send one terminal input frame on the route's own socket.
     ///
-    /// Returns false when no connection is installed or the container cannot
+    /// Returns false when the route has no live socket or the container cannot
     /// carry the route and body.
     pub fn send_terminal(&mut self, route: &str, generation: u64, body: &[u8]) -> bool {
         #[cfg(test)]
@@ -631,7 +772,7 @@ impl HubIo {
             captured.push((route.to_string(), generation, body.to_vec()));
             return true;
         }
-        let Some(link) = self.link.as_ref() else {
+        let Some(link) = self.routes.get(route) else {
             return false;
         };
         let Some(bytes) =
@@ -646,19 +787,6 @@ impl HubIo {
     /// route id is admitted again.
     pub fn forget_route(&mut self, route: &str) {
         self.budget.forget_route(route);
-    }
-
-    /// Charge one frame the application retains after dequeue (for example a
-    /// terminal frame parked until its Attach response) against the same
-    /// 256-item / 8 MiB pending budget as queued wakes. Returns false at the
-    /// bound; the caller then fails only the affected route.
-    pub fn try_retain(&self, bytes: usize) -> bool {
-        self.budget.try_reserve_terminal(bytes)
-    }
-
-    /// Release one retained frame charged with `try_retain`.
-    pub fn release_retained(&self, bytes: usize) {
-        self.budget.release_terminal(bytes);
     }
 
     /// Earliest absolute deadline among outstanding requests.
@@ -779,8 +907,17 @@ impl HubIo {
                     return None;
                 }
                 // A response for an unknown, cancelled, or expired id is discarded
-                // for that key only.
+                // for that key only, and opens no route: the application never
+                // sees its completion, so nothing would own the socket.
                 self.pending.remove(&request_id)?;
+                // The route's socket is named by its Attach response and opens
+                // before the application sees that response, so no terminal
+                // frame can reach the application first.
+                if response.kind == DaemonResponseKind::TerminalAttached
+                    && let Some(attach) = response.terminal_attach.as_ref()
+                {
+                    self.open_route(generation, attach);
+                }
                 Some(AppWake::Completed {
                     request_id,
                     result: Ok(response),
@@ -788,7 +925,29 @@ impl HubIo {
             }
             IoMessage::Event { generation, event } => {
                 self.budget.release_control();
-                self.current(generation).then_some(AppWake::Event(event))
+                if !self.current(generation) {
+                    return None;
+                }
+                // The route's last frame is applied before its close: hold the
+                // event while the route's socket is still open.
+                if let DaemonEvent::TerminalSubscriptionClosed {
+                    subscription_id, ..
+                } = &event
+                    && self.routes.contains_key(subscription_id)
+                {
+                    self.held_closed.insert(subscription_id.clone(), event);
+                    return None;
+                }
+                Some(AppWake::Event(event))
+            }
+            IoMessage::RouteEnded { generation, route } => {
+                if !self.current(generation) {
+                    return None;
+                }
+                if let Some(link) = self.routes.remove(&route) {
+                    link.close();
+                }
+                self.held_closed.remove(&route).map(AppWake::Event)
             }
             IoMessage::Entity { generation, frame } => {
                 self.budget.release_control();
@@ -821,6 +980,7 @@ impl HubIo {
                     return None;
                 }
                 self.budget.close_reader(generation);
+                self.close_routes();
                 if let Some(link) = self.link.take() {
                     link.close_now();
                 }
@@ -1004,17 +1164,17 @@ fn run_reader_thread(
             }
         };
         let message = match frame {
-            DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
+            ServerFrame::HelloAck { .. } => {
                 let _ = sender.send(IoMessage::Disconnected {
                     generation,
                     error: DaemonTransportError::Protocol("unexpected hello ack after handshake"),
                 });
                 return;
             }
-            DaemonUnixMuxFrame::Server(ServerFrame::Response {
+            ServerFrame::Response {
                 request_id,
                 response,
-            }) => {
+            } => {
                 let Some(request_id) = parse_request_id(&request_id) else {
                     let _ = sender.send(IoMessage::Disconnected {
                         generation,
@@ -1031,47 +1191,119 @@ fn run_reader_thread(
                     response: Box::new(response),
                 }
             }
-            DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
+            ServerFrame::Event { event } => {
                 budget.reserve_control();
                 IoMessage::Event { generation, event }
             }
-            DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) => {
+            ServerFrame::Entity { entity } => {
                 budget.reserve_control();
                 IoMessage::Entity {
                     generation,
                     frame: entity,
                 }
             }
-            DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+            ServerFrame::Close { reason } => {
                 let _ = sender.send(IoMessage::Disconnected {
                     generation,
                     error: DaemonTransportError::ClosedByHub(reason),
                 });
                 return;
             }
-            DaemonUnixMuxFrame::Terminal(terminal) => {
-                match admit_terminal_frame(generation, terminal, budget) {
-                    Ok(Some(frame)) => IoMessage::Terminal { generation, frame },
-                    Ok(None) => continue,
-                    Err(TerminalAdmitError::Stopped) => return,
-                    Err(TerminalAdmitError::Route {
-                        route,
-                        route_generation,
-                        reason,
-                    }) => IoMessage::RouteFault {
+        };
+        if sender.send(message).is_err() {
+            return;
+        }
+    }
+}
+
+/// Write route input frames until told to stop. A write failure means the
+/// peer no longer reads this route: the writer closes the whole socket, which
+/// faults the route so the application recovers it, then ends the route's
+/// reader. The fault is posted before the shutdown, so it always precedes the
+/// reader's end. Dropping this handle alone would not close the socket.
+fn run_route_writer(
+    generation: u64,
+    route: String,
+    route_id: RouteId,
+    route_generation: u64,
+    mut stream: UnixStream,
+    commands: &Receiver<WriteCommand>,
+    sender: &Sender<IoMessage>,
+) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            WriteCommand::Bytes(bytes) => {
+                if let Err(error) = stream.write_all(&bytes) {
+                    // Post the fault first: the reader can only see end of
+                    // stream after the shutdown, so its `RouteEnded` always
+                    // follows this fault in the wake queue.
+                    let _ = sender.send(IoMessage::RouteFault {
                         generation,
-                        route,
+                        route: route_id,
                         route_generation,
-                        reason,
-                    },
-                    Err(TerminalAdmitError::Protocol(reason)) => {
-                        let _ = sender.send(IoMessage::Disconnected {
-                            generation,
-                            error: DaemonTransportError::Protocol(reason),
-                        });
-                        return;
-                    }
+                        reason: format!("route {route} input write failed: {error}"),
+                    });
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
                 }
+            }
+            WriteCommand::Stop => return,
+        }
+    }
+}
+
+/// Read one route's socket until it ends. Its frames enter the wake queue
+/// under the shared budget, then `RouteEnded` follows the last of them.
+fn run_route_reader(
+    generation: u64,
+    route: String,
+    route_id: RouteId,
+    route_generation: u64,
+    mut stream: DaemonRouteStream,
+    sender: &Sender<IoMessage>,
+    budget: &WakeBudget,
+) {
+    loop {
+        let terminal = match stream.read_frame() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                // End of stream and I/O failures are the route's end. A frame
+                // the socket should not carry also faults the route.
+                if matches!(
+                    error,
+                    DaemonTransportError::Protocol(_) | DaemonTransportError::ProtocolViolation(_)
+                ) {
+                    let _ = sender.send(IoMessage::RouteFault {
+                        generation,
+                        route: route_id,
+                        route_generation,
+                        reason: format!("route socket protocol error: {error:?}"),
+                    });
+                }
+                let _ = sender.send(IoMessage::RouteEnded { generation, route });
+                return;
+            }
+        };
+        let message = match admit_terminal_frame(generation, terminal, budget) {
+            Ok(Some(frame)) => IoMessage::Terminal { generation, frame },
+            Ok(None) => continue,
+            Err(TerminalAdmitError::Stopped) => return,
+            Err(TerminalAdmitError::Route {
+                route,
+                route_generation,
+                reason,
+            }) => IoMessage::RouteFault {
+                generation,
+                route,
+                route_generation,
+                reason,
+            },
+            Err(TerminalAdmitError::Protocol(reason)) => {
+                let _ = sender.send(IoMessage::Disconnected {
+                    generation,
+                    error: DaemonTransportError::Protocol(reason),
+                });
+                return;
             }
         };
         if sender.send(message).is_err() {
@@ -1140,6 +1372,7 @@ fn admit_terminal_frame(
 mod tests {
     use super::*;
     use botster_terminal_protocol_client::encode_output;
+    use std::io::Read;
 
     fn terminal_container(route: &str, generation: u64, body: &[u8]) -> DaemonUnixTerminalFrame {
         DaemonUnixTerminalFrame {
@@ -1413,5 +1646,293 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// Install a connection generation on the owner, as `Connected` would.
+    fn install_link(io: &mut HubIo, generation: u64) {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let (writer, _writer_rx) = mpsc::channel();
+        let (_reader_tx, reader_stopped) = mpsc::channel();
+        let (_writer_tx, writer_stopped) = mpsc::channel();
+        io.generation = generation;
+        // connect() opens the generation's reader before the link exists.
+        io.budget.open_reader(generation);
+        io.link = Some(HubLink {
+            generation,
+            stream,
+            writer,
+            reader_stopped,
+            writer_stopped,
+        });
+    }
+
+    /// A route socket the test plays the Hub side of.
+    fn route_listener(name: &str) -> (std::os::unix::net::UnixListener, String) {
+        let path = std::env::temp_dir().join(format!("btui-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind route socket");
+        (listener, path.to_string_lossy().into_owned())
+    }
+
+    fn closed_event(route: &str) -> DaemonEvent {
+        DaemonEvent::TerminalSubscriptionClosed {
+            session_id: "s".to_string(),
+            subscription_id: route.to_string(),
+            generation: 1,
+            reason: "detached".to_string(),
+        }
+    }
+
+    /// The next wake the owner delivers, within a bound.
+    fn wake_within(io: &mut HubIo) -> AppWake {
+        // timer: deadline — the route reader thread delivers its message within the bound; expiry returns a Deadline wake and fails the test
+        let until = Instant::now() + Duration::from_secs(10);
+        io.next_wake(Some(until))
+    }
+
+    #[test]
+    fn route_input_is_written_to_that_routes_socket() {
+        let (listener, path) = route_listener("input");
+        let mut io = HubIo::new();
+        install_link(&mut io, 1);
+        let attach = DaemonTerminalAttach::new("s", "r", 7).with_route_socket(path.clone());
+        io.open_route(1, &attach);
+        let (hub_side, _) = listener.accept().expect("the client connects once");
+        assert!(io.send_terminal("r", 7, b"x"));
+        assert!(!io.send_terminal("other", 7, b"x"), "no socket, no input");
+        let mut hub_route = DaemonRouteStream::from_stream(hub_side);
+        let frame = hub_route.read_frame().expect("input frame");
+        assert_eq!((frame.route.as_str(), frame.generation), ("r", 7));
+        assert_eq!(frame.body, b"x");
+        io.disconnect_now();
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn message_kind(message: &IoMessage) -> &'static str {
+        match message {
+            IoMessage::Terminal { .. } => "terminal",
+            IoMessage::RouteEnded { .. } => "route-ended",
+            IoMessage::RouteFault { .. } => "route-fault",
+            IoMessage::Disconnected { .. } => "disconnected",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn a_route_reader_delivers_its_frames_then_its_end() {
+        let (mut hub_side, client_side) = UnixStream::pair().expect("socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let budget = Arc::new(WakeBudget::new());
+        budget.open_reader(1);
+        let reader_budget = Arc::clone(&budget);
+        let reader = thread::spawn(move || {
+            run_route_reader(
+                1,
+                "r".to_string(),
+                RouteId::new("r").expect("route id"),
+                7,
+                DaemonRouteStream::from_stream(client_side),
+                &sender,
+                &reader_budget,
+            );
+        });
+        let frame = encode_unix_terminal_frame(
+            "r",
+            7,
+            0,
+            botster_terminal_protocol_client::encode_output(b"last")
+                .expect("encode output")
+                .as_bytes(),
+        )
+        .expect("container");
+        hub_side.write_all(&frame).expect("write frame");
+        drop(hub_side);
+        let first = recv_within(&receiver, "the reader delivers the frame");
+        assert_eq!(message_kind(&first), "terminal");
+        let second = recv_within(&receiver, "the reader reports the end");
+        assert_eq!(message_kind(&second), "route-ended");
+        reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn a_route_close_event_waits_for_the_route_socket_to_end() {
+        let (listener, path) = route_listener("held");
+        let mut io = HubIo::new();
+        install_link(&mut io, 1);
+        let attach = DaemonTerminalAttach::new("s", "r", 7).with_route_socket(path.clone());
+        io.open_route(1, &attach);
+        let (mut hub_side, _) = listener.accept().expect("the client connects once");
+        // The close event arrives on the control connection while the route
+        // socket is still open: it is held. The control reader reserves budget
+        // for every event it forwards, so the test does too.
+        io.budget.reserve_control();
+        assert!(
+            io.map_message(IoMessage::Event {
+                generation: 1,
+                event: closed_event("r"),
+            })
+            .is_none()
+        );
+        // The Hub writes the route's last frame, then closes its socket.
+        let last = encode_unix_terminal_frame(
+            "r",
+            7,
+            0,
+            botster_terminal_protocol_client::encode_output(b"last")
+                .expect("encode output")
+                .as_bytes(),
+        )
+        .expect("container");
+        hub_side.write_all(&last).expect("write last frame");
+        drop(hub_side);
+        let first = wake_within(&mut io);
+        assert!(
+            matches!(first, AppWake::Terminal(_)),
+            "the last frame is applied first, got {first:?}"
+        );
+        let second = wake_within(&mut io);
+        assert!(
+            matches!(
+                second,
+                AppWake::Event(DaemonEvent::TerminalSubscriptionClosed { .. })
+            ),
+            "the close follows the route's end, got {second:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_close_event_for_a_route_without_a_socket_is_not_held() {
+        let mut io = HubIo::new();
+        install_link(&mut io, 1);
+        // No route socket was named: the route had already ended.
+        io.open_route(1, &DaemonTerminalAttach::new("s", "r", 7));
+        io.budget.reserve_control();
+        assert!(matches!(
+            io.map_message(IoMessage::Event {
+                generation: 1,
+                event: closed_event("r"),
+            }),
+            Some(AppWake::Event(
+                DaemonEvent::TerminalSubscriptionClosed { .. }
+            ))
+        ));
+    }
+
+    fn attach_response(route: &str, path: &str) -> Box<DaemonResponse> {
+        let mut response = crate::app::tests::base_response(DaemonResponseKind::TerminalAttached);
+        response.terminal_attach =
+            Some(DaemonTerminalAttach::new("s", route, 7).with_route_socket(path));
+        Box::new(response)
+    }
+
+    #[test]
+    fn an_attach_response_opens_its_route_only_for_a_pending_request() {
+        let (listener, path) = route_listener("pending");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let mut io = HubIo::new();
+        install_link(&mut io, 1);
+        // An expired or cancelled request: the application discards the
+        // completion, so the route must not open.
+        io.budget.reserve_control();
+        assert!(
+            io.map_message(IoMessage::Response {
+                generation: 1,
+                request_id: 99,
+                response: attach_response("r", &path),
+            })
+            .is_none()
+        );
+        assert!(io.routes.is_empty());
+        assert!(
+            listener.accept().is_err(),
+            "no client connected for an unknown request"
+        );
+        // A pending request opens its route before its completion is delivered.
+        io.pending.insert(
+            5,
+            PendingRequest {
+                // timer: deadline — a pending-request entry the test never lets expire
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        io.budget.reserve_control();
+        assert!(matches!(
+            io.map_message(IoMessage::Response {
+                generation: 1,
+                request_id: 5,
+                response: attach_response("r", &path),
+            }),
+            Some(AppWake::Completed { .. })
+        ));
+        assert!(io.routes.contains_key("r"));
+        io.disconnect_now();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_route_write_faults_the_route_and_closes_the_socket() {
+        // A socket whose write half is shut fails every write, while its peer
+        // stays fully open: the peer keeps its write half open, so a reader
+        // alone would never see end of stream.
+        let (writer_end, _peer) = UnixStream::pair().expect("socket pair");
+        let probe = writer_end.try_clone().expect("a second handle");
+        writer_end
+            .shutdown(Shutdown::Write)
+            .expect("shut the write half");
+        let (commands, commands_rx) = mpsc::channel();
+        let (sender, wakes) = mpsc::channel();
+        commands
+            .send(WriteCommand::Bytes(vec![0u8; 16]))
+            .expect("queue input");
+        let writer = thread::spawn(move || {
+            run_route_writer(
+                1,
+                "r".to_string(),
+                RouteId::new("r").expect("route id"),
+                7,
+                writer_end,
+                &commands_rx,
+                &sender,
+            );
+        });
+        // The probe reads end of stream only once the writer closed the socket.
+        // timer: deadline — the writer closes the socket within the bound; expiry fails the test
+        let bounded = probe.set_read_timeout(Some(Duration::from_secs(5)));
+        bounded.expect("read bound");
+        let mut buffer = [0u8; 1];
+        assert_eq!(
+            (&probe).read(&mut buffer).expect("the socket is closed"),
+            0,
+            "the writer closes the whole socket, not only its handle"
+        );
+        // The fault was posted before the socket closed.
+        match wakes.try_recv() {
+            Ok(IoMessage::RouteFault { route, .. }) => assert_eq!(route.as_str(), "r"),
+            Ok(other) => panic!("expected a route fault, got {}", message_kind(&other)),
+            Err(error) => panic!("the fault precedes the close: {error}"),
+        }
+        writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn closing_the_owner_closes_every_route_socket() {
+        let (listener, path) = route_listener("close");
+        let mut io = HubIo::new();
+        install_link(&mut io, 1);
+        let attach = DaemonTerminalAttach::new("s", "r", 7).with_route_socket(path.clone());
+        io.open_route(1, &attach);
+        let (mut hub_side, _) = listener.accept().expect("the client connects once");
+        io.disconnect_now();
+        let mut buffer = [0u8; 1];
+        assert_eq!(
+            hub_side.read(&mut buffer).expect("read after close"),
+            0,
+            "the Hub side sees end of stream"
+        );
+        assert!(!io.send_terminal("r", 7, b"x"));
+        let _ = std::fs::remove_file(path);
     }
 }
